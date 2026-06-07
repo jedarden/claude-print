@@ -238,7 +238,7 @@ OPEN_WAITING
 PAYLOAD_READ → DONE
 ```
 
-**FIFO open mechanics:** Opening O_RDONLY|O_NONBLOCK on a named FIFO returns ENXIO if no writer holds the write end. To prevent this, `claude-print` opens a "keeper" write-end fd O_WRONLY|O_NONBLOCK on the same FIFO and holds it open until Stop fires. This guarantees the read-end open succeeds (write end is always held). When Stop fires and the payload is read, the keeper write-end fd is closed. The `hook.sh` write (`cat > '<fifo>'`) opens a second write end and writes the payload — both write-end opens are valid simultaneously.
+**FIFO open mechanics:** Opening O_RDONLY|O_NONBLOCK on a named FIFO returns ENXIO if no writer holds the write end. To prevent this, `claude-print` opens a "keeper" write-end fd O_WRONLY|O_NONBLOCK on the same FIFO and holds it open until Stop fires. This guarantees the read-end open succeeds (write end is always held). When Stop fires and the payload is read, the keeper write-end fd is closed. The `hook.sh` write (`cat > '<fifo>'`) opens a second write end and writes the payload — both write-end opens are valid simultaneously. On all other exit paths (SIGINT, timeout, child-exit-before-Stop), the keeper write-end fd MUST be explicitly closed before `waitpid` — this causes any pending `cat > '<fifo>'` in `hook.sh` to receive EPIPE/ENXIO and exit, preventing a hang in claude's hook runner.
 
 ## Concurrency Model
 
@@ -459,7 +459,7 @@ Passed to claude via `--settings <temp>/settings.json`. Claude Code merges this 
 
 *Schema note: This double-nested `hooks.Stop[{hooks:[...]}]` structure matches the Claude Code settings format observed in v2.x. Add schema verification to OQ-1's resolution checklist: confirm the settings JSON schema by inspecting a real `~/.claude/settings.json` from the target Claude Code version. If the schema changes, this template must be updated.*
 
-**Hook merge ordering:** Claude Code runs merged hooks sequentially in the order they appear in the merged settings. The relay hook's `"timeout": 10` applies only to the relay hook itself — it does not affect the user's hooks. The user's Stop hooks run first (they are defined in `~/.claude/settings.json` which is merged before `--settings`); the relay hook appended by `--settings` runs after. This ordering is unverified — add to OQ-1 resolution checklist.
+**Hook merge ordering:** Claude Code runs merged hooks sequentially in the order they appear in the merged settings. The relay hook's `"timeout": 10` applies only to the relay hook itself — it does not affect the user's hooks. The user's Stop hooks likely run first (settings.json is merged before --settings), but **this ordering is unverified (per OQ-1)**.
 
 **`hook.sh`** (executed by Claude Code on Stop):
 ```sh
@@ -498,6 +498,9 @@ match unsafe { fork()? } {
     }
     ForkResult::Parent { child } => {
         drop(slave);
+        // After the prompt is read from stdin and the fork is complete, the parent
+        // closes STDIN_FILENO (nix::unistd::close(0)) to release the caller's pipe.
+        // The child's fd 0 is already replaced by login_tty's dup2(slave, 0) regardless.
         run_event_loop(master, child, ...)
     }
 }
@@ -561,7 +564,7 @@ The idle/byte fallback is a one-shot: once any trigger (keyword or idle) fires a
 
 **Phase 2 — Prompt injection:**
 
-- After Phase 1 CR, wait until PTY is idle for 2.0 s (REPL re-renders)
+- After Phase 1 CR, wait until PTY is idle for 2.0 s (REPL re-renders) (If the PTY never goes idle for 2.0 s — e.g., claude streams continuous progress output — the wall-clock `--timeout` is the only exit path. This is expected behavior; the phase has no dedicated sub-timeout. `--verbose` logs a warning if TRUST_DISMISSED persists > 10 s.)
 - Send via bracketed paste: `\x1b[200~<prompt>\x1b[201~\r`
 - Bracketed paste treats embedded `\n` as literals (no premature Enter)
 - Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After sending `/read <path>\r`, the startup sequencer re-enters the idle-wait loop (same as after trust dismiss, 2.0s idle threshold). Claude Code reads the file contents and begins processing — no system acknowledgment is emitted before the response. The response extraction path is identical to inline injection: Stop hook fires after the response, transcript JSONL is read normally. See EC-5 for sandboxing note.)
@@ -705,7 +708,9 @@ pub enum ContentBlock {
 
 **Known limitation:** `cost_usd` is always `0`. Claude Code does not expose per-session cost data via the transcript JSONL. Callers should not use this field for billing purposes. It is included for wire compatibility with `claude -p --output-format json` which also emits `0` for this field.
 
-`claude_version` field (new, not in `claude -p` wire format): included in all output formats for version-change debugging. Callers that parse strictly by field name are unaffected by the extra field.
+`claude_version` field (new, not in `claude -p` wire format): included in `json` output and in the final error result line of `stream-json` output. It does not appear in `text` output (no JSON envelope in text mode). Callers that parse strictly by field name are unaffected by the extra field.
+
+`claude_version` runtime value: run `claude --version` (or the binary at `--claude-binary`) **once at process startup, before `fork()`**. Parse the output with the same permissive regex used by `--version` flag handling. Cache the result and pass it to the emitter. On parse failure, use `"unknown"`.
 
 Error result:
 ```json
@@ -846,7 +851,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | EC-6 | `claude --version` output format changes | Version parsing uses a permissive regex. If parsing fails, `claude_version: "unknown"` in output; `--version` still exits 0. |
 | EC-7 | Stop hook fires before trust dismiss (no dialog shown) | EC-11 unsets `CLAUDE_CODE_SESSION_ID`/`CLAUDE_CODE_SESSION_KIND` before `execvp`, which should prevent this in normal operation. If Stop fires before prompt injection despite EC-11, treat it as an error: emit `is_error=true` and exit 2, rather than silently accepting an empty-prompt response. |
 | EC-8 | No PTY output received for 45 s total (total bytes received == 0 AND 45 s elapsed — detects binary-not-found or hung startup before first byte) | Hard timeout: SIGTERM → 2 s → SIGKILL → waitpid → exit 2. |
-| EC-9 | `last_assistant_message` contains ANSI escape sequences | Strip ANSI before emitting in `text` and `json` formats (simple regex on the fallback string only). |
+| EC-9 | `last_assistant_message` contains ANSI escape sequences | Strip ANSI before emitting in `text` and `json` formats (simple regex on the fallback string only). In `stream-json` mode, if the `last_assistant_message` fallback is used (retry loop exhausted), ANSI sequences MUST also be stripped before the synthesized fallback result event is emitted. |
 | EC-10 | Truncated final JSONL line | Malformed line skipped by lenient parser. If no complete assistant events remain, retry loop fires. |
 | EC-11 | `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_SESSION_KIND` inherited from parent | Unset both in child env before `execvp` to prevent session identity confusion. (See Open Questions #6.) |
 | EC-12 | Stdin is a TTY (interactive call with no prompt) | Require a prompt source. If stdin is a TTY and no positional/`--input-file` given, exit 2 with usage error. Do NOT drop into an interactive session. |
@@ -1343,7 +1348,7 @@ Unresolved questions are mapped to the phase they block. Each MUST be resolved b
 
 | # | Question | Blocks | Resolution / Fallback |
 |---|---------|--------|----------------------|
-| OQ-1 | Does `--settings <file>` merge hooks with `~/.claude/settings.json` or replace them? | Phase 2 | Verify by running `claude` with `--settings` containing a test hook alongside a real user hook and checking both fire. If merge fails: PO-1 fallback (merge in-process). |
+| OQ-1 | Does `--settings <file>` merge hooks with `~/.claude/settings.json` or replace them? | Phase 2 | Verify by running `claude` with `--settings` containing a test hook alongside a real user hook and checking both fire. If merge fails: PO-1 fallback (merge in-process). Also verify hook firing order: confirm user hooks run before or after the relay hook. If relay fires first, confirm this does not cause a read race with user Stop hooks that post-process the JSONL (e.g., ccdash). |
 | OQ-2 | Does `--setting-sources=` (empty string) suppress all standard sources? | Phase 6 | Verify by running `claude --setting-sources= --settings <relay-only-file>` and checking user hooks do not fire. If not accepted: try `--setting-sources=none`; if neither works, enumerate relay source explicitly. |
 | OQ-3 | Does `/read <path>` accept absolute paths for prompts >32 KB? Verify that `/read` is a built-in slash command (always available) vs. a tool invocation (requires allowedTools). | Phase 5 | End-to-end test with `--allowedTools=all` and a 33 KB prompt file. If not: PO-6 fallback (truncate at 32 KB). Note: `/read` is confirmed a built-in slash command — it does not require `Read` in `--allowedTools`. |
 | OQ-4 | FIFO open race: will O_NONBLOCK open-before-inject reliably prevent timing issues? | Phase 6 | Validated by `test_fast_stop_hook` integration test (MOCK_DELAY_STOP=0). If race occurs in practice, add a pre-prompt-inject `poll()` to confirm FIFO open. |
