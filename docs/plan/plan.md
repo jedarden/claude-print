@@ -59,7 +59,7 @@ By default `claude-print` does **not** redirect `CLAUDE_CONFIG_DIR`. The inner `
 
 `claude-print` adds its own Stop hook by passing `--settings <temp>/settings.json` with the per-run relay hook. Claude Code merges `--settings` with the user's settings file — all existing hooks continue to fire alongside the relay hook.
 
-This matches exactly what `claude -p` does. Transcripts, token counts, and usage stats land in `~/.claude/` with no special handling. All prior art (smithersai/claude-p, hristo2612/jinn) follows this same approach.
+This matches exactly what `claude -p` does. Transcripts, token counts, and usage stats land in `~/.claude/` with no special handling.
 
 ### `--no-inherit-hooks` (Isolation Mode)
 
@@ -315,7 +315,7 @@ for event in parse_events(path) {
 }
 ```
 
-`message.id` is present in current transcripts (observed in jinn's implementation). Usage-fingerprint fallback handles older Claude Code versions that may not include it.
+`message.id` is present in observed transcripts. Usage-fingerprint fallback handles older Claude Code versions that may not include it.
 
 **Schema tolerance (`serde` config for all JSONL structs):**
 
@@ -700,7 +700,7 @@ needle run --agent claude-print --workspace /home/coding/some-project
 
 ## Open Questions
 
-- **`--settings` merge behavior**: smithersai/claude-p uses `--settings <inline-json>` and treats it as additive. Needs end-to-end verification that `--settings` truly merges with `~/.claude/settings.json` hooks rather than replacing them. If Claude Code's merge fails, the fallback is to read `~/.claude/settings.json` in-process, merge hooks manually, write a combined settings file to the temp dir, and pass only the combined file via `--settings`.
+- **`--settings` merge behavior**: Needs end-to-end verification that `--settings` truly merges with `~/.claude/settings.json` hooks rather than replacing them. If Claude Code's merge fails, the fallback is to read `~/.claude/settings.json` in-process, merge hooks manually, write a combined settings file to the temp dir, and pass only the combined file via `--settings`.
 - **`--setting-sources=` empty value**: Verify Claude Code accepts an empty string for `--setting-sources` (to suppress all standard sources). If it doesn't, alternatives are `--setting-sources=none` (if supported) or `--no-session-persistence` + other flags to achieve the same effect.
 - **Multiline prompt > 32 KB**: Does the `/read <path>` slash command accept absolute paths? Does it interact with `--allowedTools`? Needs end-to-end verification.
 - **`FIFO` open race**: The parent must open the FIFO read end before the Stop hook fires. Mitigation: open read end before prompt injection. Verify timing in the mock integration test.
