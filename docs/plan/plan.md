@@ -217,7 +217,7 @@ DONE
 From any state:
   wall-clock timeout     → SIGTERM child → exit 124
   child exits unexpectedly → exit 2
-  SIGINT                 → SIGTERM child → exit 130
+  SIGINT                 → SIGINT child (per HR-8) → exit 130
   Stop fires before PROMPT_INJECTED → error: emit is_error=true, exit 2 (see EC-7: a response to an unsent prompt indicates a session identity leak; EC-11 prevents this in normal operation)
 ```
 
@@ -283,6 +283,8 @@ emit exit code
 ```
 
 Synchronization: one-shot `std::sync::mpsc::channel`. Reader owns the transcript file handle (no sharing). Reader thread MUST be joined before `main()` returns on all exit paths — including timeout and SIGINT paths (the SIGINT handler sets a flag that breaks the poll loop, which then joins the thread before calling `process::exit`).
+
+**Non-Stop exit paths (SIGINT, timeout):** The reader thread MUST also exit on these paths. Mechanism: the reader thread holds the mpsc `Receiver`; the main thread holds the `Sender`. On SIGINT or timeout, the main thread **drops the Sender** (without sending a value). The receiver's `recv()` or `try_recv()` then returns `Err(RecvError)`, which the reader thread treats as a shutdown signal — it exits its tail loop and returns. This means join() returns promptly on all exit paths. The reader thread drain logic: on `Ok(())` from recv = drain_signal; on `Err` = immediate exit without draining.
 
 The reader thread handle is stored as `Option<JoinHandle<()>>`, initialized to `None`. The `Option` is set to `Some(handle)` only at the `PROMPT_INJECTED` transition when the thread is spawned. On any exit path — including early exits before `PROMPT_INJECTED` — the join is conditional: `if let Some(h) = reader_handle { h.join().ok(); }`
 
@@ -362,7 +364,7 @@ Use this when running as a NEEDLE worker to prevent hook noise, or when the user
 
 ```toml
 [defaults]
-inherit_hooks = true      # pass --setting-sources=user,project,local (default)
+inherit_hooks = true      # do not pass --setting-sources; let claude use its default source loading
 model = "claude-sonnet-4-6"
 max_turns = 30
 timeout_secs = 3600
@@ -511,7 +513,7 @@ Cleanup on any exit path: `SIGTERM` → 2 s → `SIGKILL` → `waitpid`. (Note: 
 
 ### 4. Event Loop
 
-Single `poll()` call on up to two fds (plus deadline tracking):
+Single `poll()` call on `master_fd` and `self_pipe_read` (2 fds always present). At PROMPT_INJECTED, `stop_fifo` read-end is added as a third fd. Deadline tracking is separate:
 
 ```
 master_fd   POLLIN → read PTY output, dispatch to TerminalEmu + StartupSeq
@@ -821,11 +823,11 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | `claude` binary not found | PATH lookup fails at startup | emit error | 2 |
 | PTY open fails | `openpty()` returns Err | emit error | 2 |
 | Hook installer fails | temp dir / mkfifo / write error | emit error | 2 |
-| No PTY output within 45 s | startup timer | kill child, emit error | 2 |
+| total bytes received == 0 after 45 s | startup timer | kill child, emit error | 2 |
 | Child exits before Stop | `waitpid` returns | emit error with child exit code | 2 |
 | Wall-clock timeout | poll timer | SIGTERM child, emit timeout | 124 |
 | Stop hook never fires | FIFO timeout | SIGTERM child, emit timeout | 124 |
-| SIGINT | signal handler | SIGTERM child, emit interrupt result | 130 |
+| SIGINT | signal handler | SIGINT child (per HR-8); set interrupted flag, emit interrupt result | 130 |
 | SIGTERM received | signal handler | SIGTERM child, emit interrupt result | 130 |
 | Stop payload has no `transcript_path` and no `cwd` | payload parse | skip to `last_assistant_message` fallback; if also absent, emit error | 1 |
 | Transcript empty + fallback empty | retry exhausted | emit error | 1 |
@@ -843,7 +845,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | EC-5 | Prompt > 32 KB | Written to `$TMPDIR/<session>/prompt.txt`; `/read <path>\r` sent instead. File cleaned up with temp dir. Requires PO-6 to hold. See Startup Sequencer §6 for the full /read relay specification including encoding and response flow. |
 | EC-6 | `claude --version` output format changes | Version parsing uses a permissive regex. If parsing fails, `claude_version: "unknown"` in output; `--version` still exits 0. |
 | EC-7 | Stop hook fires before trust dismiss (no dialog shown) | EC-11 unsets `CLAUDE_CODE_SESSION_ID`/`CLAUDE_CODE_SESSION_KIND` before `execvp`, which should prevent this in normal operation. If Stop fires before prompt injection despite EC-11, treat it as an error: emit `is_error=true` and exit 2, rather than silently accepting an empty-prompt response. |
-| EC-8 | No PTY output for 45 s | Hard timeout: SIGTERM → 2 s → SIGKILL → waitpid → exit 2. |
+| EC-8 | No PTY output received for 45 s total (total bytes received == 0 AND 45 s elapsed — detects binary-not-found or hung startup before first byte) | Hard timeout: SIGTERM → 2 s → SIGKILL → waitpid → exit 2. |
 | EC-9 | `last_assistant_message` contains ANSI escape sequences | Strip ANSI before emitting in `text` and `json` formats (simple regex on the fallback string only). |
 | EC-10 | Truncated final JSONL line | Malformed line skipped by lenient parser. If no complete assistant events remain, retry loop fires. |
 | EC-11 | `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_SESSION_KIND` inherited from parent | Unset both in child env before `execvp` to prevent session identity confusion. (See Open Questions #6.) |
@@ -914,7 +916,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 
 **Phase 3: Event Loop (~150 LOC)**
 *Entry:* Phase 2 complete.
-- [ ] `event_loop.rs`: `poll()` on master_fd + stop_fifo + timer; read buffer; EIO detection (child exit)
+- [ ] `event_loop.rs`: `poll()` on `master_fd + self_pipe_read` (initial 2-fd set); `Vec<pollfd>` for dynamic stop_fifo registration at PROMPT_INJECTED; read buffer; EIO detection (child exit)
 
 *Complete when:* `test_event_loop_reads_pty_output` passes; `test_event_loop_detects_child_exit` (EIO → exit 2) passes.
 
@@ -1016,7 +1018,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - Trust keywords in different lines of same chunk → CR sent
 - **Alternative wording `continue` + `folder` → CR sent** (keyword union logic)
 - **Arbitrary unknown welcome text (no keywords) → fallback: CR after 0.8 s idle**
-- No output for 45 s → error returned
+- No output for 45 s (total bytes == 0) → error returned; note: if any bytes arrive before 45s, this timeout does not fire (see idle fallback at 0.8s/200 bytes)
 - 199 bytes received then idle 0.8 s → no CR yet (minimum 200 bytes enforced)
 - 200 bytes received then idle 0.8 s → CR sent
 
@@ -1051,6 +1053,7 @@ A `mock_claude` binary (compiled as a test fixture, not a shell script) simulate
 | `MOCK_EXIT_BEFORE_STOP=1` | Exit without firing Stop hook |
 | `MOCK_DELAY_STOP=<ms>` | Fire Stop after delay |
 | `MOCK_IS_ERROR=1` | Write `is_error: true` to transcript result event |
+| `MOCK_STOP_BEFORE_INJECT=1` | Fire Stop hook immediately, before trust dismiss |
 
 *All env vars listed above are exercised by at least one scenario in the integration test table. `MOCK_DELAY_STOP` is used in the SIGINT and "Stop hook never fires" scenarios.*
 
@@ -1079,6 +1082,7 @@ Integration test scenarios:
 | `--no-inherit-hooks` | `--no-inherit-hooks` flag set | appropriate `--setting-sources` arg in child argv (either `=` or `=none` per OQ-2 resolution), exit 0 |
 | Output format json | defaults | output parses as valid JSON |
 | Output format stream-json | defaults | each output line parses as valid JSON |
+| Stop fires before PROMPT_INJECTED | `MOCK_STOP_BEFORE_INJECT=1` | exit 2, `is_error: true` in output (EC-7 path) |
 
 ### Hook Inheritance Tests (`tests/hooks.rs`)
 
@@ -1266,7 +1270,7 @@ The `claude_version` field is additive (minor) and will not be removed in a majo
 
 ### Rollout / Rollback Criteria
 
-- **Promote to stable:** AS-1 through AS-5 pass; AS-4 (billing) verified manually; no open P0 bugs.
+- **Promote to stable:** AS-1 through AS-6 pass; AS-4 (billing) verified manually; no open P0 bugs.
 - **Roll back:** If AS-4 fails (entrypoint is `sdk-cli`), immediately pull the release from the CI artifact store and revert the install. The previous binary is always preserved as `claude-print.prev` by `install.sh`.
 
 ### Monitoring and Alerting
@@ -1317,7 +1321,7 @@ No automated alerting in v1.0. If billing classification fails silently in produ
 
 **Decision:** Use `nix::poll::poll()` synchronously; no `tokio` or `async-std`.
 
-**Context:** The event loop monitors at most 3 file descriptors (master_fd, stop_fifo, timer). A reader thread handles stream-json output.
+**Context:** The event loop monitors at most 3 file descriptors: `master_fd` (always), `self_pipe_read` (always), and `stop_fifo` (added at PROMPT_INJECTED). A reader thread handles stream-json output.
 
 **Rationale:** Async runtimes add binary size (~2 MB), compile time, and conceptual complexity. The workload is I/O-bound on 2–3 fds with no parallelism benefit. A single `poll()` call + one reader thread is the simplest correct model.
 
