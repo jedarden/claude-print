@@ -730,7 +730,7 @@ Error result:
 **Error output by format:**
 - `text` mode: on error, nothing is written to stdout; the error message is written to stderr. Exit code is the signal to callers.
 - `json` mode: the error JSON object is written to stdout (as specified above). Nothing to stderr unless `--verbose`.
-- `stream-json` mode: if an error occurs after prompt injection, a final JSON error line is emitted to stdout (`{"type": "result", "is_error": true, "subtype": "...", "error_message": "..."}`); if an error occurs before prompt injection, same as `text` mode (nothing to stdout, stderr message).
+- `stream-json` mode: if an error occurs after prompt injection, a final JSON error line is emitted to stdout (`{"type": "result", "is_error": true, "subtype": "...", "error_message": "...", "claude_version": "..."}`); if an error occurs before prompt injection, same as `text` mode (nothing to stdout, stderr message).
 
 ### 10. NEEDLE Agent Config
 
@@ -921,7 +921,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* `cargo build --target x86_64-unknown-linux-musl` succeeds; `claude-print --version` prints expected format; `cargo test --lib` passes; `claude-print-ci.yaml` stub exists in declarative-config and ArgoCD syncs it to `argo-workflows-ns-iad-ci`.
 
 **Phase 2: Hook Installer + PTY Spawner (~200 LOC)**
-*Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting). **PO-1 verified** (confirm `--settings` merges hooks rather than replacing; if false, see PO-1 recovery before writing the hook installer). PO-1 can be verified with a simple test: run `claude --settings /tmp/test_settings.json echo test` where test_settings.json contains a dummy hook, alongside a user hook in ~/.claude/settings.json, and confirm both fire.
+*Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting). **PO-1 verified** (confirm `--settings` merges hooks rather than replacing; if false, see PO-1 recovery before writing the hook installer). PO-1 can be verified with a simple test: run `claude --settings /tmp/test_settings.json echo test` where test_settings.json contains a dummy hook, alongside a user hook in ~/.claude/settings.json, and confirm both fire. **OQ-5 (login_tty availability in musl) verified or PO-3 inline fallback ready; OQ-6 (CLAUDE_CODE_SESSION_ID inheritance) resolved.**
 - [ ] `hook.rs`: temp dir (`tempfile::TempDir`), write `settings.json` and `hook.sh`, `mkfifo`
 - [ ] `pty.rs`: `openpty`, `fork`, window-size probe, `login_tty`, `execvp`, SIGTERM/SIGKILL/`waitpid`
 - [ ] `--no-inherit-hooks` forwards `--setting-sources=` to child (unverified per OQ-2)
@@ -948,7 +948,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* All startup unit tests pass; integration test `test_trust_dialog_standard_wording` and `test_trust_dialog_alternate_wording` pass.
 
 **Phase 6: Stop Poller (~80 LOC)**
-*Entry:* Phase 5 complete. **OQ-2 must be resolved** (verify `--setting-sources=` suppresses standard sources; see PO-2 for fallback).
+*Entry:* Phase 5 complete. **OQ-2 must be resolved** (verify `--setting-sources=` suppresses standard sources; see PO-2 for fallback). **OQ-4 (FIFO open race) validated by test.**
 - [ ] Open FIFO read-end O_NONBLOCK, integrate into `poll()` loop, parse Stop payload, derive transcript path, signal event loop exit
 
 *Complete when:* Integration test `test_stop_hook_fires` passes; `test_missing_transcript_path_derived` passes.
@@ -970,7 +970,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - [ ] `claude-print.yaml`, `install.sh`, `claude-print-ci` WorkflowTemplate in declarative-config
 - [ ] Implement `--check` doctor subcommand (openpty probe, mkfifo probe, optional mock_claude PTY round-trip)
 
-*Complete when:* `install.sh` runs to completion on a clean machine; NEEDLE dispatches a test bead using `claude-print.yaml`; AS-3 passes; README flags table matches `claude-print --help` output (verified manually).
+*Complete when:* `install.sh` is written and syntactically valid (`bash -n install.sh` passes); manually copying the locally-built binary to `~/.local/bin/claude-print` and running `claude-print --check` succeeds. Full install.sh end-to-end test (downloading from GitHub Release) is reserved for Phase 11. NEEDLE dispatches a test bead using `claude-print.yaml`; AS-3 passes; README flags table matches `claude-print --help` output (verified manually).
 
 **Phase 10: Tests (~500 LOC)**
 *Entry:* Phase 8 complete (can run in parallel with Phase 9).
@@ -1393,7 +1393,7 @@ entrypoint: main
 arguments:
   parameters:
     - name: repo          # git.ardenone.com/jedarden/claude-print
-    - name: revision      # branch or tag SHA
+    - name: revision      # branch name or tag name
     - name: tag           # set by caller; empty on branch push
 
 steps:
@@ -1409,22 +1409,23 @@ Delegates to the existing `rust-verify` WorkflowTemplate (fmt + clippy + test). 
 ### Step: build-musl
 
 ```yaml
-initContainers:
-  - name: git-clone
-    image: alpine/git:latest
-    command: [git, clone, "--branch", "$(inputs.parameters.revision)", "$(inputs.parameters.repo)", /workspace]
 container:
   image: ghcr.io/jedarden/rust-musl-builder:latest   # or equivalent
-  command: [cargo, build, --release, --target, x86_64-unknown-linux-musl]
+  command: [sh, -c, "git clone $(inputs.parameters.repo) /workspace &&
+    git -C /workspace checkout $(inputs.parameters.revision) &&
+    cd /workspace &&
+    cargo build --release --target x86_64-unknown-linux-musl &&
+    mv /workspace/target/x86_64-unknown-linux-musl/release/claude-print /workspace/claude-print-linux-amd64 &&
+    mv /workspace/target/x86_64-unknown-linux-musl/release/mock_claude /workspace/mock-claude-linux-amd64"]
   env:
     - name: CARGO_TERM_COLOR
       value: never
 outputs:
   artifacts:
     - name: binary
-      path: /workspace/target/x86_64-unknown-linux-musl/release/claude-print-linux-amd64
+      path: /workspace/claude-print-linux-amd64
     - name: mock-binary
-      path: /workspace/target/x86_64-unknown-linux-musl/release/mock-claude-linux-amd64
+      path: /workspace/mock-claude-linux-amd64
 ```
 
 The `cargo build` step also builds `mock_claude` from the `test-fixtures/mock-claude/` workspace member (it is declared as a workspace member in the root `Cargo.toml`, so a single `cargo build --release` compiles both). After the build, both binaries are renamed for upload: `claude-print` → `claude-print-linux-amd64`, `mock_claude` → `mock-claude-linux-amd64`.
@@ -1464,6 +1465,8 @@ spec:
     name: claude-print-ci
   arguments:
     parameters:
+      - name: repo
+        value: "git.ardenone.com/jedarden/claude-print"
       - name: revision
         value: main
       - name: tag
@@ -1560,7 +1563,7 @@ The repository README targets two audiences: (a) a human who wants to install an
 
 7. **Self-test** — `claude-print --check` exits 0 if the environment can run it.
 
-8. **Version compatibility** — `claude-print` embeds `claude --version` at startup; pass `--verbose` to see it. The `claude_version` field in JSON/stream-json output reflects the actual binary version used.
+8. **Version compatibility** — `claude-print` embeds `claude --version` at startup; pass `--verbose` to see it. The `claude_version` field is present in `json` output and in the synthesized error result line of `stream-json` output. In the `stream-json` success path, the final result line is forwarded verbatim from Claude Code and does not contain `claude_version`.
 
 ### Docs Organization
 
