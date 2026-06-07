@@ -318,9 +318,11 @@ Written to stderr, timestamped `[claude-print <ms>ms] <message>`. Never to stdou
 
 | Signal | Handler | Action |
 |--------|---------|--------|
-| SIGINT | installed before fork | SIGTERM child; set `interrupted` flag; poll loop breaks; join reader thread; emit exit 130 |
+| SIGINT | installed before fork | SIGINT child (forwarding the signal as required by HR-8); set `interrupted` flag; poll loop breaks; join reader thread (if any); emit exit 130 |
 | SIGTERM | installed before fork — mirrors SIGINT handler | sets `interrupted` flag; breaks poll loop; exit 130 (same as SIGINT via `Interrupted` variant); allowing normal cleanup and TempDir drop before exit. SIGTERM is handled the same as SIGINT — not a dirty kill. This guarantees INV-1 and INV-2 hold on SIGTERM. |
 | SIGPIPE | ignored | stdout pipe may close early in stream-json mode |
+
+**Signal handler safety:** The `interrupted` flag MUST be `std::sync::atomic::AtomicBool` with `store(true, Ordering::SeqCst)`. Calling `kill(2)` from a signal handler is async-signal-safe on Linux. The `AtomicBool::store` is also safe from signal handlers. To wake a blocked `poll()` call, use a self-pipe: before `fork()`, create a `pipe(2)` pair; add the read-end to the pollfd array; the SIGINT/SIGTERM handler writes one byte to the write-end. The `poll()` loop checks the self-pipe read-end and the `AtomicBool` on each wake.
 
 ### Temp Dir Cleanup
 
@@ -356,7 +358,7 @@ Use this when running as a NEEDLE worker to prevent hook noise, or when the user
 
 ### Configuration File
 
-`~/.config/claude-print/config.toml` (created with defaults on first run):
+`$XDG_CONFIG_HOME/claude-print/config.toml` if `$XDG_CONFIG_HOME` is set, otherwise `~/.config/claude-print/config.toml`. Created with defaults on first run.
 
 ```toml
 [defaults]
@@ -486,6 +488,9 @@ match unsafe { fork()? } {
     ForkResult::Child => {
         drop(master);
         login_tty(slave)?;   // setsid + TIOCSCTTY + dup2(slave, 0/1/2)
+        // Reset inherited signal handlers to default before exec
+        nix::sys::signal::signal(Signal::SIGINT, SigHandler::SigDfl)?;
+        nix::sys::signal::signal(Signal::SIGTERM, SigHandler::SigDfl)?;
         execvp("claude", &args)?;
         unreachable!()
     }
@@ -496,6 +501,8 @@ match unsafe { fork()? } {
 }
 ```
 
+Signal handlers MUST be reset to SIG_DFL in the child before `execvp` — the child inherits the parent's SIGINT/SIGTERM handlers from `fork()`, which would interfere with `claude`'s own signal handling.
+
 `login_tty(slave)` is glibc's `login_tty(3)`: `setsid()` → `TIOCSCTTY` → `dup2(slave, 0/1/2)` → `close(slave)`.
 
 Window size probe order: (1) `TIOCGWINSZ` on `STDOUT_FILENO`, (2) `TIOCGWINSZ` on `STDIN_FILENO`, (3) open `/dev/tty` and `TIOCGWINSZ`, (4) fallback `220 × 50`. In headless/NEEDLE mode, steps 1–3 all fail and the fallback is always used — this is the expected behavior.
@@ -504,15 +511,17 @@ Cleanup on any exit path: `SIGTERM` → 2 s → `SIGKILL` → `waitpid`. (Note: 
 
 ### 4. Event Loop
 
-Single `poll()` call on three fds:
+Single `poll()` call on up to two fds (plus deadline tracking):
 
 ```
 master_fd   POLLIN → read PTY output, dispatch to TerminalEmu + StartupSeq
-stop_fifo   POLLIN → Stop hook fired; read payload, begin transcript extraction
-timer       —      → check wall-clock timeout
+stop_fifo   POLLIN → Stop hook fired; read payload, begin transcript extraction (added at PROMPT_INJECTED)
+[timeout]   —      → tracked via Instant; sets poll() timeout_ms, not a physical fd
 ```
 
-**Dynamic fd registration:** The event loop initially polls only `master_fd` and the timer (2 fds). At the `TRUST_DISMISSED → PROMPT_INJECTED` transition, the FIFO read-end fd is added to the poll() set. Subsequent poll() iterations include all 3 fds. The simplest implementation: represent the pollfd array as a `Vec<pollfd>` and push the FIFO fd at transition time.
+**Timer mechanism:** There is no separate timer fd. Timeouts (startup 45s, wall-clock `--timeout`) are tracked via `Instant::now()` captured at the relevant phase transition. On each `poll()` call, the timeout argument is set to the minimum remaining ms across all active timers. `poll()` returns at or before the soonest deadline. The initial poll set is 1 fd (`master_fd`); the FIFO fd is pushed at `PROMPT_INJECTED`. The 'timer' entry in the architecture diagram is a logical representation of deadline tracking, not a physical fd.
+
+**Dynamic fd registration:** The event loop initially polls only `master_fd` (1 fd). At the `TRUST_DISMISSED → PROMPT_INJECTED` transition, the FIFO read-end fd is added to the poll() set. Subsequent poll() iterations include both fds. The simplest implementation: represent the pollfd array as a `Vec<pollfd>` and push the FIFO fd at transition time.
 
 **TerminalEmu** runs on every chunk of PTY output, scanning for escape sequences and queueing responses. Responses written to `master_fd` on the next writable poll.
 
@@ -529,7 +538,7 @@ Ink sends DEC terminal queries at startup and hangs if unanswered. The emulator 
 | `ESC [ c` or `ESC [ 0 c` | `ESC [ ? 6 c` | DA1 |
 | `ESC [ > c` or `ESC [ > 0 c` | `ESC [ > 0 ; 0 ; 0 c` | DA2 |
 | `ESC [ 6 n` | `ESC [ 1 ; 1 R` | DSR cursor position |
-| `ESC [ > q` | `\x1bP>|claude-print\x1b\\` | XTVERSION (DCS string) — ST = String Terminator = 0x1B 0x5C; the final two bytes are ESC + backslash, not backtick |
+| `ESC [ > q` or `ESC [ > 0 q` | `\x1bP>|claude-print\x1b\\` | XTVERSION (DCS string) — ST = String Terminator = 0x1B 0x5C; the final two bytes are ESC + backslash, not backtick. Both the bare form and the parameterized form (`0` parameter) produce the same response. |
 | `ESC [ 1 8 t` | `ESC [ 8 ; <rows> ; <cols> t` | Window size |
 
 **Version-resilience rule:** Unknown escape sequences (`ESC [ ... <letter>` not in the table above) are silently discarded — never treated as an error. If Ink adds new probe types in future versions, they are ignored and the session proceeds via the startup sequencer timeout.
@@ -702,6 +711,11 @@ Error result:
  "is_error": true, "error_message": "..."}
 ```
 
+**Error output by format:**
+- `text` mode: on error, nothing is written to stdout; the error message is written to stderr. Exit code is the signal to callers.
+- `json` mode: the error JSON object is written to stdout (as specified above). Nothing to stderr unless `--verbose`.
+- `stream-json` mode: if an error occurs after prompt injection, a final JSON error line is emitted to stdout (`{"type": "result", "is_error": true, "subtype": "...", "error_message": "..."}`); if an error occurs before prompt injection, same as `text` mode (nothing to stdout, stderr message).
+
 ### 10. NEEDLE Agent Config
 
 `claude-print.yaml` → `~/.needle/agents/`:
@@ -712,17 +726,22 @@ agent_cli: claude-print
 version_command: "claude-print --version"
 input_method:
   method: stdin
-invoke_template: "cd {workspace} && claude-print --model {model} --max-turns 30 --dangerously-skip-permissions"
+invoke_template: "cd {workspace} && claude-print --model {model} --max-turns 30 --dangerously-skip-permissions --no-inherit-hooks"
 timeout_secs: 3600
 provider: anthropic
-# Note: --max-turns 30 is hardcoded in the template above and takes precedence over
-# config.toml's max_turns setting for NEEDLE-dispatched jobs. To change the turn limit
-# for NEEDLE workers, edit the invoke_template in claude-print.yaml directly.
+# Note: --max-turns 30 and --no-inherit-hooks are hardcoded in the template above.
+# --max-turns 30 takes precedence over config.toml's max_turns setting for NEEDLE-dispatched
+# jobs. To change the turn limit for NEEDLE workers, edit the invoke_template directly.
+# NEEDLE workers run in isolation mode by default (--no-inherit-hooks is included in the
+# template). To enable user hook inheritance for NEEDLE jobs, remove --no-inherit-hooks
+# from the invoke_template.
 model: claude-sonnet-4-6
 output_transform: needle-transform-claude
 cost:
   type: use_or_lose
 ```
+
+`needle-transform-claude` is the built-in NEEDLE output transform for Claude Code's `--output-format json` output. It extracts the `result` field (the assistant's response text) from the JSON object and passes it to the NEEDLE worker as the agent's response. This transform is already defined in NEEDLE's built-in transform registry — no new implementation is required in Phase 9.
 
 With `input_method: stdin`, NEEDLE pipes the bead prompt text to `claude-print`'s stdin. Since `claude-print` is invoked non-interactively (its stdin is a pipe, not a TTY), the CLI reads stdin as the prompt source (see §1: "Stdin accepted as prompt when not a TTY and no positional/`--input-file` given").
 
@@ -731,12 +750,12 @@ With `input_method: stdin`, NEEDLE pipes the bead prompt text to `claude-print`'
 `install.sh`:
 1. Detect arch (`uname -m`) and select binary from release assets
 2. Verify `claude` is on `$PATH`
-2.5. If `~/.local/bin/claude-print` already exists, move it to `~/.local/bin/claude-print.prev` (enables one-step rollback)
-3. Install binary to `~/.local/bin/claude-print` (mode 755)
-3.5. Install `mock_claude` to `~/.local/bin/mock_claude` (mode 755) — required by `--check` self-test (`mock_claude` installation can be skipped by setting `SKIP_MOCK_CLAUDE=1` in the install environment — e.g., for users who prefer not to add test fixtures to their PATH). When `SKIP_MOCK_CLAUDE=1` is set, install.sh runs `--version` instead of `--check` (step 5 is replaced with `claude-print --version`).
-4. Install `claude-print.yaml` to `~/.needle/agents/` (mode 644, skipped if NEEDLE not installed)
-5. Run `claude-print --check` to verify the installation (full PTY round-trip self-test using mock_claude)
-6. Print the detected `claude` version: `claude-print --version`
+3. If `~/.local/bin/claude-print` already exists, move it to `~/.local/bin/claude-print.prev` (enables one-step rollback)
+4. Install binary to `~/.local/bin/claude-print` (mode 755)
+5. Install `mock_claude` to `~/.local/bin/mock_claude` (mode 755) — unless `SKIP_MOCK_CLAUDE=1` (`mock_claude` installation can be skipped by setting `SKIP_MOCK_CLAUDE=1` in the install environment — e.g., for users who prefer not to add test fixtures to their PATH)
+6. Install `claude-print.yaml` to `~/.needle/agents/` (mode 644, skipped if NEEDLE not installed)
+7. Run `claude-print --check` to verify installation (full PTY round-trip self-test using mock_claude; skips PTY round-trip if `SKIP_MOCK_CLAUDE=1` was set in step 5)
+8. Print `claude-print --version` for confirmation
 
 ## Data Models
 
@@ -1013,6 +1032,8 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 
 ### Mock PTY Integration Tests (`tests/integration/`)
 
+All integration tests invoke `claude-print --claude-binary <path-to-mock_claude>`. The path is resolved in `tests/integration/mod.rs` using `env!("CARGO_MANIFEST_DIR")` plus the known `target/debug/mock_claude` output path from the `test-fixtures/mock-claude` workspace member. Mock behavior is set via env vars passed to the `mock_claude` process.
+
 A `mock_claude` binary (compiled as a test fixture, not a shell script) simulates Claude Code's startup behavior. Built in a separate Cargo workspace member `test-fixtures/mock-claude/` so it compiles to a native binary with controlled behavior. Controlled via env vars:
 
 | Env var | Effect |
@@ -1088,7 +1109,7 @@ These tests verify that `--settings` relay hook merges correctly and that `--no-
 
 ### Version-Resilience Test Suite (`tests/version_compat.rs`)
 
-A dedicated test module that verifies the binary survives schema changes across Claude Code versions. These tests are run in CI on every push and also on a weekly schedule.
+A dedicated test module that verifies the binary survives schema changes across Claude Code versions. These tests run in CI on every push as part of the standard `claude-print-ci` WorkflowTemplate.
 
 **Schema migration tests** (property-based, using `serde_json::Value` to construct arbitrary payloads):
 - Stop payload with 50 unknown extra fields → parsed without error
@@ -1184,6 +1205,7 @@ needle run --agent claude-print --workspace /home/coding/some-project
 | T-3 | Environment variable leakage | None (ambient) | Inherited env of parent process | `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_SESSION_KIND` confuse child session identity | Unset both before `execvp` (EC-11). |
 | T-4 | Temp dir path with shell metacharacters | Filesystem | hook.sh path interpolation | Command injection if `hook.sh` uses shell expansion | `hook.sh` uses `cat > <literal-path>` with the FIFO path embedded at write time — no variable expansion at hook execution time. The FIFO path is written as a shell single-quoted string: `cat > '<path>'`. Single quotes prevent all shell interpretation. If the path contains a single quote character (extremely unlikely in `$TMPDIR` output from `tempfile`), reject it at temp-dir creation time. |
 | T-5 | PTY escape sequence injection from response | Malicious assistant response | ANSI sequences in prompt/response | Terminal control of caller's terminal | `claude-print` does not forward raw PTY output to its stdout. Output is extracted from JSONL as plain text. |
+| T-6 | PATH hijack | Local attacker with PATH control | PATH lookup of `claude` binary | Malicious binary intercepts all sessions; billing classification undetectable | Users can set `claude-binary` to an absolute path in `config.toml` as hardening. Out of scope for v1.0 signature verification. |
 
 ### Untrusted Input Policy
 
