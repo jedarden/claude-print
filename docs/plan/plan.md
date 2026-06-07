@@ -18,7 +18,7 @@ The billing classification is determined by `isatty(stdout)` inside the `claude`
 |------|-----------|
 | PTY | Pseudoterminal: a master/slave fd pair where `isatty()` returns true on the slave. Allows a parent process to control a child process's terminal I/O through the kernel line discipline. |
 | cc_entrypoint | Anthropic billing header field. `cli` = subscription pool; `sdk-cli` = Agent SDK credit pool. Determined at Claude Code startup by `isatty(stdout)`. |
-| Stop hook | A Claude Code hook event fired when the AI completes a turn. Payload includes `session_id`, `transcript_path`, and `last_assistant_message`. Used as the IPC signal between the inner `claude` process and `claude-print`. |
+| Stop hook | A Claude Code hook event fired when the AI completes a turn. Payload includes `session_id`, `transcript_path`, and `last_assistant_message`. Used as the IPC signal between the inner `claude` process and `claude-print`. (Note: in `claude -p`-style single-turn sessions, Stop fires once at session end. With `--max-turns > 1` and tool use, Stop behavior is unverified — add to OQ-1 resolution checklist. The Stop Poller assumes single-fire per session; if multi-fire is observed, the poller must be updated to match on the JSONL `Result` event before acting.) |
 | FIFO | POSIX named pipe (`mkfifo`). The Stop hook writes to it; the parent poll loop reads from it. Per-run, per-pid — prevents cross-invocation contamination. |
 | Bracketed paste | Terminal feature that wraps pasted text in `ESC[200~` … `ESC[201~` markers. Prevents embedded newlines from triggering premature Enter in Ink's REPL. |
 | Ink | The React/Yoga-based TUI framework used by Claude Code. Sends DEC terminal probes (DA1, DA2, DSR, XTVERSION, window-size) at startup and hangs indefinitely if unanswered. |
@@ -284,6 +284,8 @@ emit exit code
 
 Synchronization: one-shot `std::sync::mpsc::channel`. Reader owns the transcript file handle (no sharing). Reader thread MUST be joined before `main()` returns on all exit paths — including timeout and SIGINT paths (the SIGINT handler sets a flag that breaks the poll loop, which then joins the thread before calling `process::exit`).
 
+The reader thread handle is stored as `Option<JoinHandle<()>>`, initialized to `None`. The `Option` is set to `Some(handle)` only at the `PROMPT_INJECTED` transition when the thread is spawned. On any exit path — including early exits before `PROMPT_INJECTED` — the join is conditional: `if let Some(h) = reader_handle { h.join().ok(); }`
+
 ## Cross-Cutting Concerns
 
 ### Error Propagation
@@ -317,7 +319,7 @@ Written to stderr, timestamped `[claude-print <ms>ms] <message>`. Never to stdou
 | Signal | Handler | Action |
 |--------|---------|--------|
 | SIGINT | installed before fork | SIGTERM child; set `interrupted` flag; poll loop breaks; join reader thread; emit exit 130 |
-| SIGTERM | installed before fork — mirrors SIGINT handler | sets `interrupted` flag; breaks poll loop; allowing normal cleanup and TempDir drop before exit. SIGTERM is handled the same as SIGINT — not a dirty kill. This guarantees INV-1 and INV-2 hold on SIGTERM. |
+| SIGTERM | installed before fork — mirrors SIGINT handler | sets `interrupted` flag; breaks poll loop; exit 130 (same as SIGINT via `Interrupted` variant); allowing normal cleanup and TempDir drop before exit. SIGTERM is handled the same as SIGINT — not a dirty kill. This guarantees INV-1 and INV-2 hold on SIGTERM. |
 | SIGPIPE | ignored | stdout pipe may close early in stream-json mode |
 
 ### Temp Dir Cleanup
@@ -387,7 +389,7 @@ The temp dir holds only the relay infrastructure (hook script + FIFO). It is not
 | `clap` (derive) | CLI argument parsing | Derive macros generate type-safe flag structs with no boilerplate; dominates Rust CLI tooling; well-maintained. `argh` considered but lacks completions/subcommands for future extensibility. |
 | `nix` | `openpty`, `fork`, `login_tty`, `setsid`, `ioctl`, `poll`, `mkfifo`, `signal` | Safe Rust wrappers over the exact POSIX syscalls needed. Using the `libc` crate directly would require more `unsafe` blocks with no benefit. |
 | `serde` + `serde_json` | JSONL parsing with schema-tolerant deserialization | Standard choice; `#[serde(default)]` + `#[serde(other)]` give schema tolerance with no extra code. |
-| `uuid` | Session ID generation | One function needed; pulling in a minimal crate is cleaner than implementing UUID v4 manually. |
+| `uuid` | Reserved for future use (e.g., pre-assigning a session ID before spawning claude). Not required in v1.0 — the session_id is derived from the Stop payload or transcript filename. May be removed if unused after implementation. | Listed in Cargo.toml but not yet called; session_id is derived at runtime from Stop payload or transcript basename, not generated. |
 | `tempfile` | Per-run temp directory with guaranteed cleanup | `TempDir` drop cleans up even on panic — manual `mktemp` + cleanup would require careful unwinding. |
 
 No async runtime: the PTY event loop is a tight `poll()` on 2–3 fds; `tokio` would add binary size, compile time, and conceptual overhead for no throughput benefit. `stream-json` uses a single reader thread — no runtime needed.
@@ -458,7 +460,7 @@ Passed to claude via `--settings <temp>/settings.json`. Claude Code merges this 
 **`hook.sh`** (executed by Claude Code on Stop):
 ```sh
 #!/bin/sh
-cat > '<temp>/stop.fifo'
+cat > '<temp>/stop.fifo' 2>/dev/null || true
 ```
 
 Receives the Stop JSON payload on stdin and writes it to the FIFO. Claude Code does not wait for the hook to complete beyond the 10 s timeout.
@@ -551,9 +553,11 @@ The idle/byte fallback is a one-shot: once any trigger (keyword or idle) fires a
 - After Phase 1 CR, wait until PTY is idle for 2.0 s (REPL re-renders)
 - Send via bracketed paste: `\x1b[200~<prompt>\x1b[201~\r`
 - Bracketed paste treats embedded `\n` as literals (no premature Enter)
-- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After `/read`, claude processes the file contents as the prompt with no system acknowledgment — the response flow is identical to inline injection. See EC-5 for sandboxing note.)
+- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After sending `/read <path>\r`, the startup sequencer re-enters the idle-wait loop (same as after trust dismiss, 2.0s idle threshold). Claude Code reads the file contents and begins processing — no system acknowledgment is emitted before the response. The response extraction path is identical to inline injection: Stop hook fires after the response, transcript JSONL is read normally. See EC-5 for sandboxing note.)
 
 ### 7. Stop Poller
+
+**Assumption:** Stop fires once per session, not once per turn. This matches observed `claude -p` behavior for single-turn sessions. Verify for multi-turn `--max-turns > 1` sessions during OQ-1 verification.
 
 Reads from `stop.fifo` (non-blocking open; polled via the main `poll()` loop). On data available:
 
@@ -682,7 +686,11 @@ pub enum ContentBlock {
 }
 ```
 
+`duration_ms`: wall-clock milliseconds from `std::time::Instant::now()` captured at `main()` entry to the moment the emitter writes its final output. This includes all overhead AND model latency — it is the total time a caller waited for a response.
+
 **`stream-json`**: Spawns a reader thread that tails the transcript JSONL from the byte offset captured at prompt injection time, forwarding each new raw event line to stdout as it is written by Claude Code. After Stop fires, drains remaining lines. Output is raw JSONL (one JSON object per line), compatible with `claude -p --output-format stream-json`. The reader thread forwards ALL raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`.
+
+`session_id` in output: taken directly from the Stop payload if present. If absent from the payload, derive from the transcript file basename (filename without `.jsonl`). If neither is available (no transcript), emit `null`.
 
 **Known limitation:** `cost_usd` is always `0`. Claude Code does not expose per-session cost data via the transcript JSONL. Callers should not use this field for billing purposes. It is included for wire compatibility with `claude -p --output-format json` which also emits `0` for this field.
 
@@ -725,10 +733,10 @@ With `input_method: stdin`, NEEDLE pipes the bead prompt text to `claude-print`'
 2. Verify `claude` is on `$PATH`
 2.5. If `~/.local/bin/claude-print` already exists, move it to `~/.local/bin/claude-print.prev` (enables one-step rollback)
 3. Install binary to `~/.local/bin/claude-print` (mode 755)
-3.5. Install `mock_claude` to `~/.local/bin/mock_claude` (mode 755) — required by `--check` self-test (`mock_claude` installation can be skipped by setting `SKIP_MOCK_CLAUDE=1` in the install environment — e.g., for users who prefer not to add test fixtures to their PATH)
+3.5. Install `mock_claude` to `~/.local/bin/mock_claude` (mode 755) — required by `--check` self-test (`mock_claude` installation can be skipped by setting `SKIP_MOCK_CLAUDE=1` in the install environment — e.g., for users who prefer not to add test fixtures to their PATH). When `SKIP_MOCK_CLAUDE=1` is set, install.sh runs `--version` instead of `--check` (step 5 is replaced with `claude-print --version`).
 4. Install `claude-print.yaml` to `~/.needle/agents/` (mode 644, skipped if NEEDLE not installed)
-5. Run `claude-print --version` to confirm
-6. Print detected `claude` version for version-compat record
+5. Run `claude-print --check` to verify the installation (full PTY round-trip self-test using mock_claude)
+6. Print the detected `claude` version: `claude-print --version`
 
 ## Data Models
 
@@ -785,6 +793,8 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 }
 ```
 
+`duration_ms`: wall-clock milliseconds from `std::time::Instant::now()` captured at `main()` entry to the moment the emitter writes its final output. This includes all overhead AND model latency — it is the total time a caller waited for a response.
+
 ## Error Handling
 
 | Condition | Detection | Action | Exit |
@@ -797,6 +807,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | Wall-clock timeout | poll timer | SIGTERM child, emit timeout | 124 |
 | Stop hook never fires | FIFO timeout | SIGTERM child, emit timeout | 124 |
 | SIGINT | signal handler | SIGTERM child, emit interrupt result | 130 |
+| SIGTERM received | signal handler | SIGTERM child, emit interrupt result | 130 |
 | Stop payload has no `transcript_path` and no `cwd` | payload parse | skip to `last_assistant_message` fallback; if also absent, emit error | 1 |
 | Transcript empty + fallback empty | retry exhausted | emit error | 1 |
 | `is_error: true` in transcript | result event or error block | emit error result | 1 |
@@ -895,7 +906,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* All terminal unit tests pass (all 5 probes answered, unknown probe ignored, split-chunk probe handled, dedup works).
 
 **Phase 5: Startup Sequencer (~120 LOC)**
-*Entry:* Phase 4 complete.
+*Entry:* Phase 4 complete. **OQ-3 must be resolved** (verify `/read` accepts absolute paths; if false, commit to PO-6 truncation fallback before implementing the large-prompt relay).
 - [ ] `startup.rs`: keyword trust dismiss, idle-gap timing, bracketed paste injection, large-prompt file relay
 
 *Complete when:* All startup unit tests pass; integration test `test_trust_dialog_standard_wording` and `test_trust_dialog_alternate_wording` pass.
@@ -1027,22 +1038,23 @@ Integration test scenarios:
 | Scenario | Mock config | Assertion |
 |----------|------------|-----------|
 | Happy path | defaults | exit 0, correct response text, non-zero token counts |
-| Trust dialog (standard wording) | `TRUST_DIALOG=1` | exit 0 |
-| **Trust dialog (alternate wording)** | `TRUST_DIALOG=1 TRUST_WORDING=alternate` | exit 0 (resilience) |
+| Trust dialog (standard wording) | `MOCK_TRUST_DIALOG=1` | exit 0 |
+| **Trust dialog (alternate wording)** | `MOCK_TRUST_DIALOG=1 MOCK_TRUST_WORDING=alternate` | exit 0 (resilience) |
 | No startup output | emit nothing | exit 2 after timeout |
-| Child exits before Stop | `EXIT_BEFORE_STOP=1` | exit 2 |
-| Stop hook never fires | `DELAY_STOP=99999` | exit 124 |
-| Transcript race | `DELAY_JSONL=100` | retry loop fires, exit 0 |
-| Missing `transcript_path` | `OMIT_TRANSCRIPT_PATH=1` | path derived, exit 0 |
-| Missing `last_assistant_message` | `OMIT_LAST_MESSAGE=1` | retry-only path, exit 0 |
-| **Both omitted + delayed JSONL** | `OMIT_LAST_MESSAGE=1 DELAY_JSONL=200` | retries suffice, exit 0 |
-| Error in transcript | `IS_ERROR=1` | exit 1, `is_error: true` in output |
-| SIGINT | `DELAY_STOP=5000` + send SIGINT at 1 s | exit 130, child killed |
-| Multi-turn | `TURNS=3` | last turn text returned, 3 turns in token sum |
+| Child exits before Stop | `MOCK_EXIT_BEFORE_STOP=1` | exit 2 |
+| Stop hook never fires | `MOCK_DELAY_STOP=99999` | exit 124 |
+| Transcript race | `MOCK_DELAY_JSONL=100` | retry loop fires, exit 0 |
+| Missing `transcript_path` | `MOCK_OMIT_TRANSCRIPT_PATH=1` | path derived, exit 0 |
+| Missing `last_assistant_message` | `MOCK_OMIT_LAST_MESSAGE=1` | retry-only path, exit 0 |
+| **Both omitted + delayed JSONL** | `MOCK_OMIT_LAST_MESSAGE=1 MOCK_DELAY_JSONL=200` | retries suffice, exit 0 |
+| Error in transcript | `MOCK_IS_ERROR=1` | exit 1, `is_error: true` in output |
+| SIGINT | `MOCK_DELAY_STOP=5000` + send SIGINT at 1 s | exit 130, child killed |
+| Multi-turn | `MOCK_TURNS=3` | last turn text returned, 3 turns in token sum |
 | Large prompt (>32KB) | 33000-byte prompt | file relay used, exit 0 |
-| **Unknown probe emitted** | `UNKNOWN_PROBE=1` | probe ignored, session completes |
-| **Unknown event type in JSONL** | `UNKNOWN_EVENT_TYPE=1` | parse succeeds, text extracted |
-| **Unknown usage fields** | `UNKNOWN_USAGE_FIELDS=1` | ignored, token counts correct |
+| **Unknown probe emitted** | `MOCK_UNKNOWN_PROBE=1` | probe ignored, session completes |
+| **Unknown event type in JSONL** | `MOCK_UNKNOWN_EVENT_TYPE=1` | parse succeeds, text extracted |
+| **Unknown usage fields** | `MOCK_UNKNOWN_USAGE_FIELDS=1` | ignored, token counts correct |
+| Custom response text | `MOCK_RESPONSE=hello` | response field in json output equals 'hello' |
 | `--no-inherit-hooks` | `--no-inherit-hooks` flag set | appropriate `--setting-sources` arg in child argv (either `=` or `=none` per OQ-2 resolution), exit 0 |
 | Output format json | defaults | output parses as valid JSON |
 | Output format stream-json | defaults | each output line parses as valid JSON |
@@ -1249,8 +1261,9 @@ No automated alerting in v1.0. If billing classification fails silently in produ
 1. Verify `claude` binary found on PATH (or `--claude-binary`)
 2. Verify `openpty()` succeeds and returns two valid fds
 3. Verify `mkfifo` works in `$TMPDIR`
-4. Spawn `mock_claude` (installed alongside the main binary by `install.sh`) and verify a basic PTY round-trip — `mock_claude` is resolved from the same directory as `claude-print` itself, not hardcoded to `~/.local/bin/`. If `claude-print` is at `~/.local/bin/claude-print`, `mock_claude` is expected at `~/.local/bin/mock_claude`.
-5. Print `OK` or a specific failure message per step
+4. Spawn `mock_claude` (installed alongside the main binary by `install.sh`) and verify a basic PTY round-trip — `mock_claude` is resolved from the same directory as `claude-print` itself, not hardcoded to `~/.local/bin/`. If `claude-print` is at `~/.local/bin/claude-print`, `mock_claude` is expected at `~/.local/bin/mock_claude`. If `mock_claude` is not found at the expected path (e.g., because `SKIP_MOCK_CLAUDE=1` was used during install), step 4 emits a warning `mock_claude not found — skipping PTY round-trip test` and proceeds. The `--check` exits 0 with steps 1–3 verified.
+5. Scan `$TMPDIR` for leftover `claude-print-*` directories older than 1 hour and report them as warnings (does not fail the check). Example message: `WARNING: found orphaned temp dir /tmp/claude-print-12345-abc (1.2h old) — run rm -rf to clean up`.
+6. Print `OK` or a specific failure message per step
 
 `install.sh` runs `--check` after installation. `--check` exits 0 on success, 2 on failure.
 
@@ -1304,7 +1317,7 @@ Unresolved questions are mapped to the phase they block. Each MUST be resolved b
 
 | # | Question | Blocks | Resolution / Fallback |
 |---|---------|--------|----------------------|
-| OQ-1 | Does `--settings <file>` merge hooks with `~/.claude/settings.json` or replace them? | Phase 6 | Verify by running `claude` with `--settings` containing a test hook alongside a real user hook and checking both fire. If merge fails: PO-1 fallback (merge in-process). |
+| OQ-1 | Does `--settings <file>` merge hooks with `~/.claude/settings.json` or replace them? | Phase 2 | Verify by running `claude` with `--settings` containing a test hook alongside a real user hook and checking both fire. If merge fails: PO-1 fallback (merge in-process). |
 | OQ-2 | Does `--setting-sources=` (empty string) suppress all standard sources? | Phase 6 | Verify by running `claude --setting-sources= --settings <relay-only-file>` and checking user hooks do not fire. If not accepted: try `--setting-sources=none`; if neither works, enumerate relay source explicitly. |
 | OQ-3 | Does `/read <path>` accept absolute paths for prompts >32 KB? Verify that `/read` is a built-in slash command (always available) vs. a tool invocation (requires allowedTools). | Phase 5 | End-to-end test with `--allowedTools=all` and a 33 KB prompt file. If not: PO-6 fallback (truncate at 32 KB). Note: `/read` is confirmed a built-in slash command — it does not require `Read` in `--allowedTools`. |
 | OQ-4 | FIFO open race: will O_NONBLOCK open-before-inject reliably prevent timing issues? | Phase 6 | Validated by `test_fast_stop_hook` integration test (MOCK_DELAY_STOP=0). If race occurs in practice, add a pre-prompt-inject `poll()` to confirm FIFO open. |
