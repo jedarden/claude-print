@@ -23,7 +23,7 @@ The billing classification is determined by `isatty(stdout)` inside the `claude`
 | Bracketed paste | Terminal feature that wraps pasted text in `ESC[200~` … `ESC[201~` markers. Prevents embedded newlines from triggering premature Enter in Ink's REPL. |
 | Ink | The React/Yoga-based TUI framework used by Claude Code. Sends DEC terminal probes (DA1, DA2, DSR, XTVERSION, window-size) at startup and hangs indefinitely if unanswered. |
 | login_tty | glibc function: `setsid()` + `ioctl(TIOCSCTTY)` + `dup2(slave, 0/1/2)` + `close(slave)`. Makes the PTY slave the controlling terminal for the child process. |
-| JSONL transcript | Newline-delimited JSON at `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Claude Code appends one event per line as the session progresses. The `<cwd-slug>` is derived by stripping the leading `/` and replacing remaining `/` with `-`. |
+| JSONL transcript | Newline-delimited JSON at `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Claude Code appends one event per line as the session progresses. The `<cwd-slug>` is derived by stripping the leading `/` and replacing remaining `/` with `-`. (Note: paths containing hyphens in directory names produce ambiguous slugs; `session_id` resolves the file within the directory.) |
 | usage-fingerprint | Tuple of `(input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens)` used to deduplicate streaming JSONL events from the same API call when `message.id` is absent. |
 | stream-json | Output format where each transcript event line is forwarded to stdout as Claude Code writes it, providing real-time streaming compatible with `claude -p --output-format stream-json`. |
 | mock_claude | Compiled Rust binary (`test-fixtures/mock-claude/`) simulating Claude Code's PTY and JSONL behavior. Controlled via env vars — not a shell script. |
@@ -79,8 +79,10 @@ This document uses RFC-2119 conventions: **MUST** = required, **MUST NOT** = pro
 **Single statically-linked binary.** No Python, no runtime dependencies, no pip packages.
 
 ```
-claude-print          # the binary
-install.sh            # copies binary to ~/.local/bin/, installs NEEDLE agent config
+claude-print          # the binary (musl static)
+mock_claude           # test fixture binary (musl static, installed by install.sh)
+claude-print.yaml     # NEEDLE agent config
+install.sh            # installs all of the above to ~/.local/bin/ and ~/.needle/agents/
 ```
 
 Built with:
@@ -216,7 +218,7 @@ From any state:
   wall-clock timeout     → SIGTERM child → exit 124
   child exits unexpectedly → exit 2
   SIGINT                 → SIGTERM child → exit 130
-  Stop fires before PROMPT_INJECTED → skip to DONE (no-trust-dialog path)
+  Stop fires before PROMPT_INJECTED → error: emit is_error=true, exit 2 (see EC-7: a response to an unsent prompt indicates a session identity leak; EC-11 prevents this in normal operation)
 ```
 
 Guard conditions:
@@ -260,6 +262,16 @@ poll() loop (master_fd, stop_fifo)   tail transcript from prompt_injected_at
   │                                    thread reads from this byte offset forward,
   │                                    so pre-injection events (SessionStart,
   │                                    system messages) are not forwarded to stdout.
+  │                                    If the transcript file does not exist at
+  │                                    prompt injection time (claude has not yet
+  │                                    written the first event), the reader thread
+  │                                    MUST retry the file open in a loop with 50ms
+  │                                    sleeps until the file appears or a 5-second
+  │                                    timeout expires. This is the same race
+  │                                    condition handled by the normal transcript
+  │                                    reader's retry loop, applied here to the
+  │                                    file-open step rather than the content-read
+  │                                    step.
   │                                    write each new line → stdout
 Stop fires                           via mpsc::channel unbounded sender
   │
@@ -326,7 +338,7 @@ By default `claude-print` does **not** redirect `CLAUDE_CONFIG_DIR`. The inner `
 - Appends to `~/.claude/history.jsonl`
 - Fires all hooks in `~/.claude/settings.json` (SessionStart, Stop, PreToolUse, trail-boss, ccdash, etc.)
 
-`claude-print` adds its own Stop hook by passing `--settings <temp>/settings.json` with the per-run relay hook. Claude Code merges `--settings` with the user's settings file — all existing hooks continue to fire alongside the relay hook.
+`claude-print` adds its own Stop hook by passing `--settings <temp>/settings.json` with the per-run relay hook. Claude Code merges `--settings` with the user's settings file — all existing hooks continue to fire alongside the relay hook (merge behavior per OQ-1, unverified; see Hook Installer §2 schema note and PO-1 for fallback if merge fails).
 
 This matches exactly what `claude -p` does. Transcripts, token counts, and usage stats land in `~/.claude/` with no special handling.
 
@@ -352,7 +364,7 @@ max_turns = 30
 timeout_secs = 3600
 ```
 
-CLI flags override config file values. `--no-inherit-hooks` flag is equivalent to `inherit_hooks = false` in config.
+CLI flags override config file values. `inherit_hooks = true` — Setting to `false` is equivalent to passing `--no-inherit-hooks` on the command line: `--setting-sources=` (per OQ-2, unverified) is forwarded to the inner `claude` process, suppressing user hook inheritance. CLI `--no-inherit-hooks` takes precedence over the config file value.
 
 ### Where Logs and Token Counts Land
 
@@ -401,7 +413,7 @@ Drop-in for `claude -p`:
 | `--timeout SECS` | Wall-clock timeout (default: 3600) |
 | `--claude-binary PATH` | Override claude binary path (default: resolves `claude` from PATH) |
 | `--no-inherit-hooks` | Disable user hook inheritance; passes `--setting-sources=` to claude (unverified per OQ-2) |
-| `--version` | Print `claude-print <version> (wrapping claude <version>)` and exit |
+| `--version` | Print `claude-print <version> (wrapping claude <version>)` and exit. The claude version is obtained by running the binary at `--claude-binary` (or the PATH-resolved `claude` if not specified). If claude is not found, print `claude-print <version> (wrapping claude: not found)` and exit 0. |
 | `--verbose` | Write timing traces to stderr |
 
 Stdin accepted as prompt when not a TTY and no positional/`--input-file` given.
@@ -417,7 +429,7 @@ Exit codes:
 
 ### 2. Hook Installer
 
-Creates `$TMPDIR/claude-print-<pid>-<rand>/` via `tempfile::Builder`:
+Creates `$TMPDIR/claude-print-<pid>-<rand>/` via `tempfile::Builder`, created with mode 0700 (via `tempfile::Builder::new().mode(0o700)`) — world-readable temp dirs would allow other local users to read the Stop hook payload (T-1). The temp dir path is validated at creation time: if the path returned by `tempfile` contains a single-quote character, abort with exit 2 (see T-4). In practice this cannot happen with standard `tempfile` crate output, but the check is required by the security threat model.
 
 ```
 <temp>/
@@ -486,7 +498,7 @@ match unsafe { fork()? } {
 
 Window size probe order: (1) `TIOCGWINSZ` on `STDOUT_FILENO`, (2) `TIOCGWINSZ` on `STDIN_FILENO`, (3) open `/dev/tty` and `TIOCGWINSZ`, (4) fallback `220 × 50`. In headless/NEEDLE mode, steps 1–3 all fail and the fallback is always used — this is the expected behavior.
 
-Cleanup on any exit path: `SIGTERM` → 2 s → `SIGKILL` → `waitpid`.
+Cleanup on any exit path: `SIGTERM` → 2 s → `SIGKILL` → `waitpid`. (Note: the 2-second grace period means actual process exit may be up to 2s after the specified `--timeout`. Callers should account for this when setting their own outer timeout budget. The grace period exists to allow `claude` to save any in-progress state before being killed.)
 
 ### 4. Event Loop
 
@@ -497,6 +509,8 @@ master_fd   POLLIN → read PTY output, dispatch to TerminalEmu + StartupSeq
 stop_fifo   POLLIN → Stop hook fired; read payload, begin transcript extraction
 timer       —      → check wall-clock timeout
 ```
+
+**Dynamic fd registration:** The event loop initially polls only `master_fd` and the timer (2 fds). At the `TRUST_DISMISSED → PROMPT_INJECTED` transition, the FIFO read-end fd is added to the poll() set. Subsequent poll() iterations include all 3 fds. The simplest implementation: represent the pollfd array as a `Vec<pollfd>` and push the FIFO fd at transition time.
 
 **TerminalEmu** runs on every chunk of PTY output, scanning for escape sequences and queueing responses. Responses written to `master_fd` on the next writable poll.
 
@@ -513,7 +527,7 @@ Ink sends DEC terminal queries at startup and hangs if unanswered. The emulator 
 | `ESC [ c` or `ESC [ 0 c` | `ESC [ ? 6 c` | DA1 |
 | `ESC [ > c` or `ESC [ > 0 c` | `ESC [ > 0 ; 0 ; 0 c` | DA2 |
 | `ESC [ 6 n` | `ESC [ 1 ; 1 R` | DSR cursor position |
-| `ESC [ > q` | `ESC P > \| claude-print ESC \` | XTVERSION (DCS string) |
+| `ESC [ > q` | `\x1bP>|claude-print\x1b\\` | XTVERSION (DCS string) — ST = String Terminator = 0x1B 0x5C; the final two bytes are ESC + backslash, not backtick |
 | `ESC [ 1 8 t` | `ESC [ 8 ; <rows> ; <cols> t` | Window size |
 
 **Version-resilience rule:** Unknown escape sequences (`ESC [ ... <letter>` not in the table above) are silently discarded — never treated as an error. If Ink adds new probe types in future versions, they are ignored and the session proceeds via the startup sequencer timeout.
@@ -537,16 +551,16 @@ The idle/byte fallback is a one-shot: once any trigger (keyword or idle) fires a
 - After Phase 1 CR, wait until PTY is idle for 2.0 s (REPL re-renders)
 - Send via bracketed paste: `\x1b[200~<prompt>\x1b[201~\r`
 - Bracketed paste treats embedded `\n` as literals (no premature Enter)
-- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a Claude Code built-in slash command — not an MCP tool — and does not require `Read` in `--allowedTools`). Note: `--dangerously-skip-permissions` controls tool execution permissions, not filesystem access. The `/read` built-in reads from the filesystem as the current user — no sandbox restricts it in standard `claude` installations. If `claude` is run in a containerized environment with filesystem restrictions, this relay may fail; in that case, use a path under `$HOME` for the prompt file.
+- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After `/read`, claude processes the file contents as the prompt with no system acknowledgment — the response flow is identical to inline injection. See EC-5 for sandboxing note.)
 
 ### 7. Stop Poller
 
 Reads from `stop.fifo` (non-blocking open; polled via the main `poll()` loop). On data available:
 
 1. Read one line → parse JSON with lenient schema (all fields `Option<T>`)
-2. Extract `session_id` and `transcript_path` (either direct or derived from `session_id` + `cwd`)
+2. Extract `session_id` and `transcript_path` (either direct or derived from `session_id` + `cwd`). If both `transcript_path` and `cwd` are absent from the Stop payload: skip path derivation entirely; proceed directly to the retry loop using `last_assistant_message` as the only fallback. If `last_assistant_message` is also absent: emit `is_error=true`, exit 1.
 3. Signal the event loop to exit
-4. Send `/exit\r` to the PTY child to trigger graceful shutdown (plain text slash command, no bracketed paste wrapper)
+4. Send `/exit\r` to the PTY child. (Bracketed paste is not used here: at this point the REPL has returned to idle after completing the response, so a plain CR-terminated command is accepted. `/exit` is a Claude Code built-in slash command that initiates graceful shutdown.) After sending `/exit\r`, wait up to 5s for the child to exit (detected via EIO on master_fd or SIGCHLD). If the child has not exited after 5s, proceed directly to SIGTERM → 2s → SIGKILL cleanup.
 
 If Stop never fires within `--timeout` seconds: emit timeout result, SIGTERM child, exit 124.
 
@@ -559,8 +573,14 @@ On Stop receipt:
    Path derivation algorithm (observed from Claude Code v2.x): strip the leading `/` from
    `cwd`, replace all remaining `/` characters with `-`.
    Example: `/home/coding/myproject` → `home-coding-myproject`.
+   This algorithm can produce ambiguous slugs for paths where directory names contain hyphens
+   (e.g., `/home/user/a-b` and `/home/user-a/b` both produce `home-user-a-b`). In practice,
+   `session_id` uniquely identifies the JSONL file within the directory, so slug ambiguity only
+   causes a problem if the slug-derived *directory* is wrong. If path derivation fails (directory
+   not found), fall back to `last_assistant_message`.
    Add a unit test in `tests/transcript.rs` asserting this mapping for 3–4 representative
-   cwd values (e.g. `/home/coding/myproject`, `/root/foo/bar`, `/home/user/a-b`, `/tmp/x`).
+   cwd values (e.g. `/home/coding/myproject`, `/root/foo/bar`, `/home/user/a-b` [note: same
+   slug as `/home/user-a/b` — ambiguity documented above], `/tmp/x`).
 2. Scan for unique API turns (usage-fingerprint dedup)
 3. Collect final turn's text blocks
 4. Sum token counts across all unique turns
@@ -662,7 +682,9 @@ pub enum ContentBlock {
 }
 ```
 
-**`stream-json`**: Spawns a reader thread that tails the transcript JSONL from the byte offset captured at prompt injection time, forwarding each new raw event line to stdout as it is written by Claude Code. After Stop fires, drains remaining lines. Output is raw JSONL (one JSON object per line), compatible with `claude -p --output-format stream-json`.
+**`stream-json`**: Spawns a reader thread that tails the transcript JSONL from the byte offset captured at prompt injection time, forwarding each new raw event line to stdout as it is written by Claude Code. After Stop fires, drains remaining lines. Output is raw JSONL (one JSON object per line), compatible with `claude -p --output-format stream-json`. The reader thread forwards ALL raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`.
+
+**Known limitation:** `cost_usd` is always `0`. Claude Code does not expose per-session cost data via the transcript JSONL. Callers should not use this field for billing purposes. It is included for wire compatibility with `claude -p --output-format json` which also emits `0` for this field.
 
 `claude_version` field (new, not in `claude -p` wire format): included in all output formats for version-change debugging. Callers that parse strictly by field name are unaffected by the extra field.
 
@@ -685,6 +707,9 @@ input_method:
 invoke_template: "cd {workspace} && claude-print --model {model} --max-turns 30 --dangerously-skip-permissions"
 timeout_secs: 3600
 provider: anthropic
+# Note: --max-turns 30 is hardcoded in the template above and takes precedence over
+# config.toml's max_turns setting for NEEDLE-dispatched jobs. To change the turn limit
+# for NEEDLE workers, edit the invoke_template in claude-print.yaml directly.
 model: claude-sonnet-4-6
 output_transform: needle-transform-claude
 cost:
@@ -700,7 +725,7 @@ With `input_method: stdin`, NEEDLE pipes the bead prompt text to `claude-print`'
 2. Verify `claude` is on `$PATH`
 2.5. If `~/.local/bin/claude-print` already exists, move it to `~/.local/bin/claude-print.prev` (enables one-step rollback)
 3. Install binary to `~/.local/bin/claude-print` (mode 755)
-3.5. Install `mock_claude` to `~/.local/bin/mock_claude` (mode 755) — required by `--check` self-test
+3.5. Install `mock_claude` to `~/.local/bin/mock_claude` (mode 755) — required by `--check` self-test (`mock_claude` installation can be skipped by setting `SKIP_MOCK_CLAUDE=1` in the install environment — e.g., for users who prefer not to add test fixtures to their PATH)
 4. Install `claude-print.yaml` to `~/.needle/agents/` (mode 644, skipped if NEEDLE not installed)
 5. Run `claude-print --version` to confirm
 6. Print detected `claude` version for version-compat record
@@ -772,6 +797,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | Wall-clock timeout | poll timer | SIGTERM child, emit timeout | 124 |
 | Stop hook never fires | FIFO timeout | SIGTERM child, emit timeout | 124 |
 | SIGINT | signal handler | SIGTERM child, emit interrupt result | 130 |
+| Stop payload has no `transcript_path` and no `cwd` | payload parse | skip to `last_assistant_message` fallback; if also absent, emit error | 1 |
 | Transcript empty + fallback empty | retry exhausted | emit error | 1 |
 | `is_error: true` in transcript | result event or error block | emit error result | 1 |
 | Rate limit / API error | error content in transcript | emit error result | 1 |
@@ -784,7 +810,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | EC-2 | `~/.claude/projects/` does not exist | The inner `claude` creates it (standard behavior). If still absent after Stop, path derivation returns an error; fallback to `last_assistant_message`. |
 | EC-3 | FIFO write blocks (Stop fires before read-end is open) | Read-end opened O_NONBLOCK at `TRUST_DISMISSED → PROMPT_INJECTED` transition, before prompt is injected. Stop cannot fire before prompt is sent. |
 | EC-4 | Prompt contains null bytes | Rejected at CLI validation time with exit 2. `claude -p` itself does not support null bytes. |
-| EC-5 | Prompt > 32 KB | Written to `$TMPDIR/<session>/prompt.txt`; `/read <path>\r` sent instead. File cleaned up with temp dir. Requires PO-6 to hold. Note: `/read` is a Claude Code built-in slash command — not an MCP tool — and does not require `Read` in `--allowedTools`. Note: `--dangerously-skip-permissions` controls tool execution permissions, not filesystem access. The `/read` built-in slash command reads from the filesystem as the current user — no sandbox restricts it in standard `claude` installations. If `claude` is run in a containerized environment with filesystem restrictions, this relay may fail; in that case, use a path under `$HOME` for the prompt file. |
+| EC-5 | Prompt > 32 KB | Written to `$TMPDIR/<session>/prompt.txt`; `/read <path>\r` sent instead. File cleaned up with temp dir. Requires PO-6 to hold. See Startup Sequencer §6 for the full /read relay specification including encoding and response flow. |
 | EC-6 | `claude --version` output format changes | Version parsing uses a permissive regex. If parsing fails, `claude_version: "unknown"` in output; `--version` still exits 0. |
 | EC-7 | Stop hook fires before trust dismiss (no dialog shown) | EC-11 unsets `CLAUDE_CODE_SESSION_ID`/`CLAUDE_CODE_SESSION_KIND` before `execvp`, which should prevent this in normal operation. If Stop fires before prompt injection despite EC-11, treat it as an error: emit `is_error=true` and exit 2, rather than silently accepting an empty-prompt response. |
 | EC-8 | No PTY output for 45 s | Hard timeout: SIGTERM → 2 s → SIGKILL → waitpid → exit 2. |
@@ -848,7 +874,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* `cargo build --target x86_64-unknown-linux-musl` succeeds; `claude-print --version` prints expected format; `cargo test --lib` passes.
 
 **Phase 2: Hook Installer + PTY Spawner (~200 LOC)**
-*Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting).
+*Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting). **PO-1 verified** (confirm `--settings` merges hooks rather than replacing; if false, see PO-1 recovery before writing the hook installer). PO-1 can be verified with a simple test: run `claude --settings /tmp/test_settings.json echo test` where test_settings.json contains a dummy hook, alongside a user hook in ~/.claude/settings.json, and confirm both fire.
 - [ ] `hook.rs`: temp dir (`tempfile::TempDir`), write `settings.json` and `hook.sh`, `mkfifo`
 - [ ] `pty.rs`: `openpty`, `fork`, window-size probe, `login_tty`, `execvp`, SIGTERM/SIGKILL/`waitpid`
 - [ ] `--no-inherit-hooks` forwards `--setting-sources=` to child (unverified per OQ-2)
@@ -875,7 +901,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* All startup unit tests pass; integration test `test_trust_dialog_standard_wording` and `test_trust_dialog_alternate_wording` pass.
 
 **Phase 6: Stop Poller (~80 LOC)**
-*Entry:* Phase 5 complete. **PO-1 verified** (confirm `--settings` merges hooks; document result in Open Questions resolution). **OQ-2 must also be resolved** (verify `--setting-sources=` suppresses standard sources; see PO-2 for fallback).
+*Entry:* Phase 5 complete. **OQ-2 must be resolved** (verify `--setting-sources=` suppresses standard sources; see PO-2 for fallback).
 - [ ] Open FIFO read-end O_NONBLOCK, integrate into `poll()` loop, parse Stop payload, derive transcript path, signal event loop exit
 
 *Complete when:* Integration test `test_stop_hook_fires` passes; `test_missing_transcript_path_derived` passes.
@@ -900,7 +926,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 
 **Phase 10: Tests (~500 LOC)**
 *Entry:* Phase 8 complete (can run in parallel with Phase 9).
-- [ ] Complete all remaining unit and mock PTY integration test suites; version-resilience suite; hook inheritance tests (mock_claude binary built in Phase 2)
+- [ ] Phase 10 **completes** the test suite by adding any tests not already written as part of Phases 2–9's completion criteria. Each phase's completion criterion already specifies and runs its own targeted integration tests — Phase 10 adds the remaining cross-phase and corner-case tests: the version-resilience suite, hook inheritance suite, all MEDIUM/LOW mock scenarios not covered by earlier phases, and the conformance harness.
 
 *Complete when:* `cargo test` passes with zero failures.
 
@@ -1017,7 +1043,7 @@ Integration test scenarios:
 | **Unknown probe emitted** | `UNKNOWN_PROBE=1` | probe ignored, session completes |
 | **Unknown event type in JSONL** | `UNKNOWN_EVENT_TYPE=1` | parse succeeds, text extracted |
 | **Unknown usage fields** | `UNKNOWN_USAGE_FIELDS=1` | ignored, token counts correct |
-| `--no-inherit-hooks` | `--no-inherit-hooks` flag set | `--setting-sources=` in child argv, exit 0 |
+| `--no-inherit-hooks` | `--no-inherit-hooks` flag set | appropriate `--setting-sources` arg in child argv (either `=` or `=none` per OQ-2 resolution), exit 0 |
 | Output format json | defaults | output parses as valid JSON |
 | Output format stream-json | defaults | each output line parses as valid JSON |
 
@@ -1032,7 +1058,7 @@ These tests verify that `--settings` relay hook merges correctly and that `--no-
 - `--settings` flag is present in the child process argv (visible via `/proc/<pid>/cmdline`)
 
 **`--no-inherit-hooks` flag:**
-- `--setting-sources=` is present in child argv when flag is set
+- The appropriate `--setting-sources` argument is present in child argv when flag is set — either `--setting-sources=` (empty value, per OQ-2 primary) or `--setting-sources=none` (per PO-2 fallback). The test MUST be parameterized over both valid forms and accept whichever is generated by the current implementation. The specific form used MUST match what was verified in OQ-2 resolution.
 - `--setting-sources` is absent from child argv when flag is not set
 - Mock that tracks whether a "user hook" fires: with `--no-inherit-hooks`, user hook does not fire; without, it does
 
@@ -1223,7 +1249,7 @@ No automated alerting in v1.0. If billing classification fails silently in produ
 1. Verify `claude` binary found on PATH (or `--claude-binary`)
 2. Verify `openpty()` succeeds and returns two valid fds
 3. Verify `mkfifo` works in `$TMPDIR`
-4. Spawn `~/.local/bin/mock_claude` (installed alongside the main binary by `install.sh`) and verify a basic PTY round-trip
+4. Spawn `mock_claude` (installed alongside the main binary by `install.sh`) and verify a basic PTY round-trip — `mock_claude` is resolved from the same directory as `claude-print` itself, not hardcoded to `~/.local/bin/`. If `claude-print` is at `~/.local/bin/claude-print`, `mock_claude` is expected at `~/.local/bin/mock_claude`.
 5. Print `OK` or a specific failure message per step
 
 `install.sh` runs `--check` after installation. `--check` exits 0 on success, 2 on failure.
