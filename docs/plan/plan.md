@@ -329,7 +329,7 @@ Written to stderr, timestamped `[claude-print <ms>ms] <message>`. Never to stdou
 | Signal | Handler | Action |
 |--------|---------|--------|
 | SIGINT | installed before fork | SIGINT child (forwarding the signal as required by HR-8); set `interrupted` flag; poll loop breaks; join reader thread (if any); emit exit 130 |
-| SIGTERM | installed before fork — mirrors SIGINT handler | sets `interrupted` flag; breaks poll loop; exit 130 (same as SIGINT via `Interrupted` variant); allowing normal cleanup and TempDir drop before exit. SIGTERM is handled the same as SIGINT — not a dirty kill. This guarantees INV-1 and INV-2 hold on SIGTERM. |
+| SIGTERM | installed before fork — mirrors SIGINT handler | SIGTERM child (per HR-8 mirror); sets `interrupted` flag; writes to self-pipe; poll loop breaks; join reader thread; exit 130 (same as SIGINT via `Interrupted` variant); allowing normal cleanup and TempDir drop before exit. SIGTERM is handled the same as SIGINT — not a dirty kill. This guarantees INV-1 and INV-2 hold on SIGTERM. |
 | SIGPIPE | ignored | stdout pipe may close early in stream-json mode |
 
 **Signal handler safety:** The `interrupted` flag MUST be `std::sync::atomic::AtomicBool` with `store(true, Ordering::SeqCst)`. Calling `kill(2)` from a signal handler is async-signal-safe on Linux. The `AtomicBool::store` is also safe from signal handlers. To wake a blocked `poll()` call, use a self-pipe: before `fork()`, create a `pipe(2)` pair; add the read-end to the pollfd array; the SIGINT/SIGTERM handler writes one byte to the write-end. The `poll()` loop checks the self-pipe read-end and the `AtomicBool` on each wake.
@@ -984,8 +984,9 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - [ ] CI also builds `mock_claude` binary (musl) and uploads it as a release artifact alongside `claude-print`
 
 - [ ] Confirm `cargo audit` runs on every push (either via `rust-verify` or as an explicit CI step)
+- [ ] Run install.sh end-to-end download test: download release artifact from GitHub Release URL and verify install.sh exits 0 and `claude-print --check` passes
 
-*Complete when:* CI run on main branch produces release binary; `last-claude-version.txt` artifact present; binary passes `claude-print --check` (credential-free) via `install.sh`; full AS-1 is verified manually before each release tag is pushed.
+*Complete when:* CI run on main branch produces release binary; `last-claude-version.txt` artifact present; binary passes `claude-print --check` (credential-free) via `install.sh`; install.sh end-to-end download test (deferred from Phase 9) passes; full AS-1 is verified manually before each release tag is pushed.
 
 ## Testing
 
@@ -1411,8 +1412,8 @@ Delegates to the existing `rust-verify` WorkflowTemplate (fmt + clippy + test). 
 ```yaml
 container:
   image: ghcr.io/jedarden/rust-musl-builder:latest   # or equivalent
-  command: [sh, -c, "git clone $(inputs.parameters.repo) /workspace &&
-    git -C /workspace checkout $(inputs.parameters.revision) &&
+  command: [sh, -c, "git clone {{inputs.parameters.repo}} /workspace &&
+    git -C /workspace checkout {{inputs.parameters.revision}} &&
     cd /workspace &&
     cargo build --release --target x86_64-unknown-linux-musl &&
     mv /workspace/target/x86_64-unknown-linux-musl/release/claude-print /workspace/claude-print-linux-amd64 &&
