@@ -1365,3 +1365,205 @@ Unresolved questions are mapped to the phase they block. Each MUST be resolved b
 | OQ-4 | FIFO open race: will O_NONBLOCK open-before-inject reliably prevent timing issues? | Phase 6 | Validated by `test_fast_stop_hook` integration test (MOCK_DELAY_STOP=0). If race occurs in practice, add a pre-prompt-inject `poll()` to confirm FIFO open. |
 | OQ-5 | Is `login_tty` available in `x86_64-unknown-linux-musl`? | Phase 2 | Attempt compilation before Phase 2 begins. If absent: inline 4-syscall implementation (PO-3 recovery). **Resolve before writing Phase 2 code.** |
 | OQ-6 | Do `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_SESSION_KIND` from a parent session confuse the child? | Phase 2 | Unset both in child env before `execvp` as a precaution. Test by running `claude-print` from inside an active `claude` session and verifying the child gets its own session identity. |
+
+## CI/CD
+
+### Overview
+
+`claude-print` ships as a static musl binary. All CI/CD runs on Argo Workflows in the `iad-ci` cluster. GitHub Actions are disabled — never re-enable them.
+
+WorkflowTemplate location: `jedarden/declarative-config → k8s/iad-ci/argo-workflows/claude-print-ci.yaml`
+
+ArgoCD app `argo-workflows-ns-iad-ci` auto-syncs on push to `declarative-config`.
+
+### WorkflowTemplate: `claude-print-ci`
+
+Two trigger paths:
+1. **PR / branch push** — verify only (fmt + clippy + test); no release.
+2. **Release tag** (`v*`) — verify, then build musl binary, then create GitHub release.
+
+Template structure (conceptual — final YAML lives in declarative-config):
+
+```
+entrypoint: main
+arguments:
+  parameters:
+    - name: repo          # git.ardenone.com/jedarden/claude-print
+    - name: revision      # branch or tag SHA
+    - name: tag           # set by caller; empty on branch push
+
+steps:
+  - [verify]              # rust-verify WorkflowTemplate ref (fmt + clippy + test)
+  - [build-musl]          # only if tag is non-empty
+  - [github-release]      # only if tag is non-empty
+```
+
+### Step: verify
+
+Delegates to the existing `rust-verify` WorkflowTemplate (fmt + clippy + test). No duplication. If `rust-verify` is not yet parameterized for arbitrary repos, add a `repo` parameter — do not inline the verify steps.
+
+### Step: build-musl
+
+```yaml
+container:
+  image: ghcr.io/jedarden/rust-musl-builder:latest   # or equivalent
+  command: [cargo, build, --release, --target, x86_64-unknown-linux-musl]
+  env:
+    - name: CARGO_TERM_COLOR
+      value: never
+outputs:
+  artifacts:
+    - name: binary
+      path: /workspace/target/x86_64-unknown-linux-musl/release/claude-print
+```
+
+The binary MUST be statically linked and self-contained. Verify with `file <binary>` — must say "statically linked".
+
+### Step: github-release
+
+Uses `gh release create` with the artifact from build-musl:
+
+```sh
+gh release create "${TAG}" \
+  --repo jedarden/claude-print \
+  --title "${TAG}" \
+  --notes "Release ${TAG}" \
+  claude-print-linux-amd64
+```
+
+Asset naming convention: `claude-print-linux-amd64` (no version in filename — the release tag provides the version). This simplifies install scripts that pin to a known URL pattern.
+
+### Release Tag Convention
+
+Tags follow semver: `v<MAJOR>.<MINOR>.<PATCH>`. Tags are pushed manually (`git tag v0.1.0 && git push origin v0.1.0`). The workflow is submitted manually or via Argo Events webhook on tag push (out of scope for Phase 1).
+
+### Submitting CI Manually
+
+```bash
+kubectl --kubeconfig=/home/coding/.kube/iad-ci.kubeconfig create -f - <<EOF
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: claude-print-ci-manual-
+  namespace: argo-workflows
+spec:
+  workflowTemplateRef:
+    name: claude-print-ci
+  arguments:
+    parameters:
+      - name: revision
+        value: main
+      - name: tag
+        value: ""     # empty = verify only; set to "v0.1.0" for release
+EOF
+```
+
+### Implementation Placement
+
+- **Phase 1**: Add `claude-print-ci.yaml` stub to declarative-config (verify step only; no release). Create `jedarden/claude-print` repo on GitHub if not already done.
+- **Phase 11** (CI): Add build-musl and github-release steps to the template, matching the phase completion criterion in the Implementation Phases section.
+- CI also builds `mock_claude` as a musl binary and uploads it as a release artifact alongside `claude-print`.
+
+## Documentation
+
+### README.md
+
+The repository README targets two audiences: (a) a human who wants to install and use `claude-print`, and (b) an AI agent that needs to invoke it programmatically.
+
+**Required sections** (in order):
+
+1. **One-line description** — "Drop-in replacement for `claude -p` that drives the interactive TUI via PTY, preserving subscription billing after the June 15, 2026 Agent SDK split."
+
+2. **Installation** — `curl`-based one-liner pulling the latest GitHub release asset:
+   ```sh
+   curl -fsSL https://github.com/jedarden/claude-print/releases/latest/download/claude-print-linux-amd64 \
+     -o ~/.local/bin/claude-print && chmod +x ~/.local/bin/claude-print
+   ```
+   And the `install.sh` variant (from the repo) for NEEDLE agent YAML setup.
+
+3. **Requirements** — `claude` (Claude Code) must be on PATH; Linux x86-64 only; `TMPDIR` must support `mkfifo`.
+
+4. **Quick start** — Three examples:
+   ```sh
+   # Simple prompt
+   echo "What is 2+2?" | claude-print
+
+   # Structured JSON output
+   echo "Summarize this" | claude-print --output-format json
+
+   # Streaming (NEEDLE-style)
+   echo "Write a Rust function to..." | claude-print --output-format stream-json --max-turns 10
+   ```
+
+5. **Output formats** — Brief prose description of `text`, `json`, `stream-json` with a sample of each.
+
+6. **All flags** — Reference the CLI table from §1 of this plan verbatim or as a derived table; keep in sync with `claude-print --help` output.
+
+7. **Exit codes** — Table: 0 = success, 1 = assistant error, 2 = internal error, 124 = timeout, 130 = interrupted.
+
+8. **NEEDLE Integration** — One paragraph explaining the YAML agent config + install step. Link to `~/.needle/agents/claude-print.yaml` or include its contents as a code block.
+
+9. **Self-test** — `claude-print --check` and what each check does.
+
+10. **Troubleshooting** — Two most common failure modes:
+    - "PTY open failed" → likely in a container without `/dev/ptmx`; run on a real host.
+    - "Session never completes" → check `--timeout`; `--verbose` shows state transitions.
+
+**README must NOT contain**: implementation internals, PTY mechanics, JSONL schema, or billing internals — those live in `docs/`.
+
+### AGENTS.md
+
+`AGENTS.md` lives at the repo root. Its purpose is to give AI agents invoking `claude-print` everything they need in one file, without requiring the agent to read the full plan.
+
+**Required sections** (in order):
+
+1. **Purpose** — One paragraph: what `claude-print` does, why it exists, and why an agent should prefer it over `claude -p`.
+
+2. **Invocation** — The canonical single-turn invocation:
+   ```sh
+   echo "<prompt>" | claude-print \
+     --model claude-sonnet-4-6 \
+     --max-turns 30 \
+     --output-format stream-json \
+     --dangerously-skip-permissions \
+     --no-inherit-hooks
+   ```
+   And the equivalent NEEDLE template form for agents running in NEEDLE context.
+
+3. **Input** — Prompt is read from stdin. Max ~32 KB before `/read` fallback kicks in (OQ-3b). Must be plain UTF-8 text; no shell escaping needed when piped.
+
+4. **Output** — For each `--output-format`:
+   - `text`: the assistant's response, verbatim, on stdout. Nothing else.
+   - `json`: a JSON object on stdout; list every field (see Emitter §9 and Data Models for the full field list).
+   - `stream-json`: a sequence of JSONL lines forwarded from the Claude Code transcript, followed by a final `{"type":"result", ...}` line. List the result line fields.
+
+5. **Exit codes** — Same table as README, plus: "On exit ≠ 0, check stderr for a human-readable error message."
+
+6. **Do not** — A short bulleted list of anti-patterns:
+   - Do not pass `--dangerously-skip-permissions` in interactive (human-supervised) contexts.
+   - Do not read or parse mid-session JSONL files directly — wait for `claude-print` to exit.
+   - Do not retry on exit 130 (interrupted) — investigate the cause.
+   - Do not set `CLAUDE_CODE_SESSION_ID` in the environment before invoking `claude-print`.
+
+7. **Self-test** — `claude-print --check` exits 0 if the environment can run it.
+
+8. **Version compatibility** — `claude-print` embeds `claude --version` at startup; pass `--verbose` to see it. The `claude_version` field in JSON/stream-json output reflects the actual binary version used.
+
+### Docs Organization
+
+`docs/notes/` hosts short decision notes:
+- `billing-context.md` — why PTY preserves subscription billing (**already exists**)
+- `hook-design.md` — relay hook mechanics, FIFO protocol, keeper fd pattern
+- `terminal-probes.md` — Ink startup probe table and response bytes
+
+`docs/research/` hosts external reference material:
+- `claude-code-internals.md` — Claude Code TUI behavior observations (**already exists**)
+- `pty-mechanics.md` — PTY system call reference (**already exists**)
+
+`docs/plan/plan.md` — the implementation plan (**this file**).
+
+### Implementation Placement
+
+- **Phase 1**: Stub README.md with description, requirements, and placeholder sections.
+- **Phase 9** (NEEDLE Integration): Complete README.md (all sections) + write AGENTS.md.
+- **Phase 9 acceptance criterion**: `claude-print --help` output matches the README flags table exactly. Any divergence is a CI failure (checked manually before release).
