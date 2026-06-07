@@ -47,6 +47,66 @@ claude-print (single Rust binary)
   └── Cleanup          FIFO, temp dir, master_fd, waitpid
 ```
 
+## Sandbox Isolation
+
+The inner `claude` process must not:
+- Register itself in the live session registry (`~/.claude/sessions/`) where ccdash and trail-boss can see it
+- Fire the user's global hooks (ccdash session tracking, trail-boss telemetry emitter) on Start/Stop/PermissionRequest
+- Pollute `~/.claude/history.jsonl` with headless prompts
+
+But its output (transcript JSONL + token counts) must be forwarded to `~/.claude/projects/` so the normal stats pipeline can aggregate usage.
+
+### Mechanism: `CLAUDE_CONFIG_DIR`
+
+Confirmed present in the Claude Code binary. When set, Claude Code uses that directory instead of `~/.claude` for all file I/O:
+
+```
+CLAUDE_CONFIG_DIR → sessions/, projects/, history.jsonl, settings.json, stats-cache.json, etc.
+```
+
+`claude-print` sets `CLAUDE_CONFIG_DIR` to a subdirectory inside its per-run temp dir before `execvp`:
+
+```
+$TMPDIR/claude-print-<pid>-<rand>/      ← tempfile::TempDir root
+├── claude-home/                         ← CLAUDE_CONFIG_DIR value
+│   ├── .credentials.json → ~/.claude/.credentials.json  (symlink)
+│   ├── settings.json                    ← Stop hook only
+│   ├── sessions/                        ← subprocess session files (isolated)
+│   └── projects/
+│       └── <cwd-slug>/
+│           └── <session-id>.jsonl       ← subprocess transcript
+├── hook.sh
+└── stop.fifo
+```
+
+The credentials symlink gives the child access to OAuth auth without copying secrets into the temp dir.
+
+### What the Inner Process Writes (Sandbox)
+
+| File | Written by child | Disposition after session |
+|------|-----------------|--------------------------|
+| `sessions/<pid>.json` | Yes | discarded (in temp dir, cleaned up) |
+| `projects/<slug>/<id>.jsonl` | Yes | **copied to `~/.claude/projects/<slug>/<id>.jsonl`** |
+| `history.jsonl` | Yes | discarded (headless prompts not in interactive history) |
+| `stats-cache.json` | Yes | discarded (rebuilt from projects/) |
+
+### Transcript Forwarding
+
+After the Stop hook fires and the transcript is read:
+
+1. Ensure `~/.claude/projects/<cwd-slug>/` exists (create if absent)
+2. Copy `$CLAUDE_CONFIG_DIR/projects/<cwd-slug>/<session-id>.jsonl` to `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`
+3. The stats cache rebuilds naturally on next interactive Claude Code startup — the transcript appears as a normal past session
+
+This makes `claude-print` sessions visible in `/status` usage stats, preserves the billing audit trail, and lets the user see past prompts via `/resume <session-id>`.
+
+### Hooks Not Inherited
+
+`CLAUDE_CONFIG_DIR/settings.json` contains only the per-run Stop hook. The user's `~/.claude/settings.json` is not read. Therefore:
+- ccdash session tracking does not fire
+- trail-boss does not receive these session events
+- No `PermissionRequest` hook fires (the REPL trust dialog is dismissed via PTY instead)
+
 ## Crate Dependencies
 
 | Crate | Purpose |
@@ -89,16 +149,25 @@ Exit codes:
 - `124` — timeout exceeded
 - `130` — interrupted (SIGINT)
 
-### 2. Hook Installer
+### 2. Hook Installer / Sandbox Builder
 
-Creates `$TMPDIR/claude-print-<pid>-<rand>/` via `tempfile::Builder`:
+Creates `$TMPDIR/claude-print-<pid>-<rand>/` via `tempfile::Builder` with this layout:
 
-**`settings.json`** (passed via `--settings`):
+```
+<temp>/
+├── claude-home/                     ← CLAUDE_CONFIG_DIR (set in child env)
+│   ├── .credentials.json            ← symlink → ~/.claude/.credentials.json
+│   └── settings.json                ← Stop hook only (no user hooks)
+├── hook.sh                          ← executed by Claude Code on Stop
+└── stop.fifo                        ← POSIX named pipe for hook→parent IPC
+```
+
+**`claude-home/settings.json`** — the only settings file the child reads:
 ```json
 {
   "hooks": {
     "Stop": [{
-      "hooks": [{"type": "command", "command": "/tmp/.../hook.sh", "timeout": 10}]
+      "hooks": [{"type": "command", "command": "<temp>/hook.sh", "timeout": 10}]
     }]
   }
 }
@@ -107,12 +176,19 @@ Creates `$TMPDIR/claude-print-<pid>-<rand>/` via `tempfile::Builder`:
 **`hook.sh`** (executed by Claude Code on Stop; receives payload on stdin):
 ```sh
 #!/bin/sh
-cat > /tmp/.../stop.fifo
+cat > <temp>/stop.fifo
 ```
 
 **`stop.fifo`** — POSIX named pipe created with `nix::unistd::mkfifo()`.
 
-`tempfile::TempDir` handles cleanup on any drop path (panic, early return, or normal exit).
+Child process environment additions:
+```
+CLAUDE_CONFIG_DIR=<temp>/claude-home
+```
+
+`CLAUDE_CONFIG_DIR` is set in the child's env via the fork/exec path — it is not set in the parent process. This ensures the parent's own Claude Code session (if any) is unaffected.
+
+`tempfile::TempDir` handles cleanup on any drop path (panic, early return, or normal exit). Transcript copying (see Sandbox Isolation §) runs before the temp dir is dropped.
 
 The user's `~/.claude/settings.json` is never touched.
 
@@ -274,6 +350,27 @@ pub enum ContentBlock {
 }
 ```
 
+### 8b. Transcript Forwarding
+
+After extraction completes (regardless of success or failure):
+
+```rust
+let src = sandbox_claude_home
+    .join("projects")
+    .join(&cwd_slug)
+    .join(format!("{}.jsonl", session_id));
+let dst_dir = real_claude_dir.join("projects").join(&cwd_slug);
+std::fs::create_dir_all(&dst_dir)?;
+let dst = dst_dir.join(format!("{}.jsonl", session_id));
+std::fs::copy(&src, &dst)?;
+```
+
+`real_claude_dir` is `$HOME/.claude` (not `CLAUDE_CONFIG_DIR`, which is the sandbox). The copy runs before the `TempDir` is dropped.
+
+After the copy, the session appears in `~/.claude/projects/` exactly like any other Claude Code session. It is visible in `/status` usage stats and resumable via `claude --resume <session-id>`.
+
+If the copy fails (disk full, permissions): log a warning to stderr but do not change the exit code. Response extraction already succeeded; forwarding is best-effort.
+
 ### 9. Emitter
 
 **`text`** (default): `{response_text}\n`
@@ -398,8 +495,10 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | Condition | Detection | Action | Exit |
 |-----------|-----------|--------|------|
 | `claude` binary not found | PATH lookup fails at startup | emit error | 2 |
+| Credentials file missing | symlink target absent | emit error | 2 |
 | PTY open fails | `openpty()` returns Err | emit error | 2 |
-| Hook installer fails | temp dir / mkfifo error | emit error | 2 |
+| Sandbox build fails | temp dir / mkfifo / symlink error | emit error | 2 |
+| Transcript copy fails | I/O error on forwarding | warning to stderr, continue | — |
 | No PTY output within 45 s | startup timer | kill child, emit error | 2 |
 | Child exits before Stop | `waitpid` returns | emit error with child exit code | 2 |
 | Wall-clock timeout | poll timer | SIGTERM child, emit timeout | 124 |
@@ -412,7 +511,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 ## Implementation Phases
 
 - [ ] **Phase 1: Crate scaffold** — `Cargo.toml` with pinned deps, `src/main.rs` with CLI parsing (`clap`), `--version` output including detected `claude --version`
-- [ ] **Phase 2: PTY spawner** — `nix` fork/exec, window-size probe, `login_tty`, SIGTERM/SIGKILL cleanup, `waitpid`
+- [ ] **Phase 2: Sandbox builder + PTY spawner** — temp dir, `CLAUDE_CONFIG_DIR` subdirectory, credentials symlink, sandboxed `settings.json`, `hook.sh`, `mkfifo`, then `nix` fork/exec with `CLAUDE_CONFIG_DIR` in child env, window-size probe, `login_tty`, SIGTERM/SIGKILL cleanup, `waitpid`
 - [ ] **Phase 3: Event loop** — `poll()` on master_fd + FIFO fd + timeout; read buffer; EIO detection
 - [ ] **Phase 4: Terminal emulator** — probe scanner, response table, dedup bitmask; unknown-probe passthrough
 - [ ] **Phase 5: Startup sequencer** — keyword-based trust dismiss, idle-gap timing, bracketed paste injection, large-prompt file relay
@@ -530,6 +629,32 @@ Integration test scenarios:
 | Output format json | defaults | output parses as valid JSON |
 | Output format stream-json | defaults | each output line parses as valid JSON |
 
+### Sandbox Isolation Tests (`tests/sandbox.rs`)
+
+These tests verify that the inner `claude` process is contained and that transcripts are forwarded correctly to `~/.claude/projects/`.
+
+**CLAUDE_CONFIG_DIR isolation:**
+- Spawn `mock_claude` with a controlled `CLAUDE_CONFIG_DIR`; verify the child writes its session file inside that dir, not in `~/.claude/sessions/`
+- Spawn with `CLAUDE_CONFIG_DIR` set; verify real `~/.claude/sessions/` contains no new entry after the run
+- Verify real `~/.claude/settings.json` hooks (read the file before and after a mock run) are not modified
+
+**Credentials symlink:**
+- Verify sandbox dir contains `.credentials.json` as a symlink pointing to real credentials file
+- Verify the symlink resolves to the real file (not a copy)
+- Run with credentials symlink absent: expect graceful error, not hang
+
+**Transcript forwarding:**
+- After a successful mock run, verify `~/.claude/projects/<cwd-slug>/<session-id>.jsonl` was created
+- Verify its contents match the sandbox transcript byte-for-byte
+- Verify the temp dir is cleaned up after the run (no leftover files in `$TMPDIR`)
+- Run with `~/.claude/projects/` unwritable: verify warning to stderr but exit 0 (forwarding is best-effort)
+
+**Hooks not inherited:**
+- Write a test hook script to a temp file; point real `~/.claude/settings.json` at it via `CLAUDE_CONFIG_DIR` trick inside the test; verify the test hook does NOT fire during a subprocess run (because the subprocess reads only its sandboxed settings.json)
+
+**`--verbose` sandbox trace:**
+- With `--verbose`, verify stderr includes lines for: temp dir path, CLAUDE_CONFIG_DIR value, transcript copy src→dst
+
 ### Version-Resilience Test Suite (`tests/version_compat.rs`)
 
 A dedicated test module that verifies the binary survives schema changes across Claude Code versions. These tests are run in CI on every push and also on a weekly schedule.
@@ -599,3 +724,5 @@ needle run --agent claude-print --workspace /home/coding/some-project
 - **Multiline prompt > 32 KB**: Does the `/read <path>` slash command accept absolute paths? Does it block tool use (`--allowedTools`)?  Needs end-to-end verification.
 - **`FIFO` open race**: `hook.sh` opens the FIFO for writing; the parent opens it for reading. Both sides block until the other end connects. The parent must open the read end before the Stop hook fires. If the Stop hook fires before the FIFO read end is open, the write blocks and eventually times out. Mitigation: open the read end before injecting the prompt (before Stop could fire). Verify timing.
 - **musl vs glibc**: `openpty` and `login_tty` are glibc extensions. Musl provides `openpty` in its PTY headers, but `login_tty` may not be available. May need to inline the `login_tty` implementation (`setsid` + `TIOCSCTTY` ioctl + `dup2`).
+- **Credentials lookup with `CLAUDE_CONFIG_DIR`**: Confirmed `CLAUDE_CONFIG_DIR` overrides all file I/O. The child reads `.credentials.json` from `$CLAUDE_CONFIG_DIR/.credentials.json`. Symlink to the real file is the right approach — it avoids copying secrets and stays current if the token is refreshed. Verify the child follows symlinks (it should; it uses normal file open).
+- **Other `CLAUDE_*` env vars**: The binary reads many env vars. Confirm none of them cause the child to bypass `CLAUDE_CONFIG_DIR` for session or history I/O. In particular, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_SESSION_KIND`, and `CLAUDE_JOB_DIR` may need to be unset/overridden in the child env to avoid inheriting the parent session's identity.
