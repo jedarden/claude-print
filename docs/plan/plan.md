@@ -711,7 +711,7 @@ pub enum ContentBlock {
 
 `duration_ms`: wall-clock milliseconds from `std::time::Instant::now()` captured at `main()` entry to the moment the emitter writes its final output. This includes all overhead AND model latency — it is the total time a caller waited for a response.
 
-**`stream-json`**: Spawns a reader thread that tails the transcript JSONL from the byte offset captured at prompt injection time, forwarding each new raw event line to stdout as it is written by Claude Code. After Stop fires, drains remaining lines. Output is raw JSONL (one JSON object per line), compatible with `claude -p --output-format stream-json`. The reader thread forwards ALL raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`.
+**`stream-json`**: Spawns a reader thread that tails the transcript JSONL from the byte offset captured at prompt injection time, forwarding each new raw event line to stdout as it is written by Claude Code. After Stop fires, drains remaining lines. Output is raw JSONL (one JSON object per line), compatible with `claude -p --output-format stream-json`. The reader thread forwards ALL raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`. On normal completion, the final `{"type":"result", "is_error": false, ...}` line in the output is Claude Code's own Result event forwarded verbatim; claude-print does NOT synthesize an additional result line on success. `claude_version` is NOT injected into the forwarded Result event. On error (no Claude Code result), claude-print synthesizes the final result line and injects `claude_version`.
 
 `session_id` in output: taken directly from the Stop payload if present. If absent from the payload, derive from the transcript file basename (filename without `.jsonl`). If neither is available (no transcript), emit `null`.
 
@@ -742,7 +742,7 @@ agent_cli: claude-print
 version_command: "claude-print --version"
 input_method:
   method: stdin
-invoke_template: "cd {workspace} && claude-print --model {model} --max-turns 30 --dangerously-skip-permissions --no-inherit-hooks"
+invoke_template: "cd {workspace} && claude-print --model {model} --max-turns 30 --output-format json --dangerously-skip-permissions --no-inherit-hooks"
 timeout_secs: 3600
 provider: anthropic
 # Note: --max-turns 30 and --no-inherit-hooks are hardcoded in the template above.
@@ -916,8 +916,9 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Entry:* None.
 - [ ] `Cargo.toml` workspace with pinned deps, `src/main.rs`, `cli.rs` (clap), `error.rs`, `config.rs`
 - [ ] `--version` prints `claude-print 0.1.0 (wrapping claude X.Y.Z)`
+- [ ] Add `claude-print-ci.yaml` stub to `jedarden/declarative-config` (verify step only; `build-musl` and `github-release` steps added in Phase 11)
 
-*Complete when:* `cargo build --target x86_64-unknown-linux-musl` succeeds; `claude-print --version` prints expected format; `cargo test --lib` passes.
+*Complete when:* `cargo build --target x86_64-unknown-linux-musl` succeeds; `claude-print --version` prints expected format; `cargo test --lib` passes; `claude-print-ci.yaml` stub exists in declarative-config and ArgoCD syncs it to `argo-workflows-ns-iad-ci`.
 
 **Phase 2: Hook Installer + PTY Spawner (~200 LOC)**
 *Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting). **PO-1 verified** (confirm `--settings` merges hooks rather than replacing; if false, see PO-1 recovery before writing the hook installer). PO-1 can be verified with a simple test: run `claude --settings /tmp/test_settings.json echo test` where test_settings.json contains a dummy hook, alongside a user hook in ~/.claude/settings.json, and confirm both fire.
@@ -969,7 +970,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - [ ] `claude-print.yaml`, `install.sh`, `claude-print-ci` WorkflowTemplate in declarative-config
 - [ ] Implement `--check` doctor subcommand (openpty probe, mkfifo probe, optional mock_claude PTY round-trip)
 
-*Complete when:* `install.sh` runs to completion on a clean machine; NEEDLE dispatches a test bead using `claude-print.yaml`; AS-3 passes.
+*Complete when:* `install.sh` runs to completion on a clean machine; NEEDLE dispatches a test bead using `claude-print.yaml`; AS-3 passes; README flags table matches `claude-print --help` output (verified manually).
 
 **Phase 10: Tests (~500 LOC)**
 *Entry:* Phase 8 complete (can run in parallel with Phase 9).
@@ -982,7 +983,9 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - [ ] `claude-print-ci` Argo WorkflowTemplate: fmt + clippy + test + musl release binary + artifact upload
 - [ ] CI also builds `mock_claude` binary (musl) and uploads it as a release artifact alongside `claude-print`
 
-*Complete when:* CI run on main branch produces release binary; `last-claude-version.txt` artifact present; binary passes AS-1 smoke test via `install.sh`.
+- [ ] Confirm `cargo audit` runs on every push (either via `rust-verify` or as an explicit CI step)
+
+*Complete when:* CI run on main branch produces release binary; `last-claude-version.txt` artifact present; binary passes `claude-print --check` (credential-free) via `install.sh`; full AS-1 is verified manually before each release tag is pushed.
 
 ## Testing
 
@@ -1069,6 +1072,7 @@ A `mock_claude` binary (compiled as a test fixture, not a shell script) simulate
 | `MOCK_DELAY_STOP=<ms>` | Fire Stop after delay |
 | `MOCK_IS_ERROR=1` | Write `is_error: true` to transcript result event |
 | `MOCK_STOP_BEFORE_INJECT=1` | Fire Stop hook immediately, before trust dismiss |
+| `MOCK_SILENT=1` | Emit no startup output; never fire Stop hook; block indefinitely (used to test timeout paths). |
 
 *All env vars listed above are exercised by at least one scenario in the integration test table. `MOCK_DELAY_STOP` is used in the SIGINT and "Stop hook never fires" scenarios.*
 
@@ -1079,7 +1083,7 @@ Integration test scenarios:
 | Happy path | defaults | exit 0, correct response text, non-zero token counts |
 | Trust dialog (standard wording) | `MOCK_TRUST_DIALOG=1` | exit 0 |
 | **Trust dialog (alternate wording)** | `MOCK_TRUST_DIALOG=1 MOCK_TRUST_WORDING=alternate` | exit 0 (resilience) |
-| No startup output | emit nothing | exit 2 after timeout |
+| No startup output | `MOCK_SILENT=1` | exit 2 after timeout |
 | Child exits before Stop | `MOCK_EXIT_BEFORE_STOP=1` | exit 2 |
 | Stop hook never fires | `MOCK_DELAY_STOP=99999` | exit 124 |
 | Transcript race | `MOCK_DELAY_JSONL=100` | retry loop fires, exit 0 |
@@ -1089,7 +1093,7 @@ Integration test scenarios:
 | Error in transcript | `MOCK_IS_ERROR=1` | exit 1, `is_error: true` in output |
 | SIGINT | `MOCK_DELAY_STOP=5000` + send SIGINT at 1 s | exit 130, child killed |
 | Multi-turn | `MOCK_TURNS=3` | last turn text returned, 3 turns in token sum |
-| Large prompt (>32KB) | 33000-byte prompt | file relay used, exit 0 |
+| Large prompt (>32KB) | (no mock env var needed; test harness sends a 33 000-byte string as stdin; mock_claude reads stdin verbatim and reflects it in the transcript JSONL) | file relay used, exit 0 |
 | **Unknown probe emitted** | `MOCK_UNKNOWN_PROBE=1` | probe ignored, session completes |
 | **Unknown event type in JSONL** | `MOCK_UNKNOWN_EVENT_TYPE=1` | parse succeeds, text extracted |
 | **Unknown usage fields** | `MOCK_UNKNOWN_USAGE_FIELDS=1` | ignored, token counts correct |
@@ -1400,11 +1404,15 @@ steps:
 
 ### Step: verify
 
-Delegates to the existing `rust-verify` WorkflowTemplate (fmt + clippy + test). No duplication. If `rust-verify` is not yet parameterized for arbitrary repos, add a `repo` parameter — do not inline the verify steps.
+Delegates to the existing `rust-verify` WorkflowTemplate (fmt + clippy + test). No duplication. If `rust-verify` is not yet parameterized for arbitrary repos, add a `repo` parameter — do not inline the verify steps. Note: if `rust-verify` does not already include `cargo audit`, add it as an explicit step in `claude-print-ci` between `verify` and `build-musl`. The Phase 11 checklist MUST include `cargo audit` verification either way.
 
 ### Step: build-musl
 
 ```yaml
+initContainers:
+  - name: git-clone
+    image: alpine/git:latest
+    command: [git, clone, "--branch", "$(inputs.parameters.revision)", "$(inputs.parameters.repo)", /workspace]
 container:
   image: ghcr.io/jedarden/rust-musl-builder:latest   # or equivalent
   command: [cargo, build, --release, --target, x86_64-unknown-linux-musl]
@@ -1414,28 +1422,33 @@ container:
 outputs:
   artifacts:
     - name: binary
-      path: /workspace/target/x86_64-unknown-linux-musl/release/claude-print
+      path: /workspace/target/x86_64-unknown-linux-musl/release/claude-print-linux-amd64
+    - name: mock-binary
+      path: /workspace/target/x86_64-unknown-linux-musl/release/mock-claude-linux-amd64
 ```
 
-The binary MUST be statically linked and self-contained. Verify with `file <binary>` — must say "statically linked".
+The `cargo build` step also builds `mock_claude` from the `test-fixtures/mock-claude/` workspace member (it is declared as a workspace member in the root `Cargo.toml`, so a single `cargo build --release` compiles both). After the build, both binaries are renamed for upload: `claude-print` → `claude-print-linux-amd64`, `mock_claude` → `mock-claude-linux-amd64`.
+
+Both binaries MUST be statically linked and self-contained. Verify with `file <binary>` — must say "statically linked".
 
 ### Step: github-release
 
-Uses `gh release create` with the artifact from build-musl:
+Uses `gh release create` with the artifacts from build-musl:
 
 ```sh
 gh release create "${TAG}" \
   --repo jedarden/claude-print \
   --title "${TAG}" \
   --notes "Release ${TAG}" \
-  claude-print-linux-amd64
+  claude-print-linux-amd64 \
+  mock-claude-linux-amd64
 ```
 
-Asset naming convention: `claude-print-linux-amd64` (no version in filename — the release tag provides the version). This simplifies install scripts that pin to a known URL pattern.
+Asset naming convention: `claude-print-linux-amd64` and `mock-claude-linux-amd64` (no version in filenames — the release tag provides the version). This simplifies install scripts that pin to a known URL pattern.
 
 ### Release Tag Convention
 
-Tags follow semver: `v<MAJOR>.<MINOR>.<PATCH>`. Tags are pushed manually (`git tag v0.1.0 && git push origin v0.1.0`). The workflow is submitted manually or via Argo Events webhook on tag push (out of scope for Phase 1).
+Tags follow semver: `v<MAJOR>.<MINOR>.<PATCH>`. Tags are pushed manually (`git tag v0.1.0 && git push origin v0.1.0`). The workflow is submitted manually or via Argo Events webhook on tag push (out of scope for v1.0; manual workflow submission is sufficient for initial releases).
 
 ### Submitting CI Manually
 
@@ -1535,7 +1548,7 @@ The repository README targets two audiences: (a) a human who wants to install an
 4. **Output** — For each `--output-format`:
    - `text`: the assistant's response, verbatim, on stdout. Nothing else.
    - `json`: a JSON object on stdout; list every field (see Emitter §9 and Data Models for the full field list).
-   - `stream-json`: a sequence of JSONL lines forwarded from the Claude Code transcript, followed by a final `{"type":"result", ...}` line. List the result line fields.
+   - `stream-json`: A sequence of JSONL lines forwarded verbatim from the Claude Code transcript. On success, the final line is Claude Code's own `{"type":"result", "is_error": false, ...}` event (forwarded as-is; no `claude_version` field). On error, the final line is a synthesized result event: `{"type":"result", "is_error": true, "subtype": "...", "error_message": "...", "claude_version": "..."}`. List the result line fields.
 
 5. **Exit codes** — Same table as README, plus: "On exit ≠ 0, check stderr for a human-readable error message."
 
