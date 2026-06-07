@@ -267,7 +267,15 @@ poll() loop (master_fd, stop_fifo)   tail transcript from prompt_injected_at
   │                                    written the first event), the reader thread
   │                                    MUST retry the file open in a loop with 50ms
   │                                    sleeps until the file appears or a 5-second
-  │                                    timeout expires. This is the same race
+  │                                    timeout expires. If the 5-second timeout
+  │                                    expires, the reader thread MUST send the
+  │                                    drain signal on the mpsc channel (same as
+  │                                    normal Stop) before returning, so the main
+  │                                    thread's `Receiver::recv()` returns promptly.
+  │                                    The main thread then emits an error result
+  │                                    (`is_error: true`, `subtype: 'internal_error'`,
+  │                                    `error_message: 'transcript file did not appear
+  │                                    within 5s'`) and exits 2. This is the same race
   │                                    condition handled by the normal transcript
   │                                    reader's retry loop, applied here to the
   │                                    file-open step rather than the content-read
@@ -421,6 +429,7 @@ Drop-in for `claude -p`:
 | `--no-inherit-hooks` | Disable user hook inheritance; passes `--setting-sources=` to claude (unverified per OQ-2) |
 | `--version` | Print `claude-print <version> (wrapping claude <version>)` and exit. The claude version is obtained by running the binary at `--claude-binary` (or the PATH-resolved `claude` if not specified). If claude is not found, print `claude-print <version> (wrapping claude: not found)` and exit 0. |
 | `--verbose` | Write timing traces to stderr |
+| `--check` | Run installation self-test: verify openpty, mkfifo, optional PTY round-trip with mock_claude. Exits 0 on all checks passed, 2 on any failure. |
 
 Stdin accepted as prompt when not a TTY and no positional/`--input-file` given.
 
@@ -524,7 +533,7 @@ stop_fifo   POLLIN → Stop hook fired; read payload, begin transcript extractio
 [timeout]   —      → tracked via Instant; sets poll() timeout_ms, not a physical fd
 ```
 
-**Timer mechanism:** There is no separate timer fd. Timeouts (startup 45s, wall-clock `--timeout`) are tracked via `Instant::now()` captured at the relevant phase transition. On each `poll()` call, the timeout argument is set to the minimum remaining ms across all active timers. `poll()` returns at or before the soonest deadline. The initial poll set is 1 fd (`master_fd`); the FIFO fd is pushed at `PROMPT_INJECTED`. The 'timer' entry in the architecture diagram is a logical representation of deadline tracking, not a physical fd.
+**Timer mechanism:** There is no separate timer fd. Timeouts (startup 45s, wall-clock `--timeout`) are tracked via `Instant::now()` captured at the relevant phase transition. On each `poll()` call, the timeout argument is set to the minimum remaining ms across all active timers. `poll()` returns at or before the soonest deadline. The initial poll set is 2 fds (`master_fd`, `self_pipe_read`); the FIFO fd is pushed at `PROMPT_INJECTED`. The 'timer' entry in the architecture diagram is a logical representation of deadline tracking, not a physical fd.
 
 **Dynamic fd registration:** The event loop initially polls only `master_fd` (1 fd). At the `TRUST_DISMISSED → PROMPT_INJECTED` transition, the FIFO read-end fd is added to the poll() set. Subsequent poll() iterations include both fds. The simplest implementation: represent the pollfd array as a `Vec<pollfd>` and push the FIFO fd at transition time.
 
@@ -558,7 +567,7 @@ The trust dialog asks the user to confirm before allowing tool use. Detection us
 
 - If any output line contains two or more of: `trust`, `Allow`, `continue`, `folder`, `permission`, `proceed` → send `\r` immediately
 - Fallback: after 0.8 s with no new PTY bytes and ≥ 200 bytes received total → send `\r` (covers any welcome/confirmation prompt)
-- Hard timeout 45 s with zero bytes → exit 2 (binary not found or hung)
+- Hard timeout: if the process has been in WAITING state for 45 s and fewer than 200 bytes have been received → exit 2 (binary not found or hung, or partial-output hang)
 
 The idle/byte fallback is a one-shot: once any trigger (keyword or idle) fires and transitions to TRUST_DISMISSED, the fallback timer is deactivated and cannot re-fire.
 
@@ -578,7 +587,7 @@ Reads from `stop.fifo` (non-blocking open; polled via the main `poll()` loop). O
 1. Read one line → parse JSON with lenient schema (all fields `Option<T>`)
 2. Extract `session_id` and `transcript_path` (either direct or derived from `session_id` + `cwd`). If both `transcript_path` and `cwd` are absent from the Stop payload: skip path derivation entirely; proceed directly to the retry loop using `last_assistant_message` as the only fallback. If `last_assistant_message` is also absent: emit `is_error=true`, exit 1.
 3. Signal the event loop to exit
-4. Send `/exit\r` to the PTY child. (Bracketed paste is not used here: at this point the REPL has returned to idle after completing the response, so a plain CR-terminated command is accepted. `/exit` is a Claude Code built-in slash command that initiates graceful shutdown.) After sending `/exit\r`, wait up to 5s for the child to exit (detected via EIO on master_fd or SIGCHLD). If the child has not exited after 5s, proceed directly to SIGTERM → 2s → SIGKILL cleanup.
+4. Send `/exit\r` to the PTY child. (Bracketed paste is not used here: at this point the REPL has returned to idle after completing the response, so a plain CR-terminated command is accepted. `/exit` is a Claude Code built-in slash command that initiates graceful shutdown.) After sending `/exit\r`, wait up to 5s for the child to exit, detected by polling `master_fd` with a 5-second deadline: when `EIO` is returned, the child process has exited. `waitpid(WNOHANG)` MAY be used as a supplementary check on each poll iteration. No SIGCHLD handler is required for this path. If the child has not exited after 5s, proceed directly to SIGTERM → 2s → SIGKILL cleanup.
 
 If Stop never fires within `--timeout` seconds: emit timeout result, SIGTERM child, exit 124.
 
@@ -715,7 +724,7 @@ pub enum ContentBlock {
 Error result:
 ```json
 {"type": "result", "subtype": "timeout|interrupted|internal_error|assistant_error",
- "is_error": true, "error_message": "..."}
+ "is_error": true, "error_message": "...", "claude_version": "..."}
 ```
 
 **Error output by format:**
@@ -828,7 +837,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | `claude` binary not found | PATH lookup fails at startup | emit error | 2 |
 | PTY open fails | `openpty()` returns Err | emit error | 2 |
 | Hook installer fails | temp dir / mkfifo / write error | emit error | 2 |
-| total bytes received == 0 after 45 s | startup timer | kill child, emit error | 2 |
+| WAITING state persists for 45 s and bytes_received < 200 | startup timer | kill child, emit error | 2 |
 | Child exits before Stop | `waitpid` returns | emit error with child exit code | 2 |
 | Wall-clock timeout | poll timer | SIGTERM child, emit timeout | 124 |
 | Stop hook never fires | FIFO timeout | SIGTERM child, emit timeout | 124 |
@@ -850,7 +859,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | EC-5 | Prompt > 32 KB | Written to `$TMPDIR/<session>/prompt.txt`; `/read <path>\r` sent instead. File cleaned up with temp dir. Requires PO-6 to hold. See Startup Sequencer §6 for the full /read relay specification including encoding and response flow. |
 | EC-6 | `claude --version` output format changes | Version parsing uses a permissive regex. If parsing fails, `claude_version: "unknown"` in output; `--version` still exits 0. |
 | EC-7 | Stop hook fires before trust dismiss (no dialog shown) | EC-11 unsets `CLAUDE_CODE_SESSION_ID`/`CLAUDE_CODE_SESSION_KIND` before `execvp`, which should prevent this in normal operation. If Stop fires before prompt injection despite EC-11, treat it as an error: emit `is_error=true` and exit 2, rather than silently accepting an empty-prompt response. |
-| EC-8 | No PTY output received for 45 s total (total bytes received == 0 AND 45 s elapsed — detects binary-not-found or hung startup before first byte) | Hard timeout: SIGTERM → 2 s → SIGKILL → waitpid → exit 2. |
+| EC-8 | WAITING state persists for 45 s with fewer than 200 bytes received (covers both zero-byte case and partial-output hang — detects binary-not-found, hung startup, or process emitting <200 bytes then stalling) | Hard timeout: SIGTERM → 2 s → SIGKILL → waitpid → exit 2. |
 | EC-9 | `last_assistant_message` contains ANSI escape sequences | Strip ANSI before emitting in `text` and `json` formats (simple regex on the fallback string only). In `stream-json` mode, if the `last_assistant_message` fallback is used (retry loop exhausted), ANSI sequences MUST also be stripped before the synthesized fallback result event is emitted. |
 | EC-10 | Truncated final JSONL line | Malformed line skipped by lenient parser. If no complete assistant events remain, retry loop fires. |
 | EC-11 | `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_SESSION_KIND` inherited from parent | Unset both in child env before `execvp` to prevent session identity confusion. (See Open Questions #6.) |
@@ -932,7 +941,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* All terminal unit tests pass (all 5 probes answered, unknown probe ignored, split-chunk probe handled, dedup works).
 
 **Phase 5: Startup Sequencer (~120 LOC)**
-*Entry:* Phase 4 complete. **OQ-3 must be resolved** (verify `/read` accepts absolute paths; if false, commit to PO-6 truncation fallback before implementing the large-prompt relay).
+*Entry:* Phase 4 complete. **OQ-3b must be resolved** (verify `/read` accepts absolute paths; if false, commit to PO-6 truncation fallback before implementing the large-prompt relay).
 - [ ] `startup.rs`: keyword trust dismiss, idle-gap timing, bracketed paste injection, large-prompt file relay
 
 *Complete when:* All startup unit tests pass; integration test `test_trust_dialog_standard_wording` and `test_trust_dialog_alternate_wording` pass.
@@ -958,6 +967,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 **Phase 9: NEEDLE Integration (~50 LOC + config)**
 *Entry:* Phase 8 complete.
 - [ ] `claude-print.yaml`, `install.sh`, `claude-print-ci` WorkflowTemplate in declarative-config
+- [ ] Implement `--check` doctor subcommand (openpty probe, mkfifo probe, optional mock_claude PTY round-trip)
 
 *Complete when:* `install.sh` runs to completion on a clean machine; NEEDLE dispatches a test bead using `claude-print.yaml`; AS-3 passes.
 
@@ -1023,7 +1033,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - Trust keywords in different lines of same chunk → CR sent
 - **Alternative wording `continue` + `folder` → CR sent** (keyword union logic)
 - **Arbitrary unknown welcome text (no keywords) → fallback: CR after 0.8 s idle**
-- No output for 45 s (total bytes == 0) → error returned; note: if any bytes arrive before 45s, this timeout does not fire (see idle fallback at 0.8s/200 bytes)
+- WAITING state persists for 45 s with fewer than 200 bytes received → error returned (covers zero-byte case and partial-output hang; if ≥ 200 bytes arrive before 45s, the idle fallback at 0.8s fires first)
 - 199 bytes received then idle 0.8 s → no CR yet (minimum 200 bytes enforced)
 - 200 bytes received then idle 0.8 s → CR sent
 
@@ -1350,7 +1360,8 @@ Unresolved questions are mapped to the phase they block. Each MUST be resolved b
 |---|---------|--------|----------------------|
 | OQ-1 | Does `--settings <file>` merge hooks with `~/.claude/settings.json` or replace them? | Phase 2 | Verify by running `claude` with `--settings` containing a test hook alongside a real user hook and checking both fire. If merge fails: PO-1 fallback (merge in-process). Also verify hook firing order: confirm user hooks run before or after the relay hook. If relay fires first, confirm this does not cause a read race with user Stop hooks that post-process the JSONL (e.g., ccdash). |
 | OQ-2 | Does `--setting-sources=` (empty string) suppress all standard sources? | Phase 6 | Verify by running `claude --setting-sources= --settings <relay-only-file>` and checking user hooks do not fire. If not accepted: try `--setting-sources=none`; if neither works, enumerate relay source explicitly. |
-| OQ-3 | Does `/read <path>` accept absolute paths for prompts >32 KB? Verify that `/read` is a built-in slash command (always available) vs. a tool invocation (requires allowedTools). | Phase 5 | End-to-end test with `--allowedTools=all` and a 33 KB prompt file. If not: PO-6 fallback (truncate at 32 KB). Note: `/read` is confirmed a built-in slash command — it does not require `Read` in `--allowedTools`. |
+| OQ-3a | Is `/read` a built-in slash command (always available) vs. a tool invocation (requires allowedTools)? | — | **Resolved.** Confirmed built-in slash command; does not require `Read` in `--allowedTools`. |
+| OQ-3b | Does `/read` accept absolute paths for prompts >32 KB? | Phase 5 | End-to-end test with a 33 KB prompt file at an absolute path. If not: PO-6 fallback (truncate at 32 KB). |
 | OQ-4 | FIFO open race: will O_NONBLOCK open-before-inject reliably prevent timing issues? | Phase 6 | Validated by `test_fast_stop_hook` integration test (MOCK_DELAY_STOP=0). If race occurs in practice, add a pre-prompt-inject `poll()` to confirm FIFO open. |
 | OQ-5 | Is `login_tty` available in `x86_64-unknown-linux-musl`? | Phase 2 | Attempt compilation before Phase 2 begins. If absent: inline 4-syscall implementation (PO-3 recovery). **Resolve before writing Phase 2 code.** |
 | OQ-6 | Do `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_SESSION_KIND` from a parent session confuse the child? | Phase 2 | Unset both in child env before `execvp` as a precaution. Test by running `claude-print` from inside an active `claude` session and verifying the child gets its own session identity. |
