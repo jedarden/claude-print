@@ -9,5 +9,4 @@ Starting June 15, 2026, Anthropic separates `claude -p` (headless) into a separa
 ## Structure
 
 - `docs/notes/` — design decisions, constraints, integration details
-- `docs/research/` — prior art, billing change references, PTY/hook patterns
 - `docs/plan/plan.md` — complete implementation plan
