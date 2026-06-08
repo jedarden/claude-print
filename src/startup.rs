@@ -1,4 +1,6 @@
+use std::io::Write as IoWrite;
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 // Trust dialog keyword set — 2+ on a single line → send CR.
 const TRUST_KEYWORDS: &[&str] = &["trust", "Allow", "continue", "folder", "permission", "proceed"];
@@ -10,7 +12,9 @@ const HARD_TIMEOUT_SECS: u64 = 45;
 /// Default idle-gap: ms of silence after trust-dismiss before injecting prompt.
 /// Resets to zero on every PTY output chunk; fires only after uninterrupted silence.
 pub const DEFAULT_POST_DISMISS_IDLE_MS: u64 = 2000;
-// Prompts larger than this are out-of-scope for inline injection (future: /read path).
+/// Prompts at or below this size are injected inline via bracketed paste.
+/// Larger prompts are written to a temp file and a shell `read` command is
+/// injected instead, avoiding PTY pipe-buffer saturation.
 const INLINE_PROMPT_MAX: usize = 32 * 1024;
 
 /// Action requested by [`StartupSeq`] from the event loop.
@@ -59,6 +63,9 @@ pub struct StartupSeq {
     /// Configurable idle gap (ms).  After trust-dismiss, injection fires only
     /// after this many ms pass with no PTY output.
     idle_gap_ms: u64,
+    /// Temp file holding the prompt for the file-relay path (prompt > 32 KB).
+    /// Kept alive here so the file persists until the session reads it.
+    relay_file: Option<NamedTempFile>,
 }
 
 impl StartupSeq {
@@ -80,6 +87,7 @@ impl StartupSeq {
             trust_dismiss_at: None,
             line_buf: Vec::new(),
             idle_gap_ms,
+            relay_file: None,
         }
     }
 
@@ -185,15 +193,32 @@ impl StartupSeq {
         }
     }
 
-    fn make_prompt_payload(&self) -> Vec<u8> {
-        // Prompts > 32 KB would use /read <path>; inline path covers all normal cases.
-        debug_assert!(
-            self.prompt.len() <= INLINE_PROMPT_MAX,
-            "large-prompt /read path not yet implemented"
-        );
-        let mut out = Vec::with_capacity(self.prompt.len() + 12);
+    fn make_prompt_payload(&mut self) -> Vec<u8> {
+        if self.prompt.len() <= INLINE_PROMPT_MAX {
+            let mut out = Vec::with_capacity(self.prompt.len() + 12);
+            out.extend_from_slice(b"\x1b[200~");
+            out.extend_from_slice(&self.prompt);
+            out.extend_from_slice(b"\x1b[201~\r");
+            out
+        } else {
+            self.make_file_relay_payload()
+        }
+    }
+
+    /// Write the prompt to a temp file and return a bracketed-paste payload
+    /// containing a shell `read` command (`$(< path)`) that substitutes the
+    /// file contents.  Avoids saturating the PTY pipe buffer for large prompts.
+    fn make_file_relay_payload(&mut self) -> Vec<u8> {
+        let mut f = NamedTempFile::new().expect("create temp file for large prompt");
+        f.write_all(&self.prompt)
+            .expect("write large prompt to temp file");
+        let path = f.path().to_owned();
+        self.relay_file = Some(f);
+        let mut out = Vec::new();
         out.extend_from_slice(b"\x1b[200~");
-        out.extend_from_slice(&self.prompt);
+        out.extend_from_slice(b"$(< ");
+        out.extend_from_slice(path.to_string_lossy().as_bytes());
+        out.push(b')');
         out.extend_from_slice(b"\x1b[201~\r");
         out
     }
@@ -401,5 +426,97 @@ mod tests {
             payload.windows(12).any(|w| w == b"What is 2+2?"),
             "prompt text not present in payload"
         );
+    }
+
+    // ── large-prompt file relay ───────────────────────────────────────────────
+
+    /// Prompts at or below INLINE_PROMPT_MAX use the inline bracketed-paste path.
+    #[test]
+    fn inline_path_used_at_threshold() {
+        let prompt: Vec<u8> = b"Z".repeat(INLINE_PROMPT_MAX);
+        let mut seq = StartupSeq::new(prompt.clone());
+        seq.phase = StartupPhase::TrustDismissed;
+        let payload = seq.make_prompt_payload();
+        // Inline: open marker directly followed by prompt content.
+        assert!(payload.starts_with(b"\x1b[200~"), "must start with bracketed-paste open");
+        assert_eq!(payload[6], b'Z', "prompt byte must follow open marker immediately");
+        // Must not contain shell substitution syntax.
+        assert!(
+            !payload.windows(4).any(|w| w == b"$(< "),
+            "inline path must not emit shell read command"
+        );
+    }
+
+    /// Prompts above INLINE_PROMPT_MAX write to a temp file and inject a shell
+    /// `$(< path)` substitution via bracketed paste.
+    #[test]
+    fn file_relay_used_above_threshold() {
+        let large_prompt: Vec<u8> = b"A".repeat(INLINE_PROMPT_MAX + 1);
+        let mut seq = StartupSeq::new(large_prompt.clone());
+        seq.phase = StartupPhase::TrustDismissed;
+        let payload = seq.make_prompt_payload();
+        // Must start with the shell substitution inside bracketed paste.
+        assert!(
+            payload.starts_with(b"\x1b[200~$(< "),
+            "large prompt must inject shell read command"
+        );
+        assert!(
+            payload.ends_with(b"\x1b[201~\r"),
+            "must end with bracketed-paste close + CR"
+        );
+        // The relay_file field must be set (keeping the temp file alive).
+        assert!(seq.relay_file.is_some(), "relay_file must be populated");
+    }
+
+    /// The temp file created by the file-relay path contains the exact prompt bytes.
+    #[test]
+    fn file_relay_temp_file_contains_prompt() {
+        let large_prompt: Vec<u8> = b"B".repeat(INLINE_PROMPT_MAX + 256);
+        let mut seq = StartupSeq::new(large_prompt.clone());
+        seq.phase = StartupPhase::TrustDismissed;
+        let payload = seq.make_prompt_payload();
+
+        // Extract the path from payload: \x1b[200~$(< <path>)\x1b[201~\r
+        let prefix = b"\x1b[200~$(< ";
+        assert!(payload.starts_with(prefix));
+        let after_prefix = &payload[prefix.len()..];
+        let close_paren = after_prefix
+            .iter()
+            .position(|&b| b == b')')
+            .expect("closing paren in payload");
+        let path_bytes = &after_prefix[..close_paren];
+        let path_str = std::str::from_utf8(path_bytes).expect("path is valid UTF-8");
+
+        let file_content = std::fs::read(path_str).expect("temp file must exist while seq is alive");
+        assert_eq!(
+            file_content, large_prompt,
+            "temp file must contain the full prompt"
+        );
+    }
+
+    /// File-relay path integrates end-to-end through the state machine:
+    /// trust dismiss → idle gap → file-relay payload injected.
+    #[test]
+    fn file_relay_end_to_end_state_machine() {
+        let gap_ms: u64 = 15;
+        let large_prompt: Vec<u8> = b"C".repeat(INLINE_PROMPT_MAX + 1);
+        let mut seq = StartupSeq::with_idle_gap(large_prompt.clone(), gap_ms);
+
+        seq.feed(b"trust Allow folder\n");
+        assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
+
+        std::thread::sleep(Duration::from_millis(gap_ms + 10));
+
+        let action = seq.poll_timers();
+        match action {
+            StartupAction::Write(payload) => {
+                assert!(
+                    payload.starts_with(b"\x1b[200~$(< "),
+                    "large prompt must use file-relay injection"
+                );
+            }
+            _ => panic!("expected Write action from poll_timers for large prompt"),
+        }
+        assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
     }
 }
