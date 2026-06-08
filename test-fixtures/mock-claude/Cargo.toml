@@ -6,3 +6,6 @@ edition = "2021"
 [[bin]]
 name = "mock-claude"
 path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
