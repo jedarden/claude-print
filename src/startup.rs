@@ -7,8 +7,9 @@ const KEYWORD_THRESHOLD: usize = 2;
 const IDLE_THRESHOLD_BYTES: usize = 200;
 const IDLE_TIMEOUT_MS: u64 = 800;
 const HARD_TIMEOUT_SECS: u64 = 45;
-// Time to wait after the dismiss CR before injecting the prompt.
-const POST_DISMISS_IDLE_MS: u64 = 2000;
+/// Default idle-gap: ms of silence after trust-dismiss before injecting prompt.
+/// Resets to zero on every PTY output chunk; fires only after uninterrupted silence.
+pub const DEFAULT_POST_DISMISS_IDLE_MS: u64 = 2000;
 // Prompts larger than this are out-of-scope for inline injection (future: /read path).
 const INLINE_PROMPT_MAX: usize = 32 * 1024;
 
@@ -37,22 +38,38 @@ pub enum StartupPhase {
 /// Manages the startup handshake with the Claude Code TUI.
 ///
 /// Phase 1: scan PTY output for trust-dialog keywords; send `\r` to dismiss.
-/// Phase 2: after a 2 s quiet period, inject the user prompt via bracketed paste.
+/// Phase 2: wait for an idle gap (no PTY output for `idle_gap_ms`), then inject
+///          the user prompt via bracketed paste.  The idle gap resets on every
+///          output chunk so transient TUI redraws after the dismiss don't cause
+///          premature injection.
 ///
 /// Call [`feed`] for every PTY chunk and [`poll_timers`] on each poll() iteration.
 pub struct StartupSeq {
     phase: StartupPhase,
     prompt: Vec<u8>,
     bytes_received: usize,
+    /// Timestamp of the most-recent PTY output, or the dismiss instant when
+    /// entering TrustDismissed via the idle-fallback path.  Used as the start
+    /// of the idle-gap window.
     last_output_at: Instant,
     phase_start: Instant,
     trust_dismiss_at: Option<Instant>,
     /// Accumulates bytes from the current partial line for keyword scanning.
     line_buf: Vec<u8>,
+    /// Configurable idle gap (ms).  After trust-dismiss, injection fires only
+    /// after this many ms pass with no PTY output.
+    idle_gap_ms: u64,
 }
 
 impl StartupSeq {
     pub fn new(prompt: Vec<u8>) -> Self {
+        Self::with_idle_gap(prompt, DEFAULT_POST_DISMISS_IDLE_MS)
+    }
+
+    /// Construct with a custom post-dismiss idle gap in milliseconds.
+    ///
+    /// Primarily used in tests to avoid sleeping for 2 s.
+    pub fn with_idle_gap(prompt: Vec<u8>, idle_gap_ms: u64) -> Self {
         let now = Instant::now();
         Self {
             phase: StartupPhase::Waiting,
@@ -62,6 +79,7 @@ impl StartupSeq {
             phase_start: now,
             trust_dismiss_at: None,
             line_buf: Vec::new(),
+            idle_gap_ms,
         }
     }
 
@@ -118,7 +136,10 @@ impl StartupSeq {
     /// Handles:
     /// - Hard timeout (WAITING, < 200 bytes in 45 s) → [`StartupAction::HardTimeout`]
     /// - Idle fallback (WAITING, ≥ 200 bytes, 0.8 s idle) → CR write
-    /// - Post-dismiss idle (TRUST_DISMISSED, 2 s elapsed) → bracketed paste
+    /// - Post-dismiss idle gap (TRUST_DISMISSED, no output for `idle_gap_ms`) → bracketed paste
+    ///
+    /// The post-dismiss idle gap resets on every PTY chunk received via [`feed`].
+    /// Injection fires only after `idle_gap_ms` ms of uninterrupted silence.
     pub fn poll_timers(&mut self) -> StartupAction {
         let now = Instant::now();
 
@@ -134,6 +155,10 @@ impl StartupSeq {
                     && now.duration_since(self.last_output_at)
                         >= Duration::from_millis(IDLE_TIMEOUT_MS)
                 {
+                    // Reset last_output_at so the idle gap is measured from the
+                    // dismiss moment, not from whenever output last arrived in
+                    // the Waiting phase.
+                    self.last_output_at = now;
                     self.phase = StartupPhase::TrustDismissed;
                     self.trust_dismiss_at = Some(now);
                     return StartupAction::Write(b"\r".to_vec());
@@ -143,14 +168,15 @@ impl StartupSeq {
             }
 
             StartupPhase::TrustDismissed => {
-                if let Some(dismiss_at) = self.trust_dismiss_at {
-                    if now.duration_since(dismiss_at)
-                        >= Duration::from_millis(POST_DISMISS_IDLE_MS)
-                    {
-                        let payload = self.make_prompt_payload();
-                        self.phase = StartupPhase::PromptInjected;
-                        return StartupAction::Write(payload);
-                    }
+                // Idle-gap check: fire only after `idle_gap_ms` ms of silence.
+                // `last_output_at` is updated by feed() on every PTY chunk, so
+                // any new output resets this window automatically.
+                if now.duration_since(self.last_output_at)
+                    >= Duration::from_millis(self.idle_gap_ms)
+                {
+                    let payload = self.make_prompt_payload();
+                    self.phase = StartupPhase::PromptInjected;
+                    return StartupAction::Write(payload);
                 }
                 StartupAction::None
             }
@@ -264,6 +290,101 @@ mod tests {
             StartupAction::Write(bytes) => assert_eq!(bytes, b"\r"),
             _ => panic!("expected Write(b\"\\r\") after line completed"),
         }
+    }
+
+    // ── idle-gap timer tests ──────────────────────────────────────────────────
+
+    /// After trust-dismiss, new PTY output resets the idle gap so the timer
+    /// does not fire while the TUI is still redrawing.
+    #[test]
+    fn idle_gap_resets_on_new_output() {
+        let gap_ms: u64 = 60;
+        let mut seq = StartupSeq::with_idle_gap(b"prompt".to_vec(), gap_ms);
+
+        // Trigger trust dismiss via keyword line.
+        seq.feed(b"trust Allow folder\n");
+        assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
+
+        // Wait until just before the gap would expire, then feed new output.
+        std::thread::sleep(Duration::from_millis(gap_ms - 15));
+        seq.feed(b"TUI redraw output\n");
+
+        // Polling immediately after the reset must return None — the idle gap
+        // restarted from the last output, so < 1 ms has passed.
+        let action = seq.poll_timers();
+        assert!(
+            matches!(action, StartupAction::None),
+            "idle gap must not fire immediately after output reset"
+        );
+
+        // After a full gap of silence from the reset, injection must fire.
+        std::thread::sleep(Duration::from_millis(gap_ms + 20));
+        let action = seq.poll_timers();
+        match action {
+            StartupAction::Write(payload) => {
+                assert!(
+                    payload.starts_with(b"\x1b[200~"),
+                    "expected bracketed-paste open after idle gap"
+                );
+            }
+            _ => panic!("expected Write (prompt injection) after idle gap expired post-reset"),
+        }
+        assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
+    }
+
+    /// After trust-dismiss with no further PTY output, the idle gap fires and
+    /// the prompt is injected via bracketed paste.
+    #[test]
+    fn idle_gap_fires_after_silence() {
+        let gap_ms: u64 = 20;
+        let mut seq = StartupSeq::with_idle_gap(b"hello world".to_vec(), gap_ms);
+
+        // Trigger trust dismiss.
+        seq.feed(b"trust Allow folder\n");
+        assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
+
+        // Polling before the gap expires must return None.
+        let action = seq.poll_timers();
+        assert!(
+            matches!(action, StartupAction::None),
+            "should not fire before idle gap elapses"
+        );
+
+        // Wait for silence.
+        std::thread::sleep(Duration::from_millis(gap_ms + 10));
+
+        let action = seq.poll_timers();
+        match action {
+            StartupAction::Write(payload) => {
+                assert!(payload.starts_with(b"\x1b[200~"), "bracketed-paste open missing");
+                assert!(payload.ends_with(b"\x1b[201~\r"), "bracketed-paste close+CR missing");
+                assert!(
+                    payload.windows(11).any(|w| w == b"hello world"),
+                    "prompt text not in payload"
+                );
+            }
+            _ => panic!("expected Write after idle gap expired"),
+        }
+        assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
+    }
+
+    /// Idle-gap timer in TrustDismissed does not fire a second time after
+    /// PromptInjected is reached.
+    #[test]
+    fn idle_gap_does_not_fire_after_prompt_injected() {
+        let gap_ms: u64 = 10;
+        let mut seq = StartupSeq::with_idle_gap(b"p".to_vec(), gap_ms);
+
+        seq.feed(b"trust Allow folder\n");
+        std::thread::sleep(Duration::from_millis(gap_ms + 10));
+
+        // First poll → inject.
+        let a1 = seq.poll_timers();
+        assert!(matches!(a1, StartupAction::Write(_)));
+
+        // Subsequent polls must be None.
+        let a2 = seq.poll_timers();
+        assert!(matches!(a2, StartupAction::None));
     }
 
     // ── prompt injection payload ──────────────────────────────────────────────
