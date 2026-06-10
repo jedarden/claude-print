@@ -20,3 +20,9 @@ Both Phase 6 completion criteria tests passed on CI (iad-ci):
 OQ-2 (`--setting-sources=` suppression) and OQ-4 (FIFO open race) are validated:
 - OQ-4: `open_fifo_nonblock` test confirms read-end + keeper-write-end approach prevents ENXIO
 - OQ-2 resolution is handled in `cli.rs` via `--setting-sources=` forwarding when `--no-inherit-hooks` is set
+
+## Re-verification (retry run)
+
+All 73 tests pass across all test suites. Phase 6 completion criteria confirmed:
+- `test_stop_hook_fires` ✓
+- `test_missing_transcript_path_derived` ✓
