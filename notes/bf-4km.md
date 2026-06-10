@@ -1,6 +1,6 @@
 # bf-4km: ArgoCD Sync Verification for claude-print-ci WorkflowTemplate
 
-**Date:** 2026-06-10 (re-verified 2026-06-10)
+**Date:** 2026-06-10 (re-verified 2026-06-10, third verification 2026-06-10)
 
 ## Summary
 
@@ -18,11 +18,12 @@ claude-print-ci   6m29s
 
 Labels confirm ArgoCD management: `argocd.argoproj.io/instance: argo-workflows-ns-iad-ci`
 
-### ArgoCD Sync Status (2026-06-10)
+### ArgoCD Sync Status (2026-06-10, third verification)
 
 - **App:** `argo-workflows-ns-iad-ci`
 - **claude-print-ci resource:** `Sync: Synced` ✓
-- **Revision:** e2b4ed4c2985
+- **WorkflowTemplate confirmed present in cluster** (kubectl get workflowtemplate claude-print-ci -n argo-workflows returns YAML with labels `argocd.argoproj.io/instance: argo-workflows-ns-iad-ci`)
+- **Overall app:** OutOfSync / Degraded (pre-existing, unrelated to claude-print-ci)
 
 The `claude-print-ci` WorkflowTemplate is fully synced. The overall app shows `OutOfSync / Degraded` due to pre-existing unrelated issues:
 - Missing pdftract-related WorkflowTemplates and CronWorkflows (pdftract-ci, pdftract-crates-publish, etc.)
