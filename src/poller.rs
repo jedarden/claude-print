@@ -36,9 +36,8 @@ pub fn parse_stop_payload(bytes: &[u8]) -> Result<StopPayload> {
         if line.is_empty() {
             continue;
         }
-        return serde_json::from_str(line).map_err(|e| {
-            Error::Internal(anyhow::anyhow!("stop payload JSON parse failed: {e}"))
-        });
+        return serde_json::from_str(line)
+            .map_err(|e| Error::Internal(anyhow::anyhow!("stop payload JSON parse failed: {e}")));
     }
     Ok(StopPayload::default())
 }
@@ -52,13 +51,11 @@ pub fn resolve_stop_info(payload: StopPayload) -> StopInfo {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
-    let transcript_path = explicit_path.or_else(|| {
-        match (&payload.session_id, &payload.cwd) {
-            (Some(sid), Some(cwd)) if !sid.is_empty() && !cwd.is_empty() => {
-                Some(derive_transcript_path(sid, cwd))
-            }
-            _ => None,
+    let transcript_path = explicit_path.or_else(|| match (&payload.session_id, &payload.cwd) {
+        (Some(sid), Some(cwd)) if !sid.is_empty() && !cwd.is_empty() => {
+            Some(derive_transcript_path(sid, cwd))
         }
+        _ => None,
     });
 
     StopInfo {
@@ -151,7 +148,10 @@ mod tests {
 
     #[test]
     fn cwd_to_slug_home_coding_myproject() {
-        assert_eq!(cwd_to_slug("/home/coding/myproject"), "home-coding-myproject");
+        assert_eq!(
+            cwd_to_slug("/home/coding/myproject"),
+            "home-coding-myproject"
+        );
     }
 
     #[test]
@@ -199,7 +199,8 @@ mod tests {
 
     #[test]
     fn parse_payload_unknown_fields_ignored() {
-        let json = r#"{"hook_event_name":"Stop","session_id":"x","future_field":42,"nested":{"a":1}}"#;
+        let json =
+            r#"{"hook_event_name":"Stop","session_id":"x","future_field":42,"nested":{"a":1}}"#;
         let p = parse_stop_payload(json.as_bytes()).unwrap();
         assert_eq!(p.session_id.as_deref(), Some("x"));
     }

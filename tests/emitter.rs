@@ -103,8 +103,14 @@ fn test_json_usage_fields_are_integers() {
     let output = buf.lock().unwrap().clone();
     let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
     let usage = &v["usage"];
-    assert!(usage["input_tokens"].is_u64(), "input_tokens must be integer");
-    assert!(usage["output_tokens"].is_u64(), "output_tokens must be integer");
+    assert!(
+        usage["input_tokens"].is_u64(),
+        "input_tokens must be integer"
+    );
+    assert!(
+        usage["output_tokens"].is_u64(),
+        "output_tokens must be integer"
+    );
     assert!(usage["cache_creation_input_tokens"].is_u64());
     assert!(usage["cache_read_input_tokens"].is_u64());
 }
@@ -116,7 +122,15 @@ fn test_error_result_is_error_true_and_subtype() {
     let err = ClaudePrintError::Timeout;
     let (out_buf, mut stdout) = capture();
     let (_, mut stderr) = capture();
-    emit_error(&mut stdout, &mut stderr, &err, &OutputFormat::Json, "1.0", false).unwrap();
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::Json,
+        "1.0",
+        false,
+    )
+    .unwrap();
     let output = out_buf.lock().unwrap().clone();
     let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(v["is_error"], true);
@@ -128,15 +142,24 @@ fn test_error_exit_code_nonzero() {
     assert_ne!(ClaudePrintError::Setup("x".to_string()).exit_code(), 0);
     assert_ne!(ClaudePrintError::Timeout.exit_code(), 0);
     assert_ne!(ClaudePrintError::Interrupted.exit_code(), 0);
-    assert_ne!(ClaudePrintError::AssistantError("x".to_string()).exit_code(), 0);
+    assert_ne!(
+        ClaudePrintError::AssistantError("x".to_string()).exit_code(),
+        0
+    );
 }
 
 #[test]
 fn test_error_subtypes() {
-    assert_eq!(ClaudePrintError::Setup("x".to_string()).subtype(), "internal_error");
+    assert_eq!(
+        ClaudePrintError::Setup("x".to_string()).subtype(),
+        "internal_error"
+    );
     assert_eq!(ClaudePrintError::Timeout.subtype(), "timeout");
     assert_eq!(ClaudePrintError::Interrupted.subtype(), "interrupted");
-    assert_eq!(ClaudePrintError::AssistantError("x".to_string()).subtype(), "assistant_error");
+    assert_eq!(
+        ClaudePrintError::AssistantError("x".to_string()).subtype(),
+        "assistant_error"
+    );
 }
 
 #[test]
@@ -144,7 +167,10 @@ fn test_error_exit_codes() {
     assert_eq!(ClaudePrintError::Setup("x".to_string()).exit_code(), 2);
     assert_eq!(ClaudePrintError::Timeout.exit_code(), 124);
     assert_eq!(ClaudePrintError::Interrupted.exit_code(), 130);
-    assert_eq!(ClaudePrintError::AssistantError("x".to_string()).exit_code(), 1);
+    assert_eq!(
+        ClaudePrintError::AssistantError("x".to_string()).exit_code(),
+        1
+    );
 }
 
 #[test]
@@ -152,9 +178,23 @@ fn test_text_error_goes_to_stderr_not_stdout() {
     let err = ClaudePrintError::Setup("missing binary".to_string());
     let (out_buf, mut stdout) = capture();
     let (err_buf, mut stderr) = capture();
-    emit_error(&mut stdout, &mut stderr, &err, &OutputFormat::Text, "1.0", false).unwrap();
-    assert!(out_buf.lock().unwrap().is_empty(), "text error must not write to stdout");
-    assert!(!err_buf.lock().unwrap().is_empty(), "text error must write to stderr");
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::Text,
+        "1.0",
+        false,
+    )
+    .unwrap();
+    assert!(
+        out_buf.lock().unwrap().is_empty(),
+        "text error must not write to stdout"
+    );
+    assert!(
+        !err_buf.lock().unwrap().is_empty(),
+        "text error must write to stderr"
+    );
 }
 
 // ── zero token counts ─────────────────────────────────────────────────────────
@@ -212,8 +252,8 @@ fn test_stream_json_each_line_parses_as_json() {
 
     assert_eq!(output_lines.len(), lines.len(), "should forward all lines");
     for line in &output_lines {
-        let _: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|_| panic!("line is not valid JSON: {line}"));
+        let _: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("line is not valid JSON: {line}"));
     }
 }
 

@@ -1,4 +1,5 @@
 use claude_print::startup::{StartupAction, StartupPhase, StartupSeq};
+use std::time::Duration;
 
 // ── Trust dialog keyword detection ───────────────────────────────────────────
 
@@ -25,6 +26,33 @@ fn test_trust_dialog_keyword_threshold_two_triggers() {
     assert!(
         matches!(action, StartupAction::Write(_)),
         "exactly 2 keywords must trigger dismiss"
+    );
+}
+
+/// Alternative wording: `continue` + `folder` → CR sent (keyword union logic).
+///
+/// This is the Phase 10 "MEDIUM" scenario: trust dialog uses different wording
+/// than "trust Allow" — the keyword union covers "continue", "folder", "proceed",
+/// "permission" as alternatives.  Verifies that any two keywords from the union
+/// trigger the dismiss even when the primary keywords are absent.
+#[test]
+fn test_trust_dialog_alternate_wording_continue_folder() {
+    let mut seq = StartupSeq::new(b"prompt".to_vec());
+    // Line contains ONLY "continue" + "folder" from the keyword set — no "trust"/"Allow".
+    let action = seq.feed(b"Do you want to continue in this folder?\n");
+    match action {
+        StartupAction::Write(bytes) => assert_eq!(
+            bytes, b"\r",
+            "'continue' + 'folder' must send CR (alternate trust wording)"
+        ),
+        other => {
+            panic!("expected Write(b\"\\r\") for 'continue'+'folder' keywords, got: {other:?}")
+        }
+    }
+    assert_eq!(
+        *seq.phase(),
+        StartupPhase::TrustDismissed,
+        "phase must be TrustDismissed after 'continue'+'folder' trigger"
     );
 }
 
@@ -84,7 +112,10 @@ fn test_trust_dialog_keywords_across_chunk_boundary() {
     let mut seq = StartupSeq::new(b"prompt".to_vec());
     // First chunk: partial line ending mid-word.
     let a1 = seq.feed(b"Do you trust and ");
-    assert!(matches!(a1, StartupAction::None), "partial line must not trigger yet");
+    assert!(
+        matches!(a1, StartupAction::None),
+        "partial line must not trigger yet"
+    );
     // Second chunk: completes the line.
     let a2 = seq.feed(b"Allow access to the folder?\n");
     match a2 {
@@ -152,5 +183,102 @@ fn test_trust_dialog_prompt_payload_uses_bracketed_paste() {
         *seq.phase(),
         StartupPhase::TrustDismissed,
         "phase must be TrustDismissed before timer fires"
+    );
+}
+
+// ── Idle fallback (≥ 200 bytes + 0.8 s silence) ──────────────────────────────
+
+/// 200 bytes received, then 0.8 s idle → CR sent via idle fallback (no keywords needed).
+///
+/// This verifies the plan's "arbitrary unknown welcome text" path: claude emits
+/// ≥ 200 bytes of startup noise with no keywords, then goes quiet — claude-print
+/// must still dismiss the trust phase via the idle fallback.
+#[test]
+fn test_idle_fallback_fires_after_200_bytes_and_silence() {
+    // Use a very short idle timeout so the test doesn't sleep 0.8 s.
+    let gap_ms: u64 = 30;
+    let mut seq = StartupSeq::with_idle_gap(b"prompt".to_vec(), gap_ms);
+
+    // Feed exactly 200 bytes of non-keyword output to clear the byte threshold.
+    let noise = vec![b'x'; 200];
+    let action = seq.feed(&noise);
+    // No keywords → no CR yet.
+    assert!(
+        matches!(action, StartupAction::None),
+        "200 bytes of noise must not immediately trigger trust dismiss (no keywords)"
+    );
+    assert_eq!(
+        *seq.phase(),
+        StartupPhase::Waiting,
+        "still Waiting after byte dump"
+    );
+
+    // Now wait for the IDLE_TIMEOUT_MS (0.8 s normally, gap_ms here for speed).
+    // We use with_idle_gap which sets the post-dismiss idle, but the WAITING idle
+    // threshold is hardcoded at 800 ms. For test speed we sleep a short time and
+    // instead test the feed-based path; the actual 800 ms timer is covered in unit tests.
+    // Here we directly call poll_timers after sleeping past the idle window.
+    std::thread::sleep(Duration::from_millis(900)); // past 800 ms
+    let action = seq.poll_timers();
+    match action {
+        StartupAction::Write(bytes) => assert_eq!(bytes, b"\r", "idle fallback must send CR"),
+        StartupAction::HardTimeout => panic!("hard timeout should not fire — ≥ 200 bytes received"),
+        StartupAction::None => panic!("idle fallback must fire after 0.8 s with ≥ 200 bytes"),
+    }
+    assert_eq!(
+        *seq.phase(),
+        StartupPhase::TrustDismissed,
+        "phase must advance to TrustDismissed via idle fallback"
+    );
+}
+
+/// Fewer than 200 bytes received → idle fallback must NOT fire even after 0.8 s.
+/// This verifies the 200-byte minimum is enforced before the idle fallback.
+#[test]
+fn test_idle_fallback_does_not_fire_below_200_bytes() {
+    let mut seq = StartupSeq::with_idle_gap(b"prompt".to_vec(), 20);
+
+    // Feed 199 bytes — one below the threshold.
+    let noise = vec![b'y'; 199];
+    seq.feed(&noise);
+    assert_eq!(*seq.phase(), StartupPhase::Waiting);
+
+    // Wait past the idle window.
+    std::thread::sleep(Duration::from_millis(900));
+
+    let action = seq.poll_timers();
+    // Must not fire the idle fallback (< 200 bytes).
+    assert!(
+        !matches!(action, StartupAction::Write(_)),
+        "idle fallback must not fire with only 199 bytes received; got: {action:?}"
+    );
+    assert_eq!(
+        *seq.phase(),
+        StartupPhase::Waiting,
+        "phase must remain Waiting when byte threshold not met"
+    );
+}
+
+/// Hard timeout fires when WAITING persists for ≥ 45 s with fewer than 200 bytes.
+///
+/// This test is slow by design — it verifies the binary-not-found / partial-output-hang
+/// detection described in EC-8.  Use `#[ignore]` to skip in fast test runs.
+///
+/// To run: `cargo test test_hard_timeout -- --ignored`
+#[test]
+#[ignore = "slow: sleeps 45 s to verify the hard timeout"]
+fn test_hard_timeout_fires_after_45s_with_few_bytes() {
+    let mut seq = StartupSeq::with_idle_gap(b"prompt".to_vec(), 2000);
+
+    // Feed < 200 bytes so the idle fallback never fires.
+    seq.feed(b"tiny output\n");
+
+    // Wait past the 45 s hard timeout.
+    std::thread::sleep(Duration::from_secs(46));
+
+    let action = seq.poll_timers();
+    assert!(
+        matches!(action, StartupAction::HardTimeout),
+        "hard timeout must fire after 45 s with < 200 bytes; got: {action:?}"
     );
 }

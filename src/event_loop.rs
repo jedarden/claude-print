@@ -74,13 +74,8 @@ impl EventLoop {
                 pfd.revents = 0;
             }
 
-            let ret = unsafe {
-                libc::poll(
-                    self.fds.as_mut_ptr(),
-                    self.fds.len() as libc::nfds_t,
-                    -1,
-                )
-            };
+            let ret =
+                unsafe { libc::poll(self.fds.as_mut_ptr(), self.fds.len() as libc::nfds_t, -1) };
 
             if ret < 0 {
                 let errno = nix::errno::Errno::last();
@@ -96,9 +91,7 @@ impl EventLoop {
             }
 
             // Stop FIFO readable (only after add_fifo_fd).
-            if self.fds.len() > FIFO_IDX
-                && self.fds[FIFO_IDX].revents & libc::POLLIN != 0
-            {
+            if self.fds.len() > FIFO_IDX && self.fds[FIFO_IDX].revents & libc::POLLIN != 0 {
                 let mut payload: Vec<u8> = Vec::new();
                 loop {
                     let n = unsafe {

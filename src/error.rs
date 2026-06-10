@@ -17,9 +17,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// User-facing error type with exit code and JSON subtype mapping.
 #[derive(Debug)]
 pub enum ClaudePrintError {
-    Setup(String),        // exit 2
-    Timeout,              // exit 124
-    Interrupted,          // exit 130
+    Setup(String),          // exit 2
+    Timeout,                // exit 124
+    Interrupted,            // exit 130
     AssistantError(String), // exit 1
 }
 

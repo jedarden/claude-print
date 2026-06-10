@@ -9,19 +9,65 @@ use std::io::Write as IoWrite;
 use std::path::Path;
 use tempfile::TempDir;
 
+// ── Claude version format tracking ───────────────────────────────────────────
+
+/// CI artifact: record the current claude binary version for regression
+/// tracking.  If the version changes between CI runs, the operator is alerted
+/// via a diff in the `last-claude-version.txt` artifact.
+///
+/// This test is skipped (pass) when `claude` is not on PATH — non-blocking
+/// for developer machines that have the binary at a non-standard location.
+#[test]
+fn test_claude_version_recorded() {
+    let output = match std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => {
+            // claude not on PATH — skip test rather than fail.
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    let first_line = combined.lines().next().unwrap_or("").trim();
+    // The version string must contain "Claude Code" (observed format: "2.1.168 (Claude Code)")
+    assert!(
+        first_line.contains("Claude Code") || first_line.contains("claude"),
+        "unexpected claude --version format: {first_line:?}"
+    );
+    // Write to CI artifact for diff-based regression tracking.  Failure is
+    // non-fatal (e.g., read-only filesystem) — the assertion above is the real gate.
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    let _ = std::fs::create_dir_all(&artifact_dir);
+    let _ = std::fs::write(
+        artifact_dir.join("last-claude-version.txt"),
+        first_line.as_bytes(),
+    );
+}
+
 // ── Stop payload with 50 unknown extra fields ─────────────────────────────────
 
 #[test]
 fn stop_payload_50_unknown_fields_parsed_without_error() {
-    let mut json =
-        String::from(r#"{"hook_event_name":"Stop","session_id":"sid1","cwd":"/tmp/x""#);
+    let mut json = String::from(r#"{"hook_event_name":"Stop","session_id":"sid1","cwd":"/tmp/x""#);
     for i in 0..50 {
         json.push_str(&format!(r#","future_field_{i}":"value_{i}""#));
     }
     json.push('}');
     let p = parse_stop_payload(json.as_bytes()).expect("must parse with 50 unknown fields");
-    assert_eq!(p.session_id.as_deref(), Some("sid1"), "session_id must survive unknown fields");
-    assert_eq!(p.cwd.as_deref(), Some("/tmp/x"), "cwd must survive unknown fields");
+    assert_eq!(
+        p.session_id.as_deref(),
+        Some("sid1"),
+        "session_id must survive unknown fields"
+    );
+    assert_eq!(
+        p.cwd.as_deref(),
+        Some("/tmp/x"),
+        "cwd must survive unknown fields"
+    );
 }
 
 // ── Usage object with 20 new numeric fields ───────────────────────────────────
@@ -59,7 +105,10 @@ fn usage_20_new_numeric_fields_ignored_known_fields_correct() {
     let r = parse_transcript(&path).unwrap();
     assert_eq!(r.usage.input_tokens, 100, "input_tokens wrong");
     assert_eq!(r.usage.output_tokens, 50, "output_tokens wrong");
-    assert_eq!(r.usage.cache_creation_input_tokens, 10, "cache_create wrong");
+    assert_eq!(
+        r.usage.cache_creation_input_tokens, 10,
+        "cache_create wrong"
+    );
     assert_eq!(r.usage.cache_read_input_tokens, 20, "cache_read wrong");
     assert_eq!(r.num_turns, 1);
 }
@@ -93,7 +142,10 @@ fn content_block_new_type_with_required_field_treated_as_unknown() {
     drop(file);
 
     let r = parse_transcript(&path).unwrap();
-    assert_eq!(r.text, "extracted text", "text after unknown block must be extracted");
+    assert_eq!(
+        r.text, "extracted text",
+        "text after unknown block must be extracted"
+    );
     assert_eq!(r.num_turns, 1);
 }
 
@@ -117,7 +169,10 @@ fn jsonl_events_in_new_order_parse_succeeds() {
     drop(file);
 
     let r = parse_transcript(&path).unwrap();
-    assert_eq!(r.text, "world", "text must be extracted despite new event order");
+    assert_eq!(
+        r.text, "world",
+        "text must be extracted despite new event order"
+    );
     assert_eq!(r.num_turns, 1);
     assert_eq!(r.session_id.as_deref(), Some("ord-session"));
 }
@@ -184,16 +239,28 @@ fn startup_10_non_dialog_lines_do_not_trigger() {
 
 #[test]
 fn token_regression_fixture_v2_1_168() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/transcript_v2.1.168.jsonl");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.168.jsonl");
     let r = parse_transcript(&path).expect("parse fixture failed");
     // Turn 1: msg-001 — in=6178, out=295, cache_create=825, cache_read=26442
     // Turn 2: msg-002 × 3 streaming chunks — in=100, out=50, cache_create=0, cache_read=5000
     assert_eq!(r.num_turns, 2, "fixture has 2 unique assistant turns");
-    assert_eq!(r.usage.input_tokens, 6278, "input_tokens mismatch (6178 + 100)");
-    assert_eq!(r.usage.output_tokens, 345, "output_tokens mismatch (295 + 50)");
-    assert_eq!(r.usage.cache_creation_input_tokens, 825, "cache_creation mismatch (825 + 0)");
-    assert_eq!(r.usage.cache_read_input_tokens, 31442, "cache_read mismatch (26442 + 5000)");
+    assert_eq!(
+        r.usage.input_tokens, 6278,
+        "input_tokens mismatch (6178 + 100)"
+    );
+    assert_eq!(
+        r.usage.output_tokens, 345,
+        "output_tokens mismatch (295 + 50)"
+    );
+    assert_eq!(
+        r.usage.cache_creation_input_tokens, 825,
+        "cache_creation mismatch (825 + 0)"
+    );
+    assert_eq!(
+        r.usage.cache_read_input_tokens, 31442,
+        "cache_read mismatch (26442 + 5000)"
+    );
     // Last turn's text is the concatenation of the 3 streaming chunks
     assert_eq!(r.text, "chunk1 chunk2 chunk3", "last turn text mismatch");
 }
@@ -202,10 +269,13 @@ fn token_regression_fixture_v2_1_168() {
 
 #[test]
 fn fixture_unknown_usage_fields_ignored() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/transcript_v2.1.168.jsonl");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.168.jsonl");
     // The fixture contains `server_tool_use`, `service_tier`, `cache_creation`,
     // `inference_geo`, `speed` in the usage object — all should be silently ignored.
     let r = parse_transcript(&path).expect("parse fixture must succeed");
-    assert!(r.num_turns > 0, "must parse at least one turn despite unknown usage fields");
+    assert!(
+        r.num_turns > 0,
+        "must parse at least one turn despite unknown usage fields"
+    );
 }

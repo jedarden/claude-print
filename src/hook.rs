@@ -50,10 +50,7 @@ impl HookInstaller {
 
 fn write_hook_sh(hook_path: &Path, fifo_path: &Path) -> Result<()> {
     let fifo_str = fifo_path.to_string_lossy();
-    let content = format!(
-        "#!/bin/sh\ncat > '{}' 2>/dev/null || true\n",
-        fifo_str
-    );
+    let content = format!("#!/bin/sh\ncat > '{}' 2>/dev/null || true\n", fifo_str);
     std::fs::write(hook_path, &content)
         .map_err(|e| Error::Internal(anyhow::anyhow!("failed to write hook.sh: {e}")))?;
 

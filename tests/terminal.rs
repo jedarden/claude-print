@@ -55,7 +55,10 @@ fn probe_dedup_da1_answered_only_once() {
 fn unknown_probe_ignored_no_response_no_panic() {
     let mut e = emu();
     let resp = e.feed(b"\x1b[99t");
-    assert_eq!(resp, b"", "unknown escape sequence must produce no response");
+    assert_eq!(
+        resp, b"",
+        "unknown escape sequence must produce no response"
+    );
 }
 
 #[test]
@@ -64,5 +67,8 @@ fn split_chunk_probe_answered_on_second_read() {
     let first = e.feed(b"\x1b[");
     let second = e.feed(b"c");
     assert_eq!(first, b"", "partial probe should produce no response yet");
-    assert_eq!(second, b"\x1b[?6c", "probe completed on second read should be answered");
+    assert_eq!(
+        second, b"\x1b[?6c",
+        "probe completed on second read should be answered"
+    );
 }

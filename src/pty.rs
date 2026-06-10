@@ -60,8 +60,8 @@ impl PtySpawner {
 
         // SAFETY: fork is async-signal-safe; no threads exist at this point in
         // the single-threaded call path.
-        let fork_result = unsafe { fork() }
-            .map_err(|e| Error::Internal(anyhow::anyhow!("fork failed: {e}")))?;
+        let fork_result =
+            unsafe { fork() }.map_err(|e| Error::Internal(anyhow::anyhow!("fork failed: {e}")))?;
 
         match fork_result {
             ForkResult::Parent { child } => {
@@ -221,9 +221,7 @@ impl PtySpawner {
                 Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + sig as i32),
                 Ok(_) => continue,
                 Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => {
-                    return Err(Error::Internal(anyhow::anyhow!("waitpid failed: {e}")))
-                }
+                Err(e) => return Err(Error::Internal(anyhow::anyhow!("waitpid failed: {e}"))),
             }
         }
     }
@@ -257,9 +255,8 @@ mod tests {
         let mut buf = [0u8; 256];
 
         loop {
-            let n = unsafe {
-                libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n =
+                unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n <= 0 {
                 break;
             }

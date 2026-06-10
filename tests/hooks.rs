@@ -20,7 +20,10 @@ fn settings_json_double_nested_hooks_structure() {
     assert!(outer.is_object(), "first Stop entry must be an object");
     let inner = &outer["hooks"];
     assert!(inner.is_array(), "hooks inside Stop entry must be an array");
-    assert!(!inner.as_array().unwrap().is_empty(), "inner hooks must be non-empty");
+    assert!(
+        !inner.as_array().unwrap().is_empty(),
+        "inner hooks must be non-empty"
+    );
 }
 
 #[test]

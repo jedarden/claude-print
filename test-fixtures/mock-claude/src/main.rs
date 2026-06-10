@@ -13,8 +13,8 @@ fn main() {
     let mock_trust_dialog = env_flag("MOCK_TRUST_DIALOG");
     let mock_trust_wording = std::env::var("MOCK_TRUST_WORDING").unwrap_or_default();
     let mock_unknown_probe = env_flag("MOCK_UNKNOWN_PROBE");
-    let mock_response = std::env::var("MOCK_RESPONSE")
-        .unwrap_or_else(|_| "Hello from mock_claude".to_string());
+    let mock_response =
+        std::env::var("MOCK_RESPONSE").unwrap_or_else(|_| "Hello from mock_claude".to_string());
     let omit_transcript_path = env_flag("MOCK_OMIT_TRANSCRIPT_PATH");
     let omit_last_message = env_flag("MOCK_OMIT_LAST_MESSAGE");
 

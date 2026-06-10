@@ -49,9 +49,15 @@ impl AggregatedUsage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ContentBlock {
-    Text { text: String },
-    ToolUse { name: String },
-    Thinking { thinking: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        name: String,
+    },
+    Thinking {
+        thinking: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -74,8 +80,12 @@ pub struct ResultEvent {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Event {
-    Assistant { message: AssistantMessage },
-    User { message: serde_json::Value },
+    Assistant {
+        message: AssistantMessage,
+    },
+    User {
+        message: serde_json::Value,
+    },
     Result(ResultEvent),
     #[serde(other)]
     Unknown,

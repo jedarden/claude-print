@@ -1,9 +1,9 @@
+use clap::Parser;
 /// CLI tests (Phase 10).
 ///
 /// Verifies that the CLI struct parses correctly and that the `version_string`
 /// helper produces the expected output.
 use claude_print::cli::{version_string, Cli, OutputFormat};
-use clap::Parser;
 
 // ── OutputFormat Display ──────────────────────────────────────────────────────
 
@@ -57,7 +57,11 @@ fn version_string_format_is_parseable() {
     // Must match: "claude-print X.Y.Z (wrapping claude A.B.C)"
     assert!(s.contains('('), "must have opening paren");
     assert!(s.contains(')'), "must have closing paren");
-    let inside: &str = s.split('(').nth(1).and_then(|s| s.split(')').next()).unwrap_or("");
+    let inside: &str = s
+        .split('(')
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .unwrap_or("");
     assert!(
         inside.starts_with("wrapping claude"),
         "content in parens must start with 'wrapping claude'; got: {inside:?}"
@@ -75,7 +79,10 @@ fn cli_positional_prompt_parsed() {
 #[test]
 fn cli_no_prompt_gives_none() {
     let cli = Cli::try_parse_from(["claude-print"]).unwrap();
-    assert!(cli.prompt.is_none(), "no positional arg should give None prompt");
+    assert!(
+        cli.prompt.is_none(),
+        "no positional arg should give None prompt"
+    );
 }
 
 #[test]
@@ -86,34 +93,41 @@ fn cli_output_format_default_is_text() {
 
 #[test]
 fn cli_output_format_json() {
-    let cli =
-        Cli::try_parse_from(["claude-print", "--output-format", "json"]).unwrap();
+    let cli = Cli::try_parse_from(["claude-print", "--output-format", "json"]).unwrap();
     assert!(matches!(cli.output_format, OutputFormat::Json));
 }
 
 #[test]
 fn cli_output_format_stream_json() {
-    let cli =
-        Cli::try_parse_from(["claude-print", "--output-format", "stream-json"]).unwrap();
+    let cli = Cli::try_parse_from(["claude-print", "--output-format", "stream-json"]).unwrap();
     assert!(matches!(cli.output_format, OutputFormat::StreamJson));
 }
 
 #[test]
 fn cli_output_format_invalid_returns_error() {
     let result = Cli::try_parse_from(["claude-print", "--output-format", "xml"]);
-    assert!(result.is_err(), "invalid output format must produce a parse error");
+    assert!(
+        result.is_err(),
+        "invalid output format must produce a parse error"
+    );
 }
 
 #[test]
 fn cli_no_inherit_hooks_flag() {
     let cli = Cli::try_parse_from(["claude-print", "--no-inherit-hooks"]).unwrap();
-    assert!(cli.no_inherit_hooks, "--no-inherit-hooks must set no_inherit_hooks=true");
+    assert!(
+        cli.no_inherit_hooks,
+        "--no-inherit-hooks must set no_inherit_hooks=true"
+    );
 }
 
 #[test]
 fn cli_no_inherit_hooks_defaults_false() {
     let cli = Cli::try_parse_from(["claude-print"]).unwrap();
-    assert!(!cli.no_inherit_hooks, "no_inherit_hooks must default to false");
+    assert!(
+        !cli.no_inherit_hooks,
+        "no_inherit_hooks must default to false"
+    );
 }
 
 #[test]
@@ -124,8 +138,7 @@ fn cli_verbose_flag() {
 
 #[test]
 fn cli_dangerously_skip_permissions_flag() {
-    let cli =
-        Cli::try_parse_from(["claude-print", "--dangerously-skip-permissions"]).unwrap();
+    let cli = Cli::try_parse_from(["claude-print", "--dangerously-skip-permissions"]).unwrap();
     assert!(cli.dangerously_skip_permissions);
 }
 
@@ -149,8 +162,7 @@ fn cli_timeout_default_is_3600() {
 
 #[test]
 fn cli_input_file_flag() {
-    let cli =
-        Cli::try_parse_from(["claude-print", "--input-file", "/tmp/prompt.txt"]).unwrap();
+    let cli = Cli::try_parse_from(["claude-print", "--input-file", "/tmp/prompt.txt"]).unwrap();
     assert_eq!(
         cli.input_file.as_deref(),
         Some(std::path::Path::new("/tmp/prompt.txt"))
@@ -159,8 +171,7 @@ fn cli_input_file_flag() {
 
 #[test]
 fn cli_claude_binary_flag() {
-    let cli =
-        Cli::try_parse_from(["claude-print", "--claude-binary", "/usr/bin/claude"]).unwrap();
+    let cli = Cli::try_parse_from(["claude-print", "--claude-binary", "/usr/bin/claude"]).unwrap();
     assert_eq!(
         cli.claude_binary.as_deref(),
         Some(std::path::Path::new("/usr/bin/claude"))

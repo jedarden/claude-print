@@ -10,7 +10,14 @@ fn write_jsonl(path: &Path, lines: &[String]) {
     }
 }
 
-fn assistant_event(id: &str, text: &str, in_tok: u64, out_tok: u64, cache_create: u64, cache_read: u64) -> String {
+fn assistant_event(
+    id: &str,
+    text: &str,
+    in_tok: u64,
+    out_tok: u64,
+    cache_create: u64,
+    cache_read: u64,
+) -> String {
     serde_json::json!({
         "type": "assistant",
         "message": {
@@ -394,7 +401,10 @@ fn test_streaming_dedup_40_retries() {
     });
 
     let r = read_transcript(&path, None).unwrap();
-    assert_eq!(r.num_turns, 1, "5 streaming chunks of same message.id = 1 turn");
+    assert_eq!(
+        r.num_turns, 1,
+        "5 streaming chunks of same message.id = 1 turn"
+    );
     assert_eq!(r.text, "chunk0chunk1chunk2chunk3chunk4");
     assert_eq!(r.usage.input_tokens, 10);
 }
@@ -412,7 +422,10 @@ fn test_transcript_race() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         std::fs::write(
             &path_clone,
-            format!("{}\n", assistant_event("msg-race-2", "race result", 10, 5, 0, 0)),
+            format!(
+                "{}\n",
+                assistant_event("msg-race-2", "race result", 10, 5, 0, 0)
+            ),
         )
         .unwrap();
     });

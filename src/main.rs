@@ -3,9 +3,9 @@ use claude_print::cli::{version_string, Cli};
 use std::process;
 
 fn resolve_claude_version(binary: Option<&std::path::Path>) -> Option<String> {
-    let binary = binary.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-        std::path::PathBuf::from("claude")
-    });
+    let binary = binary
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("claude"));
 
     let output = std::process::Command::new(&binary)
         .arg("--version")

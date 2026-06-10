@@ -102,8 +102,7 @@ fn probe_mock_claude_pty(mock_path: &Path) -> Row {
     // even without a writer, allowing mock_claude's O_WRONLY open to succeed.
     let fifo_cstr =
         CString::new(fifo_path.to_string_lossy().as_bytes()).expect("fifo path is valid CStr");
-    let fifo_rfd =
-        unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    let fifo_rfd = unsafe { libc::open(fifo_cstr.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
     if fifo_rfd < 0 {
         let _ = std::fs::remove_file(&fifo_path);
         return Row {
@@ -216,8 +215,9 @@ pub fn run() -> i32 {
     let name_w = 20usize;
     let res_w = 6usize;
     println!(
-        "{:<name_w$} {:<res_w$} {}",
-        "CHECK", "RESULT", "DETAIL",
+        "{:<name_w$} {:<res_w$} DETAIL",
+        "CHECK",
+        "RESULT",
         name_w = name_w,
         res_w = res_w
     );

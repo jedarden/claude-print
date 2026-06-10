@@ -3,7 +3,14 @@ use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 // Trust dialog keyword set — 2+ on a single line → send CR.
-const TRUST_KEYWORDS: &[&str] = &["trust", "Allow", "continue", "folder", "permission", "proceed"];
+const TRUST_KEYWORDS: &[&str] = &[
+    "trust",
+    "Allow",
+    "continue",
+    "folder",
+    "permission",
+    "proceed",
+];
 const KEYWORD_THRESHOLD: usize = 2;
 
 const IDLE_THRESHOLD_BYTES: usize = 200;
@@ -101,10 +108,7 @@ impl StartupSeq {
     /// false positives on common words like "allow" (lowercase).
     pub fn scan_line(line: &[u8]) -> bool {
         let text = String::from_utf8_lossy(line);
-        let count = TRUST_KEYWORDS
-            .iter()
-            .filter(|&&k| text.contains(k))
-            .count();
+        let count = TRUST_KEYWORDS.iter().filter(|&&k| text.contains(k)).count();
         count >= KEYWORD_THRESHOLD
     }
 
@@ -381,8 +385,14 @@ mod tests {
         let action = seq.poll_timers();
         match action {
             StartupAction::Write(payload) => {
-                assert!(payload.starts_with(b"\x1b[200~"), "bracketed-paste open missing");
-                assert!(payload.ends_with(b"\x1b[201~\r"), "bracketed-paste close+CR missing");
+                assert!(
+                    payload.starts_with(b"\x1b[200~"),
+                    "bracketed-paste open missing"
+                );
+                assert!(
+                    payload.ends_with(b"\x1b[201~\r"),
+                    "bracketed-paste close+CR missing"
+                );
                 assert!(
                     payload.windows(11).any(|w| w == b"hello world"),
                     "prompt text not in payload"
@@ -420,8 +430,14 @@ mod tests {
         // Force into TrustDismissed so we can call make_prompt_payload.
         seq.phase = StartupPhase::TrustDismissed;
         let payload = seq.make_prompt_payload();
-        assert!(payload.starts_with(b"\x1b[200~"), "missing bracketed-paste open");
-        assert!(payload.ends_with(b"\x1b[201~\r"), "missing bracketed-paste close + CR");
+        assert!(
+            payload.starts_with(b"\x1b[200~"),
+            "missing bracketed-paste open"
+        );
+        assert!(
+            payload.ends_with(b"\x1b[201~\r"),
+            "missing bracketed-paste close + CR"
+        );
         assert!(
             payload.windows(12).any(|w| w == b"What is 2+2?"),
             "prompt text not present in payload"
@@ -438,8 +454,14 @@ mod tests {
         seq.phase = StartupPhase::TrustDismissed;
         let payload = seq.make_prompt_payload();
         // Inline: open marker directly followed by prompt content.
-        assert!(payload.starts_with(b"\x1b[200~"), "must start with bracketed-paste open");
-        assert_eq!(payload[6], b'Z', "prompt byte must follow open marker immediately");
+        assert!(
+            payload.starts_with(b"\x1b[200~"),
+            "must start with bracketed-paste open"
+        );
+        assert_eq!(
+            payload[6], b'Z',
+            "prompt byte must follow open marker immediately"
+        );
         // Must not contain shell substitution syntax.
         assert!(
             !payload.windows(4).any(|w| w == b"$(< "),
@@ -487,7 +509,8 @@ mod tests {
         let path_bytes = &after_prefix[..close_paren];
         let path_str = std::str::from_utf8(path_bytes).expect("path is valid UTF-8");
 
-        let file_content = std::fs::read(path_str).expect("temp file must exist while seq is alive");
+        let file_content =
+            std::fs::read(path_str).expect("temp file must exist while seq is alive");
         assert_eq!(
             file_content, large_prompt,
             "temp file must contain the full prompt"
