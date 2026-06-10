@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod event_loop;
 pub mod hook;
+pub mod poller;
 pub mod pty;
 pub mod startup;
 pub mod terminal;

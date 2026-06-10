@@ -37,8 +37,8 @@ fn test_pty_spawns_tty() {
 
     let fifo_content = reader.join().expect("reader thread");
     assert!(
-        fifo_content.contains("stop"),
-        "expected 'stop' in FIFO content, got: {fifo_content:?}",
+        fifo_content.contains("session_id"),
+        "expected Stop JSON payload in FIFO content, got: {fifo_content:?}",
     );
     assert_eq!(
         exit_code, 0,
