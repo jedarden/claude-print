@@ -1,6 +1,6 @@
 # bf-4km: ArgoCD Sync Verification for claude-print-ci WorkflowTemplate
 
-**Date:** 2026-06-10 (re-verified 2026-06-10, third verification 2026-06-10, fourth verification 2026-06-10, fifth verification 2026-06-10)
+**Date:** 2026-06-10 (re-verified 2026-06-10, third verification 2026-06-10, fourth verification 2026-06-10, fifth verification 2026-06-10, sixth verification 2026-06-10)
 
 ## Summary
 
@@ -17,6 +17,14 @@ claude-print-ci   6m29s
 ```
 
 Labels confirm ArgoCD management: `argocd.argoproj.io/instance: argo-workflows-ns-iad-ci`
+
+### ArgoCD Sync Status (2026-06-10, sixth verification)
+
+- **App:** `argo-workflows-ns-iad-ci`
+- **claude-print-ci resource:** `Sync: Synced` ✓
+- **WorkflowTemplate templates:** `ci`
+- **WorkflowTemplate confirmed present in cluster** (created 2026-06-10T06:09:14Z)
+- **Overall app:** OutOfSync / Degraded (pre-existing, unrelated to claude-print-ci)
 
 ### ArgoCD Sync Status (2026-06-10, fifth verification)
 
