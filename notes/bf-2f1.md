@@ -3,7 +3,7 @@
 ## Status
 
 Phase 8 implementation was already present in commit `bfb50da` (Add Phase 8: Emitter).
-This bead run verified correctness and confirmed all completion criteria.
+Two bead runs verified correctness; all 13 tests confirmed passing on each run.
 
 ## Verification
 
