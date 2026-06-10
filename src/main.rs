@@ -29,8 +29,8 @@ fn main() {
     }
 
     if cli.check {
-        eprintln!("check: not yet implemented");
-        process::exit(2);
+        let code = claude_print::check::run();
+        process::exit(code);
     }
 
     eprintln!("claude-print: not yet implemented");

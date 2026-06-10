@@ -1,0 +1,18 @@
+name: claude-print
+description: Claude Code interactive mode — subscription billing (cc_entrypoint=cli)
+agent_cli: claude-print
+version_command: "claude-print --version"
+input_method:
+  method: stdin
+invoke_template: "cd {workspace} && claude-print --model {model} --max-turns 30 --output-format json --dangerously-skip-permissions --no-inherit-hooks"
+timeout_secs: 3600
+provider: anthropic
+# Note: --max-turns 30 and --no-inherit-hooks are hardcoded in the template above.
+# --max-turns 30 takes precedence over config.toml's max_turns setting for NEEDLE-dispatched
+# jobs. To change the turn limit for NEEDLE workers, edit invoke_template directly.
+# NEEDLE workers run in isolation mode by default (--no-inherit-hooks is included in
+# the template). To enable user hook inheritance, remove --no-inherit-hooks.
+model: claude-sonnet-4-6
+output_transform: needle-transform-claude
+cost:
+  type: use_or_lose
