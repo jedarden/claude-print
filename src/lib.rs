@@ -7,3 +7,4 @@ pub mod poller;
 pub mod pty;
 pub mod startup;
 pub mod terminal;
+pub mod transcript;
