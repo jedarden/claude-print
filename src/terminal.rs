@@ -14,6 +14,7 @@ enum ParseState {
 }
 
 #[derive(Copy, Clone)]
+#[allow(clippy::upper_case_acronyms)]
 enum ProbeKind {
     DA1,
     DA2,
@@ -111,9 +112,9 @@ impl TerminalEmu {
 
         // CSI body: param/intermediate bytes in 0x20-0x3F, final byte in 0x40-0x7E.
         let last = *buf.last().unwrap();
-        if last >= 0x40 && last <= 0x7E {
+        if (0x40..=0x7E).contains(&last) {
             ParseState::Complete
-        } else if last >= 0x20 && last <= 0x3F {
+        } else if (0x20..=0x3F).contains(&last) {
             ParseState::Incomplete
         } else {
             ParseState::Invalid
