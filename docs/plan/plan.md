@@ -1369,6 +1369,19 @@ No automated alerting in v1.0. If billing classification fails silently in produ
 
 **Consequences:** Both `seen_ids: HashSet<String>` and `prev_usage_key: Option<UsageKey>` are maintained. Memory cost is O(unique API calls) per session — negligible.
 
+### ADR-004: NEEDLE Workers Must Use Configured Agent — No Silent Escalation
+
+**Decision:** A NEEDLE worker dispatching beads from this workspace MUST use its configured agent adapter (e.g., `claude-code-glm-47`). No strand may silently escalate to a different model (e.g., `claude-sonnet`) based on bead complexity or adapter availability.
+
+**Context:** During Phase 6–11 completion, the `claude-print-bravo` worker's configured adapter (`claude-code-glm-47`) was not found in the dispatcher at runtime. NEEDLE's `resolve_adapter()` silently fell back to the `claude-sonnet` built-in. `claude-sonnet` uses `unbuffer -p claude` which allocates a PTY for stdout; `needle-transform-claude` then receives escape sequences instead of `stream-json`, causing `transform.failed` with `exit -1`. The bead was dispatched at sequence 97882, timed out after exactly 600 s (exit 124), failed to release (`bead.release.failed`), and was lost when the mend cycle rebuilt the DB. This blocked the main() wiring bead indefinitely.
+
+**Rationale:** `claude-print` exists specifically because the PTY-vs-pipe distinction determines billing classification. A worker running in this workspace that silently switches to a PTY-based agent inverts the very invariant the project enforces. Beyond billing, the transform failure silently destroys progress: the bead times out, can't release, and disappears from the DB. Silent degradation is worse than loud failure.
+
+**Consequences:**
+- NEEDLE `resolve_adapter()` must fail loudly if the configured adapter is not found (NEEDLE beads bf-14w, bf-2wi track this fix).
+- All implementation beads in this workspace carry `--label atomic` to suppress the mitosis strand's forced-split behavior, which can also destroy beads when combined with release failures.
+- When launching workers for this workspace, always verify the agent adapter file is present before dispatch: `ls ~/claude-config/agents/claude-code-glm-47/` or equivalent.
+
 ## Open Questions
 
 Unresolved questions are mapped to the phase they block. Each MUST be resolved before that phase begins.
