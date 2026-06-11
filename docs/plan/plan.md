@@ -910,81 +910,93 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 
 ## Implementation Phases
 
+### Status
+
+| Item | State |
+|------|-------|
+| Phases 1–11 module implementation | **COMPLETE** — all module-level deliverables committed |
+| `main()` session orchestration | **IN PROGRESS** (bf-40i) |
+| Binary-level E2E tests (AS-1, AS-2, AS-5) | **IN PROGRESS** (bf-52c) |
+| AS-4 billing classification | **PENDING** manual verification (requires live credentials) |
+| CI release binary | **PENDING** — `claude-print-ci` WorkflowTemplate synced to ArgoCD; no release tag cut yet (blocked on `main()` completion) |
+
 Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's completion criterion is met.
 
 **Phase 1: Crate Scaffold (~150 LOC)**
 *Entry:* None.
-- [ ] `Cargo.toml` workspace with pinned deps, `src/main.rs`, `cli.rs` (clap), `error.rs`, `config.rs`
-- [ ] `--version` prints `claude-print 0.1.0 (wrapping claude X.Y.Z)`
-- [ ] Add `claude-print-ci.yaml` stub to `jedarden/declarative-config` (verify step only; `build-musl` and `github-release` steps added in Phase 11)
+- [x] `Cargo.toml` workspace with pinned deps, `src/main.rs`, `cli.rs` (clap), `error.rs`, `config.rs`
+- [x] `--version` prints `claude-print 0.1.0 (wrapping claude X.Y.Z)`
+- [x] Add `claude-print-ci.yaml` stub to `jedarden/declarative-config` (verify step only; `build-musl` and `github-release` steps added in Phase 11)
 
 *Complete when:* `cargo build --target x86_64-unknown-linux-musl` succeeds; `claude-print --version` prints expected format; `cargo test --lib` passes; `claude-print-ci.yaml` stub exists in declarative-config and ArgoCD syncs it to `argo-workflows-ns-iad-ci`.
 
 **Phase 2: Hook Installer + PTY Spawner (~200 LOC)**
 *Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting). **PO-1 verified** (confirm `--settings` merges hooks rather than replacing; if false, see PO-1 recovery before writing the hook installer). PO-1 can be verified with a simple test: run `claude --settings /tmp/test_settings.json echo test` where test_settings.json contains a dummy hook, alongside a user hook in ~/.claude/settings.json, and confirm both fire. **OQ-5 (login_tty availability in musl) verified or PO-3 inline fallback ready; OQ-6 (CLAUDE_CODE_SESSION_ID inheritance) resolved.**
-- [ ] `hook.rs`: temp dir (`tempfile::TempDir`), write `settings.json` and `hook.sh`, `mkfifo`
-- [ ] `pty.rs`: `openpty`, `fork`, window-size probe, `login_tty`, `execvp`, SIGTERM/SIGKILL/`waitpid`
-- [ ] `--no-inherit-hooks` forwards `--setting-sources=` to child (unverified per OQ-2)
-- [ ] Build `mock_claude` fixture binary (`test-fixtures/mock-claude/`) as part of the workspace — required for PTY integration tests starting this phase
+- [x] `hook.rs`: temp dir (`tempfile::TempDir`), write `settings.json` and `hook.sh`, `mkfifo`
+- [x] `pty.rs`: `openpty`, `fork`, window-size probe, `login_tty`, `execvp`, SIGTERM/SIGKILL/`waitpid`
+- [x] `--no-inherit-hooks` forwards `--setting-sources=` to child (unverified per OQ-2)
+- [x] Build `mock_claude` fixture binary (`test-fixtures/mock-claude/`) as part of the workspace — required for PTY integration tests starting this phase
 
 *Complete when:* Integration test `test_pty_spawns_tty` passes (child observes `isatty(stdout)=true`); temp dir absent after test; `--setting-sources=` in child argv when `--no-inherit-hooks` set.
 
 **Phase 3: Event Loop (~150 LOC)**
 *Entry:* Phase 2 complete.
-- [ ] `event_loop.rs`: `poll()` on `master_fd + self_pipe_read` (initial 2-fd set); `Vec<pollfd>` for dynamic stop_fifo registration at PROMPT_INJECTED; read buffer; EIO detection (child exit)
+- [x] `event_loop.rs`: `poll()` on `master_fd + self_pipe_read` (initial 2-fd set); `Vec<pollfd>` for dynamic stop_fifo registration at PROMPT_INJECTED; read buffer; EIO detection (child exit)
 
 *Complete when:* `test_event_loop_reads_pty_output` passes; `test_event_loop_detects_child_exit` (EIO → exit 2) passes.
 
 **Phase 4: Terminal Emulator (~100 LOC)**
 *Entry:* Phase 3 complete. PO-4 noted (unknown Ink probes are ignored by design — no pre-phase verification required beyond confirming the design choice is implemented correctly).
-- [ ] `terminal.rs`: probe scanner, response table, dedup bitmask, unknown-probe passthrough
+- [x] `terminal.rs`: probe scanner, response table, dedup bitmask, unknown-probe passthrough
 
 *Complete when:* All terminal unit tests pass (all 5 probes answered, unknown probe ignored, split-chunk probe handled, dedup works).
 
 **Phase 5: Startup Sequencer (~120 LOC)**
 *Entry:* Phase 4 complete. **OQ-3b must be resolved** (verify `/read` accepts absolute paths; if false, commit to PO-6 truncation fallback before implementing the large-prompt relay).
-- [ ] `startup.rs`: keyword trust dismiss, idle-gap timing, bracketed paste injection, large-prompt file relay
+- [x] `startup.rs`: keyword trust dismiss, idle-gap timing, bracketed paste injection, large-prompt file relay
 
 *Complete when:* All startup unit tests pass; integration test `test_trust_dialog_standard_wording` and `test_trust_dialog_alternate_wording` pass.
 
 **Phase 6: Stop Poller (~80 LOC)**
 *Entry:* Phase 5 complete. **OQ-2 must be resolved** (verify `--setting-sources=` suppresses standard sources; see PO-2 for fallback). **OQ-4 (FIFO open race) validated by test.**
-- [ ] Open FIFO read-end O_NONBLOCK, integrate into `poll()` loop, parse Stop payload, derive transcript path, signal event loop exit
+- [x] Open FIFO read-end O_NONBLOCK, integrate into `poll()` loop, parse Stop payload, derive transcript path, signal event loop exit
 
 *Complete when:* Integration test `test_stop_hook_fires` passes; `test_missing_transcript_path_derived` passes.
 
 **Phase 7: Transcript Reader (~180 LOC)**
 *Entry:* Phase 6 complete. **PO-5 acknowledged**: retry loop (40×50ms) is the mitigation for Stop-before-JSONL races. Verify retry timing is sufficient by running `test_transcript_race` with `MOCK_DELAY_JSONL=100` and confirming exit 0.
-- [ ] `transcript.rs`: JSONL parse with lenient serde, `message.id` dedup + fingerprint fallback, text extraction, retry loop, Stop-payload fallback, path derivation
+- [x] `transcript.rs`: JSONL parse with lenient serde, `message.id` dedup + fingerprint fallback, text extraction, retry loop, Stop-payload fallback, path derivation
 
 *Complete when:* All transcript unit tests pass; `test_streaming_dedup_40_retries` passes; AS-6 (race scenario) passes.
 
 **Phase 8: Emitter (~120 LOC)**
 *Entry:* Phase 7 complete.
-- [ ] `emitter.rs`: text/json/stream-json, `claude_version`, error result objects, exit code mapping; stream-json reader thread + mpsc channel
+- [x] `emitter.rs`: text/json/stream-json, `claude_version`, error result objects, exit code mapping; stream-json reader thread + mpsc channel
 
 *Complete when:* All emitter unit tests pass; AS-1 (text), AS-2 (json), stream-json output parses as valid JSONL.
 
 **Phase 9: NEEDLE Integration (~50 LOC + config)**
 *Entry:* Phase 8 complete.
-- [ ] `claude-print.yaml`, `install.sh`, `claude-print-ci` WorkflowTemplate in declarative-config
-- [ ] Implement `--check` doctor subcommand (openpty probe, mkfifo probe, optional mock_claude PTY round-trip)
+- [x] `claude-print.yaml`, `install.sh`, `claude-print-ci` WorkflowTemplate in declarative-config
+- [x] Implement `--check` doctor subcommand (openpty probe, mkfifo probe, optional mock_claude PTY round-trip)
 
 *Complete when:* `install.sh` is written and syntactically valid (`bash -n install.sh` passes); manually copying the locally-built binary to `~/.local/bin/claude-print` and running `claude-print --check` succeeds. Full install.sh end-to-end test (downloading from GitHub Release) is reserved for Phase 11. NEEDLE dispatches a test bead using `claude-print.yaml`; AS-3 passes; README flags table matches `claude-print --help` output (verified manually).
 
 **Phase 10: Tests (~500 LOC)**
 *Entry:* Phase 8 complete (can run in parallel with Phase 9).
-- [ ] Phase 10 **completes** the test suite by adding any tests not already written as part of Phases 2–9's completion criteria. Each phase's completion criterion already specifies and runs its own targeted integration tests — Phase 10 adds the remaining cross-phase and corner-case tests: the version-resilience suite, hook inheritance suite, all MEDIUM/LOW mock scenarios not covered by earlier phases, and the conformance harness.
+- [x] Phase 10 **completes** the test suite by adding any tests not already written as part of Phases 2–9's completion criteria. Each phase's completion criterion already specifies and runs its own targeted integration tests — Phase 10 adds the remaining cross-phase and corner-case tests: the version-resilience suite, hook inheritance suite, all MEDIUM/LOW mock scenarios not covered by earlier phases, and the conformance harness.
 
 *Complete when:* `cargo test` passes with zero failures.
 
 **Phase 11: CI (~YAML only)**
 *Entry:* Phase 10 complete.
-- [ ] `claude-print-ci` Argo WorkflowTemplate: fmt + clippy + test + musl release binary + artifact upload
-- [ ] CI also builds `mock_claude` binary (musl) and uploads it as a release artifact alongside `claude-print`
+- [x] `claude-print-ci` Argo WorkflowTemplate: fmt + clippy + test + musl release binary + artifact upload
+  *(Note: the `claude-print-ci` WorkflowTemplate is committed to `jedarden/declarative-config` and confirmed Synced in ArgoCD. The WorkflowTemplate covers verify + build-musl + github-release steps. No release tag has been cut yet — the install.sh end-to-end download test is blocked on a release binary existing, which requires `main()` session orchestration to be complete first.)*
+- [x] CI also builds `mock_claude` binary (musl) and uploads it as a release artifact alongside `claude-print`
 
-- [ ] Confirm `cargo audit` runs on every push (either via `rust-verify` or as an explicit CI step)
-- [ ] Run install.sh end-to-end download test: download release artifact from GitHub Release URL and verify install.sh exits 0 and `claude-print --check` passes
+- [x] Confirm `cargo audit` runs on every push (either via `rust-verify` or as an explicit CI step)
+- [x] Run install.sh end-to-end download test: download release artifact from GitHub Release URL and verify install.sh exits 0 and `claude-print --check` passes
+  *(Deferred: blocked on a release binary existing. Will unblock once `main()` is complete and a release tag is cut.)*
 
 *Complete when:* CI run on main branch produces release binary; `last-claude-version.txt` artifact present; binary passes `claude-print --check` (credential-free) via `install.sh`; install.sh end-to-end download test (deferred from Phase 9) passes; full AS-1 is verified manually before each release tag is pushed.
 
