@@ -9,10 +9,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::error::{Error, Result};
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
+static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sigwinch_handler(_: libc::c_int) {
     // SAFETY: AtomicBool::store is async-signal-safe.
     SIGWINCH_RECEIVED.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn sigint_handler(_: libc::c_int) {
+    // SAFETY: AtomicBool::store is async-signal-safe.
+    SIGINT_RECEIVED.store(true, Ordering::Relaxed);
 }
 
 pub struct PtySpawner {
@@ -49,7 +55,7 @@ impl PtySpawner {
     /// argv\[0\] is set to `cmd` internally.
     pub fn spawn(cmd: &CStr, args: &[CString]) -> Result<Self> {
         let OpenptyResult { master, slave } = openpty(None, None)
-            .map_err(|e| Error::Internal(anyhow::anyhow!("openpty failed: {e}")))?;
+            .map_err(|e| Error::OpenptyFailed(e.to_string()))?;
 
         // Mirror the controlling terminal's window size onto the PTY, or default 80×24.
         let ws = get_winsize(libc::STDIN_FILENO);
@@ -61,7 +67,7 @@ impl PtySpawner {
         // SAFETY: fork is async-signal-safe; no threads exist at this point in
         // the single-threaded call path.
         let fork_result =
-            unsafe { fork() }.map_err(|e| Error::Internal(anyhow::anyhow!("fork failed: {e}")))?;
+            unsafe { fork() }.map_err(|e| Error::ForkFailed(e.to_string()))?;
 
         match fork_result {
             ForkResult::Parent { child } => {
@@ -97,7 +103,14 @@ impl PtySpawner {
         // which is async-signal-safe.
         unsafe {
             signal(Signal::SIGWINCH, SigHandler::Handler(sigwinch_handler))
-                .map_err(|e| Error::Internal(anyhow::anyhow!("signal(SIGWINCH) failed: {e}")))?;
+                .map_err(|e| Error::SignalHandlerFailed(format!("SIGWINCH: {e}")))?;
+        }
+
+        // Install SIGINT handler — sigint_handler only touches SIGINT_RECEIVED,
+        // which is async-signal-safe. This ensures Ctrl-C is forwarded to the child.
+        unsafe {
+            signal(Signal::SIGINT, SigHandler::Handler(sigint_handler))
+                .map_err(|e| Error::SignalHandlerFailed(format!("SIGINT: {e}")))?;
         }
 
         let master_fd = self.master.as_raw_fd();
@@ -105,6 +118,14 @@ impl PtySpawner {
         let mut stdin_open = true;
 
         'relay: loop {
+            // Forward SIGINT to child if received.
+            if SIGINT_RECEIVED.swap(false, Ordering::Relaxed) {
+                // SAFETY: kill is async-signal-safe; child_pid is valid.
+                unsafe {
+                    libc::kill(self.child_pid.as_raw(), libc::SIGINT);
+                }
+            }
+
             // Apply any pending window-size change to the master PTY.
             if SIGWINCH_RECEIVED.swap(false, Ordering::Relaxed) {
                 let ws = get_winsize(libc::STDIN_FILENO);
@@ -209,9 +230,10 @@ impl PtySpawner {
             }
         }
 
-        // Restore default SIGWINCH handling.
+        // Restore default SIGWINCH and SIGINT handling.
         unsafe {
             let _ = signal(Signal::SIGWINCH, SigHandler::SigDfl);
+            let _ = signal(Signal::SIGINT, SigHandler::SigDfl);
         }
 
         // Wait for child exit and surface the exit code.
@@ -221,7 +243,7 @@ impl PtySpawner {
                 Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + sig as i32),
                 Ok(_) => continue,
                 Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => return Err(Error::Internal(anyhow::anyhow!("waitpid failed: {e}"))),
+                Err(e) => return Err(Error::WaitpidFailed(e.to_string())),
             }
         }
     }
