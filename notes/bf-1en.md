@@ -1,62 +1,71 @@
-# Bead bf-1en Verification: src/transcript.rs Implementation
+# bead bf-1en: transcript.rs Implementation Verification
 
-## Date: 2026-06-11
+## Task
+Implement src/transcript.rs: JSONL transcript parsing
 
-## Summary
+## Status: VERIFICATION COMPLETE ✓
 
-Verified that `src/transcript.rs` is fully implemented with all required functionality.
+The implementation was already complete in commit `c6241e3`:
+- `src/transcript.rs` implements full JSONL parsing
+- `tests/transcript.rs` has 18 comprehensive tests
 
-## Implementation Verified
+## Implementation Summary
 
-The module provides:
+### Core Functionality (`src/transcript.rs`)
 
-### Data Structures
-- `Usage` - Token counts (input, output, cache_creation, cache_read)
-- `AggregatedUsage` - Summed token counts across all turns
-- `ContentBlock` enum - text, tool_use, thinking, unknown
-- `AssistantMessage` - Message with content blocks and usage
-- `ResultEvent` - Session tracking (session_id, is_error)
-- `Event` enum - JSONL event types (assistant, user, result, unknown)
-- `TranscriptResult` - Output struct (text, num_turns, usage, session_id, is_error, used_fallback)
+1. **Data Structures**
+   - `Usage`: Token counts (input, output, cache_creation, cache_read)
+   - `AggregatedUsage`: Running totals across all turns
+   - `ContentBlock`: Text, ToolUse, Thinking, Unknown
+   - `AssistantMessage`: Message with ID, content blocks, usage
+   - `ResultEvent`: Session ID and error status
+   - `Event`: Discriminating union (Assistant, User, Result, Unknown)
+   - `TranscriptResult`: Final output with text, usage, metadata
 
-### Core Functions
-1. `parse_transcript(path)` - Parses JSONL files:
-   - Reads line-by-line with BufReader
-   - Handles missing files (returns empty result)
-   - Silently skips malformed JSON lines
-   - Extracts text from `ContentBlock::Text` blocks
+2. **`parse_transcript(path)`**
+   - Reads JSONL file line-by-line
+   - Extracts text from `ContentBlock::Text` blocks only
    - Deduplicates streaming chunks by `message.id` or usage fingerprint
-   - Aggregates token counts across all turns
-   - Returns last turn's text
+   - Aggregates token counts across all unique turns
+   - Extracts `session_id` and `is_error` from Result events
+   - Handles missing files → empty result
+   - Silently skips malformed lines
 
-2. `read_transcript(path, last_assistant_message)` - Retry with fallback:
-   - Retries up to 40×50ms (2s total) for empty text (Stop-before-JSONL race)
+3. **`read_transcript(path, last_assistant_message)`**
+   - Retry loop: 40 × 50ms = 2s budget
+   - Handles Stop-before-JSONL race window
    - Falls back to `last_assistant_message` if retries exhausted
    - Returns error if both are empty
-   - Preserves session_id and is_error from retries
 
-## Test Coverage
+### Test Coverage (`tests/transcript.rs`)
 
-All 18 integration tests pass:
-- Single/multi-turn parsing
-- Multi-block content concatenation
-- Streaming deduplication (same message.id)
+All 18 tests pass:
+- Single turn, single text block
+- Multi-block content (text + tool_use + thinking)
+- Multi-turn with unique keys
+- Streaming dedup (5 chunks → 1 turn)
 - Token aggregation (45 turns)
-- Missing cache tokens (defaults to 0)
-- Null token values (treated as 0)
-- Unknown event/block types (skipped)
-- Malformed JSON lines (skipped)
-- Empty file handling
-- Fingerprint dedup without message.id
-- Result event extraction
+- Missing/null cache tokens
+- Unknown event types and content blocks
+- Malformed JSONL lines
+- Empty files
+- Usage-fingerprint fallback (no message.id)
+- Result event fields
 - Fallback to last_assistant_message
-- Error when both empty
-- Race condition tests (40 retries, 100ms delay)
+- Race conditions (MOCK_DELAY_JSONL)
 
-## Implementation Origin
+## Verification
 
-Commit: `c6241e3` - "Add Phase 7: transcript reader with retry loop and dedup"
+```bash
+$ cargo test --lib transcript
+test result: ok. 3 passed
 
-## Conclusion
+$ cargo test --test transcript
+test result: ok. 18 passed
+```
 
-Implementation is complete and verified. Ready to close bead.
+All tests pass. Implementation matches AGENTS.md specification.
+
+## Bead Closure
+
+The bead is closed after this verification. No code changes were needed as the implementation was already complete.
