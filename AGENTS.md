@@ -67,6 +67,7 @@ cargo build -p mock-claude
 
 | File | Role |
 |------|------|
+| `src/lib.rs` | Crate root — re-exports all public modules for use in integration tests |
 | `src/main.rs` | Entry point — parses CLI, resolves claude binary version, calls run |
 | `src/cli.rs` | Clap argument definitions (`Cli`, `OutputFormat`) |
 | `src/config.rs` | Loads `~/.claude/claude-print.toml` (model default, etc.) |
