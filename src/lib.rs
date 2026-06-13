@@ -7,6 +7,7 @@ pub mod event_loop;
 pub mod hook;
 pub mod poller;
 pub mod pty;
+pub mod session;
 pub mod startup;
 pub mod terminal;
 pub mod transcript;
