@@ -1,0 +1,15 @@
+{
+  "worker_id": "alpha",
+  "qualified_id": "claude-code-glm-4.7-alpha",
+  "pid": 1939771,
+  "state": "EXECUTING",
+  "current_bead": "bf-3ag",
+  "workspace": "/home/coding/claude-print",
+  "last_heartbeat": "2026-06-13T19:55:45.212004452Z",
+  "started_at": "2026-06-13T17:04:02.959591236Z",
+  "beads_processed": 9,
+  "session": "alpha",
+  "is_idle": false,
+  "current_task": "bf-3ag",
+  "model": "claude-code-glm-4.7"
+}
