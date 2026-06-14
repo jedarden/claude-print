@@ -165,7 +165,7 @@ fn main() {
             );
             process::exit(130);
         }
-        Err(Error::Timeout(msg)) => {
+        Err(Error::Timeout(_msg)) => {
             let _ = emit_error(
                 &mut stdout,
                 &mut stderr,

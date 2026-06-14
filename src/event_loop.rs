@@ -75,7 +75,7 @@ impl EventLoop {
             }
 
             let ret =
-                unsafe { libc::poll(self.fds.as_mut_ptr(), self.fds.len() as libc::nfds_t, -1) };
+                unsafe { libc::poll(self.fds.as_mut_ptr(), self.fds.len() as libc::nfds_t, 50) };
 
             if ret < 0 {
                 let errno = nix::errno::Errno::last();
@@ -139,6 +139,11 @@ impl EventLoop {
             {
                 return Ok(ExitReason::ChildExited);
             }
+
+            // Timer tick: call on_output with an empty slice so the caller can
+            // run deadline-driven logic (e.g. startup idle-gap) even when no PTY
+            // data arrived (poll timed out or all events were already handled).
+            on_output(b"");
         }
     }
 }

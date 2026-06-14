@@ -85,6 +85,14 @@ impl PtySpawner {
                 if unsafe { libc::login_tty(slave_fd) } != 0 {
                     unsafe { libc::_exit(127) };
                 }
+                // Unset the parent session ID so the child creates a fresh session.
+                // Without this, the child inherits CLAUDE_CODE_SESSION_ID and may
+                // write events into the parent's transcript or skip Stop hook dispatch.
+                // Keep CLAUDECODE and CLAUDE_CODE_ENTRYPOINT — those are needed for
+                // the child to run as Claude Code and create a session JSONL.
+                unsafe {
+                    libc::unsetenv(b"CLAUDE_CODE_SESSION_ID\0".as_ptr() as *const libc::c_char);
+                }
                 // Build full argv: [cmd, args...].
                 let mut argv: Vec<&CStr> = Vec::with_capacity(args.len() + 1);
                 argv.push(cmd);

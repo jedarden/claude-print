@@ -26,6 +26,8 @@ pub struct SessionResult {
     pub claude_version: String,
     /// Session duration in milliseconds.
     pub duration_ms: u64,
+    /// Path to the transcript file (for stream-json replay).
+    pub transcript_path: std::path::PathBuf,
 }
 
 /// Session orchestrator.
@@ -129,16 +131,17 @@ impl Session {
         let mut startup = StartupSeq::new(prompt);
 
         // 9. Open the FIFO before the event loop (so Stop hook can fire during the session).
-        // The FIFO won't be readable until Claude Code writes to it, which happens after the prompt is injected.
-        // Keep the write-end (keeper) alive for the duration of the event loop.
-        let _fifo_keeper = match open_fifo_nonblock(&installer.fifo_path) {
+        // Both the read-end and keeper write-end must be kept alive for the full duration of the
+        // event loop: read_fd because the event loop polls its raw fd, keeper because without it
+        // the hook's `cat > fifo` would get ENXIO when it tries to open the write-end.
+        let (_fifo_read, _fifo_keeper) = match open_fifo_nonblock(&installer.fifo_path) {
             Ok((read_fd, keeper)) => {
                 event_loop.add_fifo_fd(read_fd.as_raw_fd());
-                Some(keeper)
+                (Some(read_fd), Some(keeper))
             }
             Err(e) => {
                 eprintln!("warning: failed to open FIFO, continuing without Stop detection: {e}");
-                None
+                (None, None)
             }
         };
 
@@ -146,22 +149,31 @@ impl Session {
         let master_fd = spawner.master.as_raw_fd();
 
         let exit_reason = event_loop.run(|chunk| {
-            // Feed chunk to terminal emulator.
-            let probe_responses = terminal.feed(chunk);
+            // Empty chunk = timer tick from the event loop (poll timeout with no data).
+            // Only feed real data to the terminal emulator and startup sequence.
+            if !chunk.is_empty() {
+                // Feed chunk to terminal emulator.
+                let probe_responses = terminal.feed(chunk);
 
-            // Write probe responses to master.
-            if !probe_responses.is_empty() {
-                unsafe {
-                    libc::write(
-                        master_fd,
-                        probe_responses.as_ptr() as *const libc::c_void,
-                        probe_responses.len(),
-                    );
+                // Write probe responses to master.
+                if !probe_responses.is_empty() {
+                    unsafe {
+                        libc::write(
+                            master_fd,
+                            probe_responses.as_ptr() as *const libc::c_void,
+                            probe_responses.len(),
+                        );
+                    }
                 }
             }
 
-            // Feed chunk to startup sequence.
-            let action = startup.feed(chunk);
+            // Feed chunk to startup sequence (skip empty ticks — feed() updates
+            // last_output_at which would reset the idle timer).
+            let action = if !chunk.is_empty() {
+                startup.feed(chunk)
+            } else {
+                StartupAction::None
+            };
 
             // Handle startup actions.
             match &action {
@@ -191,15 +203,16 @@ impl Session {
             }
         })?;
 
-        // Join timeout thread if it exists (mark completion before checking timeout).
-        if let Some(handle) = timeout_thread {
-            // Event loop completed - mark as done before joining to avoid race.
-            let _ = handle.join();
-        }
+        // Detach the timeout thread — do not join. The thread sleeps for the full
+        // timeout_secs duration, so joining here would block the main thread for up to
+        // timeout_secs seconds even when the event loop has already finished. Detaching
+        // is safe: process::exit() in main.rs terminates all threads, and a late SIGTERM
+        // from the thread to a dead child process is harmless (returns ESRCH).
+        drop(timeout_thread);
 
         // 13. Check if timeout fired.
         if timeout_fired.load(Ordering::SeqCst) {
-            let _ = waitpid(spawner.child_pid, None);
+            kill_child(spawner.child_pid);
             return Err(Error::Timeout(format!(
                 "session exceeded {} second deadline",
                 timeout_secs.unwrap_or(0)
@@ -224,12 +237,17 @@ impl Session {
                 };
 
                 // Wait for child to exit.
-                let _ = waitpid(spawner.child_pid, None);
+                kill_child(spawner.child_pid);
+
+                let transcript_path = stop_info.transcript_path.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from("transcript.jsonl")
+                });
 
                 Ok(SessionResult {
                     transcript,
                     claude_version,
                     duration_ms: start_time.elapsed().as_millis() as u64,
+                    transcript_path,
                 })
             }
             ExitReason::ChildExited => {
@@ -238,10 +256,7 @@ impl Session {
                 Err(Error::Internal(anyhow::anyhow!("Child exited without sending Stop payload")))
             }
             ExitReason::Interrupted => {
-                // Send SIGTERM to child.
-                nix::sys::signal::kill(spawner.child_pid, nix::sys::signal::Signal::SIGTERM)
-                    .map_err(|e| Error::Internal(anyhow::anyhow!("SIGTERM failed: {e}")))?;
-                let _ = waitpid(spawner.child_pid, None);
+                kill_child(spawner.child_pid);
                 Err(Error::Interrupted("interrupted by signal".to_string()))
             }
         }
@@ -265,6 +280,29 @@ impl Session {
             .ok_or_else(|| Error::Internal(anyhow::anyhow!("claude --version produced no output")))?;
 
         Ok(first_line.trim().to_string())
+    }
+}
+
+/// Send SIGTERM to `pid`, wait up to 2 seconds, then SIGKILL if still alive.
+fn kill_child(pid: nix::unistd::Pid) {
+    use nix::sys::wait::WaitPidFlag;
+    use nix::sys::wait::WaitStatus;
+
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if Instant::now() >= deadline {
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                    let _ = nix::sys::wait::waitpid(pid, None);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            _ => return,
+        }
     }
 }
 
@@ -378,11 +416,13 @@ exit 1
             transcript,
             claude_version: "claude-1.0.0".to_string(),
             duration_ms: 1000,
+            transcript_path: std::path::PathBuf::from("transcript.jsonl"),
         };
 
         assert_eq!(session_result.claude_version, "claude-1.0.0");
         assert_eq!(session_result.duration_ms, 1000);
         assert_eq!(session_result.transcript.text, "test");
         assert_eq!(session_result.transcript.session_id.as_deref(), Some("sess-123"));
+        assert_eq!(session_result.transcript_path, std::path::PathBuf::from("transcript.jsonl"));
     }
 }
