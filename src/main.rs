@@ -109,6 +109,20 @@ fn main() {
         claude_args.push("--setting-sources=".into());
     }
 
+    if cli.dangerously_skip_permissions {
+        claude_args.push("--dangerously-skip-permissions".into());
+    }
+
+    if let Some(ref tools) = cli.allowed_tools {
+        claude_args.push("--allowedTools".into());
+        claude_args.push(tools.as_str().into());
+    }
+
+    if let Some(ref tools) = cli.disallowed_tools {
+        claude_args.push("--disallowedTools".into());
+        claude_args.push(tools.as_str().into());
+    }
+
     let t0 = Instant::now();
 
     // Call session::Session::run()

@@ -3,7 +3,7 @@ members = [".", "test-fixtures/mock-claude"]
 
 [package]
 name = "claude-print"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Drop-in replacement for `claude -p` that bills against the subscription pool via PTY"
