@@ -1,0 +1,104 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: claude-print-ci
+  namespace: argo-workflows
+  labels:
+    app: claude-print-ci
+spec:
+  entrypoint: ci
+  serviceAccountName: argo-workflow
+  templates:
+    - name: ci
+      activeDeadlineSeconds: 3600
+      container:
+        image: debian:bookworm
+        command: [bash, -c]
+        args:
+          - |
+            set -ex
+
+            # System dependencies
+            apt-get update && apt-get install -y \
+              git curl build-essential pkg-config libssl-dev
+
+            # Install gh CLI
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            apt-get update && apt-get install -y gh
+
+            # Install Rust stable
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            . "$HOME/.cargo/env"
+            rustc --version
+
+            # Clone from trusted hardcoded source (ignore webhook payload)
+            git clone --depth 1 \
+              "https://x-access-token:${GH_TOKEN}@github.com/jedarden/claude-print.git" \
+              /workspace
+            cd /workspace
+
+            COMMIT=$(git rev-parse HEAD)
+
+            # Extract version from Cargo.toml
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)".*/\1/')
+            echo "Building claude-print v${VERSION} (commit: ${COMMIT})"
+
+            # Check if release already exists — idempotent re-runs safe
+            if gh release view "v${VERSION}" --repo jedarden/claude-print > /dev/null 2>&1; then
+              echo "Release v${VERSION} already exists — skipping"
+              exit 0
+            fi
+
+            ARCH=$(uname -m)
+            TARGET="${ARCH}-linux"
+
+            # Build claude-print
+            cargo build --release --bin claude-print
+            CLAUDE_PRINT_ASSET="claude-print-${TARGET}"
+            cp ./target/release/claude-print "${CLAUDE_PRINT_ASSET}"
+
+            # Build mock_claude (workspace member)
+            cargo build --release --manifest-path test-fixtures/mock-claude/Cargo.toml
+            MOCK_ASSET="mock_claude-${TARGET}"
+            cp ./target/release/mock-claude "${MOCK_ASSET}"
+
+            # Create GitHub release with both binaries
+            gh release create "v${VERSION}" \
+              --repo jedarden/claude-print \
+              --title "claude-print v${VERSION}" \
+              --notes "Release v${VERSION}
+
+            Built from commit: ${COMMIT}
+
+            ## Installation
+
+            \`\`\`sh
+            sh <(curl -fsSL https://raw.githubusercontent.com/jedarden/claude-print/main/install.sh)
+            \`\`\`
+
+            ## Assets
+
+            - \`claude-print-${TARGET}\` — main binary
+            - \`mock_claude-${TARGET}\` — test fixture binary
+            " \
+              --target main \
+              "./${CLAUDE_PRINT_ASSET}" \
+              "./${MOCK_ASSET}"
+
+            echo "Release v${VERSION} created successfully"
+        env:
+          - name: GH_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: github-webhook-secret
+                key: token
+        resources:
+          requests:
+            cpu: 2000m
+            memory: 4Gi
+          limits:
+            cpu: 4000m
+            memory: 8Gi

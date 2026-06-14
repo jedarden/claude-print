@@ -9,13 +9,14 @@ REPO="jedarden/claude-print"
 INSTALL_DIR="${HOME}/.local/bin"
 NEEDLE_AGENTS_DIR="${HOME}/.needle/agents"
 
-# Detect architecture
+# Detect OS and architecture
+OS=$(uname -s)
 ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
-  aarch64) TARGET="aarch64-unknown-linux-musl" ;;
+case "${OS}-${ARCH}" in
+  Linux-x86_64)  TARGET="x86_64-linux" ;;
+  Linux-aarch64) TARGET="aarch64-linux" ;;
   *)
-    echo "Unsupported architecture: ${ARCH}" >&2
+    echo "Unsupported platform: ${OS}-${ARCH}" >&2
     exit 1
     ;;
 esac
