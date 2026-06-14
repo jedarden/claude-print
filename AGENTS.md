@@ -67,18 +67,19 @@ cargo build -p mock-claude
 
 | File | Role |
 |------|------|
-| `src/lib.rs` | Crate root — re-exports all public modules for use in integration tests |
-| `src/main.rs` | Entry point — parses CLI, resolves claude binary version, calls run |
+| `src/lib.rs` | Crate root — re-exports public modules for integration tests |
+| `src/main.rs` | Entry point: CLI parse, claude binary resolution, calls `session::Session::run()` |
 | `src/cli.rs` | Clap argument definitions (`Cli`, `OutputFormat`) |
 | `src/config.rs` | Loads `~/.claude/claude-print.toml` (model default, etc.) |
-| `src/pty.rs` | Forks child, opens PTY pair, forwards SIGWINCH/SIGINT to child |
-| `src/startup.rs` | Reads PTY output until trust dialog; auto-dismisses, injects prompt |
-| `src/event_loop.rs` | Single-threaded `poll(2)` loop over PTY master + self-pipe + stop FIFO |
-| `src/hook.rs` | Installs Stop hook via `CLAUDE_CONFIG_DIR` temp dir; owns the FIFO |
-| `src/poller.rs` | Parses Stop hook payload from the FIFO bytes |
+| `src/session.rs` | Session orchestrator: installs hooks, spawns PTY child, runs event loop, reads transcript. `Session::run()` is the top-level entry point for a single prompt→response cycle. |
+| `src/pty.rs` | Forks child, opens PTY pair, calls `login_tty`, unsets `CLAUDE_CODE_SESSION_ID` in child, forwards SIGWINCH/SIGINT |
+| `src/startup.rs` | State machine: reads PTY output until trust dialog or idle; auto-dismisses (sends CR), injects prompt via bracketed paste; hard timeout after 45s with <200 bytes |
+| `src/event_loop.rs` | Single-threaded `poll(2)` loop (50ms timeout for timer ticks) over PTY master + self-pipe + stop FIFO; calls callback on each chunk |
+| `src/hook.rs` | Installs Stop hook via temp dir settings.json; creates FIFO; cleans up on drop |
+| `src/poller.rs` | Opens FIFO non-blocking (read + keeper write ends), parses Stop hook payload, derives transcript path from session_id + cwd |
 | `src/transcript.rs` | Reads `.jsonl` transcript; extracts last assistant message + token usage |
 | `src/emitter.rs` | Formats and writes output (`text`, `json`, `stream-json`) |
-| `src/terminal.rs` | Absorbs and discards terminal probe sequences (DA1/DA2/DSR/xtversion) |
+| `src/terminal.rs` | Absorbs and discards terminal probe sequences (DA1/DA2/DSR/xtversion) from Ink TUI |
 | `src/error.rs` | `Error` enum and `Result` alias |
 | `src/check.rs` | `--check` mode: verifies PTY, FIFO, hooks, and `cc_entrypoint` env |
 
@@ -103,6 +104,31 @@ These must hold across all changes:
 5. **`cc_entrypoint=cli` is the correctness invariant** — verify that
    `CLAUDE_CC_ENTRYPOINT` (or equivalent) is `cli` via `--check` before each
    release. AS-4 in the plan documents the acceptance criterion.
+
+6. **Unset `CLAUDE_CODE_SESSION_ID` in child** — the child must not inherit the
+   parent's session ID or it will write events into the parent's transcript and may
+   skip Stop hook dispatch. Only `CLAUDE_CODE_SESSION_ID` is unset;
+   `CLAUDECODE=1` and `CLAUDE_CODE_ENTRYPOINT=cli` must be preserved.
+
+7. **Keep both FIFO ends alive for the full event loop** — `open_fifo_nonblock()`
+   returns `(read_fd, keeper_write_fd)`. Both must be stored until after the event
+   loop exits. Dropping `read_fd` closes the fd the event loop is polling; dropping
+   `keeper` causes `ENXIO` when the hook writes to the FIFO.
+
+## Key implementation notes
+
+- **Event loop ticks on empty slices** — the event loop uses `poll(50ms)` (not
+  blocking) and emits an empty-slice tick to the callback on timeout. The callback
+  must guard `startup.feed()` and `terminal.feed()` from empty slices — feeding
+  empty data resets the idle timer in `StartupSeq`.
+
+- **Timeout thread is detached, not joined** — `session.rs` detaches the timeout
+  thread via `drop()` instead of joining it. The timeout thread sleeps for
+  `cli.timeout` seconds (default 3600); joining before handling the exit reason
+  would block the main thread for the full duration on early exit.
+
+- **Child cleanup uses `kill_child(pid)`** — `kill_child(pid)` sends SIGTERM, waits
+  up to 2s, then SIGKILL. Use this for all child cleanup paths, not bare `waitpid`.
 
 ## Bead workflow
 
