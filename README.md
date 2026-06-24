@@ -1,10 +1,10 @@
 # claude-print
 
-Drop-in replacement for `claude -p` (print/headless mode) that drives the Claude Code interactive TUI via PTY — preserving subscription billing after the June 15, 2026 Agent SDK credit split.
+Drop-in replacement for `claude -p` (print/headless mode) that drives the Claude Code interactive TUI via PTY — keeping sessions on the unlimited subscription pool rather than the per-token Agent SDK credit pool.
 
 ## Why this exists
 
-Starting June 15, 2026, Anthropic separates `claude -p` (headless) into a separate Agent SDK credit pool ($100–$200/month on Max plans). Only the interactive TUI (`cc_entrypoint=cli`) continues drawing from the unlimited subscription.
+Anthropic routes `claude -p` (headless/SDK mode) through a separate Agent SDK credit pool ($100–$200/month on Max plans). Only the interactive TUI (`cc_entrypoint=cli`) draws from the unlimited subscription.
 
 The billing path is determined by an `isatty` check inside the `claude` binary: when stdout is a TTY, the session is tagged `cc_entrypoint=cli` and billed against the subscription. When stdout is a pipe (as with `claude -p`), it becomes `cc_entrypoint=sdk-cli` and draws from the credit pool instead.
 
