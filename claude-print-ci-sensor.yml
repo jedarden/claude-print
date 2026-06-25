@@ -1,0 +1,38 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: claude-print-ci-sensor
+  namespace: argo-events
+spec:
+  eventBusName: default
+  dependencies:
+    - name: claude-print-push
+      eventSourceName: github-webhooks
+      eventName: claude-print
+      filters:
+        data:
+          - path: headers.X-Github-Event
+            type: string
+            value:
+              - push
+          - path: body.ref
+            type: string
+            value:
+              - refs/heads/main
+  triggers:
+    - template:
+        name: claude-print-ci
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: claude-print-ci-
+                namespace: argo-workflows
+              spec:
+                serviceAccountName: argo-workflow
+                workflowTemplateRef:
+                  name: claude-print-ci
+      conditions: claude-print-push

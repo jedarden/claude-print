@@ -208,7 +208,7 @@ fn main() {
                 &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
-            exit_with_cleanup(3);
+            exit_with_cleanup(ClaudePrintError::Timeout.exit_code());
         }
         Err(Error::Internal(e)) => {
             let msg = if e.to_string().contains("Child exited without sending Stop payload") {

@@ -1,0 +1,23 @@
+# Add this stanza to k8s/iad-ci/argo-events/github-eventsource.yml
+# under spec.github: (alongside needle, forge, agentscribe, etc.)
+    claude-print:
+      repositories:
+        - owner: jedarden
+          names:
+            - claude-print
+      webhook:
+        endpoint: /claude-print
+        port: "12000"
+        method: POST
+        url: https://webhooks-ci.ardenone.com
+      events:
+        - push
+      apiToken:
+        name: github-webhook-secret
+        key: token
+      webhookSecret:
+        name: github-webhook-secret
+        key: webhook-secret
+      insecure: false
+      active: true
+      contentType: json
