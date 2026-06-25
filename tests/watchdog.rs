@@ -90,11 +90,20 @@ fn watchdog_silent_child_times_out_with_cleanup() {
         other => panic!("Expected Timeout error, got: {:?}", other),
     }
 
-    // Give the OS a moment to reap resources
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Give the OS time to reap resources (cleanup happens via Drop but OS may lag)
+    // Use a timeout-based retry to handle race conditions in filesystem cleanup
+    let timeout = std::time::Duration::from_millis(500);
+    let start = std::time::Instant::now();
+    let mut after_count = before_count + 1; // Start with failing value
 
-    // Assert no orphaned temp dirs (cleanup happened on all exit paths)
-    let after_count = count_claude_print_temp_dirs();
+    while start.elapsed() < timeout {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        after_count = count_claude_print_temp_dirs();
+        if after_count == before_count {
+            break; // Cleanup completed
+        }
+    }
+
     assert_eq!(
         after_count, before_count,
         "temp dir count must not increase: cleanup on all exit paths failed"
@@ -136,9 +145,21 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         other => panic!("Expected Timeout error, got: {:?}", other),
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Give the OS time to reap resources (cleanup happens via Drop but OS may lag)
+    // Use a timeout-based retry to handle race conditions in filesystem cleanup
+    // Allow 2 seconds since the 1-second watchdog timeout is very aggressive
+    let timeout = std::time::Duration::from_secs(2);
+    let start = std::time::Instant::now();
+    let mut after_count = before_count + 1; // Start with failing value
 
-    let after_count = count_claude_print_temp_dirs();
+    while start.elapsed() < timeout {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        after_count = count_claude_print_temp_dirs();
+        if after_count == before_count {
+            break; // Cleanup completed
+        }
+    }
+
     assert_eq!(
         after_count, before_count,
         "temp dir cleanup must happen even with very short timeout"
