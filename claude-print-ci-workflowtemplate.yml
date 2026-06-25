@@ -46,6 +46,11 @@ spec:
             VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)".*/\1/')
             echo "Building claude-print v${VERSION} (commit: ${COMMIT})"
 
+            # Run tests (including watchdog regression tests)
+            echo "Running test suite..."
+            cargo test --verbose
+            echo "Tests passed successfully"
+
             # Check if release already exists — idempotent re-runs safe
             if gh release view "v${VERSION}" --repo jedarden/claude-print > /dev/null 2>&1; then
               echo "Release v${VERSION} already exists — skipping"
