@@ -10,12 +10,18 @@ use nix::sys::signal::{self, SigHandler};
 use nix::sys::wait::waitpid;
 use std::ffi::{CString, OsString};
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Global storage for the temp dir path that needs cleanup.
+///
+/// This is stored globally because `process::exit()` in main.rs bypasses
+/// destructors, so we need to clean up explicitly before exit.
+static TEMP_DIR_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Result of a Claude Code session.
 #[derive(Debug)]
@@ -43,12 +49,30 @@ impl<'a> Drop for CleanupGuard<'a> {
     }
 }
 
+/// Clean up the temp directory stored in the global variable.
+///
+/// This function is called before `process::exit()` to ensure cleanup
+/// happens even when destructors are bypassed.
+pub fn cleanup_temp_dir() {
+    if let Some(path) = TEMP_DIR_PATH.get() {
+        // Remove the FIFO first (it may have different permissions)
+        let fifo_path = path.join("stop.fifo");
+        let _ = std::fs::remove_file(&fifo_path);
+        // Remove the entire temp directory
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
 /// Session orchestrator.
 ///
 /// Manages the full lifecycle of a Claude Code PTY session.
 pub struct Session;
 
 impl Session {
+    /// Default first-output timeout in seconds.
+    /// If the child produces no output within this time, we assume it's hung.
+    const DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS: u64 = 90;
+
     /// Run a Claude Code session.
     ///
     /// # Arguments
@@ -56,7 +80,9 @@ impl Session {
     /// * `claude_bin` - Path to the Claude Code binary.
     /// * `claude_args` - Flags to forward to Claude Code.
     /// * `prompt` - User prompt bytes to inject.
-    /// * `timeout_secs` - Optional timeout in seconds.
+    /// * `timeout_secs` - Optional overall timeout in seconds.
+    /// * `first_output_timeout_secs` - Optional first-output timeout in seconds.
+    /// * `stop_hook_timeout_secs` - Optional Stop hook watchdog timeout in seconds.
     ///
     /// # Returns
     ///
@@ -65,18 +91,23 @@ impl Session {
     /// # Errors
     ///
     /// Returns `Error::NoResponse` if the child exits without sending a Stop payload.
-    /// Returns `Error::Timeout` if the timeout expires.
+    /// Returns `Error::Timeout` if the timeout expires (no output or overall timeout).
     /// Returns `Error::Interrupted` if a SIGINT is received.
     pub fn run(
         claude_bin: &Path,
         claude_args: &[OsString],
         prompt: Vec<u8>,
         timeout_secs: Option<u64>,
+        first_output_timeout_secs: Option<u64>,
+        stop_hook_timeout_secs: Option<u64>,
     ) -> Result<SessionResult> {
         let start_time = Instant::now();
 
         // 1. Install hook files (temp dir, hook.sh, stop.fifo).
         let installer = HookInstaller::new()?;
+
+        // Store temp dir path globally for cleanup before process::exit()
+        let _ = TEMP_DIR_PATH.set(installer.dir_path().to_path_buf());
 
         // 1a. Set up cleanup guard to ensure temp dir is removed on all exit paths
         let _cleanup_guard = CleanupGuard(&installer);
@@ -93,6 +124,9 @@ impl Session {
             CString::new(format!("--settings={}", installer.settings_path.to_string_lossy()))
                 .map_err(|e| Error::Internal(anyhow::anyhow!("settings path invalid: {e}")))?,
         );
+        // Prevent global settings inheritance - the temp settings.json contains only the Stop hook
+        // and inheriting global hooks (SessionStart, etc.) can cause the child to hang at startup.
+        args.push(CString::new("--setting-sources=").unwrap());
         for arg in claude_args {
             let arg_str = arg.to_string_lossy().to_string();
             args.push(
@@ -119,22 +153,75 @@ impl Session {
         // 5. Spawn PTY child.
         let spawner = PtySpawner::spawn(&cmd, &args)?;
 
-        // 5a. Set up timeout handling if specified.
+        // 5a. Set up timeout handling.
+        // We have three timeouts:
+        // 1. First-output timeout: if child emits no data within N seconds (default 90s)
+        // 2. Overall timeout: if session exceeds overall deadline (default from CLI, 3600s)
+        // 3. Stop hook watchdog timeout: if Stop hook doesn't fire within N seconds after prompt injection (default 120s)
         let timeout_fired = Arc::new(AtomicBool::new(false));
-        let timeout_thread = if let Some(secs) = timeout_secs {
+        let first_output_received = Arc::new(AtomicBool::new(false));
+        let prompt_injected_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let session_start = Arc::new(AtomicBool::new(false)); // Used to signal session start
+
+        let timeout_thread = {
             let child_pid = spawner.child_pid;
             let timeout_fired_clone = Arc::clone(&timeout_fired);
+            let first_output_clone = Arc::clone(&first_output_received);
+            let prompt_injected_clone = Arc::clone(&prompt_injected_at);
+            let session_start_clone = Arc::clone(&session_start);
+            let first_output_secs = first_output_timeout_secs.unwrap_or(Self::DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS);
+            let overall_secs = timeout_secs.unwrap_or(0);
+            let stop_hook_secs = stop_hook_timeout_secs.unwrap_or(120);
+
             Some(thread::spawn(move || {
-                thread::sleep(Duration::from_secs(secs));
-                // Check if we already completed before firing
-                if !timeout_fired_clone.load(Ordering::SeqCst) {
-                    // Send SIGTERM to child
-                    let _ = signal::kill(child_pid, signal::Signal::SIGTERM);
-                    timeout_fired_clone.store(true, Ordering::SeqCst);
+                let session_start_time = Instant::now();
+                session_start_clone.store(true, Ordering::SeqCst);
+
+                loop {
+                    // Check if already fired
+                    if timeout_fired_clone.load(Ordering::SeqCst) {
+                        return;
+                    }
+
+                    let elapsed = session_start_time.elapsed();
+
+                    // Get current state
+                    let has_first_output = first_output_clone.load(Ordering::SeqCst);
+                    let prompt_injected = {
+                        let guard = prompt_injected_clone.lock().unwrap();
+                        *guard
+                    };
+
+                    // Phase 1: First-output timeout
+                    if !has_first_output {
+                        if elapsed >= Duration::from_secs(first_output_secs) {
+                            let _ = signal::kill(child_pid, signal::Signal::SIGTERM);
+                            timeout_fired_clone.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    // Phase 2: Overall timeout (only if configured and prompt not injected)
+                    else if prompt_injected.is_none() && overall_secs > 0 {
+                        if elapsed >= Duration::from_secs(first_output_secs + overall_secs) {
+                            let _ = signal::kill(child_pid, signal::Signal::SIGTERM);
+                            timeout_fired_clone.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    // Phase 3: Stop hook watchdog timeout (after prompt injected)
+                    else if let Some(injected_time) = prompt_injected {
+                        let time_since_injection = injected_time.elapsed();
+                        if time_since_injection >= Duration::from_secs(stop_hook_secs) {
+                            let _ = signal::kill(child_pid, signal::Signal::SIGTERM);
+                            timeout_fired_clone.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+
+                    // Sleep a bit before next check
+                    thread::sleep(Duration::from_millis(100));
                 }
             }))
-        } else {
-            None
         };
 
         // 6. Create event loop.
@@ -163,11 +250,16 @@ impl Session {
 
         // 12. Run the event loop.
         let master_fd = spawner.master.as_raw_fd();
+        let first_output_clone = Arc::clone(&first_output_received);
+        let prompt_injected_clone = Arc::clone(&prompt_injected_at);
+        let mut last_phase = startup.phase().clone();
 
         let exit_reason = event_loop.run(|chunk| {
             // Empty chunk = timer tick from the event loop (poll timeout with no data).
             // Only feed real data to the terminal emulator and startup sequence.
             if !chunk.is_empty() {
+                // Mark that we've received first output from the child
+                first_output_clone.store(true, Ordering::SeqCst);
                 // Feed chunk to terminal emulator.
                 let probe_responses = terminal.feed(chunk);
 
@@ -206,6 +298,14 @@ impl Session {
 
             // Poll timers for startup sequence.
             let timer_action = startup.poll_timers();
+
+            // Check if phase changed to PromptInjected and notify timeout thread
+            let current_phase = startup.phase();
+            if last_phase != *current_phase && current_phase.is_prompt_injected() {
+                *prompt_injected_clone.lock().unwrap() = Some(Instant::now());
+            }
+            last_phase = current_phase.clone();
+
             match &timer_action {
                 StartupAction::Write(bytes) => {
                     unsafe {
@@ -220,19 +320,40 @@ impl Session {
         })?;
 
         // Detach the timeout thread — do not join. The thread sleeps for the full
-        // timeout_secs duration, so joining here would block the main thread for up to
-        // timeout_secs seconds even when the event loop has already finished. Detaching
-        // is safe: process::exit() in main.rs terminates all threads, and a late SIGTERM
-        // from the thread to a dead child process is harmless (returns ESRCH).
+        // timeout duration, so joining here would block the main thread even when the
+        // event loop has already finished. Detaching is safe: process::exit() in main.rs
+        // terminates all threads, and a late SIGTERM from the thread to a dead child process
+        // is harmless (returns ESRCH).
         drop(timeout_thread);
 
         // 13. Check if timeout fired.
         if timeout_fired.load(Ordering::SeqCst) {
+            // Determine which timeout fired for better error message
+            let had_first_output = first_output_received.load(Ordering::SeqCst);
+            let was_prompt_injected = prompt_injected_at.lock().unwrap().is_some();
+            let timeout_msg = if !had_first_output {
+                format!(
+                    "child produced no output within {} second deadline (process may be hung)",
+                    first_output_timeout_secs.unwrap_or(Self::DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS)
+                )
+            } else if !was_prompt_injected {
+                format!(
+                    "session exceeded {} second overall deadline",
+                    timeout_secs.unwrap_or(0)
+                )
+            } else {
+                format!(
+                    "Stop hook did not fire within {} second deadline after prompt injection (child may have hung during tool use or model inference)",
+                    stop_hook_timeout_secs.unwrap_or(120)
+                )
+            };
+
+            // Write diagnostic to stderr
+            eprintln!("claude-print: {}", timeout_msg);
+            eprintln!("claude-print: sending SIGTERM to child pid {}", spawner.child_pid);
+
             kill_child(spawner.child_pid);
-            return Err(Error::Timeout(format!(
-                "session exceeded {} second deadline",
-                timeout_secs.unwrap_or(0)
-            )));
+            return Err(Error::Timeout(timeout_msg));
         }
 
         // 14. Handle exit reason.
