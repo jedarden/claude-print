@@ -33,6 +33,10 @@ fn exit_with_cleanup(code: i32) -> ! {
 }
 
 fn main() {
+    // Register the cleanup handler early to ensure it runs on all exit paths,
+    // including external signals that trigger Rust's default handler.
+    session::register_cleanup_handler();
+
     // Clean up orphaned temp dirs from previous crashed runs.
     // This runs on all invocations, not just when a session runs,
     // ensuring orphans are eventually removed.

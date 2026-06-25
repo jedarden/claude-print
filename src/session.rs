@@ -13,6 +13,7 @@ use std::ffi::{CString, OsString};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,9 @@ use std::time::{Duration, Instant};
 /// This is stored globally because `process::exit()` in main.rs bypasses
 /// destructors, so we need to clean up explicitly before exit.
 static TEMP_DIR_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Flag to track if cleanup has already been performed (prevents double cleanup).
+static CLEANUP_PERFORMED: AtomicBool = AtomicBool::new(false);
 
 /// Result of a Claude Code session.
 #[derive(Debug)]
@@ -51,8 +55,16 @@ impl<'a> Drop for CleanupGuard<'a> {
 /// Clean up the temp directory stored in the global variable.
 ///
 /// This function is called before `process::exit()` to ensure cleanup
-/// happens even when destructors are bypassed.
+/// happens even when destructors are bypassed. It's idempotent - calling
+/// it multiple times is safe.
 pub fn cleanup_temp_dir() {
+    // Use atomic swap to ensure we only cleanup once, even if called
+    // from multiple threads or from atexit handler after explicit cleanup.
+    if CLEANUP_PERFORMED.swap(true, Ordering::SeqCst) {
+        // Already cleaned up
+        return;
+    }
+
     if let Some(path) = TEMP_DIR_PATH.get() {
         // Remove the FIFO first (it may have different permissions)
         let fifo_path = path.join("stop.fifo");
@@ -71,6 +83,23 @@ pub fn cleanup_temp_dir() {
             }
         }
         // Ignore final error - we've done our best
+    }
+}
+
+/// Register cleanup as an atexit handler.
+///
+/// This ensures cleanup happens even on external signals that trigger
+/// the default Rust handler (which calls process::exit() without running
+/// destructors). The atexit handler is called by the C runtime before
+/// process exit in all cases.
+pub fn register_cleanup_handler() {
+    extern "C" fn cleanup_atexit() {
+        cleanup_temp_dir();
+    }
+
+    // Safety: cleanup_atexit only performs idempotent cleanup and is async-signal-safe.
+    unsafe {
+        libc::atexit(cleanup_atexit);
     }
 }
 

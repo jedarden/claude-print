@@ -66,25 +66,26 @@ fn watchdog_silent_child_times_out_with_cleanup() {
         return;
     }
 
-    // Run session with 2-second stop-hook timeout
-    // MOCK_SILENT makes the child block forever, so the stop hook never fires
+    // Run session with 2-second first-output timeout
+    // MOCK_SILENT makes the child block forever without producing any output
     let result = Session::run(
         &mock_bin,
         &[OsString::from("--version")], // dummy arg, will be ignored due to MOCK_SILENT
         b"What is 2+2?".to_vec(),
         None,    // no overall timeout
-        None,    // use default first-output timeout
+        Some(2), // 2-second first-output timeout (PTY output)
         None,    // use default stream-json timeout
-        Some(2), // 2-second stop-hook timeout
+        None,    // no stop-hook timeout (prompt never injected for silent children)
     );
 
     // Clean up env var
     std::env::remove_var("MOCK_SILENT");
 
-    // Assert timeout error
+    // Assert timeout error - should be PTY first-output timeout
     match result {
         Err(Error::Timeout(msg)) => {
-            assert!(msg.contains("2"), "timeout message should mention the 2-second deadline");
+            assert!(msg.contains("PTY") || msg.contains("output"),
+                    "timeout message should mention PTY or output, got: {}", msg);
         }
         other => panic!("Expected Timeout error, got: {:?}", other),
     }
@@ -120,16 +121,17 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         &[OsString::from("--version")],
         b"prompt".to_vec(),
         None,    // no overall timeout
-        None,    // use default first-output timeout
+        Some(1), // 1-second first-output timeout
         None,    // use default stream-json timeout
-        Some(1), // 1-second stop-hook timeout
+        None,    // no stop-hook timeout
     );
 
     std::env::remove_var("MOCK_SILENT");
 
     match result {
         Err(Error::Timeout(msg)) => {
-            assert!(msg.contains("1"));
+            assert!(msg.contains("PTY") || msg.contains("output"),
+                    "timeout message should mention PTY or output, got: {}", msg);
         }
         other => panic!("Expected Timeout error, got: {:?}", other),
     }
