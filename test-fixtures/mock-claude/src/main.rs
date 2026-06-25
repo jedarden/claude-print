@@ -18,6 +18,15 @@ fn main() {
     let omit_transcript_path = env_flag("MOCK_OMIT_TRANSCRIPT_PATH");
     let omit_last_message = env_flag("MOCK_OMIT_LAST_MESSAGE");
 
+    // Handle --version before MOCK_SILENT so version resolution works in tests
+    // This is needed because Session::run() resolves the version before spawning
+    // the PTY child, and we need the timeout path to work correctly.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--version" {
+        println!("mock-claude-version-1.0.0");
+        std::process::exit(0);
+    }
+
     // MOCK_SILENT: block forever without firing Stop (tests timeout path)
     if mock_silent {
         loop {
