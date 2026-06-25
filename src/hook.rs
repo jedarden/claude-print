@@ -4,6 +4,45 @@ use nix::unistd::mkfifo;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+/// Sweep and remove orphaned temp directories from previous crashed runs.
+///
+/// This looks for directories matching the pattern `claude-print-*` in the
+/// system temp directory and removes any that are older than 1 hour.
+/// This prevents accumulation of stale temp dirs from crashes.
+///
+/// This function is called at the start of main() to ensure orphans are
+/// cleaned up on all invocations, not just when a session runs.
+pub fn cleanup_orphans() {
+    let temp_dir = std::env::temp_dir();
+
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            // Check if the entry name matches our pattern
+            let name = path.file_name().and_then(|n| n.to_str());
+            if let Some(name) = name {
+                if name.starts_with("claude-print-") {
+                    // Check if it's a directory and old enough (> 1 hour)
+                    if let Ok(metadata) = entry.metadata() {
+                        if metadata.is_dir() {
+                            if let Ok(created) = metadata.created() {
+                                if let Ok(age) = created.elapsed() {
+                                    // Only remove if older than 1 hour to avoid
+                                    // deleting active sessions from other processes
+                                    if age > std::time::Duration::from_secs(3600) {
+                                        let _ = std::fs::remove_dir_all(&path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct HookInstaller {
     pub dir: TempDir,
     pub settings_path: PathBuf,
@@ -13,9 +52,6 @@ pub struct HookInstaller {
 
 impl HookInstaller {
     pub fn new() -> Result<Self> {
-        // Clean up any orphaned temp dirs from previous crashed runs
-        Self::cleanup_orphans();
-
         let dir = tempfile::Builder::new()
             .prefix(&format!("claude-print-{}-", std::process::id()))
             .tempdir()
@@ -59,42 +95,6 @@ impl HookInstaller {
         let _ = std::fs::remove_file(&self.fifo_path);
         // Note: TempDir's Drop will handle the rest when self.dir is dropped
         // We don't call close() here because it takes ownership
-    }
-
-    /// Sweep and remove orphaned temp directories from previous crashed runs.
-    ///
-    /// This looks for directories matching the pattern `claude-print-*` in the
-    /// system temp directory and removes any that are older than 1 hour.
-    /// This prevents accumulation of stale temp dirs from crashes.
-    pub fn cleanup_orphans() {
-        let temp_dir = std::env::temp_dir();
-
-        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-
-                // Check if the entry name matches our pattern
-                let name = path.file_name().and_then(|n| n.to_str());
-                if let Some(name) = name {
-                    if name.starts_with("claude-print-") {
-                        // Check if it's a directory and old enough (> 1 hour)
-                        if let Ok(metadata) = entry.metadata() {
-                            if metadata.is_dir() {
-                                if let Ok(created) = metadata.created() {
-                                    if let Ok(age) = created.elapsed() {
-                                        // Only remove if older than 1 hour to avoid
-                                        // deleting active sessions from other processes
-                                        if age > std::time::Duration::from_secs(3600) {
-                                            let _ = std::fs::remove_dir_all(&path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -211,7 +211,7 @@ mod tests {
         // This test verifies that cleanup_orphans() doesn't panic
         // It's hard to test the actual behavior without creating real orphans,
         // but we can at least verify it runs without error
-        HookInstaller::cleanup_orphans();
+        crate::hook::cleanup_orphans();
     }
 
     #[test]

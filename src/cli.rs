@@ -64,6 +64,18 @@ pub struct Cli {
     #[arg(long, default_value = "3600")]
     pub timeout: u64,
 
+    /// First-output timeout in seconds (PTY output, default: 90)
+    #[arg(long, default_value = "90")]
+    pub first_output_timeout: u64,
+
+    /// Stream-json first-output timeout in seconds (default: 90)
+    #[arg(long, default_value = "90")]
+    pub stream_json_timeout: u64,
+
+    /// Stop hook watchdog timeout in seconds (default: 120)
+    #[arg(long, default_value = "120")]
+    pub stop_hook_timeout: u64,
+
     /// Path to claude binary (default: resolved from PATH)
     #[arg(long = "claude-binary")]
     pub claude_binary: Option<std::path::PathBuf>,

@@ -46,6 +46,13 @@ pub enum StartupPhase {
     PromptInjected,
 }
 
+impl StartupPhase {
+    /// Returns true if the phase is PromptInjected (prompt has been sent to the child).
+    pub fn is_prompt_injected(&self) -> bool {
+        matches!(self, Self::PromptInjected)
+    }
+}
+
 /// Manages the startup handshake with the Claude Code TUI.
 ///
 /// Phase 1: scan PTY output for trust-dialog keywords; send `\r` to dismiss.

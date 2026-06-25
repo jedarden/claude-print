@@ -11,3 +11,4 @@ pub mod session;
 pub mod startup;
 pub mod terminal;
 pub mod transcript;
+pub mod watchdog;

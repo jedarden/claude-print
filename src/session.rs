@@ -6,14 +6,13 @@ use crate::pty::PtySpawner;
 use crate::startup::{StartupAction, StartupSeq};
 use crate::terminal::TerminalEmu;
 use crate::transcript::{read_transcript, TranscriptResult};
+use crate::watchdog::{Watchdog, WatchdogConfig, TimeoutType};
 use nix::sys::signal::{self, SigHandler};
 use nix::sys::wait::waitpid;
 use std::ffi::{CString, OsString};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -73,6 +72,10 @@ impl Session {
     /// If the child produces no output within this time, we assume it's hung.
     const DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS: u64 = 90;
 
+    /// Default stream-json first-output timeout in seconds.
+    /// If the child produces no stream-json events within this time, we assume it's hung.
+    const DEFAULT_STREAM_JSON_TIMEOUT_SECS: u64 = 90;
+
     /// Run a Claude Code session.
     ///
     /// # Arguments
@@ -82,6 +85,7 @@ impl Session {
     /// * `prompt` - User prompt bytes to inject.
     /// * `timeout_secs` - Optional overall timeout in seconds.
     /// * `first_output_timeout_secs` - Optional first-output timeout in seconds.
+    /// * `stream_json_timeout_secs` - Optional stream-json first-output timeout in seconds.
     /// * `stop_hook_timeout_secs` - Optional Stop hook watchdog timeout in seconds.
     ///
     /// # Returns
@@ -99,6 +103,7 @@ impl Session {
         prompt: Vec<u8>,
         timeout_secs: Option<u64>,
         first_output_timeout_secs: Option<u64>,
+        stream_json_timeout_secs: Option<u64>,
         stop_hook_timeout_secs: Option<u64>,
     ) -> Result<SessionResult> {
         let start_time = Instant::now();
@@ -153,76 +158,29 @@ impl Session {
         // 5. Spawn PTY child.
         let spawner = PtySpawner::spawn(&cmd, &args)?;
 
-        // 5a. Set up timeout handling.
-        // We have three timeouts:
-        // 1. First-output timeout: if child emits no data within N seconds (default 90s)
-        // 2. Overall timeout: if session exceeds overall deadline (default from CLI, 3600s)
-        // 3. Stop hook watchdog timeout: if Stop hook doesn't fire within N seconds after prompt injection (default 120s)
-        let timeout_fired = Arc::new(AtomicBool::new(false));
-        let first_output_received = Arc::new(AtomicBool::new(false));
-        let prompt_injected_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
-        let session_start = Arc::new(AtomicBool::new(false)); // Used to signal session start
+        // 5a. Set up watchdog timeout handling.
+        // We have four timeouts:
+        // 1. PTY first-output timeout: if child emits no PTY data within N seconds (default 90s)
+        // 2. Stream-json first-output timeout: if child emits no stream-json events within N seconds (default 90s)
+        // 3. Overall timeout: if session exceeds overall deadline (default from CLI, 3600s)
+        // 4. Stop hook watchdog timeout: if Stop hook doesn't fire within N seconds after prompt injection (default 120s)
+        let watchdog_config = WatchdogConfig::new(
+            first_output_timeout_secs,
+            stream_json_timeout_secs.or_else(|| first_output_timeout_secs),
+            timeout_secs,
+            stop_hook_timeout_secs,
+        );
 
-        let timeout_thread = {
-            let child_pid = spawner.child_pid;
-            let timeout_fired_clone = Arc::clone(&timeout_fired);
-            let first_output_clone = Arc::clone(&first_output_received);
-            let prompt_injected_clone = Arc::clone(&prompt_injected_at);
-            let session_start_clone = Arc::clone(&session_start);
-            let first_output_secs = first_output_timeout_secs.unwrap_or(Self::DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS);
-            let overall_secs = timeout_secs.unwrap_or(0);
-            let stop_hook_secs = stop_hook_timeout_secs.unwrap_or(120);
+        // Get transcript path for stream-json monitoring (will be resolved from stop payload)
+        // For now, we don't know the transcript path, so we pass None
+        // The watchdog will monitor PTY output and overall timeout, and stream-json monitoring
+        // will be handled by the main thread via the emitter
+        let watchdog = Watchdog::new(watchdog_config, spawner.child_pid, None);
 
-            Some(thread::spawn(move || {
-                let session_start_time = Instant::now();
-                session_start_clone.store(true, Ordering::SeqCst);
+        let watchdog_state = watchdog.state();
 
-                loop {
-                    // Check if already fired
-                    if timeout_fired_clone.load(Ordering::SeqCst) {
-                        return;
-                    }
-
-                    let elapsed = session_start_time.elapsed();
-
-                    // Get current state
-                    let has_first_output = first_output_clone.load(Ordering::SeqCst);
-                    let prompt_injected = {
-                        let guard = prompt_injected_clone.lock().unwrap();
-                        *guard
-                    };
-
-                    // Phase 1: First-output timeout
-                    if !has_first_output {
-                        if elapsed >= Duration::from_secs(first_output_secs) {
-                            let _ = signal::kill(child_pid, signal::Signal::SIGTERM);
-                            timeout_fired_clone.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                    }
-                    // Phase 2: Overall timeout (only if configured and prompt not injected)
-                    else if prompt_injected.is_none() && overall_secs > 0 {
-                        if elapsed >= Duration::from_secs(first_output_secs + overall_secs) {
-                            let _ = signal::kill(child_pid, signal::Signal::SIGTERM);
-                            timeout_fired_clone.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                    }
-                    // Phase 3: Stop hook watchdog timeout (after prompt injected)
-                    else if let Some(injected_time) = prompt_injected {
-                        let time_since_injection = injected_time.elapsed();
-                        if time_since_injection >= Duration::from_secs(stop_hook_secs) {
-                            let _ = signal::kill(child_pid, signal::Signal::SIGTERM);
-                            timeout_fired_clone.store(true, Ordering::SeqCst);
-                            return;
-                        }
-                    }
-
-                    // Sleep a bit before next check
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }))
-        };
+        // Spawn the watchdog timeout thread
+        let _timeout_thread = watchdog.spawn_timeout_thread();
 
         // 6. Create event loop.
         let mut event_loop = EventLoop::new(spawner.master.as_raw_fd(), self_pipe_read.as_raw_fd());
@@ -250,16 +208,15 @@ impl Session {
 
         // 12. Run the event loop.
         let master_fd = spawner.master.as_raw_fd();
-        let first_output_clone = Arc::clone(&first_output_received);
-        let prompt_injected_clone = Arc::clone(&prompt_injected_at);
+        let watchdog_state_clone = watchdog_state.clone();
         let mut last_phase = startup.phase().clone();
 
         let exit_reason = event_loop.run(|chunk| {
             // Empty chunk = timer tick from the event loop (poll timeout with no data).
             // Only feed real data to the terminal emulator and startup sequence.
             if !chunk.is_empty() {
-                // Mark that we've received first output from the child
-                first_output_clone.store(true, Ordering::SeqCst);
+                // Mark that we've received first output from the child (PTY output)
+                watchdog_state_clone.mark_pty_output();
                 // Feed chunk to terminal emulator.
                 let probe_responses = terminal.feed(chunk);
 
@@ -299,10 +256,10 @@ impl Session {
             // Poll timers for startup sequence.
             let timer_action = startup.poll_timers();
 
-            // Check if phase changed to PromptInjected and notify timeout thread
+            // Check if phase changed to PromptInjected and notify watchdog
             let current_phase = startup.phase();
             if last_phase != *current_phase && current_phase.is_prompt_injected() {
-                *prompt_injected_clone.lock().unwrap() = Some(Instant::now());
+                watchdog_state_clone.mark_prompt_injected();
             }
             last_phase = current_phase.clone();
 
@@ -319,41 +276,17 @@ impl Session {
             }
         })?;
 
-        // Detach the timeout thread — do not join. The thread sleeps for the full
-        // timeout duration, so joining here would block the main thread even when the
-        // event loop has already finished. Detaching is safe: process::exit() in main.rs
-        // terminates all threads, and a late SIGTERM from the thread to a dead child process
-        // is harmless (returns ESRCH).
-        drop(timeout_thread);
-
-        // 13. Check if timeout fired.
-        if timeout_fired.load(Ordering::SeqCst) {
-            // Determine which timeout fired for better error message
-            let had_first_output = first_output_received.load(Ordering::SeqCst);
-            let was_prompt_injected = prompt_injected_at.lock().unwrap().is_some();
-            let timeout_msg = if !had_first_output {
-                format!(
-                    "child produced no output within {} second deadline (process may be hung)",
-                    first_output_timeout_secs.unwrap_or(Self::DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS)
-                )
-            } else if !was_prompt_injected {
-                format!(
-                    "session exceeded {} second overall deadline",
-                    timeout_secs.unwrap_or(0)
-                )
-            } else {
-                format!(
-                    "Stop hook did not fire within {} second deadline after prompt injection (child may have hung during tool use or model inference)",
-                    stop_hook_timeout_secs.unwrap_or(120)
-                )
-            };
+        // 13. Check if watchdog timeout fired.
+        if watchdog_state.has_timeout_fired() {
+            let timeout_type = watchdog_state.get_timeout_type().unwrap_or(TimeoutType::OverallTimeout);
+            let timeout_msg = timeout_type.description();
 
             // Write diagnostic to stderr
             eprintln!("claude-print: {}", timeout_msg);
             eprintln!("claude-print: sending SIGTERM to child pid {}", spawner.child_pid);
 
             kill_child(spawner.child_pid);
-            return Err(Error::Timeout(timeout_msg));
+            return Err(Error::Timeout(timeout_msg.to_string()));
         }
 
         // 14. Handle exit reason.

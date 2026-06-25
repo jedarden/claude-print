@@ -2,6 +2,7 @@ use clap::Parser;
 use claude_print::cli::{version_string, Cli};
 use claude_print::emitter;
 use claude_print::error::{ClaudePrintError, Error};
+use claude_print::hook;
 use claude_print::session;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -25,18 +26,29 @@ fn resolve_claude_version(binary: Option<&std::path::Path>) -> Option<String> {
     Some(first_line.trim().to_string())
 }
 
+/// Exit with cleanup, ensuring temp dir is removed before process::exit().
+fn exit_with_cleanup(code: i32) -> ! {
+    session::cleanup_temp_dir();
+    process::exit(code);
+}
+
 fn main() {
+    // Clean up orphaned temp dirs from previous crashed runs.
+    // This runs on all invocations, not just when a session runs,
+    // ensuring orphans are eventually removed.
+    hook::cleanup_orphans();
+
     let cli = Cli::parse();
 
     if cli.version {
         let claude_version = resolve_claude_version(cli.claude_binary.as_deref());
         println!("{}", version_string(claude_version.as_deref()));
-        process::exit(0);
+        exit_with_cleanup(0);
     }
 
     if cli.check {
         let code = claude_print::check::run();
-        process::exit(code);
+        exit_with_cleanup(code);
     }
 
     // Resolve the claude binary path
@@ -51,7 +63,7 @@ fn main() {
             "claude-print: '{}' not found in PATH",
             claude_bin.to_string_lossy()
         );
-        process::exit(2);
+        exit_with_cleanup(2);
     }
 
     // Prompt resolution (in order of precedence)
@@ -65,7 +77,7 @@ fn main() {
                     input_file.display(),
                     e
                 );
-                process::exit(4);
+                exit_with_cleanup(4);
             }
         }
     } else if let Some(ref prompt_str) = cli.prompt {
@@ -77,17 +89,17 @@ fn main() {
             let mut buffer = Vec::new();
             if let Err(e) = io::stdin().read_to_end(&mut buffer) {
                 eprintln!("claude-print: failed to read stdin: {}", e);
-                process::exit(4);
+                exit_with_cleanup(4);
             }
             if buffer.is_empty() {
                 eprintln!("claude-print: no prompt provided (pass as argument, --input-file, or stdin)");
-                process::exit(4);
+                exit_with_cleanup(4);
             }
             buffer
         } else {
             // None found → exit 4
             eprintln!("claude-print: no prompt provided (pass as argument, --input-file, or stdin)");
-            process::exit(4);
+            exit_with_cleanup(4);
         }
     };
 
@@ -126,7 +138,15 @@ fn main() {
     let t0 = Instant::now();
 
     // Call session::Session::run()
-    let result = session::Session::run(&claude_bin, &claude_args, prompt_bytes, Some(cli.timeout), None);
+    let result = session::Session::run(
+        &claude_bin,
+        &claude_args,
+        prompt_bytes,
+        Some(cli.timeout),
+        Some(cli.first_output_timeout),
+        Some(cli.stream_json_timeout),
+        Some(cli.stop_hook_timeout),
+    );
 
     // Lock stdout and stderr for output
     let mut stdout = io::stdout().lock();
@@ -151,7 +171,7 @@ fn main() {
                         &session_result.claude_version,
                         false,
                     );
-                    process::exit(2);
+                    exit_with_cleanup(2);
                 }
             } else {
                 // For text and json formats, emit success
@@ -163,10 +183,10 @@ fn main() {
                     duration_ms,
                 ) {
                     eprintln!("claude-print: failed to write output: {}", e);
-                    process::exit(2);
+                    exit_with_cleanup(2);
                 }
             }
-            process::exit(0);
+            exit_with_cleanup(0);
         }
         Err(Error::Interrupted(_msg)) => {
             let _ = emit_error(
@@ -177,7 +197,7 @@ fn main() {
                 &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
-            process::exit(130);
+            exit_with_cleanup(130);
         }
         Err(Error::Timeout(_msg)) => {
             let _ = emit_error(
@@ -188,7 +208,7 @@ fn main() {
                 &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
-            process::exit(3);
+            exit_with_cleanup(3);
         }
         Err(Error::Internal(e)) => {
             let msg = if e.to_string().contains("Child exited without sending Stop payload") {
@@ -204,7 +224,7 @@ fn main() {
                 &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
-            process::exit(2);
+            exit_with_cleanup(2);
         }
         Err(e) => {
             let _ = emit_error(
@@ -215,7 +235,7 @@ fn main() {
                 &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
-            process::exit(2);
+            exit_with_cleanup(2);
         }
     }
 }

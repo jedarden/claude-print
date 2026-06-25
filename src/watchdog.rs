@@ -1,0 +1,452 @@
+//! Watchdog timeout mechanism for claude-print.
+//!
+//! This module implements a comprehensive watchdog that monitors:
+//! - Stream-json output from the transcript file
+//! - PTY output for first-output detection
+//! - Overall session duration
+//! - Stop hook execution
+//!
+//! The watchdog ensures that hung child processes are terminated with
+//! proper cleanup (SIGTERM → SIGKILL) and clear diagnostics.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Default timeout for first stream-json output in seconds.
+/// If the child produces no stream-json events within this time, we assume it's hung.
+pub const DEFAULT_STREAM_JSON_TIMEOUT_SECS: u64 = 90;
+
+/// Default timeout for PTY first-output in seconds.
+/// If the child produces no PTY output within this time, we assume it's hung.
+pub const DEFAULT_PTY_TIMEOUT_SECS: u64 = 90;
+
+/// Default overall timeout in seconds (0 = no limit).
+pub const DEFAULT_OVERALL_TIMEOUT_SECS: u64 = 3600;
+
+/// Default Stop hook watchdog timeout in seconds.
+/// If the Stop hook doesn't fire within this time after prompt injection, the child may be hung.
+pub const DEFAULT_STOP_HOOK_TIMEOUT_SECS: u64 = 120;
+
+/// Timeout classification for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutType {
+    /// No PTY output received within deadline.
+    PtyFirstOutput,
+    /// No stream-json output received within deadline.
+    StreamJsonFirstOutput,
+    /// Overall session timeout exceeded.
+    OverallTimeout,
+    /// Stop hook didn't fire within deadline after prompt injection.
+    StopHookTimeout,
+}
+
+impl TimeoutType {
+    /// Returns a human-readable description of this timeout type.
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::PtyFirstOutput => "child produced no PTY output within deadline (process may be hung at startup)",
+            Self::StreamJsonFirstOutput => "child produced no stream-json output within deadline (process may be hung during session initialization)",
+            Self::OverallTimeout => "session exceeded overall time deadline",
+            Self::StopHookTimeout => "Stop hook did not fire within deadline after prompt injection (child may have hung during tool use or model inference)",
+        }
+    }
+
+    /// Returns the error subtype for JSON/stream-json output.
+    pub fn subtype(&self) -> &'static str {
+        match self {
+            Self::PtyFirstOutput => "pty_first_output_timeout",
+            Self::StreamJsonFirstOutput => "stream_json_first_output_timeout",
+            Self::OverallTimeout => "overall_timeout",
+            Self::StopHookTimeout => "stop_hook_timeout",
+        }
+    }
+}
+
+/// Watchdog configuration.
+#[derive(Debug, Clone)]
+pub struct WatchdogConfig {
+    /// Timeout for first PTY output in seconds (0 = disabled).
+    pub pty_first_output_timeout_secs: u64,
+    /// Timeout for first stream-json output in seconds (0 = disabled).
+    pub stream_json_first_output_timeout_secs: u64,
+    /// Overall session timeout in seconds (0 = disabled).
+    pub overall_timeout_secs: u64,
+    /// Stop hook watchdog timeout in seconds (0 = disabled).
+    pub stop_hook_timeout_secs: u64,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            pty_first_output_timeout_secs: DEFAULT_PTY_TIMEOUT_SECS,
+            stream_json_first_output_timeout_secs: DEFAULT_STREAM_JSON_TIMEOUT_SECS,
+            overall_timeout_secs: DEFAULT_OVERALL_TIMEOUT_SECS,
+            stop_hook_timeout_secs: DEFAULT_STOP_HOOK_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl WatchdogConfig {
+    /// Create a new config with custom timeouts.
+    pub fn new(
+        pty_timeout: Option<u64>,
+        stream_json_timeout: Option<u64>,
+        overall_timeout: Option<u64>,
+        stop_hook_timeout: Option<u64>,
+    ) -> Self {
+        Self {
+            pty_first_output_timeout_secs: pty_timeout.unwrap_or(DEFAULT_PTY_TIMEOUT_SECS),
+            stream_json_first_output_timeout_secs: stream_json_timeout.unwrap_or(DEFAULT_STREAM_JSON_TIMEOUT_SECS),
+            overall_timeout_secs: overall_timeout.unwrap_or(0),
+            stop_hook_timeout_secs: stop_hook_timeout.unwrap_or(DEFAULT_STOP_HOOK_TIMEOUT_SECS),
+        }
+    }
+
+    /// Returns true if any timeout is configured.
+    pub fn has_any_timeout(&self) -> bool {
+        self.pty_first_output_timeout_secs > 0
+            || self.stream_json_first_output_timeout_secs > 0
+            || self.overall_timeout_secs > 0
+            || self.stop_hook_timeout_secs > 0
+    }
+}
+
+/// Watchdog state shared between the main thread and timeout thread.
+#[derive(Debug, Clone)]
+pub struct WatchdogState {
+    /// Whether a timeout has fired.
+    timeout_fired: Arc<AtomicBool>,
+    /// Type of timeout that fired (0 = none, 1-4 = TimeoutType enum).
+    timeout_type: Arc<AtomicU64>,
+    /// Whether PTY output has been received.
+    pty_output_received: Arc<AtomicBool>,
+    /// Whether stream-json output has been received.
+    stream_json_output_received: Arc<AtomicBool>,
+    /// When the prompt was injected (None = not injected yet).
+    prompt_injected_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// Session start time.
+    session_start: Arc<AtomicBool>,
+}
+
+impl WatchdogState {
+    /// Create a new watchdog state.
+    pub fn new() -> Self {
+        Self {
+            timeout_fired: Arc::new(AtomicBool::new(false)),
+            timeout_type: Arc::new(AtomicU64::new(0)),
+            pty_output_received: Arc::new(AtomicBool::new(false)),
+            stream_json_output_received: Arc::new(AtomicBool::new(false)),
+            prompt_injected_at: Arc::new(std::sync::Mutex::new(None)),
+            session_start: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Mark that PTY output has been received.
+    pub fn mark_pty_output(&self) {
+        self.pty_output_received.store(true, Ordering::SeqCst);
+    }
+
+    /// Mark that stream-json output has been received.
+    pub fn mark_stream_json_output(&self) {
+        self.stream_json_output_received.store(true, Ordering::SeqCst);
+    }
+
+    /// Mark that the prompt has been injected.
+    pub fn mark_prompt_injected(&self) {
+        *self.prompt_injected_at.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Mark that the session has started.
+    pub fn mark_session_start(&self) {
+        self.session_start.store(true, Ordering::SeqCst);
+    }
+
+    /// Check if a timeout has fired.
+    pub fn has_timeout_fired(&self) -> bool {
+        self.timeout_fired.load(Ordering::SeqCst)
+    }
+
+    /// Get the timeout type that fired.
+    pub fn get_timeout_type(&self) -> Option<TimeoutType> {
+        match self.timeout_type.load(Ordering::SeqCst) {
+            0 => None,
+            1 => Some(TimeoutType::PtyFirstOutput),
+            2 => Some(TimeoutType::StreamJsonFirstOutput),
+            3 => Some(TimeoutType::OverallTimeout),
+            4 => Some(TimeoutType::StopHookTimeout),
+            _ => None,
+        }
+    }
+
+    /// Internal: fire a timeout.
+    fn fire_timeout(&self, timeout_type: TimeoutType) {
+        self.timeout_fired.store(true, Ordering::SeqCst);
+        let type_code = match timeout_type {
+            TimeoutType::PtyFirstOutput => 1,
+            TimeoutType::StreamJsonFirstOutput => 2,
+            TimeoutType::OverallTimeout => 3,
+            TimeoutType::StopHookTimeout => 4,
+        };
+        self.timeout_type.store(type_code, Ordering::SeqCst);
+    }
+}
+
+/// Watchdog instance that monitors the child process.
+#[derive(Debug)]
+pub struct Watchdog {
+    /// Watchdog configuration.
+    config: WatchdogConfig,
+    /// Shared state.
+    state: WatchdogState,
+    /// Child process PID.
+    child_pid: nix::unistd::Pid,
+    /// Temp directory path where transcript will be written.
+    temp_dir_path: Option<PathBuf>,
+}
+
+impl Watchdog {
+    /// Create a new watchdog.
+    pub fn new(
+        config: WatchdogConfig,
+        child_pid: nix::unistd::Pid,
+        temp_dir_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            config,
+            state: WatchdogState::new(),
+            child_pid,
+            temp_dir_path,
+        }
+    }
+
+    /// Get the shared state for use in the main thread.
+    pub fn state(&self) -> &WatchdogState {
+        &self.state
+    }
+
+    /// Spawn the watchdog timeout thread.
+    ///
+    /// The thread monitors:
+    /// 1. PTY first-output timeout
+    /// 2. Stream-json first-output timeout (if temp_dir_path provided)
+    /// 3. Overall session timeout
+    /// 4. Stop hook watchdog timeout (after prompt injection)
+    ///
+    /// Returns a thread handle that should be dropped (not joined) - the thread
+    /// runs until timeout or completion, and late SIGTERMs to a dead child are harmless.
+    pub fn spawn_timeout_thread(&self) -> thread::JoinHandle<()> {
+        let config = self.config.clone();
+        let child_pid = self.child_pid;
+        let timeout_fired = Arc::clone(&self.state.timeout_fired);
+        let timeout_type = Arc::clone(&self.state.timeout_type);
+        let pty_output_received = Arc::clone(&self.state.pty_output_received);
+        let stream_json_output_received = Arc::clone(&self.state.stream_json_output_received);
+        let prompt_injected_at = Arc::clone(&self.state.prompt_injected_at);
+        let session_start = Arc::clone(&self.state.session_start);
+        let temp_dir_path = self.temp_dir_path.clone();
+
+        thread::spawn(move || {
+            let session_start_time = Instant::now();
+            session_start.store(true, Ordering::SeqCst);
+
+            // Spawn stream-json monitor if temp directory provided
+            // The transcript file will be created at <temp_dir>/transcript.jsonl
+            let _stream_json_monitor = if let Some(ref dir) = temp_dir_path {
+                Some(spawn_stream_json_monitor_in_dir(
+                    dir.clone(),
+                    Arc::clone(&stream_json_output_received),
+                ))
+            } else {
+                None
+            };
+
+            loop {
+                // Check if already fired
+                if timeout_fired.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                let elapsed = session_start_time.elapsed();
+
+                // Get current state
+                let has_pty_output = pty_output_received.load(Ordering::SeqCst);
+                let has_stream_json_output = stream_json_output_received.load(Ordering::SeqCst);
+                let prompt_injected = { *prompt_injected_at.lock().unwrap() };
+
+                // Check Phase 1: PTY first-output timeout
+                if config.pty_first_output_timeout_secs > 0 && !has_pty_output {
+                    if elapsed >= Duration::from_secs(config.pty_first_output_timeout_secs) {
+                        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                        timeout_fired.store(true, Ordering::SeqCst);
+                        timeout_type.store(1, Ordering::SeqCst); // PtyFirstOutput
+                        return;
+                    }
+                }
+
+                // Check Phase 2: Stream-json first-output timeout
+                if config.stream_json_first_output_timeout_secs > 0 && !has_stream_json_output {
+                    if elapsed >= Duration::from_secs(config.stream_json_first_output_timeout_secs) {
+                        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                        timeout_fired.store(true, Ordering::SeqCst);
+                        timeout_type.store(2, Ordering::SeqCst); // StreamJsonFirstOutput
+                        return;
+                    }
+                }
+
+                // Check Phase 3: Overall timeout (only if configured and no prompt injected yet)
+                if config.overall_timeout_secs > 0 && prompt_injected.is_none() {
+                    if elapsed >= Duration::from_secs(config.overall_timeout_secs) {
+                        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                        timeout_fired.store(true, Ordering::SeqCst);
+                        timeout_type.store(3, Ordering::SeqCst); // OverallTimeout
+                        return;
+                    }
+                }
+
+                // Check Phase 4: Stop hook watchdog timeout (after prompt injected)
+                if config.stop_hook_timeout_secs > 0 {
+                    if let Some(injected_time) = prompt_injected {
+                        let time_since_injection = injected_time.elapsed();
+                        if time_since_injection >= Duration::from_secs(config.stop_hook_timeout_secs) {
+                            let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                            timeout_fired.store(true, Ordering::SeqCst);
+                            timeout_type.store(4, Ordering::SeqCst); // StopHookTimeout
+                            return;
+                        }
+                    }
+                }
+
+                // Sleep a bit before next check
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    }
+
+    /// Fire a timeout manually (for testing).
+    #[cfg(test)]
+    pub fn fire_timeout(&self, timeout_type: TimeoutType) {
+        self.state.fire_timeout(timeout_type);
+    }
+}
+
+/// Spawn a background thread that monitors the temp directory for stream-json events.
+///
+/// This thread wakes up every 100ms to check if the transcript file exists in the
+/// temp directory and contains any valid JSON lines. When it finds stream-json output,
+/// it sets the flag and exits.
+///
+/// The transcript file is expected to be at <temp_dir>/transcript.jsonl
+fn spawn_stream_json_monitor_in_dir(
+    temp_dir: PathBuf,
+    output_received: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        // Check if file exists and has content
+        let mut last_size = 0u64;
+        let transcript_path = temp_dir.join("transcript.jsonl");
+
+        loop {
+            // Exit if already received output
+            if output_received.load(Ordering::SeqCst) {
+                return;
+            }
+
+            // Try to read the transcript file
+            if let Ok(metadata) = std::fs::metadata(&transcript_path) {
+                let current_size = metadata.len();
+
+                // If file has grown, check for content
+                if current_size > last_size {
+                    if let Ok(file) = std::fs::File::open(&transcript_path) {
+                        use std::io::{BufRead, BufReader};
+                        let reader = BufReader::new(file);
+
+                        // Check each line for valid JSON
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    // Try to parse as JSON
+                                    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+                                        output_received.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    last_size = current_size;
+                }
+            }
+
+            // Sleep before next check
+            thread::sleep(Duration::from_millis(100));
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timeout_type_descriptions() {
+        assert!(TimeoutType::PtyFirstOutput.description().contains("PTY"));
+        assert!(TimeoutType::StreamJsonFirstOutput.description().contains("stream-json"));
+        assert!(TimeoutType::OverallTimeout.description().contains("overall"));
+        assert!(TimeoutType::StopHookTimeout.description().contains("Stop hook"));
+    }
+
+    #[test]
+    fn test_timeout_type_subtypes() {
+        assert_eq!(TimeoutType::PtyFirstOutput.subtype(), "pty_first_output_timeout");
+        assert_eq!(TimeoutType::StreamJsonFirstOutput.subtype(), "stream_json_first_output_timeout");
+        assert_eq!(TimeoutType::OverallTimeout.subtype(), "overall_timeout");
+        assert_eq!(TimeoutType::StopHookTimeout.subtype(), "stop_hook_timeout");
+    }
+
+    #[test]
+    fn test_watchdog_config_default() {
+        let config = WatchdogConfig::default();
+        assert_eq!(config.pty_first_output_timeout_secs, DEFAULT_PTY_TIMEOUT_SECS);
+        assert_eq!(config.stream_json_first_output_timeout_secs, DEFAULT_STREAM_JSON_TIMEOUT_SECS);
+        assert_eq!(config.overall_timeout_secs, DEFAULT_OVERALL_TIMEOUT_SECS);
+        assert_eq!(config.stop_hook_timeout_secs, DEFAULT_STOP_HOOK_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_watchdog_config_custom() {
+        let config = WatchdogConfig::new(Some(30), Some(60), Some(120), Some(90));
+        assert_eq!(config.pty_first_output_timeout_secs, 30);
+        assert_eq!(config.stream_json_first_output_timeout_secs, 60);
+        assert_eq!(config.overall_timeout_secs, 120);
+        assert_eq!(config.stop_hook_timeout_secs, 90);
+    }
+
+    #[test]
+    fn test_watchdog_state() {
+        let state = WatchdogState::new();
+        assert!(!state.has_timeout_fired());
+        assert!(state.get_timeout_type().is_none());
+
+        state.mark_pty_output();
+        assert!(!state.has_timeout_fired()); // Should not fire automatically
+
+        state.mark_prompt_injected();
+        assert!(!state.has_timeout_fired());
+    }
+
+    #[test]
+    fn test_watchdog_state_fire_timeout() {
+        let state = WatchdogState::new();
+        assert!(!state.has_timeout_fired());
+
+        state.fire_timeout(TimeoutType::StreamJsonFirstOutput);
+        assert!(state.has_timeout_fired());
+        assert_eq!(state.get_timeout_type(), Some(TimeoutType::StreamJsonFirstOutput));
+    }
+}

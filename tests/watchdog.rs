@@ -7,7 +7,6 @@
 use claude_print::error::Error;
 use claude_print::session::Session;
 use std::ffi::OsString;
-use std::path::Path;
 
 /// Locate the mock-claude binary compiled alongside the test binary.
 /// Test binaries live at `target/<profile>/deps/`; other bins at `target/<profile>/`.
@@ -68,6 +67,8 @@ fn watchdog_silent_child_times_out_with_cleanup() {
         b"What is 2+2?".to_vec(),
         Some(2), // 2-second timeout
         None,    // use default first-output timeout
+        None,    // use default stream-json timeout
+        None,    // use default stop-hook timeout
     );
 
     // Clean up env var
@@ -113,6 +114,8 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         b"prompt".to_vec(),
         Some(1), // 1-second timeout
         None,    // use default first-output timeout
+        None,    // use default stream-json timeout
+        None,    // use default stop-hook timeout
     );
 
     std::env::remove_var("MOCK_SILENT");
