@@ -2,6 +2,8 @@ use crate::error::{Error, Result};
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Sweep and remove orphaned temp directories from previous crashed runs.
@@ -48,6 +50,9 @@ pub struct HookInstaller {
     pub settings_path: PathBuf,
     pub hook_path: PathBuf,
     pub fifo_path: PathBuf,
+    /// Flag to track whether cleanup has already been performed.
+    /// This prevents double-panic issues during cleanup.
+    cleanup_performed: Arc<AtomicBool>,
 }
 
 impl HookInstaller {
@@ -79,22 +84,46 @@ impl HookInstaller {
             settings_path,
             hook_path,
             fifo_path,
+            cleanup_performed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub fn dir_path(&self) -> &Path {
         self.dir.path()
     }
+}
 
+impl Drop for HookInstaller {
+    fn drop(&mut self) {
+        // Clean up on drop to ensure temp dirs are removed even if
+        // explicit cleanup() is not called.
+        self.cleanup();
+    }
+}
+
+impl HookInstaller {
     /// Explicitly clean up the temporary directory and FIFO.
     ///
     /// This is called automatically on Drop, but can be called explicitly
     /// to ensure cleanup on all exit paths (normal, error, timeout, signal).
+    ///
+    /// This function is idempotent - calling it multiple times is safe.
     pub fn cleanup(&self) {
+        // Use atomic swap to ensure we only cleanup once, even if called
+        // from multiple threads or recursively during panic/abort.
+        if self.cleanup_performed.swap(true, Ordering::SeqCst) {
+            // Already cleaned up
+            return;
+        }
+
         // Remove the FIFO first (it may have different permissions)
         let _ = std::fs::remove_file(&self.fifo_path);
-        // Note: TempDir's Drop will handle the rest when self.dir is dropped
-        // We don't call close() here because it takes ownership
+
+        // Explicitly remove the entire temp directory
+        // This is more robust than relying on TempDir::drop, especially
+        // during panic/abort where destructors may not run properly.
+        let dir_path = self.dir.path();
+        let _ = std::fs::remove_dir_all(dir_path);
     }
 }
 
