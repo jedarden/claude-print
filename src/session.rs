@@ -11,7 +11,6 @@ use nix::sys::signal::{self, SigHandler};
 use nix::sys::wait::waitpid;
 use std::ffi::{CString, OsString};
 use std::os::fd::AsRawFd;
-use std::os::unix::io::AsRawFd as UnixAsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -58,8 +57,20 @@ pub fn cleanup_temp_dir() {
         // Remove the FIFO first (it may have different permissions)
         let fifo_path = path.join("stop.fifo");
         let _ = std::fs::remove_file(&fifo_path);
-        // Remove the entire temp directory
-        let _ = std::fs::remove_dir_all(path);
+
+        // Remove the entire temp directory with retry logic
+        // This helps handle cases where files are temporarily locked
+        for attempt in 0..3 {
+            let result = std::fs::remove_dir_all(path);
+            if result.is_ok() {
+                break; // Successfully removed
+            }
+            // If this is not the last attempt, wait a bit before retrying
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        // Ignore final error - we've done our best
     }
 }
 
@@ -91,6 +102,41 @@ impl Session {
     /// Returns `Error::Timeout` if the timeout expires (no output or overall timeout).
     /// Returns `Error::Interrupted` if a SIGINT is received.
     pub fn run(
+        claude_bin: &Path,
+        claude_args: &[OsString],
+        prompt: Vec<u8>,
+        timeout_secs: Option<u64>,
+        first_output_timeout_secs: Option<u64>,
+        stream_json_timeout_secs: Option<u64>,
+        stop_hook_timeout_secs: Option<u64>,
+    ) -> Result<SessionResult> {
+        // Use a catch_unwind to ensure cleanup happens even on panics
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::run_inner(
+                claude_bin,
+                claude_args,
+                prompt,
+                timeout_secs,
+                first_output_timeout_secs,
+                stream_json_timeout_secs,
+                stop_hook_timeout_secs,
+            )
+        }));
+
+        match result {
+            Ok(inner_result) => inner_result,
+            Err(_) => {
+                // Panic occurred - cleanup already handled by CleanupGuard
+                Err(Error::Internal(anyhow::anyhow!("Session panicked")))
+            }
+        }
+    }
+
+    /// Inner implementation of Session::run.
+    ///
+    /// This is separated from `run` to allow panic handling via catch_unwind
+    /// while still ensuring cleanup happens through the CleanupGuard.
+    fn run_inner(
         claude_bin: &Path,
         claude_args: &[OsString],
         prompt: Vec<u8>,

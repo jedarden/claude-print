@@ -66,15 +66,16 @@ fn watchdog_silent_child_times_out_with_cleanup() {
         return;
     }
 
-    // Run session with 2-second timeout
+    // Run session with 2-second stop-hook timeout
+    // MOCK_SILENT makes the child block forever, so the stop hook never fires
     let result = Session::run(
         &mock_bin,
         &[OsString::from("--version")], // dummy arg, will be ignored due to MOCK_SILENT
         b"What is 2+2?".to_vec(),
-        Some(2), // 2-second timeout
+        None,    // no overall timeout
         None,    // use default first-output timeout
         None,    // use default stream-json timeout
-        None,    // use default stop-hook timeout
+        Some(2), // 2-second stop-hook timeout
     );
 
     // Clean up env var
@@ -118,10 +119,10 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         &mock_bin,
         &[OsString::from("--version")],
         b"prompt".to_vec(),
-        Some(1), // 1-second timeout
+        None,    // no overall timeout
         None,    // use default first-output timeout
         None,    // use default stream-json timeout
-        None,    // use default stop-hook timeout
+        Some(1), // 1-second stop-hook timeout
     );
 
     std::env::remove_var("MOCK_SILENT");

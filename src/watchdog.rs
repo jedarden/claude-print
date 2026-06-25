@@ -9,9 +9,7 @@
 //! The watchdog ensures that hung child processes are terminated with
 //! proper cleanup (SIGTERM → SIGKILL) and clear diagnostics.
 
-use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::PathBuf;
-use std::os::unix::io::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
