@@ -10,7 +10,8 @@ use crate::watchdog::{Watchdog, WatchdogConfig, TimeoutType};
 use nix::sys::signal::{self, SigHandler};
 use nix::sys::wait::waitpid;
 use std::ffi::{CString, OsString};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsRawFd;
+use std::os::unix::io::AsRawFd as UnixAsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -166,7 +167,11 @@ impl Session {
         // Get temp directory path for stream-json monitoring
         // The watchdog will monitor <temp_dir>/transcript.jsonl for stream-json output
         let temp_dir_path = installer.dir_path().to_path_buf();
-        let watchdog = Watchdog::new(watchdog_config, spawner.child_pid, Some(temp_dir_path));
+
+        // Get the raw fd for the self-pipe write end for the watchdog to signal timeout
+        let watchdog_self_pipe_fd = Some(self_pipe_write.as_raw_fd());
+
+        let watchdog = Watchdog::new(watchdog_config, spawner.child_pid, Some(temp_dir_path), watchdog_self_pipe_fd);
 
         let watchdog_state = watchdog.state();
 

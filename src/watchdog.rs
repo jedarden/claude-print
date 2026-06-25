@@ -9,7 +9,9 @@
 //! The watchdog ensures that hung child processes are terminated with
 //! proper cleanup (SIGTERM → SIGKILL) and clear diagnostics.
 
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::PathBuf;
+use std::os::unix::io::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -205,6 +207,8 @@ pub struct Watchdog {
     child_pid: nix::unistd::Pid,
     /// Temp directory path where transcript will be written.
     temp_dir_path: Option<PathBuf>,
+    /// Self-pipe write end raw fd for signaling the event loop on timeout.
+    self_pipe_write_fd: Option<i32>,
 }
 
 impl Watchdog {
@@ -213,12 +217,14 @@ impl Watchdog {
         config: WatchdogConfig,
         child_pid: nix::unistd::Pid,
         temp_dir_path: Option<PathBuf>,
+        self_pipe_write_fd: Option<i32>,
     ) -> Self {
         Self {
             config,
             state: WatchdogState::new(),
             child_pid,
             temp_dir_path,
+            self_pipe_write_fd,
         }
     }
 
@@ -247,6 +253,8 @@ impl Watchdog {
         let prompt_injected_at = Arc::clone(&self.state.prompt_injected_at);
         let session_start = Arc::clone(&self.state.session_start);
         let temp_dir_path = self.temp_dir_path.clone();
+        // Copy the raw fd for signaling the event loop
+        let self_pipe_write_fd = self.self_pipe_write_fd;
 
         thread::spawn(move || {
             let session_start_time = Instant::now();
@@ -282,6 +290,13 @@ impl Watchdog {
                         let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
                         timeout_fired.store(true, Ordering::SeqCst);
                         timeout_type.store(1, Ordering::SeqCst); // PtyFirstOutput
+                        // Signal the event loop via self-pipe
+                        if let Some(fd) = self_pipe_write_fd {
+                            let byte: [u8; 1] = [1];
+                            unsafe {
+                                let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
+                            }
+                        }
                         return;
                     }
                 }
@@ -292,6 +307,13 @@ impl Watchdog {
                         let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
                         timeout_fired.store(true, Ordering::SeqCst);
                         timeout_type.store(2, Ordering::SeqCst); // StreamJsonFirstOutput
+                        // Signal the event loop via self-pipe
+                        if let Some(fd) = self_pipe_write_fd {
+                            let byte: [u8; 1] = [1];
+                            unsafe {
+                                let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
+                            }
+                        }
                         return;
                     }
                 }
@@ -302,6 +324,13 @@ impl Watchdog {
                         let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
                         timeout_fired.store(true, Ordering::SeqCst);
                         timeout_type.store(3, Ordering::SeqCst); // OverallTimeout
+                        // Signal the event loop via self-pipe
+                        if let Some(fd) = self_pipe_write_fd {
+                            let byte: [u8; 1] = [1];
+                            unsafe {
+                                let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
+                            }
+                        }
                         return;
                     }
                 }
@@ -314,6 +343,13 @@ impl Watchdog {
                             let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
                             timeout_fired.store(true, Ordering::SeqCst);
                             timeout_type.store(4, Ordering::SeqCst); // StopHookTimeout
+                            // Signal the event loop via self-pipe
+                            if let Some(fd) = self_pipe_write_fd {
+                                let byte: [u8; 1] = [1];
+                                unsafe {
+                                    let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
+                                }
+                            }
                             return;
                         }
                     }
