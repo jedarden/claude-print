@@ -68,14 +68,6 @@ pub fn cleanup_temp_dir() {
 pub struct Session;
 
 impl Session {
-    /// Default first-output timeout in seconds.
-    /// If the child produces no output within this time, we assume it's hung.
-    const DEFAULT_FIRST_OUTPUT_TIMEOUT_SECS: u64 = 90;
-
-    /// Default stream-json first-output timeout in seconds.
-    /// If the child produces no stream-json events within this time, we assume it's hung.
-    const DEFAULT_STREAM_JSON_TIMEOUT_SECS: u64 = 90;
-
     /// Run a Claude Code session.
     ///
     /// # Arguments
@@ -171,11 +163,10 @@ impl Session {
             stop_hook_timeout_secs,
         );
 
-        // Get transcript path for stream-json monitoring (will be resolved from stop payload)
-        // For now, we don't know the transcript path, so we pass None
-        // The watchdog will monitor PTY output and overall timeout, and stream-json monitoring
-        // will be handled by the main thread via the emitter
-        let watchdog = Watchdog::new(watchdog_config, spawner.child_pid, None);
+        // Get temp directory path for stream-json monitoring
+        // The watchdog will monitor <temp_dir>/transcript.jsonl for stream-json output
+        let temp_dir_path = installer.dir_path().to_path_buf();
+        let watchdog = Watchdog::new(watchdog_config, spawner.child_pid, Some(temp_dir_path));
 
         let watchdog_state = watchdog.state();
 

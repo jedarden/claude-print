@@ -8,14 +8,20 @@ use claude_print::error::Error;
 use claude_print::session::Session;
 use std::ffi::OsString;
 
-/// Locate the mock-claude binary compiled alongside the test binary.
-/// Test binaries live at `target/<profile>/deps/`; other bins at `target/<profile>/`.
+/// Locate the mock-claude binary.
+///
+/// In a workspace, binaries are built to the workspace target directory, not the
+/// individual project's target directory. The test binary lives at `target/<profile>/deps/`
+/// (within the project), but mock-claude is built to `<workspace-root>/target/<profile>/`.
 fn mock_claude_bin() -> std::path::PathBuf {
+    // Get the test executable path
     let exe = std::env::current_exe().expect("current_exe");
-    let profile_dir = exe
-        .parent() // deps/
-        .and_then(|p| p.parent()) // target/<profile>/
-        .expect("unexpected test binary path");
+
+    // Walk up from the test binary to find the workspace root
+    // Test binary: <workspace>/target/<profile>/deps/watchdog-<hash>
+    // We need: <workspace>/target/<profile>/mock-claude
+    let deps_dir = exe.parent().expect("no parent"); // deps/
+    let profile_dir = deps_dir.parent().expect("no grandparent"); // target/<profile>/
     profile_dir.join("mock-claude")
 }
 
