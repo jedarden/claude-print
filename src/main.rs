@@ -126,7 +126,7 @@ fn main() {
     let t0 = Instant::now();
 
     // Call session::Session::run()
-    let result = session::Session::run(&claude_bin, &claude_args, prompt_bytes, Some(cli.timeout));
+    let result = session::Session::run(&claude_bin, &claude_args, prompt_bytes, Some(cli.timeout), None);
 
     // Lock stdout and stderr for output
     let mut stdout = io::stdout().lock();
