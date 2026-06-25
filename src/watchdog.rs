@@ -3,11 +3,13 @@
 //! This module implements a comprehensive watchdog that monitors:
 //! - Stream-json output from the transcript file
 //! - PTY output for first-output detection
-//! - Overall session duration
+//! - Overall session duration (max-turn timeout, applies throughout entire session)
 //! - Stop hook execution
 //!
 //! The watchdog ensures that hung child processes are terminated with
-//! proper cleanup (SIGTERM → SIGKILL) and clear diagnostics.
+//! proper cleanup (SIGTERM → SIGKILL) and clear diagnostics. The overall
+//! timeout prevents indefinite polling of stop.fifo by killing the child
+//! and exiting non-zero regardless of why the child wedged.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,7 +51,7 @@ impl TimeoutType {
         match self {
             Self::PtyFirstOutput => "child produced no PTY output within deadline (process may be hung at startup)",
             Self::StreamJsonFirstOutput => "child produced no stream-json output within deadline (process may be hung during session initialization)",
-            Self::OverallTimeout => "session exceeded overall time deadline",
+            Self::OverallTimeout => "session exceeded overall max-turn deadline (max-turn timeout applies throughout entire session)",
             Self::StopHookTimeout => "Stop hook did not fire within deadline after prompt injection (child may have hung during tool use or model inference)",
         }
     }
@@ -316,8 +318,8 @@ impl Watchdog {
                     }
                 }
 
-                // Check Phase 3: Overall timeout (only if configured and no prompt injected yet)
-                if config.overall_timeout_secs > 0 && prompt_injected.is_none() {
+                // Check Phase 3: Overall timeout (applies throughout entire session)
+                if config.overall_timeout_secs > 0 {
                     if elapsed >= Duration::from_secs(config.overall_timeout_secs) {
                         let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
                         timeout_fired.store(true, Ordering::SeqCst);
