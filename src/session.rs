@@ -67,8 +67,19 @@ pub fn cleanup_temp_dir() {
 
     if let Some(path) = TEMP_DIR_PATH.get() {
         // Remove the FIFO first (it may have different permissions)
+        // The FIFO must be removed before the directory can be deleted.
         let fifo_path = path.join("stop.fifo");
-        let _ = std::fs::remove_file(&fifo_path);
+        for fifo_attempt in 0..3 {
+            let result = std::fs::remove_file(&fifo_path);
+            if result.is_ok() {
+                break; // FIFO successfully removed
+            }
+            // If this is not the last attempt, wait a bit before retrying
+            if fifo_attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        // Ignore FIFO removal errors
 
         // Remove the entire temp directory with retry logic
         // This helps handle cases where files are temporarily locked

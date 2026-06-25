@@ -9,7 +9,7 @@ use tempfile::TempDir;
 /// Sweep and remove orphaned temp directories from previous crashed runs.
 ///
 /// This looks for directories matching the pattern `claude-print-*` in the
-/// system temp directory and removes any that are older than 10 minutes.
+/// system temp directory and removes any that are older than 60 seconds.
 /// This prevents accumulation of stale temp dirs from crashes.
 ///
 /// This function is called at the start of main() to ensure orphans are
@@ -25,20 +25,26 @@ pub fn cleanup_orphans() {
             let name = path.file_name().and_then(|n| n.to_str());
             if let Some(name) = name {
                 if name.starts_with("claude-print-") {
-                    // Check if it's a directory and old enough (> 10 minutes)
+                    // Check if it's a directory and old enough (> 60 seconds)
                     if let Ok(metadata) = entry.metadata() {
                         if metadata.is_dir() {
                             if let Ok(created) = metadata.created() {
                                 if let Ok(age) = created.elapsed() {
-                                    // Remove if older than 10 minutes (600 seconds)
-                                    // This is more aggressive than the previous 1-hour threshold
-                                    // to prevent accumulation of orphaned dirs
-                                    if age > std::time::Duration::from_secs(600) {
+                                    // Remove if older than 60 seconds
+                                    // Shorter threshold prevents orphans from accumulating
+                                    // while avoiding deletion of active instances
+                                    if age > std::time::Duration::from_secs(60) {
                                         // Try to remove the FIFO first if it exists
                                         let fifo_path = path.join("stop.fifo");
-                                        let _ = std::fs::remove_file(&fifo_path);
+                                        if let Err(e) = std::fs::remove_file(&fifo_path) {
+                                            eprintln!("claude-print: warning: failed to remove FIFO {:?}: {}", fifo_path, e);
+                                        }
                                         // Remove the entire temp directory
-                                        let _ = std::fs::remove_dir_all(&path);
+                                        if let Err(e) = std::fs::remove_dir_all(&path) {
+                                            eprintln!("claude-print: warning: failed to remove orphaned temp dir {:?}: {}", path, e);
+                                        } else {
+                                            eprintln!("claude-print: cleaned up orphaned temp dir: {:?}", path);
+                                        }
                                     }
                                 }
                             }
@@ -122,8 +128,19 @@ impl HookInstaller {
         }
 
         // Remove the FIFO first (it may have different permissions)
-        // Ignore errors - the FIFO might not exist or might already be removed
-        let _ = std::fs::remove_file(&self.fifo_path);
+        // The FIFO must be removed before the directory can be deleted.
+        // Retry FIFO removal multiple times in case of transient errors.
+        for fifo_attempt in 0..3 {
+            let result = std::fs::remove_file(&self.fifo_path);
+            if result.is_ok() {
+                break; // FIFO successfully removed
+            }
+            // If this is not the last attempt, wait a bit before retrying
+            if fifo_attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        // Ignore FIFO removal errors - it might not exist or be already removed
 
         // Explicitly remove the entire temp directory
         // This is more robust than relying on TempDir::drop, especially
