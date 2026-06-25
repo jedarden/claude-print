@@ -30,6 +30,19 @@ pub struct SessionResult {
     pub transcript_path: std::path::PathBuf,
 }
 
+/// Guard that ensures temp dir cleanup on all exit paths.
+///
+/// This guard calls `installer.cleanup()` when dropped, ensuring that
+/// temporary directories and FIFOs are removed even on error, timeout,
+/// or signal interruption.
+struct CleanupGuard<'a>(&'a HookInstaller);
+
+impl<'a> Drop for CleanupGuard<'a> {
+    fn drop(&mut self) {
+        self.0.cleanup();
+    }
+}
+
 /// Session orchestrator.
 ///
 /// Manages the full lifecycle of a Claude Code PTY session.
@@ -64,6 +77,9 @@ impl Session {
 
         // 1. Install hook files (temp dir, hook.sh, stop.fifo).
         let installer = HookInstaller::new()?;
+
+        // 1a. Set up cleanup guard to ensure temp dir is removed on all exit paths
+        let _cleanup_guard = CleanupGuard(&installer);
 
         // 2. Resolve Claude Code version.
         let claude_version = Self::resolve_claude_version(claude_bin)?;

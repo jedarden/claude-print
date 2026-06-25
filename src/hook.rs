@@ -13,6 +13,9 @@ pub struct HookInstaller {
 
 impl HookInstaller {
     pub fn new() -> Result<Self> {
+        // Clean up any orphaned temp dirs from previous crashed runs
+        Self::cleanup_orphans();
+
         let dir = tempfile::Builder::new()
             .prefix(&format!("claude-print-{}-", std::process::id()))
             .tempdir()
@@ -45,6 +48,53 @@ impl HookInstaller {
 
     pub fn dir_path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Explicitly clean up the temporary directory and FIFO.
+    ///
+    /// This is called automatically on Drop, but can be called explicitly
+    /// to ensure cleanup on all exit paths (normal, error, timeout, signal).
+    pub fn cleanup(&self) {
+        // Remove the FIFO first (it may have different permissions)
+        let _ = std::fs::remove_file(&self.fifo_path);
+        // Note: TempDir's Drop will handle the rest when self.dir is dropped
+        // We don't call close() here because it takes ownership
+    }
+
+    /// Sweep and remove orphaned temp directories from previous crashed runs.
+    ///
+    /// This looks for directories matching the pattern `claude-print-*` in the
+    /// system temp directory and removes any that are older than 1 hour.
+    /// This prevents accumulation of stale temp dirs from crashes.
+    pub fn cleanup_orphans() {
+        let temp_dir = std::env::temp_dir();
+
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+
+                // Check if the entry name matches our pattern
+                let name = path.file_name().and_then(|n| n.to_str());
+                if let Some(name) = name {
+                    if name.starts_with("claude-print-") {
+                        // Check if it's a directory and old enough (> 1 hour)
+                        if let Ok(metadata) = entry.metadata() {
+                            if metadata.is_dir() {
+                                if let Ok(created) = metadata.created() {
+                                    if let Ok(age) = created.elapsed() {
+                                        // Only remove if older than 1 hour to avoid
+                                        // deleting active sessions from other processes
+                                        if age > std::time::Duration::from_secs(3600) {
+                                            let _ = std::fs::remove_dir_all(&path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -136,5 +186,39 @@ mod tests {
             installer.dir_path().to_path_buf()
         };
         assert!(!path.exists(), "temp dir must be removed after drop");
+    }
+
+    #[test]
+    fn cleanup_explicitly_removes_fifo() {
+        let installer = HookInstaller::new().unwrap();
+        let fifo_path = installer.fifo_path.clone();
+        let dir_path = installer.dir_path().to_path_buf();
+
+        // Call cleanup explicitly
+        installer.cleanup();
+
+        // FIFO should be removed
+        assert!(!fifo_path.exists(), "FIFO must be removed after cleanup");
+
+        // Temp dir should still exist (owned by installer)
+        // but will be cleaned when installer is dropped
+        drop(installer);
+        assert!(!dir_path.exists(), "temp dir must be removed after drop");
+    }
+
+    #[test]
+    fn cleanup_orphans_does_not_panic() {
+        // This test verifies that cleanup_orphans() doesn't panic
+        // It's hard to test the actual behavior without creating real orphans,
+        // but we can at least verify it runs without error
+        HookInstaller::cleanup_orphans();
+    }
+
+    #[test]
+    fn cleanup_can_be_called_multiple_times() {
+        let installer = HookInstaller::new().unwrap();
+        installer.cleanup();
+        installer.cleanup(); // Should not panic
+        drop(installer);
     }
 }
