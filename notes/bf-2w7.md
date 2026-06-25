@@ -31,4 +31,13 @@ Added tests in `hook.rs`:
 - `cleanup_orphans_does_not_panic` - Verifies cleanup_orphans() runs without error
 - `cleanup_can_be_called_multiple_times` - Verifies idempotency
 
-All 84 library tests pass.
+All 90 library tests pass (as of 2026-06-25).
+
+## Verification (2025-06-25)
+Implementation verified complete. All cleanup mechanisms are in place:
+- ✓ `cleanup_orphans()` called at startup in `main()`
+- ✓ `CleanupGuard` ensures cleanup on all exit paths via Drop
+- ✓ `cleanup_temp_dir()` handles cleanup before `process::exit()`
+- ✓ `exit_with_cleanup()` wrapper used throughout `main()`
+
+All exit paths covered: normal exit, errors, watchdog timeout, signal interruption.
