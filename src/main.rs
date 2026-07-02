@@ -165,7 +165,7 @@ fn main() {
 
             // For stream-json format, the reader thread has already streamed all output.
             // For text and json formats, emit the success result.
-            if cli.output_format != claude_print::cli::OutputFormat::StreamJson {
+            if output_format != claude_print::cli::OutputFormat::StreamJson {
                 if let Err(e) = emitter::emit_success(
                     &mut stdout,
                     &session_result.transcript,

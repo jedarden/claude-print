@@ -125,16 +125,26 @@ fn stream_json_reader_loop(
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
     // Open the file, waiting if it doesn't exist yet.
+    // Per plan: retry with 50ms sleeps for up to 5 seconds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let file = loop {
         match File::open(&transcript_path) {
             Ok(f) => break f,
-            Err(_) => match drain_rx.try_recv() {
-                Ok(()) => return,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-                Err(mpsc::TryRecvError::Empty) => {
-                    thread::sleep(Duration::from_millis(5));
+            Err(_) => {
+                // Check for drain signal or timeout
+                match drain_rx.try_recv() {
+                    Ok(()) => return,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // Check 5-second timeout
+                        if std::time::Instant::now() >= deadline {
+                            // Timeout expired - file never appeared
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
                 }
-            },
+            }
         }
     };
 

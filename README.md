@@ -146,3 +146,4 @@ If you use NEEDLE for LLM fleet dispatch, `install.sh` automatically copies `cla
 
 - `docs/notes/` — design decisions, constraints, integration details
 - `docs/plan/plan.md` — complete implementation plan
+# 

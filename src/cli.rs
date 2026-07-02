@@ -2,7 +2,7 @@ use clap::{Parser, ValueEnum};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, PartialEq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum OutputFormat {
     Text,
     Json,

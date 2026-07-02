@@ -302,7 +302,7 @@ impl Session {
         let temp_dir_path = installer.dir_path().to_path_buf();
         let transcript_path = temp_dir_path.join("transcript.jsonl");
         let mut stream_json_handle: Option<emitter::StreamJsonHandle> = None;
-        let mut stream_json_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream_json_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // 12. Run the event loop.
         let master_fd = spawner.master.as_raw_fd();
@@ -630,6 +630,7 @@ exit 1
             claude_version: "claude-1.0.0".to_string(),
             duration_ms: 1000,
             transcript_path: std::path::PathBuf::from("transcript.jsonl"),
+            stream_json_handle: None,
         };
 
         assert_eq!(session_result.claude_version, "claude-1.0.0");

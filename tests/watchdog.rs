@@ -4,6 +4,7 @@
 /// the Stop hook. Asserts that claude-print exits non-zero within the configured
 /// watchdog window, kills the stub, and leaves no orphaned temp dir/FIFO.
 
+use claude_print::cli::OutputFormat;
 use claude_print::error::Error;
 use claude_print::session::Session;
 use std::ffi::OsString;
@@ -76,6 +77,7 @@ fn watchdog_silent_child_times_out_with_cleanup() {
         Some(2), // 2-second first-output timeout (PTY output)
         None,    // use default stream-json timeout
         None,    // no stop-hook timeout (prompt never injected for silent children)
+        OutputFormat::Text,
     );
 
     // Clean up env var
@@ -133,6 +135,7 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         Some(1), // 1-second first-output timeout
         None,    // use default stream-json timeout
         None,    // no stop-hook timeout
+        OutputFormat::Text,
     );
 
     std::env::remove_var("MOCK_SILENT");
