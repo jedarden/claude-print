@@ -140,6 +140,7 @@ fn main() {
     }
 
     let t0 = Instant::now();
+    let output_format = cli.output_format; // Save before move
 
     // Call session::Session::run()
     let result = session::Session::run(
@@ -150,6 +151,7 @@ fn main() {
         Some(cli.first_output_timeout),
         Some(cli.stream_json_timeout),
         Some(cli.stop_hook_timeout),
+        output_format,
     );
 
     // Lock stdout and stderr for output
@@ -161,24 +163,9 @@ fn main() {
         Ok(session_result) => {
             let duration_ms = t0.elapsed().as_millis() as u64;
 
-            // For stream-json format, replay the transcript line by line
-            if cli.output_format == claude_print::cli::OutputFormat::StreamJson {
-                if let Err(e) = replay_stream_json(&session_result.transcript_path) {
-                    let _ = emit_error(
-                        &mut stdout,
-                        &mut stderr,
-                        &ClaudePrintError::Setup(format!(
-                            "failed to replay transcript: {}",
-                            e
-                        )),
-                        &cli.output_format,
-                        &session_result.claude_version,
-                        false,
-                    );
-                    exit_with_cleanup(2);
-                }
-            } else {
-                // For text and json formats, emit success
+            // For stream-json format, the reader thread has already streamed all output.
+            // For text and json formats, emit the success result.
+            if cli.output_format != claude_print::cli::OutputFormat::StreamJson {
                 if let Err(e) = emitter::emit_success(
                     &mut stdout,
                     &session_result.transcript,
@@ -242,23 +229,6 @@ fn main() {
             exit_with_cleanup(2);
         }
     }
-}
-
-/// Replay the transcript as stream-json output.
-fn replay_stream_json(transcript_path: &std::path::Path) -> std::io::Result<()> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(transcript_path)?;
-    let reader = BufReader::new(file);
-    let mut stdout = io::stdout().lock();
-
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            writeln!(stdout, "{}", trimmed)?;
-        }
-    }
-    Ok(())
 }
 
 /// Emit an error in the appropriate format.

@@ -86,6 +86,7 @@ pub fn emit_error(
 }
 
 /// Handle for the stream-json reader thread.
+#[derive(Debug)]
 pub struct StreamJsonHandle {
     /// Send `()` to signal "drain remaining lines then exit".
     /// Drop without sending to signal "exit immediately".

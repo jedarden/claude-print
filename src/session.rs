@@ -1,19 +1,23 @@
 use crate::error::{Error, Result};
 use crate::event_loop::{ExitReason, EventLoop};
 use crate::hook::HookInstaller;
-use crate::poller::{open_fifo_nonblock, parse_stop_payload, resolve_stop_info};
+use crate::poller::{open_fifo_nonblock, parse_stop_payload, resolve_stop_info, cwd_to_slug};
 use crate::pty::PtySpawner;
 use crate::startup::{StartupAction, StartupSeq};
 use crate::terminal::TerminalEmu;
 use crate::transcript::{read_transcript, TranscriptResult};
 use crate::watchdog::{Watchdog, WatchdogConfig, TimeoutType};
+use crate::emitter;
 use nix::sys::signal::{self, SigHandler};
 use nix::sys::wait::waitpid;
+use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +41,8 @@ pub struct SessionResult {
     pub duration_ms: u64,
     /// Path to the transcript file (for stream-json replay).
     pub transcript_path: std::path::PathBuf,
+    /// Stream-json reader handle (only set when output_format is stream-json).
+    pub stream_json_handle: Option<emitter::StreamJsonHandle>,
 }
 
 /// Guard that ensures temp dir cleanup on all exit paths.
@@ -131,10 +137,11 @@ impl Session {
     /// * `first_output_timeout_secs` - Optional first-output timeout in seconds.
     /// * `stream_json_timeout_secs` - Optional stream-json first-output timeout in seconds.
     /// * `stop_hook_timeout_secs` - Optional Stop hook watchdog timeout in seconds.
+    /// * `output_format` - Output format (text, json, or stream-json).
     ///
     /// # Returns
     ///
-    /// Returns a `SessionResult` containing the transcript, Claude version, and duration.
+    /// Returns a `SessionResult` containing the transcript, Claude version, duration, and stream-json handle.
     ///
     /// # Errors
     ///
@@ -149,6 +156,7 @@ impl Session {
         first_output_timeout_secs: Option<u64>,
         stream_json_timeout_secs: Option<u64>,
         stop_hook_timeout_secs: Option<u64>,
+        output_format: crate::cli::OutputFormat,
     ) -> Result<SessionResult> {
         // Use a catch_unwind to ensure cleanup happens even on panics
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -160,6 +168,7 @@ impl Session {
                 first_output_timeout_secs,
                 stream_json_timeout_secs,
                 stop_hook_timeout_secs,
+                output_format,
             )
         }));
 
@@ -184,6 +193,7 @@ impl Session {
         first_output_timeout_secs: Option<u64>,
         stream_json_timeout_secs: Option<u64>,
         stop_hook_timeout_secs: Option<u64>,
+        output_format: crate::cli::OutputFormat,
     ) -> Result<SessionResult> {
         let start_time = Instant::now();
 
@@ -288,10 +298,17 @@ impl Session {
             }
         };
 
+        // 12. Prepare stream-json reader (will be spawned at PROMPT_INJECTED).
+        let temp_dir_path = installer.dir_path().to_path_buf();
+        let transcript_path = temp_dir_path.join("transcript.jsonl");
+        let mut stream_json_handle: Option<emitter::StreamJsonHandle> = None;
+        let mut stream_json_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // 12. Run the event loop.
         let master_fd = spawner.master.as_raw_fd();
         let watchdog_state_clone = watchdog_state.clone();
         let mut last_phase = startup.phase().clone();
+        let stream_json_spawned_clone = stream_json_spawned.clone();
 
         let exit_reason = event_loop.run(|chunk| {
             // Empty chunk = timer tick from the event loop (poll timeout with no data).
@@ -342,6 +359,20 @@ impl Session {
             let current_phase = startup.phase();
             if last_phase != *current_phase && current_phase.is_prompt_injected() {
                 watchdog_state_clone.mark_prompt_injected();
+
+                // Spawn stream-json reader at PROMPT_INJECTED for stream-json output
+                if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
+                    // Calculate byte offset: current transcript file size, or 0 if not exists
+                    let start_offset = std::fs::metadata(&transcript_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    stream_json_handle = Some(emitter::spawn_stream_json_reader(
+                        transcript_path.clone(),
+                        start_offset,
+                    ));
+                    stream_json_spawned_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
             last_phase = current_phase.clone();
 
@@ -368,6 +399,13 @@ impl Session {
             eprintln!("claude-print: sending SIGTERM to child pid {}", spawner.child_pid);
 
             kill_child(spawner.child_pid);
+
+            // INV-8: Join stream-json reader on timeout path (drop sender, exit immediately)
+            if let Some(handle) = stream_json_handle {
+                drop(handle.drain_tx); // Drop without sending -> exit immediately
+                let _ = handle.join_handle.join();
+            }
+
             return Err(Error::Timeout(timeout_msg.to_string()));
         }
 
@@ -383,6 +421,11 @@ impl Session {
                 let transcript = if let Some(path) = transcript_path {
                     read_transcript(path, stop_info.last_assistant_message.as_deref())?
                 } else {
+                    // Drain and join stream-json reader before returning error
+                    if let Some(handle) = stream_json_handle {
+                        let _ = handle.drain_tx.send(()); // Signal drain
+                        let _ = handle.join_handle.join();
+                    }
                     return Err(Error::Internal(anyhow::anyhow!(
                         "Stop payload contained no transcript path and could not derive one"
                     )));
@@ -395,20 +438,38 @@ impl Session {
                     std::path::PathBuf::from("transcript.jsonl")
                 });
 
+                // INV-8: On success, send drain signal and join stream-json reader
+                if let Some(handle) = stream_json_handle {
+                    // Send drain signal: drain remaining lines then exit
+                    let _ = handle.drain_tx.send(());
+                    let _ = handle.join_handle.join();
+                }
+
                 Ok(SessionResult {
                     transcript,
                     claude_version,
                     duration_ms: start_time.elapsed().as_millis() as u64,
                     transcript_path,
+                    stream_json_handle: None, // Already joined
                 })
             }
             ExitReason::ChildExited => {
                 // Child exited without Stop hook.
                 let _ = waitpid(spawner.child_pid, None);
+                // INV-8: Join stream-json reader on child exit path
+                if let Some(handle) = stream_json_handle {
+                    drop(handle.drain_tx); // Drop without sending -> exit immediately
+                    let _ = handle.join_handle.join();
+                }
                 Err(Error::Internal(anyhow::anyhow!("Child exited without sending Stop payload")))
             }
             ExitReason::Interrupted => {
                 kill_child(spawner.child_pid);
+                // INV-8: Join stream-json reader on interrupted path
+                if let Some(handle) = stream_json_handle {
+                    drop(handle.drain_tx); // Drop without sending -> exit immediately
+                    let _ = handle.join_handle.join();
+                }
                 Err(Error::Interrupted("interrupted by signal".to_string()))
             }
         }
