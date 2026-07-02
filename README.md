@@ -144,8 +144,41 @@ If you use NEEDLE for LLM fleet dispatch, `install.sh` automatically copies `cla
 - **One prompt per invocation** — there is no multi-turn session mode; each call starts a fresh session.
 - **Startup latency ~2–5s** — the PTY handshake and Claude Code startup add overhead versus a direct HTTP call.
 
+## Troubleshooting
+
+### Billing classification verification
+
+Before deploying to production, verify that sessions are billing against the subscription pool (`cc_entrypoint=cli`):
+
+```bash
+# Check the most recent session's billing classification
+./scripts/check-billing.sh
+```
+
+This script inspects the latest transcript JSONL under `~/.claude/projects/` and asserts the `entrypoint` field is `"cli"` (subscription), not `"sdk-cli"` (credit pool). Exit 0 means correct billing; exit 1 means a billing regression. Run this after every release or Claude Code upgrade.
+
+### Common issues
+
+**PTY open failed** — You may be in a container without `/dev/ptmx`. Run on a bare-metal host or a VM with full PTY support.
+
+**Session never completes** — The Stop hook may not be firing. Check `--verbose` output for "Stop received" and verify your `~/.claude/settings.json` isn't blocking hook execution.
+
+**Empty output despite success** — The transcript reader may have hit a race condition. Run with `--verbose` to see retry attempts; if retries exceed 40×50ms, the Stop hook fired before the JSONL was flushed.
+
+## Release checklist
+
+Before cutting a release tag:
+
+1. Run `./scripts/check-billing.sh` to verify billing conformance (requires credentials)
+2. Run `cargo test` to ensure all mocked tests pass
+3. Run `claude-print --check` to verify PTY and Stop hook mechanics
+4. Update version in `Cargo.toml`
+5. Commit and push: `git tag v0.x.y && git push origin v0.x.y`
+6. Monitor the `claude-print-ci` Argo Workflow for successful build and GitHub release
+
 ## Structure
 
 - `docs/notes/` — design decisions, constraints, integration details
 - `docs/plan/plan.md` — complete implementation plan
-# 
+- `scripts/check-billing.sh` — AS-4 billing conformance script (run before every release)
+- `scripts/` — integration test scripts
