@@ -99,6 +99,9 @@ claude-print --timeout 30 "quick question"
 | `--disallowedTools <LIST>` | | | Comma-separated list of disallowed tools |
 | `--dangerously-skip-permissions` | | | Skip permission prompts (dangerous) |
 | `--timeout <SECS>` | | `3600` | Wall-clock timeout in seconds |
+| `--first-output-timeout <SECS>` | | `90` | First-output timeout in seconds (PTY output) |
+| `--stream-json-timeout <SECS>` | | `90` | Stream-json first-output timeout in seconds |
+| `--stop-hook-timeout <SECS>` | | `120` | Stop hook watchdog timeout in seconds |
 | `--claude-binary <PATH>` | | PATH lookup | Path to claude binary |
 | `--no-inherit-hooks` | | | Disable user hook inheritance |
 | `--verbose` | | | Write timing traces to stderr |
@@ -119,8 +122,7 @@ claude-print --timeout 30 "quick question"
 | `0` | Success |
 | `1` | Assistant error (`is_error: true` in transcript) |
 | `2` | Internal error (PTY spawn, hook setup, parse failure) |
-| `3` | Timeout exceeded |
-| `4` | Bad input (missing prompt, unreadable file) |
+| `124` | Timeout exceeded |
 | `130` | Interrupted (SIGINT) |
 
 ## How it works
