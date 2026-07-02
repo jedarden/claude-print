@@ -1514,7 +1514,7 @@ Asset naming convention: `claude-print-linux-amd64` and `mock-claude-linux-amd64
 
 ### Release Tag Convention
 
-Tags follow semver: `v<MAJOR>.<MINOR>.<PATCH>`. Tags are pushed manually (`git tag v0.1.0 && git push origin v0.1.0`). The workflow is submitted manually or via Argo Events webhook on tag push (out of scope for v1.0; manual workflow submission is sufficient for initial releases).
+Tags follow semver: `v<MAJOR>.<MINOR>.<PATCH>`. Tags are pushed manually (`git tag vX.Y.Z && git push origin vX.Y.Z`). The workflow is submitted manually or via Argo Events webhook on tag push (out of scope for v1.0; manual workflow submission is sufficient for initial releases).
 
 ### Submitting CI Manually
 
@@ -1535,7 +1535,7 @@ spec:
       - name: revision
         value: main
       - name: tag
-        value: ""     # empty = verify only; set to "v0.1.0" for release
+        value: ""     # empty = verify only; set to "vX.Y.Z" for release
 EOF
 ```
 
