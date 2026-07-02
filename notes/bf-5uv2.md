@@ -1,12 +1,13 @@
-# Verification: Store StreamJsonHandle and Set Spawned Flag
+# Verification: StreamJsonHandle Storage and Spawned Flag Setting
 
-## Task (bf-5uv2)
-Verify that the returned StreamJsonHandle is stored in stream_json_handle and the stream_json_spawned_clone flag is set.
+## Task Confirmation
 
-## Verification Results
+Verified that `StreamJsonHandle` is stored and the spawned flag is set correctly in `src/session.rs`.
 
-### 1. stream_json_handle = Some(...) assignment ✅
-**Location:** src/session.rs:370-373
+## Acceptance Criteria Verified
+
+### 1. ✓ stream_json_handle = Some(...) assignment exists
+**Location:** `src/session.rs:370-373`
 ```rust
 stream_json_handle = Some(emitter::spawn_stream_json_reader(
     transcript_path.clone(),
@@ -14,36 +15,34 @@ stream_json_handle = Some(emitter::spawn_stream_json_reader(
 ));
 ```
 
-### 2. stream_json_spawned_clone.store(true, ...) call ✅
-**Location:** src/session.rs:374
+### 2. ✓ stream_json_spawned_clone.store(true, ...) call is present
+**Location:** `src/session.rs:374`
 ```rust
 stream_json_spawned_clone.store(true, std::sync::atomic::Ordering::SeqCst);
 ```
 
-### 3. Ordering::SeqCst is used ✅
-The atomic store at line 374 uses `std::sync::atomic::Ordering::SeqCst`, which provides the strongest memory ordering guarantee and ensures visibility across all threads.
+### 3. ✓ Ordering::SeqCst is used for the atomic store
+The store operation uses `std::sync::atomic::Ordering::SeqCst`, providing the strongest memory ordering guarantees.
 
-### 4. Correct variable type ✅
-**Declaration at src/session.rs:304:**
+### 4. ✓ stream_json_handle is the correct variable type
+**Variable declaration:** `src/session.rs:304`
 ```rust
 let mut stream_json_handle: Option<emitter::StreamJsonHandle> = None;
 ```
 
-**Struct field at src/session.rs:45:**
+**Struct field definition:** `src/session.rs:45`
 ```rust
 pub stream_json_handle: Option<emitter::StreamJsonHandle>,
 ```
 
-**Type definition at src/emitter.rs:90:**
+### 5. ✓ Spawned flag visibility to other parts of the code
+The flag is declared as:
 ```rust
-pub struct StreamJsonHandle { ... }
+let stream_json_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 ```
 
-### 5. Spawned flag visibility ✅
-The `Ordering::SeqCst` memory ordering ensures that:
-- The store operation is sequentially consistent
-- All threads see the write in the same order
-- The flag becomes visible to other parts of the code immediately after the store
+Since it's wrapped in `Arc<AtomicBool>` and stored with `Ordering::SeqCst`, the spawned flag is properly synchronized and will be visible across threads.
 
 ## Context
-This code runs in the event loop callback when the phase transitions to `PromptInjected` (line 360-376). The spawned flag signals to the watchdog that the stream-json reader has been started, which is important for monitoring stream-json output timeouts.
+
+The handle and spawned flag are set when the `PROMPT_INJECTED` phase is reached in the event loop (`src/session.rs:360-376`). This ensures the stream-json reader is spawned at the correct time during the session lifecycle.
