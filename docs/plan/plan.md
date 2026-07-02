@@ -182,7 +182,7 @@ claude-print/
 │   ├── lib.rs                        # library exports for testing
 │   ├── poller.rs                     # stop.fifo poller: IPC read from Stop hook
 │   ├── session.rs                    # Session: main orchestration flow (prompt → response)
-│   └── watchdog.rs                  # Watchdog: no-output/max-turn/stop-hook timeout monitoring
+│   └── watchdog.rs                  # Watchdog: no-output/max-turn/stop-hook/stream-json timeout monitoring
 ├── tests/
 │   ├── cli.rs
 │   ├── terminal.rs
