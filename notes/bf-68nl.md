@@ -1,54 +1,48 @@
-# Bead bf-68nl: Stream-JSON Reader Join Verification
+# Verification of stream-json reader join on all exit paths
 
-**Date:** 2026-07-02
-**Status:** ✅ Already Implemented
+## Task (bf-68nl)
+Ensure the stream-json reader thread is properly joined on all exit paths (success, timeout, interrupted, error).
 
-## Task
-Add stream-json reader join on all exit paths (success, timeout, interrupted, error).
+## Verification Status: COMPLETE ✓
 
-## Verification Results
+The stream-json reader join implementation is already present in `src/session.rs` on all exit paths:
 
-### Implementation Found
-The stream-json reader join logic was already implemented in commit `e0cf57abf11beeb49de7ed953d9be71e6c43008b` (Pre-release commit for v0.2.0).
+### Exit paths verified
 
-### Exit Path Verification
+1. **Success path (FifoPayload)** - Lines 442-446
+   - Sends drain signal: `handle.drain_tx.send(())`
+   - Joins thread: `handle.join_handle.join()`
 
-All exit paths properly join the stream-json reader thread:
+2. **Timeout path** - Lines 404-407
+   - Drops handle without sending: `drop(handle.drain_tx)`
+   - Joins thread: `handle.join_handle.join()`
 
-| Exit Path | Line Numbers | Cleanup Mode | Status |
-|-----------|--------------|--------------|--------|
-| **Timeout** | 404-407 | Drop drain_tx (immediate exit) | ✅ |
-| **Success (FifoPayload)** | 442-446 | Send drain signal | ✅ |
-| **Error (no transcript)** | 424-428 | Send drain signal | ✅ |
-| **Child Exit** | 460-463 | Drop drain_tx (immediate exit) | ✅ |
-| **Interrupted** | 469-472 | Drop drain_tx (immediate exit) | ✅ |
+3. **Interrupted path** - Lines 469-472
+   - Drops handle without sending: `drop(handle.drain_tx)`
+   - Joins thread: `handle.join_handle.join()`
 
-### Code Examples
+4. **Child exit path** - Lines 460-463
+   - Drops handle without sending: `drop(handle.drain_tx)`
+   - Joins thread: `handle.join_handle.join()`
 
-**Success Path (drain mode):**
-```rust
-// INV-8: On success, send drain signal and join stream-json reader
-if let Some(handle) = stream_json_handle {
-    // Send drain signal: drain remaining lines then exit
-    let _ = handle.drain_tx.send(());
-    let _ = handle.join_handle.join();
-}
-```
+5. **Early error path (no transcript path)** - Lines 425-428
+   - Sends drain signal: `handle.drain_tx.send(())`
+   - Joins thread: `handle.join_handle.join()`
 
-**Timeout Path (immediate exit mode):**
-```rust
-// INV-8: Join stream-json reader on timeout path (drop sender, exit immediately)
-if let Some(handle) = stream_json_handle {
-    drop(handle.drain_tx); // Drop without sending -> exit immediately
-    let _ = handle.join_handle.join();
-}
-```
+### Acceptance criteria met
+- ✓ Drain signal and join on success path (FifoPayload)
+- ✓ Drop-and-join on timeout path
+- ✓ Drop-and-join on interrupted path
+- ✓ Drop-and-join on child exit path
+- ✓ All paths join the thread before returning
+- ✓ Code compiles and tests pass (90 passed)
 
-### Test Results
-- **Lib tests:** 90/90 passed ✅
-- **Integration tests:** 28/28 passed ✅
-- **Emitter tests:** 13/13 passed ✅
-- **Total:** 131/131 tests passed ✅
+## Implementation details
 
-## Conclusion
-The stream-json reader join implementation is complete and correct. All exit paths properly join the background thread before returning, ensuring all output is drained and no threads are leaked.
+The design distinguishes between two types of exit paths:
+
+1. **Graceful exits (success, early error)**: Send drain signal `()` via channel to allow the reader thread to finish processing remaining output before exiting.
+
+2. **Immediate exits (timeout, interrupted, child exit)**: Drop the sender handle without sending, which causes the channel to close immediately and the reader thread exits without waiting for more data.
+
+In both cases, `join_handle.join()` is called to wait for the thread to finish before proceeding.
