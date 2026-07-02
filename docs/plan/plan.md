@@ -955,7 +955,7 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 |------|-------|
 | Phases 1–11 module implementation | **COMPLETE** — all module-level deliverables committed |
 | `main()` session orchestration | **COMPLETE** — src/main.rs and src/session.rs orchestration shipped as v0.2.0 |
-| Binary-level E2E tests (AS-1, AS-2, AS-5) | **IN PROGRESS** (bf-46x) |
+| Binary-level E2E tests (AS-1, AS-2, AS-5) | **COMPLETE** — tests passing (bf-46x) |
 | AS-4 billing classification | **PENDING** manual verification (requires live credentials) |
 | CI release binary | **PENDING** — `claude-print-ci` WorkflowTemplate synced to ArgoCD; no release tag cut yet |
 
