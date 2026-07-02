@@ -160,8 +160,12 @@ claude-print (single Rust binary)
 claude-print/
 ├── Cargo.toml                        # workspace root; declares `test-fixtures/mock-claude` as a workspace member so `cargo build` compiles `mock_claude`
 ├── Cargo.lock
+├── build.rs                          # build script for version info
 ├── install.sh
 ├── claude-print.yaml                 # NEEDLE agent config
+├── claude-print-ci-workflowtemplate.yml    # Argo WorkflowTemplate for CI/CD
+├── claude-print-ci-sensor.yml        # Event sensor for CI workflow triggers
+├── claude-print-eventsource-stanza.yml     # EventSource stanza for workflow events
 ├── src/
 │   ├── main.rs                       # entry point: parse args, orchestrate
 │   ├── cli.rs                        # clap CLI struct + validation
@@ -173,21 +177,36 @@ claude-print/
 │   ├── startup.rs                    # StartupSeq: trust dismiss, bracketed paste injection
 │   ├── transcript.rs                 # JSONL parser, usage dedup, text extraction, retry loop
 │   ├── emitter.rs                    # Output formatter: text/json/stream-json
-│   └── error.rs                      # ClaudePrintError enum, exit code mapping
+│   ├── error.rs                      # ClaudePrintError enum, exit code mapping
+│   ├── check.rs                      # --check subcommand: installation self-test
+│   ├── lib.rs                        # library exports for testing
+│   ├── poller.rs                     # stop.fifo poller: IPC read from Stop hook
+│   ├── session.rs                    # Session: main orchestration flow (prompt → response)
+│   └── watchdog.rs                  # Watchdog: no-output/max-turn/stop-hook timeout monitoring
 ├── tests/
 │   ├── cli.rs
 │   ├── terminal.rs
 │   ├── transcript.rs
-│   ├── hook.rs
 │   ├── emitter.rs
 │   ├── startup.rs
 │   ├── version_compat.rs
+│   ├── hooks.rs                      # hook inheritance tests
+│   ├── integration.rs                # integration test module entry point
+│   ├── pty_integration.rs            # PTY-specific integration tests
+│   ├── stop_poller.rs                # stop.fifo polling tests
+│   ├── watchdog.rs                   # watchdog timeout tests
 │   ├── integration/
 │   │   ├── mod.rs
 │   │   └── scenarios.rs              # 20+ mock PTY integration tests
-│   ├── hooks.rs                      # hook inheritance tests
 │   └── fixtures/
 │       └── transcript_v2.1.168.jsonl
+├── scripts/
+│   ├── check-billing.sh              # AS-4 billing conformance verification
+│   ├── test_exact_claude_print_scenario.sh
+│   ├── test_sessionstart_hook.sh
+│   ├── test_startup_wedge.sh
+│   ├── verify_fix.sh
+│   └── verify-startup-wedge-fix.sh
 └── test-fixtures/
     └── mock-claude/
         ├── Cargo.toml
@@ -425,6 +444,9 @@ Drop-in for `claude -p`:
 | `--disallowedTools LIST` | Forwarded |
 | `--dangerously-skip-permissions` | Forwarded |
 | `--timeout SECS` | Wall-clock timeout (default: 3600) |
+| `--first-output-timeout SECS` | PTY first-output timeout in seconds (default: 90). If child produces no PTY output within this deadline, watchdog terminates with timeout error. |
+| `--stream-json-timeout SECS` | Stream-json first-output timeout in seconds (default: 90). If child produces no stream-json events within this deadline, watchdog terminates with timeout error. |
+| `--stop-hook-timeout SECS` | Stop hook watchdog timeout in seconds (default: 120). If Stop hook doesn't fire within this deadline after prompt injection, watchdog assumes child is hung and terminates. |
 | `--claude-binary PATH` | Override claude binary path (default: resolves `claude` from PATH) |
 | `--no-inherit-hooks` | Disable user hook inheritance; passes `--setting-sources=` to claude (unverified per OQ-2) |
 | `--version` | Print `claude-print <version> (wrapping claude <version>)` and exit. The claude version is obtained by running the binary at `--claude-binary` (or the PATH-resolved `claude` if not specified). If claude is not found, print `claude-print <version> (wrapping claude: not found)` and exit 0. |
@@ -711,7 +733,7 @@ pub enum ContentBlock {
 
 `duration_ms`: wall-clock milliseconds from `std::time::Instant::now()` captured at `main()` entry to the moment the emitter writes its final output. This includes all overhead AND model latency — it is the total time a caller waited for a response.
 
-**`stream-json`**: Spawns a reader thread that tails the transcript JSONL from the byte offset captured at prompt injection time, forwarding each new raw event line to stdout as it is written by Claude Code. After Stop fires, drains remaining lines. Output is raw JSONL (one JSON object per line), compatible with `claude -p --output-format stream-json`. The reader thread forwards ALL raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`. On normal completion, the final `{"type":"result", "is_error": false, ...}` line in the output is Claude Code's own Result event forwarded verbatim; claude-print does NOT synthesize an additional result line on success. `claude_version` is NOT injected into the forwarded Result event. On error (no Claude Code result), claude-print synthesizes the final result line and injects `claude_version`.
+**`stream-json`**: Current implementation (v0.2.0) is post-session replay — after Stop fires and the child exits, the emitter reads the complete transcript from the beginning and forwards all JSONL events to stdout. This provides `claude -p`-compatible output but does not stream events in real-time. Live tailing (real-time forwarding as Claude Code writes events) is tracked as an open work item (bead bf-5vm). When live tailing lands, a reader thread will tail the transcript from the byte offset captured at prompt injection time, forwarding each new line immediately. Until then, the replay implementation forwards all raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`. On normal completion, the final `{"type":"result", "is_error": false, ...}` line in the output is Claude Code's own Result event forwarded verbatim; claude-print does NOT synthesize an additional result line on success. `claude_version` is NOT injected into the forwarded Result event. On error (no Claude Code result), claude-print synthesizes the final result line and injects `claude_version`.
 
 `session_id` in output: taken directly from the Stop payload if present. If absent from the payload, derive from the transcript file basename (filename without `.jsonl`). If neither is available (no transcript), emit `null`.
 
@@ -732,7 +754,24 @@ Error result:
 - `json` mode: the error JSON object is written to stdout (as specified above). Nothing to stderr unless `--verbose`.
 - `stream-json` mode: if an error occurs after prompt injection, a final JSON error line is emitted to stdout (`{"type": "result", "is_error": true, "subtype": "...", "error_message": "...", "claude_version": "..."}`); if an error occurs before prompt injection, same as `text` mode (nothing to stdout, stderr message).
 
-### 10. NEEDLE Agent Config
+### 10. Watchdog
+
+The watchdog prevents indefinite hangs when the child `claude` process wedges. Without watchdog, a hung child would cause `claude-print` to poll `stop.fifo` forever, never exiting.
+
+**Timeout types:**
+
+| Timeout Type | Default | Purpose | Error Subtype |
+|--------------|---------|---------|---------------|
+| PTY first-output timeout | 90 s | Child produces no PTY output within deadline (process may be hung at startup) | `pty_first_output_timeout` |
+| Stream-json first-output timeout | 90 s | Child produces no stream-json events within deadline (process may be hung during session initialization) | `stream_json_first_output_timeout` |
+| Overall timeout | 3600 s | Session exceeded overall max-turn deadline (max-turn timeout applies throughout entire session) | `overall_timeout` |
+| Stop hook timeout | 120 s | Stop hook didn't fire within deadline after prompt injection (child may have hung during tool use or model inference) | `stop_hook_timeout` |
+
+**Implementation:** `src/watchdog.rs` runs timeout checks on separate deadlines tracked via `Instant::now()`. Each timeout is independent — if any deadline expires, the watchdog triggers cleanup: SIGTERM child → 2 s grace → SIGKILL → waitpid → emit timeout result and exit.
+
+**Integration with event loop:** The watchdog is consulted on each `poll()` iteration. When a timeout fires, the event loop breaks, cleanup runs, and a timeout result is emitted with the appropriate `subtype` field.
+
+### 11. NEEDLE Agent Config
 
 `claude-print.yaml` → `~/.needle/agents/`:
 ```yaml
@@ -761,7 +800,7 @@ cost:
 
 With `input_method: stdin`, NEEDLE pipes the bead prompt text to `claude-print`'s stdin. Since `claude-print` is invoked non-interactively (its stdin is a pipe, not a TTY), the CLI reads stdin as the prompt source (see §1: "Stdin accepted as prompt when not a TTY and no positional/`--input-file` given").
 
-### 11. Install Script
+### 12. Install Script
 
 `install.sh`:
 1. Detect arch (`uname -m`) and select binary from release assets
@@ -915,17 +954,17 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 | Item | State |
 |------|-------|
 | Phases 1–11 module implementation | **COMPLETE** — all module-level deliverables committed |
-| `main()` session orchestration | **IN PROGRESS** (bf-40i) |
-| Binary-level E2E tests (AS-1, AS-2, AS-5) | **IN PROGRESS** (bf-52c) |
+| `main()` session orchestration | **COMPLETE** — src/main.rs and src/session.rs orchestration shipped as v0.2.0 |
+| Binary-level E2E tests (AS-1, AS-2, AS-5) | **IN PROGRESS** (bf-46x) |
 | AS-4 billing classification | **PENDING** manual verification (requires live credentials) |
-| CI release binary | **PENDING** — `claude-print-ci` WorkflowTemplate synced to ArgoCD; no release tag cut yet (blocked on `main()` completion) |
+| CI release binary | **PENDING** — `claude-print-ci` WorkflowTemplate synced to ArgoCD; no release tag cut yet |
 
 Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's completion criterion is met.
 
 **Phase 1: Crate Scaffold (~150 LOC)**
 *Entry:* None.
 - [x] `Cargo.toml` workspace with pinned deps, `src/main.rs`, `cli.rs` (clap), `error.rs`, `config.rs`
-- [x] `--version` prints `claude-print 0.1.0 (wrapping claude X.Y.Z)`
+- [x] `--version` prints `claude-print <VERSION> (wrapping claude <claude-version>)` where <VERSION> is from Cargo.toml and <claude-version> is resolved at runtime
 - [x] Add `claude-print-ci.yaml` stub to `jedarden/declarative-config` (verify step only; `build-musl` and `github-release` steps added in Phase 11)
 
 *Complete when:* `cargo build --target x86_64-unknown-linux-musl` succeeds; `claude-print --version` prints expected format; `cargo test --lib` passes; `claude-print-ci.yaml` stub exists in declarative-config and ArgoCD syncs it to `argo-workflows-ns-iad-ci`.
