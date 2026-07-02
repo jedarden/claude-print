@@ -1,0 +1,8 @@
+# Rust build artifacts
+target/
+
+# Bead-forge database backups
+.beads/beads.db.backup.*
+
+# NEEDLE worker artifacts
+.needle-predispatch-sha
