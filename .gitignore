@@ -6,3 +6,4 @@ target/
 
 # NEEDLE worker artifacts
 .needle-predispatch-sha
+.force_local
