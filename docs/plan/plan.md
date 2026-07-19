@@ -196,8 +196,7 @@ claude-print/
 │   ├── stop_poller.rs                # stop.fifo polling tests
 │   ├── watchdog.rs                   # watchdog timeout tests
 │   ├── integration/
-│   │   ├── mod.rs
-│   │   └── scenarios.rs              # 20+ mock PTY integration tests
+│   │   └── scenarios.rs              # 20+ mock PTY integration tests (declared via `mod scenarios;` in integration.rs; no mod.rs)
 │   └── fixtures/
 │       └── transcript_v2.1.168.jsonl
 ├── scripts/
