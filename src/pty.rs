@@ -264,7 +264,10 @@ mod tests {
 
     #[test]
     fn spawn_bin_true_exits_zero() {
-        let cmd = CString::new("/bin/true").unwrap();
+        // Resolve `true` via PATH: a hardcoded `/bin/true` breaks on non-FHS
+        // systems (e.g. NixOS, where /bin/true does not exist).
+        let true_path = which::which("true").expect("'true' should be resolvable on PATH");
+        let cmd = CString::new(true_path.as_os_str().as_encoded_bytes()).unwrap();
         let spawner = PtySpawner::spawn(&cmd, &[]).expect("PtySpawner::spawn should succeed");
 
         let status = waitpid(spawner.child_pid, None).expect("waitpid should succeed");

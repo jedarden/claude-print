@@ -589,13 +589,14 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mock_bin = temp_dir.path().join("mock-claude-version");
 
-        let mock_script = r#"#!/bin/bash
-if [[ "$1" == "--version" ]]; then
-    echo "claude-print-mock-1.0.0"
-    exit 0
-fi
-exit 1
-"#;
+        // Resolve bash via PATH and use its absolute path in the shebang: a
+        // hardcoded `#!/bin/bash` breaks on non-FHS systems (e.g. NixOS, where
+        // /bin/bash does not exist and the kernel cannot exec the mock script).
+        let bash = which::which("bash").expect("bash should be resolvable on PATH");
+        let mock_script = format!(
+            "#!{}\nif [[ \"$1\" == \"--version\" ]]; then\n    echo \"claude-print-mock-1.0.0\"\n    exit 0\nfi\nexit 1\n",
+            bash.display(),
+        );
 
         fs::write(&mock_bin, mock_script).unwrap();
 

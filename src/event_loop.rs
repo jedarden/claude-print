@@ -191,7 +191,9 @@ mod tests {
     fn test_event_loop_detects_child_exit() {
         let (pipe_r, _pipe_w) = make_self_pipe();
 
-        let cmd = CString::new("/bin/true").unwrap();
+        // Resolve `true` via PATH; `/bin/true` is absent on non-FHS systems (NixOS).
+        let true_path = which::which("true").expect("'true' should be resolvable on PATH");
+        let cmd = CString::new(true_path.as_os_str().as_encoded_bytes()).unwrap();
         let spawner = PtySpawner::spawn(&cmd, &[]).expect("PtySpawner::spawn");
 
         let mut el = EventLoop::new(spawner.master.as_raw_fd(), pipe_r.as_raw_fd());
