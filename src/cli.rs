@@ -84,6 +84,30 @@ pub struct Cli {
     #[arg(long = "no-inherit-hooks")]
     pub no_inherit_hooks: bool,
 
+    /// MCP config (path or inline JSON) to load. Headless runs always pass
+    /// `--strict-mcp-config` to the child so only configs named here are loaded
+    /// — inherited/project/global MCP servers cannot wedge startup. May be
+    /// repeated, or comma-separated for multiple files.
+    #[arg(long = "mcp-config", value_delimiter = ',')]
+    pub mcp_config: Vec<String>,
+
+    /// Pre-grant folder trust for the working dir by writing
+    /// `hasTrustDialogAccepted: true` into `~/.claude.json` before spawning the
+    /// child. Claude Code reads trust only from that file (not from `--settings`),
+    /// so this is the only way to prevent the one-time trust dialog from
+    /// stalling an untrusted cwd without relying on the PTY keyword scanner.
+    /// Off by default to avoid mutating the shared user config under fleet
+    /// concurrency; enable it when you have seen trust-dialog stalls.
+    #[arg(long = "pretrust-cwd")]
+    pub pretrust_cwd: bool,
+
+    /// Surface the child's captured PTY output to stderr when startup is slow
+    /// or stalls (watchdog first-output timeout, or the prompt was never
+    /// injected). The child runs under a PTY, so this is its combined
+    /// stdout/stderr — useful for diagnosing MCP/init wedges.
+    #[arg(long = "show-child-stderr")]
+    pub show_child_stderr: bool,
+
     /// Write timing traces to stderr
     #[arg(long)]
     pub verbose: bool,

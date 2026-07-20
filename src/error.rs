@@ -77,6 +77,12 @@ pub enum Error {
     /// Child process error - child exited with unexpected status.
     #[error("child process error: {0}")]
     ChildProcessError(String),
+
+    /// Assistant error - Claude Code's own transcript result event reported
+    /// `is_error: true` (rate limit, tool failure, or any assistant-side error).
+    /// Maps to exit code 1, distinct from Setup (2) which is a claude-print failure.
+    #[error("assistant error: {0}")]
+    AssistantError(String),
 }
 
 /// Result type alias for operations that can fail with [`Error`].
@@ -148,6 +154,7 @@ impl From<Error> for ClaudePrintError {
         match &err {
             Error::Timeout(_) => ClaudePrintError::Timeout,
             Error::Interrupted(_) => ClaudePrintError::Interrupted,
+            Error::AssistantError(msg) => ClaudePrintError::AssistantError(msg.clone()),
             Error::Internal(_) | Error::HookSetupFailed(_) | Error::BinaryResolutionFailed(_) => {
                 ClaudePrintError::Setup(err.to_string())
             }
@@ -276,6 +283,24 @@ mod tests {
             }
             _ => panic!("expected Setup variant"),
         }
+    }
+
+    #[test]
+    fn error_to_claude_print_error_assistant_error() {
+        // An assistant-side error (is_error:true transcript) must map to
+        // exit-1 AssistantError, NOT the Setup catch-all (exit 2).
+        let internal = Error::AssistantError("rate limit exceeded".to_string());
+        let user_facing: ClaudePrintError = internal.into();
+        // Match on a reference so `user_facing` is not partially moved and can
+        // still be queried for exit_code/subtype below.
+        match &user_facing {
+            ClaudePrintError::AssistantError(msg) => {
+                assert_eq!(msg.as_str(), "rate limit exceeded");
+            }
+            _ => panic!("expected AssistantError variant"),
+        }
+        assert_eq!(user_facing.exit_code(), 1);
+        assert_eq!(user_facing.subtype(), "assistant_error");
     }
 
     #[test]

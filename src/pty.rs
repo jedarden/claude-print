@@ -54,8 +54,8 @@ impl PtySpawner {
     /// `args` contains only the arguments to the program — not argv\[0\].
     /// argv\[0\] is set to `cmd` internally.
     pub fn spawn(cmd: &CStr, args: &[CString]) -> Result<Self> {
-        let OpenptyResult { master, slave } = openpty(None, None)
-            .map_err(|e| Error::OpenptyFailed(e.to_string()))?;
+        let OpenptyResult { master, slave } =
+            openpty(None, None).map_err(|e| Error::OpenptyFailed(e.to_string()))?;
 
         // Mirror the controlling terminal's window size onto the PTY, or default 80×24.
         let ws = get_winsize(libc::STDIN_FILENO);
@@ -66,8 +66,7 @@ impl PtySpawner {
 
         // SAFETY: fork is async-signal-safe; no threads exist at this point in
         // the single-threaded call path.
-        let fork_result =
-            unsafe { fork() }.map_err(|e| Error::ForkFailed(e.to_string()))?;
+        let fork_result = unsafe { fork() }.map_err(|e| Error::ForkFailed(e.to_string()))?;
 
         match fork_result {
             ForkResult::Parent { child } => {
@@ -91,7 +90,7 @@ impl PtySpawner {
                 // Keep CLAUDECODE and CLAUDE_CODE_ENTRYPOINT — those are needed for
                 // the child to run as Claude Code and create a session JSONL.
                 unsafe {
-                    libc::unsetenv(b"CLAUDE_CODE_SESSION_ID\0".as_ptr() as *const libc::c_char);
+                    libc::unsetenv(c"CLAUDE_CODE_SESSION_ID".as_ptr() as *const libc::c_char);
                 }
                 // Build full argv: [cmd, args...].
                 let mut argv: Vec<&CStr> = Vec::with_capacity(args.len() + 1);

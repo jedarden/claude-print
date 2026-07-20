@@ -43,7 +43,10 @@ pub fn cleanup_orphans() {
                                         if let Err(e) = std::fs::remove_dir_all(&path) {
                                             eprintln!("claude-print: warning: failed to remove orphaned temp dir {:?}: {}", path, e);
                                         } else {
-                                            eprintln!("claude-print: cleaned up orphaned temp dir: {:?}", path);
+                                            eprintln!(
+                                                "claude-print: cleaned up orphaned temp dir: {:?}",
+                                                path
+                                            );
                                         }
                                     }
                                 }

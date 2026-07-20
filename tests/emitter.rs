@@ -115,6 +115,30 @@ fn test_json_usage_fields_are_integers() {
     assert!(usage["cache_read_input_tokens"].is_u64());
 }
 
+// bf-416c: emit_success reads result.is_error rather than hardcoding false, as
+// defense in depth. In normal operation session.rs converts an errored
+// transcript into an Err before this is reached, so is_error is always false
+// here — but the emitted flag must reflect the real transcript state, never lie.
+#[test]
+fn test_json_is_error_reflects_transcript_flag() {
+    let mut result = make_result("ok");
+    result.is_error = false;
+    let (buf, mut writer) = capture();
+    emit_success(&mut writer, &result, &OutputFormat::Json, "1.0", 0).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&buf.lock().unwrap()).unwrap();
+    assert_eq!(v["is_error"], false, "success transcript → is_error false");
+
+    let mut result = make_result("rate limited");
+    result.is_error = true;
+    let (buf, mut writer) = capture();
+    emit_success(&mut writer, &result, &OutputFormat::Json, "1.0", 0).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&buf.lock().unwrap()).unwrap();
+    assert_eq!(
+        v["is_error"], true,
+        "errored transcript must surface is_error=true (defense in depth)"
+    );
+}
+
 // ── error result ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -243,8 +267,8 @@ fn test_stream_json_each_line_parses_as_json() {
     let writer = Box::new(CaptureWriter(Arc::clone(&output_buf)));
 
     let handle = spawn_stream_json_reader_to(path, 0, writer);
-    handle.drain_tx.send(()).unwrap();
-    handle.join_handle.join().unwrap();
+    handle.signal_drain();
+    drop(handle); // disconnect + join (INV-8); drains remaining lines first
 
     let output = output_buf.lock().unwrap().clone();
     let text = std::str::from_utf8(&output).unwrap();
@@ -267,7 +291,7 @@ fn test_stream_json_disconnect_exits_immediately() {
     let writer = Box::new(CaptureWriter(Arc::clone(&output_buf)));
 
     let handle = spawn_stream_json_reader_to(path, 0, writer);
-    // Drop drain_tx without sending — thread should exit immediately
-    drop(handle.drain_tx);
-    handle.join_handle.join().unwrap(); // must not hang
+    // No drain signal — Drop disconnects the channel, so the thread exits
+    // immediately. Must not hang.
+    drop(handle);
 }

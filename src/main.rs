@@ -96,13 +96,17 @@ fn main() {
                 exit_with_cleanup(4);
             }
             if buffer.is_empty() {
-                eprintln!("claude-print: no prompt provided (pass as argument, --input-file, or stdin)");
+                eprintln!(
+                    "claude-print: no prompt provided (pass as argument, --input-file, or stdin)"
+                );
                 exit_with_cleanup(4);
             }
             buffer
         } else {
             // None found → exit 4
-            eprintln!("claude-print: no prompt provided (pass as argument, --input-file, or stdin)");
+            eprintln!(
+                "claude-print: no prompt provided (pass as argument, --input-file, or stdin)"
+            );
             exit_with_cleanup(4);
         }
     };
@@ -142,6 +146,14 @@ fn main() {
     let t0 = Instant::now();
     let output_format = cli.output_format; // Save before move
 
+    // bf-uj0: headless-launch safety knobs — pre-trust cwd, bound MCP init, and
+    // child-stderr surfacing on slow/stall. All default off.
+    let launch = session::LaunchOptions {
+        mcp_configs: cli.mcp_config.clone(),
+        pretrust_cwd: cli.pretrust_cwd,
+        show_child_stderr: cli.show_child_stderr,
+    };
+
     // Call session::Session::run()
     let result = session::Session::run(
         &claude_bin,
@@ -152,6 +164,7 @@ fn main() {
         Some(cli.stream_json_timeout),
         Some(cli.stop_hook_timeout),
         output_format,
+        &launch,
     );
 
     // Lock stdout and stderr for output
@@ -185,7 +198,8 @@ fn main() {
                 &mut stderr,
                 &ClaudePrintError::Interrupted,
                 &cli.output_format,
-                &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
             exit_with_cleanup(130);
@@ -196,13 +210,17 @@ fn main() {
                 &mut stderr,
                 &ClaudePrintError::Timeout,
                 &cli.output_format,
-                &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
             exit_with_cleanup(ClaudePrintError::Timeout.exit_code());
         }
         Err(Error::Internal(e)) => {
-            let msg = if e.to_string().contains("Child exited without sending Stop payload") {
+            let msg = if e
+                .to_string()
+                .contains("Child exited without sending Stop payload")
+            {
                 "claude exited before Stop hook fired".to_string()
             } else {
                 e.to_string()
@@ -212,10 +230,29 @@ fn main() {
                 &mut stderr,
                 &ClaudePrintError::Setup(msg),
                 &cli.output_format,
-                &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
             exit_with_cleanup(2);
+        }
+        Err(Error::AssistantError(msg)) => {
+            // bf-416c: the turn completed but Claude Code's own transcript
+            // reported is_error:true. Exit 1 (not 2) and emit an error result
+            // so callers that gate on exit code / is_error don't treat a failed
+            // turn as success. The prompt was injected, so stream-json after-inject
+            // writes the synthesized error JSON to stdout.
+            let err = ClaudePrintError::AssistantError(msg);
+            let _ = emit_error(
+                &mut stdout,
+                &mut stderr,
+                &err,
+                &cli.output_format,
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                true,
+            );
+            exit_with_cleanup(err.exit_code());
         }
         Err(e) => {
             let _ = emit_error(
@@ -223,7 +260,8 @@ fn main() {
                 &mut stderr,
                 &ClaudePrintError::Setup(e.to_string()),
                 &cli.output_format,
-                &resolve_claude_version(cli.claude_binary.as_deref()).unwrap_or_else(|| "unknown".to_string()),
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
             exit_with_cleanup(2);
@@ -240,5 +278,12 @@ fn emit_error(
     claude_version: &str,
     stream_json_after_inject: bool,
 ) -> std::io::Result<()> {
-    emitter::emit_error(stdout, stderr, error, format, claude_version, stream_json_after_inject)
+    emitter::emit_error(
+        stdout,
+        stderr,
+        error,
+        format,
+        claude_version,
+        stream_json_after_inject,
+    )
 }

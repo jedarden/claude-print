@@ -8,7 +8,7 @@
 /// callers.
 use claude_print::cli::OutputFormat;
 use claude_print::emitter::{emit_error, emit_success, spawn_stream_json_reader_to};
-use claude_print::error::ClaudePrintError;
+use claude_print::error::{ClaudePrintError, Error};
 use claude_print::hook::HookInstaller;
 use claude_print::poller::{cwd_to_slug, parse_stop_payload, resolve_stop_info};
 use claude_print::transcript::{
@@ -223,6 +223,15 @@ fn session_id_flows_from_transcript_to_json_output() {
 // ── Pipeline: error transcript → emitter ─────────────────────────────────────
 
 /// is_error: true in transcript result event → AssistantError → error JSON.
+///
+/// Drives the REAL conversion path that bf-416c wired up: the transcript's
+/// `is_error:true` becomes `Error::AssistantError(text)` (what session.rs
+/// returns), which `main.rs` converts to the user-facing type via the
+/// `From<Error> for ClaudePrintError` impl. Constructing
+/// `ClaudePrintError::AssistantError` by hand (as this test did before) gave
+/// false coverage — it never exercised that mapping, so a regression that let
+/// `Error::AssistantError` fall into the Setup catch-all (exit 2) would have
+/// passed silently. This version would catch it.
 #[test]
 fn is_error_transcript_maps_to_assistant_error_json() {
     let dir = TempDir::new().unwrap();
@@ -244,7 +253,17 @@ fn is_error_transcript_maps_to_assistant_error_json() {
     let result = parse_transcript(&path).unwrap();
     assert!(result.is_error, "transcript must reflect is_error=true");
 
-    let err = ClaudePrintError::AssistantError(result.text.clone());
+    // Mirror exactly what session.rs does on this path, then convert through
+    // the same From impl main.rs relies on.
+    let internal_err = Error::AssistantError(result.text.clone());
+    let err: ClaudePrintError = internal_err.into();
+    assert!(
+        matches!(err, ClaudePrintError::AssistantError(_)),
+        "Error::AssistantError must map to the user-facing AssistantError (exit 1), \
+         not the Setup catch-all (exit 2)"
+    );
+    assert_eq!(err.exit_code(), 1);
+
     let (out_buf, mut stdout) = capture();
     let (_, mut stderr) = capture();
     emit_error(
@@ -343,8 +362,8 @@ fn stream_json_pipeline_all_lines_valid_json() {
     let out_buf = Arc::new(Mutex::new(Vec::new()));
     let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
     let handle = spawn_stream_json_reader_to(path, 0, writer);
-    handle.drain_tx.send(()).unwrap();
-    handle.join_handle.join().unwrap();
+    handle.signal_drain();
+    drop(handle); // disconnect + join (INV-8); drains remaining lines first
 
     let output = out_buf.lock().unwrap().clone();
     let text = std::str::from_utf8(&output).unwrap();
@@ -379,8 +398,8 @@ fn stream_json_start_offset_skips_pre_injection_lines() {
     let out_buf = Arc::new(Mutex::new(Vec::new()));
     let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
     let handle = spawn_stream_json_reader_to(path, pre_len, writer);
-    handle.drain_tx.send(()).unwrap();
-    handle.join_handle.join().unwrap();
+    handle.signal_drain();
+    drop(handle); // disconnect + join (INV-8); drains remaining lines first
 
     let output = out_buf.lock().unwrap().clone();
     let text = std::str::from_utf8(&output).unwrap();

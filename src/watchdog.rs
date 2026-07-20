@@ -101,7 +101,8 @@ impl WatchdogConfig {
     ) -> Self {
         Self {
             pty_first_output_timeout_secs: pty_timeout.unwrap_or(DEFAULT_PTY_TIMEOUT_SECS),
-            stream_json_first_output_timeout_secs: stream_json_timeout.unwrap_or(DEFAULT_STREAM_JSON_TIMEOUT_SECS),
+            stream_json_first_output_timeout_secs: stream_json_timeout
+                .unwrap_or(DEFAULT_STREAM_JSON_TIMEOUT_SECS),
             overall_timeout_secs: overall_timeout.unwrap_or(0),
             stop_hook_timeout_secs: stop_hook_timeout.unwrap_or(DEFAULT_STOP_HOOK_TIMEOUT_SECS),
         }
@@ -153,7 +154,8 @@ impl WatchdogState {
 
     /// Mark that stream-json output has been received.
     pub fn mark_stream_json_output(&self) {
-        self.stream_json_output_received.store(true, Ordering::SeqCst);
+        self.stream_json_output_received
+            .store(true, Ordering::SeqCst);
     }
 
     /// Mark that the prompt has been injected.
@@ -262,14 +264,12 @@ impl Watchdog {
 
             // Spawn stream-json monitor if temp directory provided
             // The transcript file will be created at <temp_dir>/transcript.jsonl
-            let _stream_json_monitor = if let Some(ref dir) = temp_dir_path {
-                Some(spawn_stream_json_monitor_in_dir(
+            let _stream_json_monitor = temp_dir_path.as_ref().map(|dir| {
+                spawn_stream_json_monitor_in_dir(
                     dir.clone(),
                     Arc::clone(&stream_json_output_received),
-                ))
-            } else {
-                None
-            };
+                )
+            });
 
             loop {
                 // Check if already fired
@@ -285,69 +285,77 @@ impl Watchdog {
                 let prompt_injected = { *prompt_injected_at.lock().unwrap() };
 
                 // Check Phase 1: PTY first-output timeout
-                if config.pty_first_output_timeout_secs > 0 && !has_pty_output {
-                    if elapsed >= Duration::from_secs(config.pty_first_output_timeout_secs) {
-                        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-                        timeout_fired.store(true, Ordering::SeqCst);
-                        timeout_type.store(1, Ordering::SeqCst); // PtyFirstOutput
-                        // Signal the event loop via self-pipe
-                        if let Some(fd) = self_pipe_write_fd {
-                            let byte: [u8; 1] = [1];
-                            unsafe {
-                                let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
-                            }
+                if config.pty_first_output_timeout_secs > 0
+                    && !has_pty_output
+                    && elapsed >= Duration::from_secs(config.pty_first_output_timeout_secs)
+                {
+                    let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                    timeout_fired.store(true, Ordering::SeqCst);
+                    timeout_type.store(1, Ordering::SeqCst); // PtyFirstOutput
+                                                             // Signal the event loop via self-pipe
+                    if let Some(fd) = self_pipe_write_fd {
+                        let byte: [u8; 1] = [1];
+                        unsafe {
+                            let _ = libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
                         }
-                        return;
                     }
+                    return;
                 }
 
                 // Check Phase 2: Stream-json first-output timeout
-                if config.stream_json_first_output_timeout_secs > 0 && !has_stream_json_output {
-                    if elapsed >= Duration::from_secs(config.stream_json_first_output_timeout_secs) {
-                        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-                        timeout_fired.store(true, Ordering::SeqCst);
-                        timeout_type.store(2, Ordering::SeqCst); // StreamJsonFirstOutput
-                        // Signal the event loop via self-pipe
-                        if let Some(fd) = self_pipe_write_fd {
-                            let byte: [u8; 1] = [1];
-                            unsafe {
-                                let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
-                            }
+                if config.stream_json_first_output_timeout_secs > 0
+                    && !has_stream_json_output
+                    && elapsed >= Duration::from_secs(config.stream_json_first_output_timeout_secs)
+                {
+                    let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                    timeout_fired.store(true, Ordering::SeqCst);
+                    timeout_type.store(2, Ordering::SeqCst); // StreamJsonFirstOutput
+                                                             // Signal the event loop via self-pipe
+                    if let Some(fd) = self_pipe_write_fd {
+                        let byte: [u8; 1] = [1];
+                        unsafe {
+                            let _ = libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
                         }
-                        return;
                     }
+                    return;
                 }
 
                 // Check Phase 3: Overall timeout (applies throughout entire session)
-                if config.overall_timeout_secs > 0 {
-                    if elapsed >= Duration::from_secs(config.overall_timeout_secs) {
-                        let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
-                        timeout_fired.store(true, Ordering::SeqCst);
-                        timeout_type.store(3, Ordering::SeqCst); // OverallTimeout
-                        // Signal the event loop via self-pipe
-                        if let Some(fd) = self_pipe_write_fd {
-                            let byte: [u8; 1] = [1];
-                            unsafe {
-                                let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
-                            }
+                if config.overall_timeout_secs > 0
+                    && elapsed >= Duration::from_secs(config.overall_timeout_secs)
+                {
+                    let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                    timeout_fired.store(true, Ordering::SeqCst);
+                    timeout_type.store(3, Ordering::SeqCst); // OverallTimeout
+                                                             // Signal the event loop via self-pipe
+                    if let Some(fd) = self_pipe_write_fd {
+                        let byte: [u8; 1] = [1];
+                        unsafe {
+                            let _ = libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
                         }
-                        return;
                     }
+                    return;
                 }
 
                 // Check Phase 4: Stop hook watchdog timeout (after prompt injected)
                 if config.stop_hook_timeout_secs > 0 {
                     if let Some(injected_time) = prompt_injected {
                         let time_since_injection = injected_time.elapsed();
-                        if time_since_injection >= Duration::from_secs(config.stop_hook_timeout_secs) {
-                            let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                        if time_since_injection
+                            >= Duration::from_secs(config.stop_hook_timeout_secs)
+                        {
+                            let _ = nix::sys::signal::kill(
+                                child_pid,
+                                nix::sys::signal::Signal::SIGTERM,
+                            );
                             timeout_fired.store(true, Ordering::SeqCst);
                             timeout_type.store(4, Ordering::SeqCst); // StopHookTimeout
-                            // Signal the event loop via self-pipe
+                                                                     // Signal the event loop via self-pipe
                             if let Some(fd) = self_pipe_write_fd {
                                 let byte: [u8; 1] = [1];
                                 unsafe {
-                                    let _ = libc::write(fd as i32, byte.as_ptr() as *const libc::c_void, 1);
+                                    let _ =
+                                        libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
                                 }
                             }
                             return;
@@ -401,15 +409,13 @@ fn spawn_stream_json_monitor_in_dir(
                         let reader = BufReader::new(file);
 
                         // Check each line for valid JSON
-                        for line in reader.lines() {
-                            if let Ok(line) = line {
-                                let trimmed = line.trim();
-                                if !trimmed.is_empty() {
-                                    // Try to parse as JSON
-                                    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
-                                        output_received.store(true, Ordering::SeqCst);
-                                        return;
-                                    }
+                        for line in reader.lines().flatten() {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                // Try to parse as JSON
+                                if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+                                    output_received.store(true, Ordering::SeqCst);
+                                    return;
                                 }
                             }
                         }
@@ -432,15 +438,27 @@ mod tests {
     #[test]
     fn test_timeout_type_descriptions() {
         assert!(TimeoutType::PtyFirstOutput.description().contains("PTY"));
-        assert!(TimeoutType::StreamJsonFirstOutput.description().contains("stream-json"));
-        assert!(TimeoutType::OverallTimeout.description().contains("overall"));
-        assert!(TimeoutType::StopHookTimeout.description().contains("Stop hook"));
+        assert!(TimeoutType::StreamJsonFirstOutput
+            .description()
+            .contains("stream-json"));
+        assert!(TimeoutType::OverallTimeout
+            .description()
+            .contains("overall"));
+        assert!(TimeoutType::StopHookTimeout
+            .description()
+            .contains("Stop hook"));
     }
 
     #[test]
     fn test_timeout_type_subtypes() {
-        assert_eq!(TimeoutType::PtyFirstOutput.subtype(), "pty_first_output_timeout");
-        assert_eq!(TimeoutType::StreamJsonFirstOutput.subtype(), "stream_json_first_output_timeout");
+        assert_eq!(
+            TimeoutType::PtyFirstOutput.subtype(),
+            "pty_first_output_timeout"
+        );
+        assert_eq!(
+            TimeoutType::StreamJsonFirstOutput.subtype(),
+            "stream_json_first_output_timeout"
+        );
         assert_eq!(TimeoutType::OverallTimeout.subtype(), "overall_timeout");
         assert_eq!(TimeoutType::StopHookTimeout.subtype(), "stop_hook_timeout");
     }
@@ -448,10 +466,19 @@ mod tests {
     #[test]
     fn test_watchdog_config_default() {
         let config = WatchdogConfig::default();
-        assert_eq!(config.pty_first_output_timeout_secs, DEFAULT_PTY_TIMEOUT_SECS);
-        assert_eq!(config.stream_json_first_output_timeout_secs, DEFAULT_STREAM_JSON_TIMEOUT_SECS);
+        assert_eq!(
+            config.pty_first_output_timeout_secs,
+            DEFAULT_PTY_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.stream_json_first_output_timeout_secs,
+            DEFAULT_STREAM_JSON_TIMEOUT_SECS
+        );
         assert_eq!(config.overall_timeout_secs, DEFAULT_OVERALL_TIMEOUT_SECS);
-        assert_eq!(config.stop_hook_timeout_secs, DEFAULT_STOP_HOOK_TIMEOUT_SECS);
+        assert_eq!(
+            config.stop_hook_timeout_secs,
+            DEFAULT_STOP_HOOK_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -483,6 +510,9 @@ mod tests {
 
         state.fire_timeout(TimeoutType::StreamJsonFirstOutput);
         assert!(state.has_timeout_fired());
-        assert_eq!(state.get_timeout_type(), Some(TimeoutType::StreamJsonFirstOutput));
+        assert_eq!(
+            state.get_timeout_type(),
+            Some(TimeoutType::StreamJsonFirstOutput)
+        );
     }
 }

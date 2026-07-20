@@ -13,7 +13,7 @@ pub struct Defaults {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub defaults: Option<Defaults>,
 }
@@ -29,13 +29,14 @@ impl Config {
     /// Loads the config file, returning an empty config if the file doesn't exist
     pub fn load_or_default(path: &PathBuf) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                toml::from_str(&contents)
-                    .unwrap_or_else(|e| {
-                        eprintln!("claude-print: warning: invalid config at {}: {}", path.display(), e);
-                        Config { defaults: None }
-                    })
-            }
+            Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
+                eprintln!(
+                    "claude-print: warning: invalid config at {}: {}",
+                    path.display(),
+                    e
+                );
+                Config { defaults: None }
+            }),
             Err(_) => Config { defaults: None },
         }
     }
@@ -60,12 +61,6 @@ impl Config {
         cli_model
             .or(self.default_model().map(|s| s.to_string()))
             .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config { defaults: None }
     }
 }
 
@@ -147,10 +142,7 @@ model = "claude-opus-4-8""#,
         .unwrap();
 
         let config = Config::load_or_default(&config_path);
-        assert_eq!(
-            config.default_model(),
-            Some("claude-opus-4-8")
-        );
+        assert_eq!(config.default_model(), Some("claude-opus-4-8"));
     }
 
     #[test]

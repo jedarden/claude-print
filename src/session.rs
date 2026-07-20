@@ -1,23 +1,20 @@
+use crate::emitter;
 use crate::error::{Error, Result};
-use crate::event_loop::{ExitReason, EventLoop};
+use crate::event_loop::{EventLoop, ExitReason};
 use crate::hook::HookInstaller;
-use crate::poller::{open_fifo_nonblock, parse_stop_payload, resolve_stop_info, cwd_to_slug};
+use crate::poller::{open_fifo_nonblock, parse_stop_payload, resolve_stop_info};
 use crate::pty::PtySpawner;
 use crate::startup::{StartupAction, StartupSeq};
 use crate::terminal::TerminalEmu;
 use crate::transcript::{read_transcript, TranscriptResult};
-use crate::watchdog::{Watchdog, WatchdogConfig, TimeoutType};
-use crate::emitter;
+use crate::watchdog::{TimeoutType, Watchdog, WatchdogConfig};
 use nix::sys::signal::{self, SigHandler};
 use nix::sys::wait::waitpid;
-use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +40,94 @@ pub struct SessionResult {
     pub transcript_path: std::path::PathBuf,
     /// Stream-json reader handle (only set when output_format is stream-json).
     pub stream_json_handle: Option<emitter::StreamJsonHandle>,
+}
+
+/// Headless-launch safety knobs (bf-uj0).
+///
+/// The PTY keyword scanner in [`crate::startup::StartupSeq`] dismisses the trust
+/// dialog heuristically, but two startup blockers defeat it: a one-time folder
+/// trust prompt for a never-trusted cwd, and an MCP server that hangs on connect.
+/// These knobs remove both blocking paths *before* the child is spawned, so
+/// headless runs can't wedge on an interactive prompt the scanner can't see.
+///
+/// All three default off — claude-print never mutates `~/.claude.json` or
+/// overrides MCP config unless the caller explicitly asks. See [`Cli`] flag docs
+/// for the per-knob rationale.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+    /// MCP configs (path or inline JSON) to load. When non-empty, the child is
+    /// launched with `--strict-mcp-config` plus `--mcp-config <entry>` for each
+    /// entry, so ONLY the named configs load — inherited/project/global MCP
+    /// servers that can hang on connect cannot wedge startup.
+    pub mcp_configs: Vec<String>,
+    /// Write `hasTrustDialogAccepted: true` for the cwd into `~/.claude.json`
+    /// before spawning the child, so the one-time trust dialog can't stall an
+    /// untrusted working dir.
+    pub pretrust_cwd: bool,
+    /// Capture the child's raw PTY output (combined stdout+stderr) and dump it
+    /// to claude-print's stderr when startup is slow or stalls — surfaces
+    /// MCP/init wedges for diagnosis.
+    pub show_child_stderr: bool,
+}
+
+/// Bounded ring buffer of the child's raw PTY output (bf-uj0).
+///
+/// The child runs under a PTY, so this captures its combined stdout+stderr.
+/// Kept to a fixed tail (`cap`) so a wedged-but-chatty child can't grow memory
+/// unbounded; the tail is what matters for diagnosing a stall. A no-op until
+/// `dump` is called on a slow/stall exit path, and only when the caller opted
+/// in via `--show-child-stderr`.
+struct ChildCapture {
+    enabled: bool,
+    buf: Vec<u8>,
+    cap: usize,
+}
+
+impl ChildCapture {
+    /// Maximum tail size kept, in bytes. ~64 KiB is enough to capture the
+    /// failing region of a startup wedge without holding the whole session.
+    const CAP: usize = 64 * 1024;
+
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            buf: Vec::new(),
+            cap: Self::CAP,
+        }
+    }
+
+    /// Append a PTY chunk, dropping the oldest bytes once `cap` is exceeded.
+    fn feed(&mut self, chunk: &[u8]) {
+        if !self.enabled || chunk.is_empty() {
+            return;
+        }
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > self.cap {
+            let drop_n = self.buf.len() - self.cap;
+            self.buf.drain(0..drop_n);
+        }
+    }
+
+    /// Write the captured tail to claude-print's stderr with a bounding header.
+    /// No-op when disabled or empty.
+    fn dump(&self, reason: &str) {
+        if !self.enabled || self.buf.is_empty() {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        use std::io::Write;
+        let _ = writeln!(
+            stderr,
+            "claude-print: ----- child PTY output ({}, {} bytes) -----",
+            reason,
+            self.buf.len()
+        );
+        let _ = stderr.write_all(&self.buf);
+        if self.buf.last() != Some(&b'\n') {
+            let _ = stderr.write_all(b"\n");
+        }
+        let _ = writeln!(stderr, "claude-print: ----- end child output -----");
+    }
 }
 
 /// Guard that ensures temp dir cleanup on all exit paths.
@@ -138,6 +223,7 @@ impl Session {
     /// * `stream_json_timeout_secs` - Optional stream-json first-output timeout in seconds.
     /// * `stop_hook_timeout_secs` - Optional Stop hook watchdog timeout in seconds.
     /// * `output_format` - Output format (text, json, or stream-json).
+    /// * `launch` - Headless-launch safety knobs (pre-trust cwd, bound MCP, stderr surfacing).
     ///
     /// # Returns
     ///
@@ -148,6 +234,7 @@ impl Session {
     /// Returns `Error::NoResponse` if the child exits without sending a Stop payload.
     /// Returns `Error::Timeout` if the timeout expires (no output or overall timeout).
     /// Returns `Error::Interrupted` if a SIGINT is received.
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         claude_bin: &Path,
         claude_args: &[OsString],
@@ -157,6 +244,7 @@ impl Session {
         stream_json_timeout_secs: Option<u64>,
         stop_hook_timeout_secs: Option<u64>,
         output_format: crate::cli::OutputFormat,
+        launch: &LaunchOptions,
     ) -> Result<SessionResult> {
         // Use a catch_unwind to ensure cleanup happens even on panics
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -169,6 +257,7 @@ impl Session {
                 stream_json_timeout_secs,
                 stop_hook_timeout_secs,
                 output_format,
+                launch,
             )
         }));
 
@@ -185,6 +274,7 @@ impl Session {
     ///
     /// This is separated from `run` to allow panic handling via catch_unwind
     /// while still ensuring cleanup happens through the CleanupGuard.
+    #[allow(clippy::too_many_arguments)]
     fn run_inner(
         claude_bin: &Path,
         claude_args: &[OsString],
@@ -194,6 +284,7 @@ impl Session {
         stream_json_timeout_secs: Option<u64>,
         stop_hook_timeout_secs: Option<u64>,
         output_format: crate::cli::OutputFormat,
+        launch: &LaunchOptions,
     ) -> Result<SessionResult> {
         let start_time = Instant::now();
 
@@ -209,18 +300,48 @@ impl Session {
         // 2. Resolve Claude Code version.
         let claude_version = Self::resolve_claude_version(claude_bin)?;
 
+        // 2a. Pre-grant folder trust for the cwd before spawning (bf-uj0). Claude
+        // Code reads trust only from ~/.claude.json, never from --settings, so the
+        // PTY keyword scanner is the only other line of defense — and it can miss
+        // the one-time dialog for a never-trusted cwd. Doing this up front removes
+        // the stall at the source. No-op unless --pretrust-cwd was passed.
+        if launch.pretrust_cwd {
+            pretrust_cwd()?;
+        }
+
         // 3. Build child argv.
         let cmd = CString::new(claude_bin.to_string_lossy().as_bytes())
             .map_err(|e| Error::Internal(anyhow::anyhow!("claude_bin path invalid: {e}")))?;
-        let mut args: Vec<CString> = Vec::with_capacity(claude_args.len() + 3);
+        let mut args: Vec<CString> =
+            Vec::with_capacity(claude_args.len() + 4 + 2 * launch.mcp_configs.len());
         args.push(CString::new("--dangerously-skip-permissions").unwrap());
         args.push(
-            CString::new(format!("--settings={}", installer.settings_path.to_string_lossy()))
-                .map_err(|e| Error::Internal(anyhow::anyhow!("settings path invalid: {e}")))?,
+            CString::new(format!(
+                "--settings={}",
+                installer.settings_path.to_string_lossy()
+            ))
+            .map_err(|e| Error::Internal(anyhow::anyhow!("settings path invalid: {e}")))?,
         );
         // Prevent global settings inheritance - the temp settings.json contains only the Stop hook
         // and inheriting global hooks (SessionStart, etc.) can cause the child to hang at startup.
         args.push(CString::new("--setting-sources=").unwrap());
+
+        // bf-uj0: bound MCP init. When the caller names MCP configs, launch the
+        // child in strict mode so ONLY those load — inherited/project/global MCP
+        // servers that can hang on connect (a startup-wedge trigger from the
+        // bf-2u1 investigation) are ignored entirely. Each entry is emitted as its
+        // own `--mcp-config <entry>` pair: unambiguous regardless of what flags
+        // follow, and tolerant of either inline-JSON or file-path values.
+        if !launch.mcp_configs.is_empty() {
+            args.push(CString::new("--strict-mcp-config").unwrap());
+            for cfg in &launch.mcp_configs {
+                args.push(CString::new("--mcp-config").unwrap());
+                args.push(CString::new(cfg.as_str()).map_err(|e| {
+                    Error::Internal(anyhow::anyhow!("mcp-config value invalid: {e}"))
+                })?);
+            }
+        }
+
         for arg in claude_args {
             let arg_str = arg.to_string_lossy().to_string();
             args.push(
@@ -230,15 +351,18 @@ impl Session {
         }
 
         // 4. Self-pipe for SIGINT.
-        let (self_pipe_read, self_pipe_write) =
-            nix::unistd::pipe().map_err(|e| Error::Internal(anyhow::anyhow!("pipe() failed: {e}")))?;
+        let (self_pipe_read, self_pipe_write) = nix::unistd::pipe()
+            .map_err(|e| Error::Internal(anyhow::anyhow!("pipe() failed: {e}")))?;
         unsafe {
             let write_ptr = &raw mut SELF_PIPE_WRITE;
             *write_ptr = Some(self_pipe_write.try_clone().unwrap());
             signal::signal(signal::Signal::SIGINT, SigHandler::Handler(sigint_handler))
                 .map_err(|e| Error::SignalHandlerFailed(format!("SIGINT: {e}")))?;
-            signal::signal(signal::Signal::SIGTERM, SigHandler::Handler(sigterm_handler))
-                .map_err(|e| Error::SignalHandlerFailed(format!("SIGTERM: {e}")))?;
+            signal::signal(
+                signal::Signal::SIGTERM,
+                SigHandler::Handler(sigterm_handler),
+            )
+            .map_err(|e| Error::SignalHandlerFailed(format!("SIGTERM: {e}")))?;
         }
 
         // Restore default signal handlers on drop.
@@ -255,7 +379,7 @@ impl Session {
         // 4. Stop hook watchdog timeout: if Stop hook doesn't fire within N seconds after prompt injection (default 120s)
         let watchdog_config = WatchdogConfig::new(
             first_output_timeout_secs,
-            stream_json_timeout_secs.or_else(|| first_output_timeout_secs),
+            stream_json_timeout_secs.or(first_output_timeout_secs),
             timeout_secs,
             stop_hook_timeout_secs,
         );
@@ -267,7 +391,12 @@ impl Session {
         // Get the raw fd for the self-pipe write end for the watchdog to signal timeout
         let watchdog_self_pipe_fd = Some(self_pipe_write.as_raw_fd());
 
-        let watchdog = Watchdog::new(watchdog_config, spawner.child_pid, Some(temp_dir_path), watchdog_self_pipe_fd);
+        let watchdog = Watchdog::new(
+            watchdog_config,
+            spawner.child_pid,
+            Some(temp_dir_path),
+            watchdog_self_pipe_fd,
+        );
 
         let watchdog_state = watchdog.state();
 
@@ -299,6 +428,14 @@ impl Session {
         };
 
         // 12. Prepare stream-json reader (will be spawned at PROMPT_INJECTED).
+        //
+        // Reader-thread cleanup is RAII: StreamJsonHandle::Drop disconnects the
+        // drain channel and joins the reader, so EVERY return path below —
+        // success, timeout, SIGINT/SIGTERM, child-exit, and the `?` propagations
+        // from parse_stop_payload / read_transcript — joins the reader before
+        // this function returns (plan invariant INV-8). Only the normal Stop
+        // (success) path calls signal_drain() first; all error paths drop the
+        // handle without signaling so the reader exits immediately.
         let temp_dir_path = installer.dir_path().to_path_buf();
         let transcript_path = temp_dir_path.join("transcript.jsonl");
         let mut stream_json_handle: Option<emitter::StreamJsonHandle> = None;
@@ -309,6 +446,9 @@ impl Session {
         let watchdog_state_clone = watchdog_state.clone();
         let mut last_phase = startup.phase().clone();
         let stream_json_spawned_clone = stream_json_spawned.clone();
+        // bf-uj0: capture the child's raw PTY output so --show-child-stderr can
+        // surface it on a slow/stall exit. A no-op (empty buffer) until dumped.
+        let mut child_capture = ChildCapture::new(launch.show_child_stderr);
 
         let exit_reason = event_loop.run(|chunk| {
             // Empty chunk = timer tick from the event loop (poll timeout with no data).
@@ -316,6 +456,8 @@ impl Session {
             if !chunk.is_empty() {
                 // Mark that we've received first output from the child (PTY output)
                 watchdog_state_clone.mark_pty_output();
+                // Capture raw child output for --show-child-stderr diagnosis.
+                child_capture.feed(chunk);
                 // Feed chunk to terminal emulator.
                 let probe_responses = terminal.feed(chunk);
 
@@ -341,11 +483,13 @@ impl Session {
 
             // Handle startup actions.
             match &action {
-                StartupAction::Write(bytes) => {
-                    unsafe {
-                        libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
-                    }
-                }
+                StartupAction::Write(bytes) => unsafe {
+                    libc::write(
+                        master_fd,
+                        bytes.as_ptr() as *const libc::c_void,
+                        bytes.len(),
+                    );
+                },
                 StartupAction::HardTimeout => {
                     // Handled after event loop exits.
                 }
@@ -377,11 +521,13 @@ impl Session {
             last_phase = current_phase.clone();
 
             match &timer_action {
-                StartupAction::Write(bytes) => {
-                    unsafe {
-                        libc::write(master_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
-                    }
-                }
+                StartupAction::Write(bytes) => unsafe {
+                    libc::write(
+                        master_fd,
+                        bytes.as_ptr() as *const libc::c_void,
+                        bytes.len(),
+                    );
+                },
                 StartupAction::HardTimeout => {
                     // Handled after event loop exits.
                 }
@@ -391,41 +537,65 @@ impl Session {
 
         // 13. Check if watchdog timeout fired.
         if watchdog_state.has_timeout_fired() {
-            let timeout_type = watchdog_state.get_timeout_type().unwrap_or(TimeoutType::OverallTimeout);
+            let timeout_type = watchdog_state
+                .get_timeout_type()
+                .unwrap_or(TimeoutType::OverallTimeout);
             let timeout_msg = timeout_type.description();
 
             // Write diagnostic to stderr
             eprintln!("claude-print: {}", timeout_msg);
-            eprintln!("claude-print: sending SIGTERM to child pid {}", spawner.child_pid);
+            eprintln!(
+                "claude-print: sending SIGTERM to child pid {}",
+                spawner.child_pid
+            );
+
+            // bf-uj0: a watchdog timeout means startup (or the session) stalled;
+            // surface what the child emitted so MCP/init wedges are diagnosable.
+            child_capture.dump(timeout_msg);
 
             kill_child(spawner.child_pid);
 
-            // INV-8: Join stream-json reader on timeout path (drop sender, exit immediately)
-            if let Some(handle) = stream_json_handle {
-                drop(handle.drain_tx); // Drop without sending -> exit immediately
-                let _ = handle.join_handle.join();
-            }
+            // INV-8: Timeout path — drop the reader WITHOUT a drain signal (the
+            // sender is dropped, not signaled). StreamJsonHandle::Drop disconnects
+            // the channel so the reader exits immediately, then joins the thread
+            // before we return.
+            drop(stream_json_handle);
 
             return Err(Error::Timeout(timeout_msg.to_string()));
         }
 
         // 14. Handle exit reason.
+        // bf-uj0: if the prompt was never injected, startup stalled before the
+        // session even began — surface the child output for diagnosis on the
+        // non-success arms below.
+        let prompt_injected = startup.phase().is_prompt_injected();
         match exit_reason {
             ExitReason::FifoPayload(payload) => {
-                // Parse stop payload.
+                // Parse stop payload. On error, `?` returns and Drop joins the
+                // reader without draining (INV-8, exit-immediately on error).
                 let stop_payload = parse_stop_payload(&payload)?;
                 let stop_info = resolve_stop_info(stop_payload);
 
-                // Read transcript.
+                // Read transcript. On error, `?` returns and Drop joins the
+                // reader without draining (INV-8, exit-immediately on error).
                 let transcript_path = stop_info.transcript_path.as_ref();
                 let transcript = if let Some(path) = transcript_path {
-                    read_transcript(path, stop_info.last_assistant_message.as_deref())?
-                } else {
-                    // Drain and join stream-json reader before returning error
-                    if let Some(handle) = stream_json_handle {
-                        let _ = handle.drain_tx.send(()); // Signal drain
-                        let _ = handle.join_handle.join();
+                    let t = read_transcript(path, stop_info.last_assistant_message.as_deref())?;
+                    // bf-416c: Claude Code's own transcript result event reported
+                    // is_error:true (rate limit, tool failure, any assistant-side
+                    // error). This is a COMPLETED turn that the assistant itself
+                    // flagged as failed — distinct from a claude-print Setup error.
+                    // Surface it as exit-1 AssistantError so callers that gate on
+                    // exit code / is_error (NEEDLE's output_transform) don't
+                    // silently treat a failed turn as success. The reader handle
+                    // is dropped (joined without draining) on this return — same
+                    // INV-8 exit-immediately pattern as the `?` propagations above.
+                    if t.is_error {
+                        return Err(Error::AssistantError(t.text));
                     }
+                    t
+                } else {
+                    // No transcript path: error path — Drop joins without draining.
                     return Err(Error::Internal(anyhow::anyhow!(
                         "Stop payload contained no transcript path and could not derive one"
                     )));
@@ -434,42 +604,52 @@ impl Session {
                 // Wait for child to exit.
                 kill_child(spawner.child_pid);
 
-                let transcript_path = stop_info.transcript_path.clone().unwrap_or_else(|| {
-                    std::path::PathBuf::from("transcript.jsonl")
-                });
+                let transcript_path = stop_info
+                    .transcript_path
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from("transcript.jsonl"));
 
-                // INV-8: On success, send drain signal and join stream-json reader
-                if let Some(handle) = stream_json_handle {
-                    // Send drain signal: drain remaining lines then exit
-                    let _ = handle.drain_tx.send(());
-                    let _ = handle.join_handle.join();
+                // Normal Stop transition: signal the reader to drain its
+                // remaining transcript lines to stdout, then drop it so Drop
+                // disconnects the channel and joins (draining completes inside
+                // the join before we return). INV-8.
+                if let Some(handle) = stream_json_handle.as_ref() {
+                    handle.signal_drain();
                 }
+                drop(stream_json_handle);
 
                 Ok(SessionResult {
                     transcript,
                     claude_version,
                     duration_ms: start_time.elapsed().as_millis() as u64,
                     transcript_path,
-                    stream_json_handle: None, // Already joined
+                    stream_json_handle: None, // reader drained + joined via Drop above
                 })
             }
             ExitReason::ChildExited => {
                 // Child exited without Stop hook.
                 let _ = waitpid(spawner.child_pid, None);
-                // INV-8: Join stream-json reader on child exit path
-                if let Some(handle) = stream_json_handle {
-                    drop(handle.drain_tx); // Drop without sending -> exit immediately
-                    let _ = handle.join_handle.join();
+                // bf-uj0: if the prompt was never injected, the child died during
+                // startup (bad args, init crash) — surface its output.
+                if !prompt_injected {
+                    child_capture.dump("child exited before prompt was injected");
                 }
-                Err(Error::Internal(anyhow::anyhow!("Child exited without sending Stop payload")))
+                // Drop joins the reader without draining (INV-8, exit-immediately).
+                drop(stream_json_handle);
+                Err(Error::Internal(anyhow::anyhow!(
+                    "Child exited without sending Stop payload"
+                )))
             }
             ExitReason::Interrupted => {
                 kill_child(spawner.child_pid);
-                // INV-8: Join stream-json reader on interrupted path
-                if let Some(handle) = stream_json_handle {
-                    drop(handle.drain_tx); // Drop without sending -> exit immediately
-                    let _ = handle.join_handle.join();
+                // bf-uj0: surface output if interrupted before injection (likely a
+                // user-noticed stall).
+                if !prompt_injected {
+                    child_capture.dump("interrupted before prompt was injected");
                 }
+                // SIGINT/SIGTERM path: the sender is dropped (not signaled), so
+                // the reader exits immediately; Drop joins it before we return (INV-8).
+                drop(stream_json_handle);
                 Err(Error::Interrupted("interrupted by signal".to_string()))
             }
         }
@@ -487,10 +667,9 @@ impl Session {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
-        let first_line = combined
-            .lines()
-            .next()
-            .ok_or_else(|| Error::Internal(anyhow::anyhow!("claude --version produced no output")))?;
+        let first_line = combined.lines().next().ok_or_else(|| {
+            Error::Internal(anyhow::anyhow!("claude --version produced no output"))
+        })?;
 
         Ok(first_line.trim().to_string())
     }
@@ -517,6 +696,106 @@ fn kill_child(pid: nix::unistd::Pid) {
             _ => return,
         }
     }
+}
+
+/// Pre-grant folder trust for the current working dir by writing
+/// `hasTrustDialogAccepted: true` into `~/.claude.json` (bf-uj0).
+///
+/// Claude Code reads workspace trust only from this file (never from `--settings`),
+/// keyed under `projects["<abs-cwd>"]`. Setting the flag before spawn removes the
+/// one-time trust dialog as a startup blocker for an untrusted cwd — the PTY
+/// keyword scanner can miss it, and a missed dialog stalls the session forever.
+///
+/// Safety: the existing file is parsed and only the trust field is modified, then
+/// written back atomically (sibling tmp file + rename) preserving its mode. If the
+/// file exists but is not a valid JSON object, it is left **untouched** (the trust
+/// scanner remains the fallback) — clobbering the user's config would be far worse
+/// than a possible stall.
+fn pretrust_cwd() -> Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::Internal(anyhow::anyhow!("pretrust cwd: {e}")))?;
+    let home = std::env::var("HOME")
+        .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
+    let claude_json = PathBuf::from(&home).join(".claude.json");
+
+    // Read existing content + mode. On a parse error of an *existing* file, do
+    // NOT rewrite — clobbering the user's config is worse than a possible stall.
+    let (mut root, existing_mode) = match std::fs::read_to_string(&claude_json) {
+        Ok(s) => {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&claude_json)
+                .ok()
+                .map(|m| m.permissions().mode());
+            match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(v) if v.is_object() => (v, mode),
+                Ok(_) => {
+                    eprintln!(
+                        "claude-print: warning: ~/.claude.json is not a JSON object; leaving it untouched (trust scanner remains active)"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "claude-print: warning: ~/.claude.json is unreadable ({e}); leaving it untouched (trust scanner remains active)"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        Err(_) => (serde_json::json!({}), None),
+    };
+
+    // projects[cwd].hasTrustDialogAccepted = true
+    let key = cwd.to_string_lossy().into_owned();
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("~/.claude.json root is not an object")))?;
+    let projects = root_obj
+        .entry("projects".to_string())
+        .or_insert(serde_json::json!({}));
+    let proj = projects.as_object_mut().ok_or_else(|| {
+        Error::Internal(anyhow::anyhow!("~/.claude.json projects is not an object"))
+    })?;
+    let entry = proj.entry(key).or_insert(serde_json::json!({}));
+    let entry_obj = entry.as_object_mut().ok_or_else(|| {
+        Error::Internal(anyhow::anyhow!(
+            "~/.claude.json project entry is not an object"
+        ))
+    })?;
+    entry_obj.insert(
+        "hasTrustDialogAccepted".to_string(),
+        serde_json::json!(true),
+    );
+
+    // Atomic write: sibling tmp file (same dir ⇒ same filesystem) + rename.
+    let tmp_path = claude_json.with_file_name(format!(
+        ".claude.json.tmp-claude-print-{}",
+        std::process::id()
+    ));
+    let content = serde_json::to_string(&root)
+        .map_err(|e| Error::Internal(anyhow::anyhow!("serialize ~/.claude.json: {e}")))?;
+    std::fs::write(&tmp_path, content)
+        .map_err(|e| Error::Internal(anyhow::anyhow!("write ~/.claude.json tmp: {e}")))?;
+
+    // Preserve existing mode, or default to 0600 for a newly created file
+    // (~/.claude.json holds auth/session state).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = existing_mode.unwrap_or(0o600);
+        if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode)) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(Error::Internal(anyhow::anyhow!(
+                "chmod ~/.claude.json tmp: {e}"
+            )));
+        }
+    }
+
+    std::fs::rename(&tmp_path, &claude_json).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        Error::Internal(anyhow::anyhow!("rename ~/.claude.json: {e}"))
+    })?;
+
+    Ok(())
 }
 
 // Signal handler that writes to the self-pipe.
@@ -607,7 +886,11 @@ mod tests {
 
         // Test version resolution
         let result = Session::resolve_claude_version(&mock_bin);
-        assert!(result.is_ok(), "Version resolution should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Version resolution should succeed: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), "claude-print-mock-1.0.0");
     }
 
@@ -615,7 +898,7 @@ mod tests {
     fn test_session_result_struct_has_required_fields() {
         // This test verifies that SessionResult has the required fields
         // by checking that we can construct and access them
-        use crate::transcript::{TranscriptResult, AggregatedUsage};
+        use crate::transcript::{AggregatedUsage, TranscriptResult};
 
         let transcript = TranscriptResult {
             text: "test".to_string(),
@@ -637,7 +920,13 @@ mod tests {
         assert_eq!(session_result.claude_version, "claude-1.0.0");
         assert_eq!(session_result.duration_ms, 1000);
         assert_eq!(session_result.transcript.text, "test");
-        assert_eq!(session_result.transcript.session_id.as_deref(), Some("sess-123"));
-        assert_eq!(session_result.transcript_path, std::path::PathBuf::from("transcript.jsonl"));
+        assert_eq!(
+            session_result.transcript.session_id.as_deref(),
+            Some("sess-123")
+        );
+        assert_eq!(
+            session_result.transcript_path,
+            std::path::PathBuf::from("transcript.jsonl")
+        );
     }
 }

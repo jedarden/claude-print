@@ -1,11 +1,10 @@
+use std::env;
+use std::path::Path;
 /// Build script to compile mock-claude test fixture.
 ///
 /// This ensures that integration tests (specifically tests/watchdog.rs) have
 /// the mock-claude binary available without manual building.
-
 use std::process::Command;
-use std::env;
-use std::path::Path;
 
 fn main() {
     // Only build mock-claude if we're not in a doctest context

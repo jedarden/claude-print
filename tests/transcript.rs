@@ -335,6 +335,53 @@ fn test_result_event_fields() {
     assert!(!r.is_error);
 }
 
+// ── is_error flows through read_transcript (bf-416c upstream) ─────────────────
+//
+// session.rs calls read_transcript() and then checks `.is_error`. These tests
+// pin the contract that an is_error:true result event surfaces as
+// TranscriptResult.is_error == true on BOTH the direct-parse path and the
+// fallback path — so the session-level AssistantError conversion has a real
+// signal to act on.
+
+#[test]
+fn parse_transcript_reflects_is_error_true() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("t.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            assistant_event("msg-err", "Rate limit exceeded", 0, 0, 0, 0),
+            result_event("err-session", true),
+        ],
+    );
+    let r = parse_transcript(&path).unwrap();
+    assert_eq!(r.text, "Rate limit exceeded");
+    assert!(
+        r.is_error,
+        "parse_transcript must surface is_error=true from the result event"
+    );
+}
+
+#[test]
+fn read_transcript_preserves_is_error_true() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("t.jsonl");
+    write_jsonl(
+        &path,
+        &[
+            assistant_event("msg-err", "Rate limit exceeded", 0, 0, 0, 0),
+            result_event("err-session", true),
+        ],
+    );
+    // This is the exact call session.rs makes in the FifoPayload arm.
+    let r = read_transcript(&path, None).unwrap();
+    assert!(!r.used_fallback, "text is present, so no fallback expected");
+    assert!(
+        r.is_error,
+        "read_transcript must preserve is_error=true for session.rs to act on"
+    );
+}
+
 // ── read_transcript: fallback to last_assistant_message ──────────────────────
 
 #[test]

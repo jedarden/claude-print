@@ -3,7 +3,6 @@
 /// Regression test for a child that (a) produces no output and (b) never fires
 /// the Stop hook. Asserts that claude-print exits non-zero within the configured
 /// watchdog window, kills the stub, and leaves no orphaned temp dir/FIFO.
-
 use claude_print::cli::OutputFormat;
 use claude_print::error::Error;
 use claude_print::session::Session;
@@ -63,7 +62,10 @@ fn watchdog_silent_child_times_out_with_cleanup() {
 
     let mock_bin = mock_claude_bin();
     if !mock_bin.exists() {
-        eprintln!("Skipping test: mock-claude binary not found at {}", mock_bin.display());
+        eprintln!(
+            "Skipping test: mock-claude binary not found at {}",
+            mock_bin.display()
+        );
         return;
     }
 
@@ -78,6 +80,7 @@ fn watchdog_silent_child_times_out_with_cleanup() {
         None,    // use default stream-json timeout
         None,    // no stop-hook timeout (prompt never injected for silent children)
         OutputFormat::Text,
+        &Default::default(), // bf-uj0: headless-launch knobs (all off)
     );
 
     // Clean up env var
@@ -86,8 +89,11 @@ fn watchdog_silent_child_times_out_with_cleanup() {
     // Assert timeout error - should be PTY first-output timeout
     match result {
         Err(Error::Timeout(msg)) => {
-            assert!(msg.contains("PTY") || msg.contains("output"),
-                    "timeout message should mention PTY or output, got: {}", msg);
+            assert!(
+                msg.contains("PTY") || msg.contains("output"),
+                "timeout message should mention PTY or output, got: {}",
+                msg
+            );
         }
         other => panic!("Expected Timeout error, got: {:?}", other),
     }
@@ -123,7 +129,10 @@ fn watchdog_one_second_timeout_fires_cleanly() {
 
     let mock_bin = mock_claude_bin();
     if !mock_bin.exists() {
-        eprintln!("Skipping test: mock-claude binary not found at {}", mock_bin.display());
+        eprintln!(
+            "Skipping test: mock-claude binary not found at {}",
+            mock_bin.display()
+        );
         return;
     }
 
@@ -136,14 +145,18 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         None,    // use default stream-json timeout
         None,    // no stop-hook timeout
         OutputFormat::Text,
+        &Default::default(), // bf-uj0: headless-launch knobs (all off)
     );
 
     std::env::remove_var("MOCK_SILENT");
 
     match result {
         Err(Error::Timeout(msg)) => {
-            assert!(msg.contains("PTY") || msg.contains("output"),
-                    "timeout message should mention PTY or output, got: {}", msg);
+            assert!(
+                msg.contains("PTY") || msg.contains("output"),
+                "timeout message should mention PTY or output, got: {}",
+                msg
+            );
         }
         other => panic!("Expected Timeout error, got: {:?}", other),
     }
