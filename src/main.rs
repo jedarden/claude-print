@@ -1,5 +1,6 @@
 use clap::Parser;
 use claude_print::cli::{version_string, Cli};
+use claude_print::config::Config;
 use claude_print::emitter;
 use claude_print::error::{ClaudePrintError, Error};
 use claude_print::hook;
@@ -111,12 +112,23 @@ fn main() {
         }
     };
 
+    // Load the config file once at startup (plan.md "Configuration File"). A
+    // missing $HOME or a missing/invalid file yields an empty config, so this
+    // never aborts the run — it just means no config-derived defaults apply.
+    let config = Config::default_path()
+        .map(|path| Config::load_or_default(&path))
+        .unwrap_or_default();
+
     // Build claude_args: collect flags to forward to child
     let mut claude_args: Vec<std::ffi::OsString> = Vec::new();
 
-    if let Some(ref model) = cli.model {
-        claude_args.push("--model".into());
-        claude_args.push(model.as_str().into());
+    // Model precedence (plan.md "Model precedence"): CLI --model flag >
+    // config.toml defaults.model > compiled-in default (claude-sonnet-4-6).
+    // Always forward an explicit --model so the compiled-in default is applied
+    // rather than letting the child silently fall back to its own internal
+    // default when neither a flag nor a config value is present.
+    for arg in build_model_args(&config, cli.model.clone()) {
+        claude_args.push(arg.into());
     }
 
     if cli.max_turns != 30 {
@@ -286,4 +298,68 @@ fn emit_error(
         claude_version,
         stream_json_after_inject,
     )
+}
+
+/// Build the `--model <resolved>` argv pair to forward to the child, applying
+/// the plan's documented precedence: CLI `--model` flag > `config.toml`
+/// `defaults.model` > compiled-in default (`claude-sonnet-4-6`).
+///
+/// Always returns a two-element pair (never empty) so the model forwarded to
+/// the child is always explicit — the compiled-in default is applied here
+/// rather than being left to the child's own internal default.
+fn build_model_args(config: &Config, cli_model: Option<String>) -> Vec<String> {
+    vec!["--model".to_string(), config.resolve_model(cli_model)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_config(dir: &std::path::Path, model: Option<&str>) -> std::path::PathBuf {
+        let path = dir.join("claude-print.toml");
+        let contents = match model {
+            Some(m) => format!("[defaults]\nmodel = \"{m}\"\n"),
+            None => String::new(),
+        };
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // (a) no --model flag + no config file → compiled-in default forwarded.
+    #[test]
+    fn model_args_compiled_default_when_no_flag_and_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml"));
+        let args = build_model_args(&config, None);
+        assert_eq!(
+            args,
+            vec!["--model".to_string(), "claude-sonnet-4-6".to_string()]
+        );
+    }
+
+    // (b) no --model flag + config sets a model → config model forwarded.
+    #[test]
+    fn model_args_config_model_when_no_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), Some("claude-opus-4-8"));
+        let config = Config::load_or_default(&path);
+        let args = build_model_args(&config, None);
+        assert_eq!(
+            args,
+            vec!["--model".to_string(), "claude-opus-4-8".to_string()]
+        );
+    }
+
+    // (c) --model flag set + config also sets a model → CLI flag wins.
+    #[test]
+    fn model_args_cli_flag_wins_over_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), Some("claude-opus-4-8"));
+        let config = Config::load_or_default(&path);
+        let args = build_model_args(&config, Some("claude-haiku-4-5".to_string()));
+        assert_eq!(
+            args,
+            vec!["--model".to_string(), "claude-haiku-4-5".to_string()]
+        );
+    }
 }
