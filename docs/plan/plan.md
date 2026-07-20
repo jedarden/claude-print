@@ -1420,6 +1420,31 @@ No automated alerting in v1.0. If billing classification fails silently in produ
 - All implementation beads in this workspace carry `--label atomic` to suppress the mitosis strand's forced-split behavior, which can also destroy beads when combined with release failures.
 - When launching workers for this workspace, always verify the agent adapter file is present before dispatch: `ls ~/claude-config/agents/claude-code-glm-47/` or equivalent.
 
+### ADR-005: 2026-07-20 — Opt-In Warm PTY Pool for NEEDLE-Fleet Latency (v2, Deferred)
+
+**Decision:** Add a new, entirely opt-in `claude-print serve --pool-size N` daemon mode that pre-forks and pre-warms `claude` PTY processes (through trust-dismiss and idle-settle, but never past prompt injection) and hands them out over a local Unix domain socket to ordinary `claude-print` invocations that pass `--pool-socket <path>` (or find a default socket). If no pool is reachable, `claude-print` behaves exactly as it does today — this is additive, not a replacement for the default stateless path. Scoped as v2 / future work: this ADR records the decision and rationale; implementation is tracked via beads, not built in this pass.
+
+**Context:** `claude-print`'s real production usage is not one-off ad-hoc calls — it is the NEEDLE fleet's `claude-print-sonnet.yaml` adapter (`~/.needle/agents/claude-print-sonnet.yaml`), which dispatches a fresh `claude-print` invocation per bead, across up to ~20 concurrent workers (the documented Scalability Limits ceiling), all day. Every single invocation today pays the full cost from zero: `fork()`, `openpty()`, `execvp(claude)`, Claude Code's own startup (including MCP server init), the trust-dialog wait, and the 2.0s post-CR idle settle — none of it is amortized across invocations.
+
+Empirical measurement (2026-07-20, this audit, wrapping locally-installed `claude-print` 0.2.0 / `claude` 2.1.215): a maximally trivial round trip —
+```
+echo "Reply with exactly one word: pong" | claude-print --output-format json --timeout 45
+```
+— took **10.2–13.2s wall-clock** across two runs, for a one-word answer. The Performance Budgets table targets "<5s" for *startup overhead alone* (invocation → prompt injection), a sub-metric that excludes model latency — but even granting that the remainder is Claude Code/model latency outside `claude-print`'s control, the fixed per-invocation cost is being re-paid by every bead the fleet dispatches, with zero reuse. At fleet scale this is the single largest aggregate latency/throughput lever available for this artifact — larger than any output-format or reliability tweak, because it is multiplicative across every dispatch rather than a one-time fix.
+
+**Alternatives Considered:**
+1. **Do nothing / accept the cost.** Rejected — the cost is paid on every one of potentially hundreds of daily NEEDLE dispatches; it is the dominant lever for fleet throughput, not a minor rough edge.
+2. **True multi-turn reuse — keep one `claude` REPL alive and `/clear` + resubmit for each new bead, instead of spawning fresh processes.** Rejected — this would violate the explicit Non-Goal "Multi-turn interactive sessions," and more concretely risks context/prompt bleed between unrelated beads if a `/clear` is incomplete or races with tool output — a correctness/isolation regression far worse than the latency it would save. Process-per-session isolation is a feature, not overhead to be optimized away.
+3. **Shrink the fixed idle-wait constants (0.8s trust-dismiss fallback, 2.0s post-CR settle) instead of pooling.** Not rejected outright — filed as a separate, smaller bead (see below) — but rejected as the *primary* fix: most of the observed 10–13s is `claude`'s own startup/MCP-init and model inference, not these two constants, so shaving them saves at most ~1–2s and does nothing for the dominant cost.
+4. **Embed pool logic in every `claude-print` invocation (self-electing leader/coordinator) instead of a separate long-lived manager process.** Rejected — adds locking/coordination complexity (concurrent invocations racing to become "the pool") for no benefit over one long-lived `serve` process, and cuts against the simplicity bias already established by ADR-002 (synchronous `poll()` over an async runtime).
+
+**Consequences:**
+- This is a genuinely new component (a daemon subcommand + a small local IPC surface — JSON request/response over a Unix socket, reusing the existing bracketed-paste/Stop-FIFO machinery unchanged inside the pool manager), not a tweak to the existing event loop's state machine — hence it is scoped as v2, opt-in, and deferred rather than folded into a v0.2.x patch.
+- The default `claude-print` invocation path is completely unchanged when no pool is configured — HR-1 (single static binary, no runtime deps) and the Scope Lock's "no runtime dependency" clause hold for the default path; the pool manager is the same musl-static binary running in a different subcommand, not a new dependency.
+- Every pooled invocation still gets a unique `claude` process and session per prompt — no cross-request identity leakage, no change to the "one prompt per invocation" contract callers see.
+- New invariants will be needed before implementation (tracked as follow-up, not yet written as formal INV-N entries): e.g. "a pool member is never handed a second prompt without first being torn down and replaced," and "pool manager crash/restart never leaves a `claude-print` client blocked past `--timeout`."
+- Implementation is intentionally NOT started in this pass — this ADR exists to record the decision and scope it correctly for whoever picks it up next, so it isn't re-litigated from scratch.
+
 ## Open Questions
 
 Unresolved questions are mapped to the phase they block. Each MUST be resolved before that phase begins.
