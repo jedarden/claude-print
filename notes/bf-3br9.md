@@ -12,13 +12,26 @@ expected binaries. Both acceptance criteria are met **with two documented
 discrepancies** between the task description's wording and the project's actual
 conventions (see *Discrepancies*).
 
+### Re-verification (this bead was re-dispatched)
+The original run (`claude-print-ci-manual-4xzkj`) had been Argo-GC'd by the time
+of re-dispatch, so the core action was repeated independently:
+- A fresh manual run was submitted per the plan's "Submitting CI Manually"
+  snippet with `tag=v0.2.0` → **`claude-print-ci-manual-vs42v`**, reached
+  `Succeeded`/exitCode 0 in 76 s (130 CPU-s). With the release pre-existing,
+  the template's idempotency guard skipped re-creation (no double-release).
+- The release was re-confirmed live: `claude-print-x86_64-linux` downloaded,
+  size 1,035,880 B matches API metadata exactly, and local SHA256
+  `431e2630da1e02752f23ef792bc91871e08971e0367e02219d06479e78caf41f` **exactly
+  matches** the GitHub API asset digest. `mock_claude-x86_64-linux` present
+  (318,640 B). `ldd` confirms dynamic glibc linking (the *Discrepancies* #2 gap).
+
 ## Verification
 
 | Criterion | Result |
 |-----------|--------|
 | Tag `v0.2.0` pushed to origin | ✅ `043d726` (prereq, from `bf-4scb`) |
-| CI workflow submitted | ✅ `claude-print-ci-manual-4xzkj` |
-| Workflow reached terminal state | ✅ `Succeeded`, exitCode 0 (79s, 132 CPU-s) |
+| CI workflow submitted | ✅ `claude-print-ci-manual-4xzkj`, re-verified `…-vs42v` |
+| Workflow reached terminal state | ✅ `Succeeded`, exitCode 0 (79s/76s, 132/130 CPU-s) |
 | Release `v0.2.0` exists | ✅ published `2026-07-19T23:32:15Z`, `target_commitish=main` |
 | Release contains both binaries | ✅ `claude-print-x86_64-linux` + `mock_claude-x86_64-linux` |
 
