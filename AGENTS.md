@@ -50,6 +50,9 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/stop_poller.rs` | Stop payload polling logic |
 | `tests/pty_integration.rs` | PTY spawn + round-trip (requires PTY capability) |
 | `tests/version_compat.rs` | `--version` output parsing |
+| `tests/watchdog.rs` | Watchdog timeout for silent children (no output + no Stop hook) |
+| `tests/binary_e2e.rs` | Binary-level end-to-end via the *compiled* binary + mock-claude (exit codes, stdout/stderr contract) |
+| `tests/stream_json_incremental.rs` | Incremental stream-json forwarding through the real binary (events emitted mid-session, not post-burst) |
 | `tests/fixtures/` | Shared fixture helpers |
 
 ### mock_claude
@@ -78,8 +81,9 @@ cargo build -p mock-claude
 | `src/hook.rs` | Installs Stop hook via temp dir settings.json; creates FIFO; cleans up on drop |
 | `src/poller.rs` | Opens FIFO non-blocking (read + keeper write ends), parses Stop hook payload, derives transcript path from session_id + cwd |
 | `src/transcript.rs` | Reads `.jsonl` transcript; extracts last assistant message + token usage |
-| `src/emitter.rs` | Formats and writes output (`text`, `json`, `stream-json`) |
+| `src/emitter.rs` | Formats and writes output (`text`, `json`, `stream-json`); owns the incremental stream-json reader thread (`StreamJsonHandle`) |
 | `src/terminal.rs` | Absorbs and discards terminal probe sequences (DA1/DA2/DSR/xtversion) from Ink TUI |
+| `src/watchdog.rs` | Watchdog: monitors four deadlines (PTY first-output, stream-json first-output, overall session, Stop-hook) in a background thread; signals timeout via the event-loop self-pipe |
 | `src/error.rs` | `Error` enum and `Result` alias |
 | `src/check.rs` | `--check` mode: verifies PTY, FIFO, hooks, and `cc_entrypoint` env |
 
@@ -122,10 +126,19 @@ These must hold across all changes:
   must guard `startup.feed()` and `terminal.feed()` from empty slices — feeding
   empty data resets the idle timer in `StartupSeq`.
 
-- **Timeout thread is detached, not joined** — `session.rs` detaches the timeout
-  thread via `drop()` instead of joining it. The timeout thread sleeps for
-  `cli.timeout` seconds (default 3600); joining before handling the exit reason
-  would block the main thread for the full duration on early exit.
+- **Watchdog timeout thread is detached, not joined** — `session.rs` spawns the
+  `watchdog`'s timeout thread and drops the `JoinHandle` (bound to `_timeout_thread`)
+  instead of joining it. The watchdog enforces four deadlines — PTY first-output
+  (default 90s), stream-json first-output (default 90s), overall session (default
+  3600s), and Stop-hook (default 120s) — and on expiry signals the event loop via
+  the self-pipe write fd. Joining would block the main thread for the full deadline
+  on early exit; the watchdog thread exits on its own once the child is killed.
+
+- **Stream-json reader cleanup is RAII** — `emitter::StreamJsonHandle::Drop`
+  disconnects the drain channel and joins the reader thread, so every return path in
+  `Session::run_inner` (success, timeout, signal, child-exit, and `?` propagations)
+  joins the reader before returning (plan invariant INV-8). Only the normal Stop path
+  calls `signal_drain()` first; error paths drop the handle without signaling.
 
 - **Child cleanup uses `kill_child(pid)`** — `kill_child(pid)` sends SIGTERM, waits
   up to 2s, then SIGKILL. Use this for all child cleanup paths, not bare `waitpid`.
