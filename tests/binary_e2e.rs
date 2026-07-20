@@ -22,6 +22,7 @@
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 /// A captured subprocess outcome: exit code (or `None` if killed on timeout),
 /// and decoded stdout/stderr.
@@ -369,5 +370,114 @@ fn version_flag_exit0_names_claude_print_and_wrapping() {
         out.stdout.contains("wrapping"),
         "--version: stdout must contain 'wrapping', got:\n{}",
         out.stdout
+    );
+}
+
+// ── Hook inheritance: --setting-sources= forwarding (bf-390l, HR-5) ──────────
+//
+// Implements the plan's "Hook Inheritance Tests > --no-inherit-hooks flag"
+// spec: `--setting-sources=` must be ABSENT from the child argv in default
+// mode (so the user's ~/.claude/settings.json hooks fire alongside the relay
+// hook — Hard Requirement 5) and PRESENT when `--no-inherit-hooks` is passed
+// (isolation mode). The child argv is captured via mock-claude's
+// MOCK_RECORD_ARGS seam, which dumps argv NUL-separated (mirroring
+// /proc/<pid>/cmdline) on the session child only — the `--version` probe
+// claude-print runs before spawn is skipped by mock-claude so it can't
+// overwrite the recording.
+
+/// Read mock-claude's MOCK_RECORD_ARGS dump (NUL-separated argv) into a
+/// `Vec<String>`, panicking if the file was never written.
+fn read_recorded_argv(path: &std::path::Path) -> Vec<String> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        panic!(
+            "MOCK_RECORD_ARGS file was not written at {}: {e}",
+            path.display()
+        )
+    });
+    bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// Default mode (no `--no-inherit-hooks`) MUST NOT forward `--setting-sources=`,
+/// so user hooks fire alongside the relay hook (HR-5). The relay `--settings=`
+/// is always present, proving the recording captured the real session child's
+/// argv rather than a `--version` probe.
+#[test]
+fn default_mode_omits_setting_sources_in_child_argv() {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let record_str = record.to_string_lossy().into_owned();
+
+    let out = run_with(
+        claude_print().arg("test prompt"),
+        BUDGET,
+        Stdio::null(),
+        Some(("MOCK_RECORD_ARGS", record_str.as_str())),
+    );
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "default mode: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    let args = read_recorded_argv(&record);
+
+    // Sanity: the relay --settings=<temp>/settings.json is ALWAYS forwarded.
+    assert!(
+        args.iter().any(|a| a.starts_with("--settings=")),
+        "default mode: relay --settings= must be in child argv, got: {:?}",
+        args
+    );
+    // HR-5: --setting-sources= must be ABSENT in default mode.
+    assert!(
+        !args.iter().any(|a| a.starts_with("--setting-sources=")),
+        "default mode (HR-5): --setting-sources= must NOT be forwarded to the \
+         child, got: {:?}",
+        args
+    );
+}
+
+/// `--no-inherit-hooks` (isolation mode) MUST forward `--setting-sources=` so
+/// the child loads no standard settings sources — only the relay hook fires.
+/// The plan accepts either the empty form (`--setting-sources=`, OQ-2 primary)
+/// or `--setting-sources=none` (PO-2 fallback); the current implementation uses
+/// the empty form.
+#[test]
+fn no_inherit_hooks_forwards_setting_sources_in_child_argv() {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let record_str = record.to_string_lossy().into_owned();
+
+    let out = run_with(
+        claude_print().arg("--no-inherit-hooks").arg("test prompt"),
+        BUDGET,
+        Stdio::null(),
+        Some(("MOCK_RECORD_ARGS", record_str.as_str())),
+    );
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "isolation mode: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    let args = read_recorded_argv(&record);
+
+    let has_sources = args
+        .iter()
+        .any(|a| a == "--setting-sources=" || a == "--setting-sources=none");
+    assert!(
+        has_sources,
+        "isolation mode: --setting-sources= must be forwarded to the child, \
+         got: {:?}",
+        args
     );
 }

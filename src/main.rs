@@ -125,10 +125,6 @@ fn main() {
         claude_args.push(cli.max_turns.to_string().into());
     }
 
-    if cli.no_inherit_hooks {
-        claude_args.push("--setting-sources=".into());
-    }
-
     if cli.dangerously_skip_permissions {
         claude_args.push("--dangerously-skip-permissions".into());
     }
@@ -146,9 +142,13 @@ fn main() {
     let t0 = Instant::now();
     let output_format = cli.output_format; // Save before move
 
-    // bf-uj0: headless-launch safety knobs — pre-trust cwd, bound MCP init, and
-    // child-stderr surfacing on slow/stall. All default off.
+    // Launch options for the child: hook-inheritance mode plus the bf-uj0
+    // headless-launch safety knobs (pre-trust cwd, bound MCP init, child-stderr
+    // surfacing on slow/stall). All default off. The no_inherit_hooks flag is
+    // consumed here — session.rs is the single source of truth that decides
+    // whether `--setting-sources=` is forwarded to the child (Hard Requirement 5).
     let launch = session::LaunchOptions {
+        no_inherit_hooks: cli.no_inherit_hooks,
         mcp_configs: cli.mcp_config.clone(),
         pretrust_cwd: cli.pretrust_cwd,
         show_child_stderr: cli.show_child_stderr,

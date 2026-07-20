@@ -482,7 +482,11 @@ fn stream_json_reader_forwards_lines_incrementally_as_file_grows() {
     let bytes = out_buf.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).unwrap();
     let output_lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(output_lines.len(), 2, "expected exactly two forwarded lines");
+    assert_eq!(
+        output_lines.len(),
+        2,
+        "expected exactly two forwarded lines"
+    );
     assert!(output_lines[0].contains("first chunk"));
     assert!(output_lines[1].contains("second chunk"));
 }
@@ -577,6 +581,9 @@ fn conformance_claude_version_extra_field_doesnt_break_strict_parse() {
 
     // A strict caller that parses only known claude -p fields must succeed.
     // We simulate this by deserializing the value into a struct with known fields.
+    // Schema validator: every field below must deserialize successfully, so all
+    // fields are required even though only some are asserted on below.
+    #[expect(dead_code)]
     #[derive(serde::Deserialize)]
     struct ClaudeMinusPResult {
         #[serde(rename = "type")]
@@ -590,6 +597,7 @@ fn conformance_claude_version_extra_field_doesnt_break_strict_parse() {
         cost_usd: u64,
         usage: UsageFields,
     }
+    #[expect(dead_code)]
     #[derive(serde::Deserialize)]
     struct UsageFields {
         input_tokens: u64,
@@ -841,7 +849,7 @@ fn stop_payload_explicit_path_used_directly() {
 /// Missing transcript_path → derive from session_id + cwd → transcript read → emit.
 #[test]
 fn stop_payload_path_derivation_and_transcript_emit() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let _home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let dir = TempDir::new().unwrap();
     let session_id = "derive-test-session";
     let cwd = "/home/user/myproject";

@@ -186,6 +186,11 @@ impl WatchdogState {
     }
 
     /// Internal: fire a timeout.
+    ///
+    /// Test-only — production code sets the underlying atomics directly from the
+    /// watchdog thread (see the timeout handler). This helper exists so tests can
+    /// simulate a fired timeout without spawning a thread.
+    #[cfg(test)]
     fn fire_timeout(&self, timeout_type: TimeoutType) {
         self.timeout_fired.store(true, Ordering::SeqCst);
         let type_code = match timeout_type {
@@ -195,6 +200,12 @@ impl WatchdogState {
             TimeoutType::StopHookTimeout => 4,
         };
         self.timeout_type.store(type_code, Ordering::SeqCst);
+    }
+}
+
+impl Default for WatchdogState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -409,7 +420,7 @@ fn spawn_stream_json_monitor_in_dir(
                         let reader = BufReader::new(file);
 
                         // Check each line for valid JSON
-                        for line in reader.lines().flatten() {
+                        for line in reader.lines().map_while(Result::ok) {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
                                 // Try to parse as JSON

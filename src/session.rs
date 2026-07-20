@@ -42,19 +42,35 @@ pub struct SessionResult {
     pub stream_json_handle: Option<emitter::StreamJsonHandle>,
 }
 
-/// Headless-launch safety knobs (bf-uj0).
+/// Child-launch options.
+///
+/// Groups every decision about how the inner `claude` process is spawned: which
+/// settings sources it loads, which MCP configs (if any) it trusts, and the
+/// bf-uj0 headless-safety knobs that keep startup from wedging.
 ///
 /// The PTY keyword scanner in [`crate::startup::StartupSeq`] dismisses the trust
 /// dialog heuristically, but two startup blockers defeat it: a one-time folder
 /// trust prompt for a never-trusted cwd, and an MCP server that hangs on connect.
-/// These knobs remove both blocking paths *before* the child is spawned, so
+/// The launch knobs remove both blocking paths *before* the child is spawned, so
 /// headless runs can't wedge on an interactive prompt the scanner can't see.
 ///
-/// All three default off — claude-print never mutates `~/.claude.json` or
-/// overrides MCP config unless the caller explicitly asks. See [`Cli`] flag docs
-/// for the per-knob rationale.
+/// All fields default off — claude-print never suppresses user hooks, mutates
+/// `~/.claude.json`, or overrides MCP config unless the caller explicitly asks.
+/// See [`Cli`] flag docs for the per-knob rationale.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
+    /// Isolation mode (`--no-inherit-hooks`): forward `--setting-sources=` to
+    /// the child so it loads NO standard settings sources — only the temp
+    /// `--settings` relay hook is active, and the user's `~/.claude/settings.json`
+    /// hooks (SessionStart, PreToolUse, ccdash, trail-boss, …) do not fire.
+    ///
+    /// Default `false` (Hard Requirement 5): the flag is OMITTED so the user's
+    /// hooks fire alongside the relay hook, exactly as `claude -p` behaves. If
+    /// user-hook inheritance ever wedges headless startup, that startup-safety
+    /// concern is bf-uj0's scope (bound MCP init / `--pretrust-cwd`) — not a
+    /// reason to blanket-suppress sources here and silently break HR-5 for every
+    /// invocation.
+    pub no_inherit_hooks: bool,
     /// MCP configs (path or inline JSON) to load. When non-empty, the child is
     /// launched with `--strict-mcp-config` plus `--mcp-config <entry>` for each
     /// entry, so ONLY the named configs load — inherited/project/global MCP
@@ -329,9 +345,21 @@ impl Session {
             ))
             .map_err(|e| Error::Internal(anyhow::anyhow!("settings path invalid: {e}")))?,
         );
-        // Prevent global settings inheritance - the temp settings.json contains only the Stop hook
-        // and inheriting global hooks (SessionStart, etc.) can cause the child to hang at startup.
-        args.push(CString::new("--setting-sources=").unwrap());
+        // Isolation mode (--no-inherit-hooks, LaunchOptions::no_inherit_hooks):
+        // forward `--setting-sources=` so the child loads NO standard settings
+        // sources — only the temp --settings relay hook is active, suppressing
+        // the user's ~/.claude/settings.json hooks (SessionStart, PreToolUse,
+        // ccdash, trail-boss, …). Empty value = load no standard sources.
+        //
+        // Default mode OMITS this flag so the user's hooks fire alongside the
+        // relay hook (Hard Requirement 5), matching `claude -p`. session.rs is
+        // the single source of truth for this argv flag — main.rs must NOT also
+        // push it into claude_args. If user-hook inheritance ever wedges headless
+        // startup, that is bf-uj0's scope (bound MCP / --pretrust-cwd), not a
+        // reason to blanket-suppress sources here and break HR-5 for every run.
+        if launch.no_inherit_hooks {
+            args.push(CString::new("--setting-sources=").unwrap());
+        }
 
         // bf-uj0: bound MCP init. When the caller names MCP configs, launch the
         // child in strict mode so ONLY those load — inherited/project/global MCP
@@ -1018,7 +1046,10 @@ mod tests {
         let mut out = Vec::new();
         c.dump_to("r", &mut out);
         let s = String::from_utf8(out).unwrap();
-        assert!(!s.contains("line\n\n"), "must not double the trailing newline");
+        assert!(
+            !s.contains("line\n\n"),
+            "must not double the trailing newline"
+        );
     }
 
     // ── pretrust_cwd_at (bf-uj0): ~/.claude.json trust pre-grant ──────────────
@@ -1061,7 +1092,10 @@ mod tests {
             serde_json::json!(true)
         );
         // Existing fields must survive.
-        assert_eq!(v["projects"]["/abs/cwd"]["history"][1], serde_json::json!("b"));
+        assert_eq!(
+            v["projects"]["/abs/cwd"]["history"][1],
+            serde_json::json!("b")
+        );
         assert_eq!(v["projects"]["/other"]["x"], serde_json::json!(1));
     }
 
@@ -1076,7 +1110,10 @@ mod tests {
         pretrust_cwd_at(&json, "/abs/cwd").unwrap();
 
         let mode = std::fs::metadata(&json).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o644, "existing mode must be preserved, not reset to 0600");
+        assert_eq!(
+            mode, 0o644,
+            "existing mode must be preserved, not reset to 0600"
+        );
     }
 
     #[test]

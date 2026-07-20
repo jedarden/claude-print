@@ -3,8 +3,52 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    // Positional arg 1 is the FIFO path (legacy mode used by test_pty_spawns_tty).
-    let fifo_path = std::env::args().nth(1);
+    // Test fixture: when MOCK_RECORD_ARGS points at a path, dump the full argv
+    // this process received (NUL-separated, mirroring /proc/<pid>/cmdline) so
+    // integration tests can assert on the exact flags claude-print forwarded to
+    // the child — e.g. whether `--setting-sources=` is present. Written FIRST so
+    // it fires even under MOCK_SILENT / MOCK_EXIT_BEFORE_STOP.
+    //
+    // SKIPPED for the `--version` probe: claude-print resolves the child version
+    // by running `<bin> --version` both before spawning the session child AND
+    // again on the error-exit path (main.rs re-resolves it to render the error
+    // result). Recording a `--version` call would overwrite the real child's
+    // argv with just `[mock, --version]`, so the only argv we ever record is the
+    // actual session child's. mock_claude is test-only, so MOCK_RECORD_ARGS is
+    // never set in production.
+    let is_version_probe = std::env::args().nth(1).as_deref() == Some("--version");
+    if !is_version_probe {
+        if let Ok(path) = std::env::var("MOCK_RECORD_ARGS") {
+            let mut bytes: Vec<u8> = Vec::new();
+            for arg in std::env::args() {
+                bytes.extend_from_slice(arg.as_bytes());
+                bytes.push(0);
+            }
+            let _ = std::fs::write(&path, &bytes);
+        }
+    }
+
+    // Discover the stop FIFO path. mock-claude simulates the Stop hook that real
+    // claude fires — it does not execute hooks, so it writes the Stop payload to
+    // the fifo directly. claude-print never passes the fifo path in the child
+    // argv; instead derive it from `--settings=<dir>/settings.json` (the fifo is
+    // the `stop.fifo` sibling in the same temp dir — exactly the relationship the
+    // installed hook.sh relies on, since its fifo path is baked in at install
+    // time from this same dir). Falls back to positional arg 1 for the legacy
+    // direct-spawn mode (test_pty_spawns_tty), which passes the fifo as its sole
+    // arg with no --settings. NB: `--setting-sources=` does NOT match the
+    // `--settings=` prefix (the next char is `-`, not `s`), so isolation mode is
+    // unaffected.
+    let fifo_path: Option<String> = std::env::args()
+        .find_map(|a| {
+            a.strip_prefix("--settings=").map(|s| {
+                std::path::Path::new(s)
+                    .parent()
+                    .map(|d| d.join("stop.fifo").to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+        })
+        .or_else(|| std::env::args().nth(1));
 
     // ── Env var controls ──────────────────────────────────────────────────────
     let mock_silent = env_flag("MOCK_SILENT");
