@@ -212,7 +212,18 @@ pub fn read_transcript(
 
     if let Some(msg) = last_assistant_message.filter(|s| !s.is_empty()) {
         return Ok(TranscriptResult {
-            text: msg.to_string(),
+            // EC-9: the Stop payload's `last_assistant_message` originates from
+            // Claude Code's TUI-facing internals and may carry raw ANSI escapes
+            // (SGR color codes, OSC title strings, cursor moves). Sanitize it
+            // HERE — the single point where fallback text enters the system —
+            // so every downstream consumer receives clean text. This is required
+            // for the `stream-json` synthesized error result path: that flows
+            // through `Error::AssistantError(t.text)` → `emit_error`, whose
+            // signature carries only the message string and has no `used_fallback`
+            // context to gate a strip on, so the strip must happen upstream.
+            // The text/json emitter path also gets an idempotent defense-in-depth
+            // strip in `emit_success`.
+            text: strip_ansi(msg),
             num_turns: 0,
             usage: AggregatedUsage::default(),
             session_id: last_session_id,
@@ -224,4 +235,106 @@ pub fn read_transcript(
     Err(Error::Internal(anyhow::anyhow!(
         "no response text after 40 retries; no last_assistant_message fallback"
     )))
+}
+
+/// Strip ANSI escape sequences from a string (EC-9).
+///
+/// Claude Code's TUI-facing internals can plausibly embed raw ANSI escapes —
+/// SGR color codes (`ESC[31m`…`ESC[0m`), cursor moves, OSC title strings — in
+/// the Stop payload's `last_assistant_message`. When the transcript retry loop
+/// exhausts its budget and falls back to that string ([`read_transcript`]),
+/// those codes must not leak to the caller's stdout in `text`/`json` output or
+/// the `stream-json` synthesized error result. EC-9 scopes this to the fallback
+/// string ONLY; normal JSONL-sourced assistant text is never routed through
+/// here (see [`parse_transcript`]), so legitimate output is preserved verbatim.
+///
+/// The scan is byte-oriented. Every ANSI introducer is ASCII (`ESC` `0x1B` plus
+/// ASCII control bytes), so removing such runs can never split a UTF-8 multibyte
+/// sequence — the output is always valid UTF-8. Recognized sequences:
+///
+/// - **CSI** (`ESC [`): parameters `0x30–0x3F`, intermediates `0x20–0x2F`,
+///   terminated by a final byte `0x40–0x7E` (covers SGR, cursor, erase, private
+///   `?`-prefixed modes such as `ESC[?25l`).
+/// - **OSC** (`ESC ]`): runs until `BEL` (`0x07`) or the String Terminator
+///   (`ESC \`), matching both legacy BEL-terminated and ST-terminated forms.
+/// - **Other escapes**: two-byte `ESC <byte>` (e.g. `ESC \`, `ESC M`) and the
+///   intermediate-byte form `ESC` + `0x20–0x2F` + final (charset designators
+///   like `ESC ( B`).
+pub fn strip_ansi(input: &str) -> String {
+    const ESC: u8 = 0x1B;
+    const BEL: u8 = 0x07;
+
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] != ESC {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        // ESC seen — classify the byte that follows.
+        i += 1;
+        if i >= bytes.len() {
+            break; // lone trailing ESC — drop it
+        }
+        match bytes[i] {
+            b'[' => {
+                // CSI: skip '[', then parameters/intermediates up to a final byte.
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if (0x40..=0x7E).contains(&b) {
+                        i += 1; // final byte — consume and end sequence
+                        break;
+                    } else if (0x20..=0x3F).contains(&b) {
+                        i += 1; // parameter (0x30-0x3F) or intermediate (0x20-0x2F) byte
+                    } else {
+                        break; // unexpected byte — leave it for normal copy
+                    }
+                }
+            }
+            b']' => {
+                // OSC: skip ']', then consume until BEL or any ESC. The ST is
+                // `ESC \`; a bare ESC also ends OSC content and is left for the
+                // outer loop to reprocess as a fresh escape.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == BEL {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == ESC {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2; // consume String Terminator (ESC \)
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                // Other escape. If the next byte is an intermediate (0x20-0x2F,
+                // e.g. `(`/`)` for charset designators), consume it plus any
+                // further intermediates and a final byte. Otherwise treat this
+                // as a two-byte escape (`ESC <byte>`, e.g. `ESC \` or `ESC M`).
+                if (0x20..=0x2F).contains(&bytes[i]) {
+                    i += 1;
+                    while i < bytes.len() && (0x20..=0x2F).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() && (0x30..=0x7E).contains(&bytes[i]) {
+                        i += 1; // final byte
+                    }
+                } else {
+                    i += 1; // two-byte escape: consume the single following byte
+                }
+            }
+        }
+    }
+
+    // Removing ASCII-only runs from valid UTF-8 always yields valid UTF-8.
+    String::from_utf8(out).expect("stripping ASCII ANSI codes preserves UTF-8 validity")
 }

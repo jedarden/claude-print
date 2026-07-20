@@ -245,6 +245,44 @@ fn test_zero_token_counts_when_fallback() {
     assert_eq!(usage["cache_read_input_tokens"], 0);
 }
 
+// ── EC-9: fallback ANSI stripping in the text/json emitter path ───────────────
+//
+// `read_transcript` is the primary sanitizer, but `emit_success` strips again
+// (gated on `used_fallback`) as defense in depth. These tests exercise the
+// emitter path directly by handing it a fallback result that still carries raw
+// ANSI escapes.
+
+#[test]
+fn test_emit_success_strips_ansi_from_fallback_in_text_and_json() {
+    let mut result = make_result("\x1b[31mred\x1b[0m green");
+    result.used_fallback = true;
+
+    // text format
+    let (buf, mut writer) = capture();
+    emit_success(&mut writer, &result, &OutputFormat::Text, "1.0", 0).unwrap();
+    let text_out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert_eq!(text_out, "red green\n");
+    assert!(!text_out.contains('\x1b'));
+
+    // json format
+    let (buf, mut writer) = capture();
+    emit_success(&mut writer, &result, &OutputFormat::Json, "1.0", 0).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&buf.lock().unwrap()).unwrap();
+    assert_eq!(v["result"], "red green");
+    assert!(!v["result"].as_str().unwrap().contains('\x1b'));
+}
+
+#[test]
+fn test_emit_success_does_not_strip_normal_text() {
+    // Normal (non-fallback) text with an ESC byte passes through verbatim —
+    // EC-9 must not alter legitimate JSONL-sourced assistant output.
+    let result = make_result("raw \x1b[31mcolor\x1b[0m text"); // used_fallback == false
+    let (buf, mut writer) = capture();
+    emit_success(&mut writer, &result, &OutputFormat::Text, "1.0", 0).unwrap();
+    let text_out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert_eq!(text_out, "raw \x1b[31mcolor\x1b[0m text\n");
+}
+
 // ── stream-json ───────────────────────────────────────────────────────────────
 
 #[test]
