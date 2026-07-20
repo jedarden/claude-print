@@ -29,10 +29,16 @@ spec:
               | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
             apt-get update && apt-get install -y gh
 
-            # Install Rust stable
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            # Install Rust stable + components/targets/tooling
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile default
             . "$HOME/.cargo/env"
             rustc --version
+            # fmt + clippy gates (profile default installs them; add explicitly to be safe)
+            rustup component add rustfmt clippy
+            # musl static target — required by HR-1 (single statically-linked binary)
+            rustup target add x86_64-unknown-linux-musl
+            # cargo audit gate (RustSec advisory DB check)
+            cargo install cargo-audit
 
             # Clone from trusted hardcoded source (ignore webhook payload)
             git clone --depth 1 \
@@ -46,10 +52,26 @@ spec:
             VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)".*/\1/')
             echo "Building claude-print v${VERSION} (commit: ${COMMIT})"
 
+            # === Quality gates — run on EVERY CI invocation; fail fast on error ===
+            # Per plan "Definition of Done" / all-gates policy: every commit that
+            # reaches the CI step MUST pass fmt + clippy + test + audit simultaneously.
+
+            echo "Running cargo fmt --check..."
+            cargo fmt --check
+            echo "fmt OK"
+
+            echo "Running cargo clippy --all-targets -- -D warnings..."
+            cargo clippy --all-targets -- -D warnings
+            echo "clippy OK"
+
             # Run tests (including watchdog regression tests)
             echo "Running test suite..."
             cargo test --verbose
             echo "Tests passed successfully"
+
+            echo "Running cargo audit..."
+            cargo audit
+            echo "audit OK (no known vulnerabilities)"
 
             # Check if release already exists — idempotent re-runs safe
             if gh release view "v${VERSION}" --repo jedarden/claude-print > /dev/null 2>&1; then
@@ -59,16 +81,35 @@ spec:
 
             ARCH=$(uname -m)
             TARGET="${ARCH}-linux"
+            MUSL_TARGET="${ARCH}-unknown-linux-musl"
 
-            # Build claude-print
-            cargo build --release --bin claude-print
+            # Build claude-print as a STATIC musl binary (HR-1: no shared lib deps).
+            cargo build --release --target "${MUSL_TARGET}" --bin claude-print
             CLAUDE_PRINT_ASSET="claude-print-${TARGET}"
-            cp ./target/release/claude-print "${CLAUDE_PRINT_ASSET}"
+            cp "./target/${MUSL_TARGET}/release/claude-print" "${CLAUDE_PRINT_ASSET}"
 
-            # Build mock_claude (workspace member)
-            cargo build --release --manifest-path test-fixtures/mock-claude/Cargo.toml
+            # Build mock_claude (workspace member) as a static musl binary too.
+            cargo build --release --target "${MUSL_TARGET}" --manifest-path test-fixtures/mock-claude/Cargo.toml
             MOCK_ASSET="mock_claude-${TARGET}"
-            cp ./target/release/mock-claude "${MOCK_ASSET}"
+            cp "./target/${MUSL_TARGET}/release/mock-claude" "${MOCK_ASSET}"
+
+            # Verify both binaries are statically linked (HR-1 enforcement).
+            # NOTE: ldd exits 0 for BOTH static and dynamic binaries, so we check
+            # its stdout/stderr for the "statically linked" / "not a dynamic
+            # executable" marker rather than trusting the exit status.
+            verify_static() {
+              local out
+              out="$(ldd "$1" 2>&1 || true)"
+              echo "ldd $1:"; echo "${out}"
+              if echo "${out}" | grep -qE 'statically linked|not a dynamic executable'; then
+                echo "OK: $1 is statically linked"
+              else
+                echo "ERROR: $1 is NOT statically linked — violates HR-1" >&2
+                exit 1
+              fi
+            }
+            verify_static "./${CLAUDE_PRINT_ASSET}"
+            verify_static "./${MOCK_ASSET}"
 
             # Create GitHub release with both binaries
             gh release create "v${VERSION}" \
