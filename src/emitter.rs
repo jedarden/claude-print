@@ -1,6 +1,7 @@
 use crate::cli::OutputFormat;
 use crate::error::ClaudePrintError;
-use crate::transcript::TranscriptResult;
+use crate::transcript::{strip_ansi, TranscriptResult};
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -19,9 +20,25 @@ pub fn emit_success(
     claude_version: &str,
     duration_ms: u64,
 ) -> std::io::Result<()> {
+    // EC-9: defense-in-depth sanitizer for the `last_assistant_message` fallback
+    // path. `read_transcript()` already strips ANSI from the fallback string at
+    // its source, so for normal operation this is a no-op (the `Borrowed` arm —
+    // zero allocation). It guarantees a `TranscriptResult` built with
+    // `used_fallback=true` — which tests and any future code path can construct
+    // directly, bypassing `read_transcript` — can never leak raw ANSI escapes to
+    // the caller's stdout in `text` or `json`. Normal JSONL-sourced text
+    // (`used_fallback=false`) is emitted verbatim, never routed through the
+    // strip. Stripping is idempotent, so double-application with the source strip
+    // is harmless.
+    let text: Cow<'_, str> = if result.used_fallback {
+        Cow::Owned(strip_ansi(&result.text))
+    } else {
+        Cow::Borrowed(&result.text)
+    };
+
     match format {
         OutputFormat::Text => {
-            writeln!(writer, "{}", result.text)?;
+            writeln!(writer, "{}", text)?;
         }
         OutputFormat::Json => {
             // bf-416c: read is_error from the transcript rather than hardcoding
@@ -33,7 +50,7 @@ pub fn emit_success(
                 "type": "result",
                 "subtype": "success",
                 "is_error": result.is_error,
-                "result": result.text,
+                "result": text.as_ref(),
                 "session_id": result.session_id,
                 "num_turns": result.num_turns as u64,
                 "duration_ms": duration_ms,

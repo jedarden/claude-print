@@ -1,4 +1,4 @@
-use claude_print::transcript::{parse_transcript, read_transcript, AggregatedUsage};
+use claude_print::transcript::{parse_transcript, read_transcript, strip_ansi, AggregatedUsage};
 use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
@@ -480,4 +480,103 @@ fn test_transcript_race() {
     let r = read_transcript(&path, None).unwrap();
     assert_eq!(r.text, "race result");
     assert_eq!(r.num_turns, 1);
+}
+
+// ── EC-9: strip_ansi helper ─────────────────────────────────────────────────
+
+#[test]
+fn strip_ansi_removes_csi_sgr_codes() {
+    // ESC[31m ... ESC[0m  → plain text
+    let input = "\x1b[31mhello\x1b[0m world";
+    assert_eq!(strip_ansi(input), "hello world");
+}
+
+#[test]
+fn strip_ansi_removes_csi_with_params_and_private_modes() {
+    // cursor position (ESC[2;3H), erase line (ESC[2K), hide cursor (ESC[?25l)
+    let input = "\x1b[2;3Hmove\x1b[2K\x1b[?25ldone";
+    assert_eq!(strip_ansi(input), "movedone");
+}
+
+#[test]
+fn strip_ansi_removes_osc_sequences() {
+    // OSC title set: BEL-terminated and ST-terminated (ESC \) forms
+    assert_eq!(strip_ansi("\x1b]0;title\x07after"), "after");
+    assert_eq!(strip_ansi("\x1b]2;other\x1b\\after2"), "after2");
+}
+
+#[test]
+fn strip_ansi_preserves_plain_and_multibyte_text() {
+    assert_eq!(strip_ansi("just plain text"), "just plain text");
+    assert_eq!(strip_ansi(""), "");
+    // Multibyte UTF-8 must survive — ANSI bytes are ASCII and never split a
+    // multibyte sequence.
+    assert_eq!(strip_ansi("héllo→wörld 🦀"), "héllo→wörld 🦀");
+}
+
+#[test]
+fn strip_ansi_preserves_utf8_across_escape_boundaries() {
+    // Multibyte chars immediately before and after an SGR run stay intact.
+    assert_eq!(strip_ansi("café\x1b[31mXL\x1b[0m→茶"), "caféXL→茶");
+}
+
+#[test]
+fn strip_ansi_drops_lone_trailing_esc() {
+    assert_eq!(strip_ansi("text\x1b"), "text");
+}
+
+#[test]
+fn strip_ansi_is_idempotent() {
+    let stripped = strip_ansi("\x1b[31mred\x1b[0m");
+    assert_eq!(strip_ansi(&stripped), stripped);
+}
+
+// ── EC-9: fallback path strips ANSI; normal JSONL path does NOT ─────────────
+//
+// EC-9 scopes the sanitizer to the `last_assistant_message` fallback string
+// only. The two tests below pin that scoping: a fallback string carrying SGR
+// codes comes back clean, while a *real* JSONL assistant message carrying an
+// ESC byte (legitimate content) is forwarded verbatim.
+
+#[test]
+fn read_transcript_fallback_strips_ansi() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("empty.jsonl");
+    // No assistant text → retry loop exhausts → falls back to last_assistant_message
+    write_jsonl(&path, &[result_event("s1", false)]);
+
+    let r = read_transcript(&path, Some("\x1b[31mred error\x1b[0m")).unwrap();
+    assert!(r.used_fallback);
+    assert_eq!(
+        r.text, "red error",
+        "ANSI must be stripped from the fallback string"
+    );
+    assert!(!r.text.contains('\x1b'));
+}
+
+#[test]
+fn read_transcript_normal_jsonl_does_not_strip_escapes() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("t.jsonl");
+    // A real JSONL transcript whose assistant text happens to contain an ESC
+    // byte (legitimate content). EC-9 scopes stripping to the fallback only,
+    // so this must pass through verbatim — never routed through strip_ansi.
+    write_jsonl(
+        &path,
+        &[assistant_event(
+            "msg-ansi",
+            "raw \x1b[31mcolor\x1b[0m text",
+            5,
+            3,
+            0,
+            0,
+        )],
+    );
+
+    let r = read_transcript(&path, Some("fallback-not-used")).unwrap();
+    assert!(!r.used_fallback);
+    assert_eq!(
+        r.text, "raw \x1b[31mcolor\x1b[0m text",
+        "normal JSONL text must NOT be passed through strip_ansi"
+    );
 }
