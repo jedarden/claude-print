@@ -111,22 +111,29 @@ impl ChildCapture {
     /// Write the captured tail to claude-print's stderr with a bounding header.
     /// No-op when disabled or empty.
     fn dump(&self, reason: &str) {
+        let mut stderr = std::io::stderr().lock();
+        self.dump_to(reason, &mut stderr);
+    }
+
+    /// Core dump logic, separated from [`dump`] so tests can capture the
+    /// rendered output into a buffer instead of redirecting process stderr.
+    /// No-op when disabled or empty. Writes a bounding header, the raw tail,
+    /// a trailing newline if the tail lacks one, and an end marker.
+    fn dump_to(&self, reason: &str, w: &mut impl std::io::Write) {
         if !self.enabled || self.buf.is_empty() {
             return;
         }
-        let mut stderr = std::io::stderr().lock();
-        use std::io::Write;
         let _ = writeln!(
-            stderr,
+            w,
             "claude-print: ----- child PTY output ({}, {} bytes) -----",
             reason,
             self.buf.len()
         );
-        let _ = stderr.write_all(&self.buf);
+        let _ = w.write_all(&self.buf);
         if self.buf.last() != Some(&b'\n') {
-            let _ = stderr.write_all(b"\n");
+            let _ = w.write_all(b"\n");
         }
-        let _ = writeln!(stderr, "claude-print: ----- end child output -----");
+        let _ = writeln!(w, "claude-print: ----- end child output -----");
     }
 }
 
@@ -717,13 +724,25 @@ fn pretrust_cwd() -> Result<()> {
     let home = std::env::var("HOME")
         .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
     let claude_json = PathBuf::from(&home).join(".claude.json");
+    pretrust_cwd_at(&claude_json, cwd.to_string_lossy().as_ref())
+}
 
+/// Inner file-mutation logic for [`pretrust_cwd`], separated so it can be
+/// exercised against a temp path without touching the real `$HOME` or racing
+/// other tests on a process-global env var.
+///
+/// Sets `projects[cwd_abs].hasTrustDialogAccepted = true` in the JSON object at
+/// `claude_json`, creating the file if absent. Safety: if the file exists but is
+/// not a valid JSON object, it is left **untouched** (the trust scanner remains
+/// the fallback) — clobbering the user's config would be far worse than a
+/// possible stall.
+fn pretrust_cwd_at(claude_json: &Path, cwd_abs: &str) -> Result<()> {
     // Read existing content + mode. On a parse error of an *existing* file, do
     // NOT rewrite — clobbering the user's config is worse than a possible stall.
-    let (mut root, existing_mode) = match std::fs::read_to_string(&claude_json) {
+    let (mut root, existing_mode) = match std::fs::read_to_string(claude_json) {
         Ok(s) => {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&claude_json)
+            let mode = std::fs::metadata(claude_json)
                 .ok()
                 .map(|m| m.permissions().mode());
             match serde_json::from_str::<serde_json::Value>(&s) {
@@ -746,7 +765,7 @@ fn pretrust_cwd() -> Result<()> {
     };
 
     // projects[cwd].hasTrustDialogAccepted = true
-    let key = cwd.to_string_lossy().into_owned();
+    let key = cwd_abs.to_owned();
     let root_obj = root
         .as_object_mut()
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("~/.claude.json root is not an object")))?;
@@ -790,7 +809,7 @@ fn pretrust_cwd() -> Result<()> {
         }
     }
 
-    std::fs::rename(&tmp_path, &claude_json).map_err(|e| {
+    std::fs::rename(&tmp_path, claude_json).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         Error::Internal(anyhow::anyhow!("rename ~/.claude.json: {e}"))
     })?;
@@ -927,6 +946,189 @@ mod tests {
         assert_eq!(
             session_result.transcript_path,
             std::path::PathBuf::from("transcript.jsonl")
+        );
+    }
+
+    // ── ChildCapture (bf-uj0): --show-child-stderr ring buffer ────────────────
+
+    #[test]
+    fn child_capture_disabled_is_noop() {
+        let mut c = ChildCapture::new(false);
+        c.feed(b"some output");
+        assert!(c.buf.is_empty(), "disabled capture must not accumulate");
+    }
+
+    #[test]
+    fn child_capture_accumulates_when_enabled() {
+        let mut c = ChildCapture::new(true);
+        c.feed(b"hello ");
+        c.feed(b"world");
+        assert_eq!(c.buf, b"hello world");
+    }
+
+    #[test]
+    fn child_capture_evicts_oldest_past_cap() {
+        // Bounded tail: once cap is exceeded the oldest bytes drop so a chatty
+        // but wedged child can't grow memory unbounded.
+        let mut c = ChildCapture::new(true);
+        c.cap = 10;
+        c.feed(b"0123456789ABCDEF"); // 16 bytes → keep last 10
+        assert_eq!(c.buf.len(), 10);
+        assert_eq!(&*c.buf, b"6789ABCDEF");
+    }
+
+    #[test]
+    fn child_capture_dump_to_noop_when_disabled() {
+        let mut c = ChildCapture::new(false);
+        c.buf.extend_from_slice(b"data");
+        let mut out = Vec::new();
+        c.dump_to("reason", &mut out);
+        assert!(out.is_empty(), "disabled capture must dump nothing");
+    }
+
+    #[test]
+    fn child_capture_dump_to_noop_when_empty() {
+        let c = ChildCapture::new(true);
+        let mut out = Vec::new();
+        c.dump_to("reason", &mut out);
+        assert!(out.is_empty(), "empty capture must dump nothing");
+    }
+
+    #[test]
+    fn child_capture_dump_to_renders_header_bytes_and_trailing_newline() {
+        let mut c = ChildCapture::new(true);
+        c.buf.extend_from_slice(b"child stderr line"); // no trailing newline
+        let mut out = Vec::new();
+        c.dump_to("watchdog fired", &mut out);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("----- child PTY output (watchdog fired, 17 bytes) -----"));
+        assert!(s.contains("child stderr line"));
+        assert!(s.contains("----- end child output -----"));
+        // Tail lacked a newline → one must be appended before the end marker.
+        assert!(
+            s.contains("child stderr line\n"),
+            "trailing newline must be added when tail lacks one"
+        );
+    }
+
+    #[test]
+    fn child_capture_dump_to_no_extra_newline_when_tail_ends_in_newline() {
+        let mut c = ChildCapture::new(true);
+        c.buf.extend_from_slice(b"line\n");
+        let mut out = Vec::new();
+        c.dump_to("r", &mut out);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("line\n\n"), "must not double the trailing newline");
+    }
+
+    // ── pretrust_cwd_at (bf-uj0): ~/.claude.json trust pre-grant ──────────────
+
+    /// Helper: read ~/.claude.json back as a JSON object (panics on failure).
+    fn read_claude_json(path: &Path) -> serde_json::Value {
+        let s = std::fs::read_to_string(path).expect("claude.json readable");
+        serde_json::from_str(&s).expect("claude.json valid JSON object")
+    }
+
+    #[test]
+    fn pretrust_creates_file_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+
+        let v = read_claude_json(&json);
+        assert_eq!(
+            v["projects"]["/abs/cwd"]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn pretrust_sets_flag_preserving_existing_project_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        // Pre-existing project with unrelated state, and a sibling project.
+        std::fs::write(
+            &json,
+            r#"{"projects":{"/abs/cwd":{"history":["a","b"]},"/other":{"x":1}}}"#,
+        )
+        .unwrap();
+
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+
+        let v = read_claude_json(&json);
+        assert_eq!(
+            v["projects"]["/abs/cwd"]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+        // Existing fields must survive.
+        assert_eq!(v["projects"]["/abs/cwd"]["history"][1], serde_json::json!("b"));
+        assert_eq!(v["projects"]["/other"]["x"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn pretrust_preserves_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        std::fs::write(&json, r#"{"projects":{}}"#).unwrap();
+        std::fs::set_permissions(&json, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+
+        let mode = std::fs::metadata(&json).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "existing mode must be preserved, not reset to 0600");
+    }
+
+    #[test]
+    fn pretrust_new_file_gets_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+        let mode = std::fs::metadata(&json).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "newly created ~/.claude.json must default to 0600 (holds auth state)"
+        );
+    }
+
+    #[test]
+    fn pretrust_leaves_invalid_json_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        let original = b"{ not valid json";
+        std::fs::write(&json, original).unwrap();
+
+        // Returns Ok (scanner remains the fallback) but must NOT clobber.
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+
+        assert_eq!(
+            std::fs::read(&json).unwrap(),
+            original,
+            "unparseable ~/.claude.json must be left byte-for-byte untouched"
+        );
+        // No leftover tmp file in the dir.
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no tmp file must remain after the run"
+        );
+    }
+
+    #[test]
+    fn pretrust_leaves_non_object_root_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        // Valid JSON but an array, not an object.
+        let original = b"[1, 2, 3]";
+        std::fs::write(&json, original).unwrap();
+
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+
+        assert_eq!(
+            std::fs::read(&json).unwrap(),
+            original,
+            "non-object root must be left untouched"
         );
     }
 }
