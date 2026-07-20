@@ -16,6 +16,7 @@ use claude_print::transcript::{
 };
 use std::io::Write as IoWrite;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -414,6 +415,76 @@ fn stream_json_start_offset_skips_pre_injection_lines() {
         output_lines[0].contains("post-injection"),
         "wrong line forwarded"
     );
+}
+
+/// Stream-JSON reader forwards each line INCREMENTALLY as the file grows — not as
+/// a single post-completion burst.
+///
+/// This is the non-ignored primitive that pins the live-tail behavior of
+/// `spawn_stream_json_reader_to` independent of mock_claude: it proves a line is
+/// forwarded WHILE the file is still being appended to (before `signal_drain`),
+/// i.e. the reader is tailing the file in real time. The higher-level end-to-end
+/// test in `tests/stream_json_incremental.rs` (gated on bf-3isy/bf-5vm) asserts the
+/// same property through the real binary against mock_claude.
+#[test]
+fn stream_json_reader_forwards_lines_incrementally_as_file_grows() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("t.jsonl");
+
+    // Pre-create the file with only the FIRST line. The reader opens the file at
+    // spawn and tails it; nothing drains yet.
+    write_jsonl(&path, &[assistant_event("m1", "first chunk", 10, 5, 0, 0)]);
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+    let handle = spawn_stream_json_reader_to(path.clone(), 0, writer);
+
+    // Give the live tail time to observe and forward the first line. The reader
+    // polls EOF every 5ms; 100ms is comfortably above that without slowing the
+    // suite. Crucially, no drain has been signaled and no further bytes written.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // CORE INCREMENTAL ASSERTION: line 1 already reached the writer while the
+    // file is still "open" (drain not signaled) — proving live forwarding, not a
+    // post-completion replay.
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("first chunk"),
+            "stream-json reader did not forward the first line incrementally; got:\n{text}"
+        );
+    }
+
+    // Append a second line — the live tail must pick it up without re-seeking.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{}", assistant_event("m2", "second chunk", 10, 5, 0, 0)).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("second chunk"),
+            "stream-json reader did not forward the appended second line; got:\n{text}"
+        );
+    }
+
+    // Drain + join. Final output must carry both lines, in order.
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let output_lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(output_lines.len(), 2, "expected exactly two forwarded lines");
+    assert!(output_lines[0].contains("first chunk"));
+    assert!(output_lines[1].contains("second chunk"));
 }
 
 // ── Conformance harness ───────────────────────────────────────────────────────
