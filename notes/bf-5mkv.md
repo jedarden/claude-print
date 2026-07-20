@@ -70,3 +70,12 @@ independently for the v0.2.0 asset — cross-validated.
   real `~/.needle/agents/`).
 - Test prefix `/tmp/claude-print-test` was left in place as evidence; it can be
   `rm -rf`'d freely (fully regenerable via `sh install.sh`).
+
+## Re-verification (2026-07-19)
+Re-dispatched bead re-ran the full flow from scratch on a fresh clean prefix
+(`rm -rf /tmp/claude-print-test` then `sh ./install.sh` under `HOME=/tmp/claude-print-test`).
+Identical result — install.sh exit 0, all 3 probes PASS, version `claude-print 0.2.0
+(wrapping claude 2.1.203)`. Both installed artifacts re-SHA256'd against the v0.2.0
+release URLs and matched byte-for-byte (same digests as the table above). `mock_claude
+--version` → `mock-claude-version-1.0.0` (exit 0); no-arg exit 0. Result remains PASS;
+release `latest` still resolves to v0.2.0 with both assets.
