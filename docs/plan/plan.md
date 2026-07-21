@@ -460,8 +460,11 @@ Exit codes:
 - `0` — success
 - `1` — assistant error (`is_error: true` in transcript)
 - `2` — internal error (PTY spawn, hook setup, parse failure)
+- `4` — input error (no prompt source: stdin is a TTY with no positional/`--input-file`, or `--input-file`/stdin unreadable, or stdin empty)
 - `124` — timeout exceeded
 - `130` — interrupted (SIGINT)
+
+Code 4 is a claude-print input-validation code outside the `claude -p` wire-compatibility set (the five codes 0/1/2/124/130 referenced in HR-3). It is emitted from the prompt-resolution path in `main()` before any PTY work: `eprintln!` to stderr + `exit_with_cleanup(4)`, with no structured JSON result object.
 
 ### 2. Hook Installer
 
@@ -872,6 +875,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 
 | Condition | Detection | Action | Exit |
 |-----------|-----------|--------|------|
+| No prompt source, or unreadable `--input-file`/stdin | prompt resolution in `main()` (TTY stdin with no positional/`--input-file`; `--input-file` or stdin read fails; stdin empty) | stderr message (no JSON result) | 4 |
 | `claude` binary not found | PATH lookup fails at startup | emit error | 2 |
 | PTY open fails | `openpty()` returns Err | emit error | 2 |
 | Hook installer fails | temp dir / mkfifo / write error | emit error | 2 |
@@ -901,7 +905,7 @@ Only `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read
 | EC-9 | `last_assistant_message` contains ANSI escape sequences | Strip ANSI before emitting in `text` and `json` formats (simple regex on the fallback string only). In `stream-json` mode, if the `last_assistant_message` fallback is used (retry loop exhausted), ANSI sequences MUST also be stripped before the synthesized fallback result event is emitted. |
 | EC-10 | Truncated final JSONL line | Malformed line skipped by lenient parser. If no complete assistant events remain, retry loop fires. |
 | EC-11 | `CLAUDE_CODE_SESSION_ID` / `CLAUDE_CODE_SESSION_KIND` inherited from parent | Unset both in child env before `execvp` to prevent session identity confusion. (See Open Questions #6.) |
-| EC-12 | Stdin is a TTY (interactive call with no prompt) | Require a prompt source. If stdin is a TTY and no positional/`--input-file` given, exit 2 with usage error. Do NOT drop into an interactive session. |
+| EC-12 | Stdin is a TTY (interactive call with no prompt) | Require a prompt source. If stdin is a TTY and no positional/`--input-file` given, exit 4 with a usage error on stderr. Do NOT drop into an interactive session. (Exit 4, matching the `src/main.rs` prompt-resolution path — the same code covers an unreadable `--input-file`, an unreadable stdin, and an empty stdin. EC-12 previously said "exit 2"; corrected to exit 4 to match the implementation. Source behavior is unchanged.) |
 
 ## Anti-Patterns
 

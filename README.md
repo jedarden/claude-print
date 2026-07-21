@@ -38,7 +38,7 @@ cargo build --release
 cargo build --target x86_64-unknown-linux-musl --release
 ```
 
-Architectures: `x86_64` and `aarch64`.
+Architectures: `x86_64` only (static musl binary). aarch64 / ARM Linux is out of scope for v1.0 — see `docs/plan/plan.md` Non-Goals. CI builds only for the x86_64 runner; an `install.sh` aarch64 branch would 404 because no such release asset is produced.
 
 ## Self-check
 
@@ -74,7 +74,7 @@ claude-print --input-file prompt.txt
 claude-print --model claude-opus-4-8 "Write a haiku about Rust"
 
 # JSON output
-claude-print --output-format json "what is 2+2?" | jq .text
+claude-print --output-format json "what is 2+2?" | jq .result
 
 # Stream-JSON — real-time JSONL event replay
 claude-print --output-format stream-json "Write a story"
@@ -112,7 +112,7 @@ claude-print --timeout 30 "quick question"
 ## Output formats
 
 - `text` (default): plain text response, printed to stdout.
-- `json`: one-line JSON object with `text`, `session_id`, `model`, and `usage` fields.
+- `json`: one-line JSON object with `type`, `subtype`, `is_error`, `result`, `session_id`, `num_turns`, `duration_ms`, `cost_usd`, `claude_version`, and `usage` fields. `result` holds the response text (there is no `text` or `model` field); `usage` is an object with `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`.
 - `stream-json`: JSONL replay of the raw transcript events in real time, one event per line.
 
 ## Exit codes
@@ -122,6 +122,7 @@ claude-print --timeout 30 "quick question"
 | `0` | Success |
 | `1` | Assistant error (`is_error: true` in transcript) |
 | `2` | Internal error (PTY spawn, hook setup, parse failure) |
+| `4` | Input error (no prompt provided, or `--input-file`/stdin unreadable) |
 | `124` | Timeout exceeded |
 | `130` | Interrupted (SIGINT) |
 
