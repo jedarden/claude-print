@@ -75,12 +75,20 @@ fn main() {
     // MOCK_IS_ERROR=1: stamp the result event with is_error:true (maps to
     // Session::run's exit-1 AssistantError path).
     //
+    // MOCK_STOP_BEFORE_INJECT=1 (bf-3i07): fire the Stop hook immediately, with
+    // NO trust-dialog output and NO delay — before claude-print's startup
+    // scanner can reach PROMPT_INJECTED. This is the EC-7 fixture: a response to
+    // a prompt that was never sent. Real Claude Code is prevented from this by
+    // EC-11 (pty.rs unsets CLAUDE_CODE_SESSION_ID before execvp); this fixture
+    // simulates the leak that the EC-7 backstop in session.rs guards against.
+    //
     // OUT OF SCOPE (follow-up): MOCK_TURNS, MOCK_UNKNOWN_EVENT_TYPE,
-    // MOCK_UNKNOWN_USAGE_FIELDS, MOCK_STOP_BEFORE_INJECT — the plan's full
-    // MOCK_* matrix is intentionally not implemented here; this bead only adds
-    // the minimum (file write + delay + is_error) to unblock AS-6.
+    // MOCK_UNKNOWN_USAGE_FIELDS — the plan's full MOCK_* matrix is intentionally
+    // not implemented here; this bead only adds the minimum (file write + delay
+    // + is_error) to unblock AS-6.
     let mock_delay_jsonl_ms: u64 = env_u64("MOCK_DELAY_JSONL", 0);
     let mock_is_error = env_flag("MOCK_IS_ERROR");
+    let mock_stop_before_inject = env_flag("MOCK_STOP_BEFORE_INJECT");
 
     // Handle --version before MOCK_SILENT so version resolution works in tests
     // This is needed because Session::run() resolves the version before spawning
@@ -104,8 +112,12 @@ fn main() {
         std::io::stdout().flush().ok();
     }
 
-    // Optionally emit trust dialog text
-    if mock_trust_dialog {
+    // Optionally emit trust dialog text. Suppressed under MOCK_STOP_BEFORE_INJECT
+    // so the Stop hook (fired below) wins the race against claude-print's startup
+    // scanner — emitting trust keywords here would let the scanner reach
+    // PROMPT_INJECTED and turn the run into a normal success instead of the EC-7
+    // leak this fixture is meant to produce.
+    if mock_trust_dialog && !mock_stop_before_inject {
         if mock_trust_wording == "alternate" {
             // Uses "continue" + "folder" as trust keywords
             print!("Do you want to continue and grant permission to this folder?\r\n");
@@ -121,8 +133,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Delay Stop if requested
-    if mock_delay_stop_ms > 0 {
+    // Delay Stop if requested. Skipped under MOCK_STOP_BEFORE_INJECT so the Stop
+    // fires immediately (see comment above the trust-dialog emission).
+    if mock_delay_stop_ms > 0 && !mock_stop_before_inject {
         thread::sleep(Duration::from_millis(mock_delay_stop_ms));
     }
 

@@ -606,6 +606,35 @@ impl Session {
         let prompt_injected = startup.phase().is_prompt_injected();
         match exit_reason {
             ExitReason::FifoPayload(payload) => {
+                // EC-7: a Stop hook firing before the prompt was injected means
+                // the child responded to a prompt claude-print never sent — a
+                // session identity leak. Real Claude Code is prevented from this
+                // by EC-11 (pty.rs unsets CLAUDE_CODE_SESSION_ID before execvp),
+                // so this is the defense-in-depth backstop for the case where
+                // that mitigation nonetheless fails. Treat it as a Setup error
+                // (exit 2, is_error:true in output) rather than silently
+                // accepting an unsolicited response and proceeding to
+                // read_transcript(). The FIFO payload is untrustworthy in this
+                // state, so we gate on `prompt_injected` BEFORE touching it.
+                //
+                // `prompt_injected` reflects startup.phase() at the moment the
+                // event loop returned: phase transitions only happen inside
+                // startup.feed() on PTY output, and the FIFO-readable branch of
+                // the event loop never calls feed(), so this is the true phase
+                // at the instant Stop arrived (phase is monotonic — once
+                // PromptInjected it never reverts).
+                //
+                // INV-8: the reader was never spawned (prompt wasn't injected),
+                // so stream_json_handle is None and this drop is a no-op; it is
+                // here for symmetry with the other error arms.
+                if !prompt_injected {
+                    kill_child(spawner.child_pid);
+                    drop(stream_json_handle);
+                    return Err(Error::Internal(anyhow::anyhow!(
+                        "Stop hook fired before prompt was injected (EC-7: response to an unsent prompt — possible session identity leak)"
+                    )));
+                }
+
                 // Parse stop payload. On error, `?` returns and Drop joins the
                 // reader without draining (INV-8, exit-immediately on error).
                 let stop_payload = parse_stop_payload(&payload)?;

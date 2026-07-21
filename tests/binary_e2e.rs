@@ -281,6 +281,96 @@ fn as5_missing_binary_json_mode_is_error_true() {
     );
 }
 
+// ── EC-7: Stop fires before PROMPT_INJECTED (bf-3i07) ───────────────────────
+//
+// Implements the plan's "Mock PTY Integration Tests" row: with
+// MOCK_STOP_BEFORE_INJECT=1 the mock-claude fixture fires the Stop hook
+// immediately, with no trust-dialog output and no delay — before
+// claude-print's startup scanner can reach PROMPT_INJECTED. This is the EC-7
+// condition: a response to a prompt that was never sent (a session identity
+// leak that EC-11 in pty.rs prevents in normal operation; the session.rs
+// check is the defense-in-depth backstop). The session must NOT silently
+// accept the response — it returns a Setup error (exit 2, is_error:true).
+
+/// `MOCK_STOP_BEFORE_INJECT=1` in text mode → exit 2 and a stderr message that
+/// names the EC-7 condition. Text-mode errors are stderr-only, so stdout is
+/// empty (no response text leaks through for an unsent prompt).
+#[test]
+fn ec7_stop_before_inject_text_mode_exit2_stderr() {
+    let out = run_with(
+        claude_print().arg("test prompt"),
+        BUDGET,
+        Stdio::null(),
+        Some(("MOCK_STOP_BEFORE_INJECT", "1")),
+    );
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "EC-7 (text): expected exit 2, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "EC-7 (text): stdout must be empty (text errors are stderr-only), got:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("EC-7"),
+        "EC-7 (text): stderr must name the EC-7 condition, got:\n{}",
+        out.stderr
+    );
+}
+
+/// `MOCK_STOP_BEFORE_INJECT=1` under `--output-format json` → exit 2 and a
+/// `result` object on stdout with `is_error: true` — the plan's exact EC-7
+/// contract ("exit 2, is_error: true in output").
+#[test]
+fn ec7_stop_before_inject_json_mode_is_error_true() {
+    let out = run_with(
+        claude_print()
+            .arg("--output-format")
+            .arg("json")
+            .arg("test prompt"),
+        BUDGET,
+        Stdio::null(),
+        Some(("MOCK_STOP_BEFORE_INJECT", "1")),
+    );
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "EC-7 (json): expected exit 2, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+
+    let trimmed = out.stdout.trim();
+    let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!(
+            "EC-7 (json): stdout must be valid JSON: {e}\n  raw:\n{}",
+            out.stdout
+        )
+    });
+    assert_eq!(v["type"], "result", "EC-7 (json): type must be 'result'");
+    assert_eq!(v["is_error"], true, "EC-7 (json): is_error must be true");
+    assert_eq!(
+        v["subtype"], "internal_error",
+        "EC-7 (json): subtype must be the Setup 'internal_error'"
+    );
+    assert!(
+        v.get("error_message")
+            .and_then(|m| m.as_str())
+            .map(|m| m.contains("EC-7"))
+            .unwrap_or(false),
+        "EC-7 (json): error_message must name the EC-7 condition, got:\n{}",
+        out.stdout
+    );
+}
+
 // ── stream-json ─────────────────────────────────────────────────────────────
 
 /// `claude-print --claude-binary <mock> --output-format stream-json 'test prompt'`
