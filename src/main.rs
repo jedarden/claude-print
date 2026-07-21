@@ -52,7 +52,7 @@ fn main() {
     }
 
     if cli.check {
-        let code = claude_print::check::run();
+        let code = claude_print::check::run(cli.claude_binary.as_deref());
         exit_with_cleanup(code);
     }
 
