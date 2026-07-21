@@ -61,6 +61,26 @@ fn main() {
         std::env::var("MOCK_RESPONSE").unwrap_or_else(|_| "Hello from mock_claude".to_string());
     let omit_transcript_path = env_flag("MOCK_OMIT_TRANSCRIPT_PATH");
     let omit_last_message = env_flag("MOCK_OMIT_LAST_MESSAGE");
+    // bf-3isy: make mock_claude honor the transcript_path it reports. Real
+    // claude writes a transcript JSONL file at this path; until now mock_claude
+    // only sent `last_assistant_message` inline over the Stop FIFO, so the retry
+    // loop in src/transcript.rs always exhausted and fell back — leaving AS-6
+    // (Stop-before-JSONL race) with zero coverage and the stream-json live
+    // reader (bf-5vm) with nothing to tail.
+    //
+    // MOCK_DELAY_JSONL=<ms>: write the transcript file <ms> AFTER the Stop FIFO
+    // payload is sent, simulating the race where Claude fires Stop before
+    // flushing the transcript — exactly what read_transcript's 40×50ms retry
+    // loop exists to absorb.
+    // MOCK_IS_ERROR=1: stamp the result event with is_error:true (maps to
+    // Session::run's exit-1 AssistantError path).
+    //
+    // OUT OF SCOPE (follow-up): MOCK_TURNS, MOCK_UNKNOWN_EVENT_TYPE,
+    // MOCK_UNKNOWN_USAGE_FIELDS, MOCK_STOP_BEFORE_INJECT — the plan's full
+    // MOCK_* matrix is intentionally not implemented here; this bead only adds
+    // the minimum (file write + delay + is_error) to unblock AS-6.
+    let mock_delay_jsonl_ms: u64 = env_u64("MOCK_DELAY_JSONL", 0);
+    let mock_is_error = env_flag("MOCK_IS_ERROR");
 
     // Handle --version before MOCK_SILENT so version resolution works in tests
     // This is needed because Session::run() resolves the version before spawning
@@ -122,23 +142,46 @@ fn main() {
     } else {
         format!(
             ",\"last_assistant_message\":\"{}\"",
-            mock_response.replace('\\', "\\\\").replace('"', "\\\"")
+            json_escape(&mock_response)
         )
     };
 
-    let payload = if omit_transcript_path {
-        format!(
-            "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{session_id}\",\"cwd\":\"{cwd}\"{last_msg_part}}}\n"
-        )
+    // transcript_path reported in the Stop payload. Held as a String so the
+    // same path is both advertised to claude-print AND written below (the
+    // contract real claude honors). None when the caller asked to omit it.
+    let transcript_path: Option<String> = if omit_transcript_path {
+        None
     } else {
-        format!(
-            "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{session_id}\",\"transcript_path\":\"{home}/.claude/projects/mock-cwd/{session_id}.jsonl\",\"cwd\":\"{cwd}\"{last_msg_part}}}\n"
-        )
+        Some(format!(
+            "{home}/.claude/projects/mock-cwd/{session_id}.jsonl"
+        ))
     };
+
+    let transcript_path_part = match &transcript_path {
+        Some(p) => format!(",\"transcript_path\":\"{}\"", json_escape(p)),
+        None => String::new(),
+    };
+
+    let payload = format!(
+        "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{session_id}\"{transcript_path_part},\"cwd\":\"{cwd}\"{last_msg_part}}}\n"
+    );
 
     // O_WRONLY on a FIFO blocks until a reader opens the other end.
     if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&fifo_path) {
         let _ = file.write_all(payload.as_bytes());
+    }
+
+    // bf-3isy: write the transcript JSONL to the path advertised above. With
+    // MOCK_DELAY_JSONL the write lands <ms> AFTER the Stop payload, so the
+    // Stop-before-JSONL race window is real (the retry loop must absorb it).
+    // Skipped when transcript_path was omitted — there is no advertised path
+    // to honor, and MOCK_OMIT_TRANSCRIPT_PATH's own scenario relies on the
+    // last_assistant_message fallback.
+    if let Some(path) = transcript_path {
+        if mock_delay_jsonl_ms > 0 {
+            thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
+        }
+        write_transcript_jsonl(&path, &mock_response, session_id, mock_is_error);
     }
 
     // Exit 0 if stdin is a controlling TTY (login_tty succeeded), 1 otherwise.
@@ -155,4 +198,49 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Escape a string for safe embedding inside a JSON string literal.
+///
+/// Handles the characters that matter for MOCK_RESPONSE values: backslash,
+/// double-quote, and the JSONL-breaking control chars (newline / CR / tab — a
+/// raw newline would split one logical event across two lines and break
+/// `transcript::parse_transcript`'s line-based reader).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+/// Write a well-formed Claude Code transcript JSONL file at `path`.
+///
+/// Emits two lines — an `assistant` event (the turn text + a usage object
+/// carrying all four token fields) followed by a `result` event — which is the
+/// minimal shape `transcript::parse_transcript` needs to extract text, usage,
+/// session_id, and is_error. Parent directories are created as needed. Errors
+/// are swallowed: mock_claude is a test fixture, and a failed write simply
+/// leaves the retry loop / last_assistant_message fallback as the source of
+/// truth (matching pre-bf-3isy behavior).
+fn write_transcript_jsonl(path: &str, response: &str, session_id: &str, is_error: bool) {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // assistant event — message.id, content text=MOCK_RESPONSE, all 4 usage
+    // token fields (non-zero so the happy-path "non-zero token counts"
+    // assertion holds).
+    let assistant = format!(
+        "{{\"type\":\"assistant\",\"message\":{{\"id\":\"msg_mock_001\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"usage\":{{\"input_tokens\":10,\"output_tokens\":25,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":15}}}}}}",
+        text = json_escape(response)
+    );
+    // result event — is_error reflects MOCK_IS_ERROR; session_id flows through
+    // to the SessionResult so callers can assert on it.
+    let result = format!(
+        "{{\"type\":\"result\",\"session_id\":\"{session_id}\",\"is_error\":{is_error}}}",
+        is_error = if is_error { "true" } else { "false" }
+    );
+
+    let _ = std::fs::write(path, format!("{assistant}\n{result}\n"));
 }
