@@ -4,6 +4,7 @@ use claude_print::config::Config;
 use claude_print::emitter;
 use claude_print::error::{ClaudePrintError, Error};
 use claude_print::hook;
+use claude_print::prompt;
 use claude_print::session;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -73,13 +74,45 @@ fn main() {
 
     // Prompt resolution (in order of precedence)
     let prompt_bytes = if let Some(ref input_file) = cli.input_file {
-        // --input-file <path>: read file bytes
-        match std::fs::read(input_file) {
+        // --input-file <path>: resolve to an absolute path and size/type-check
+        // it BEFORE slurping the contents (plan Security > T-2), then read.
+        let resolved = match prompt::resolve_input_file(input_file) {
+            Ok(p) => p,
+            Err(prompt::InputFileError::TooLarge {
+                resolved,
+                size,
+                limit,
+            }) => {
+                eprintln!(
+                    "claude-print: input file '{}' is {} bytes, which exceeds the {}-byte limit",
+                    resolved.display(),
+                    size,
+                    limit
+                );
+                exit_with_cleanup(2);
+            }
+            Err(prompt::InputFileError::NotRegularFile { resolved }) => {
+                eprintln!(
+                    "claude-print: input file '{}' is not a regular file",
+                    resolved.display()
+                );
+                exit_with_cleanup(4);
+            }
+            Err(prompt::InputFileError::ResolveFailed { path, source }) => {
+                eprintln!(
+                    "claude-print: failed to resolve input file '{}': {}",
+                    path.display(),
+                    source
+                );
+                exit_with_cleanup(4);
+            }
+        };
+        match std::fs::read(&resolved) {
             Ok(bytes) => bytes,
             Err(e) => {
                 eprintln!(
                     "claude-print: failed to read input file '{}': {}",
-                    input_file.display(),
+                    resolved.display(),
                     e
                 );
                 exit_with_cleanup(4);
@@ -111,6 +144,17 @@ fn main() {
             exit_with_cleanup(4);
         }
     };
+
+    // EC-4: reject prompts containing an embedded NUL byte from any source
+    // (positional, stdin, --input-file). `claude -p` does not support null
+    // bytes, so this is a CLI validation failure → exit 2.
+    if let Some(offset) = prompt::find_null_byte(&prompt_bytes) {
+        eprintln!(
+            "claude-print: prompt contains a null byte at offset {} (not supported)",
+            offset
+        );
+        exit_with_cleanup(2);
+    }
 
     // Load the config file once at startup (plan.md "Configuration File"). A
     // missing $HOME or a missing/invalid file yields an empty config, so this

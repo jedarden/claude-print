@@ -6,6 +6,7 @@ pub mod error;
 pub mod event_loop;
 pub mod hook;
 pub mod poller;
+pub mod prompt;
 pub mod pty;
 pub mod session;
 pub mod startup;
