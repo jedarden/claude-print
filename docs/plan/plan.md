@@ -195,6 +195,9 @@ claude-print/
 │   ├── pty_integration.rs            # PTY-specific integration tests
 │   ├── stop_poller.rs                # stop.fifo polling tests
 │   ├── watchdog.rs                   # watchdog timeout tests
+│   ├── binary_e2e.rs                 # binary-level E2E: AS-1/AS-2/AS-5 + stream-json + no-prompt exit 4 (compiled claude-print + mock-claude subprocess; bf-46x)
+│   ├── stream_json_incremental.rs    # incremental (real-time) stream-json E2E test (bf-5xw); #[ignore]'d pending bf-3isy + bf-5vm
+│   ├── transcript_race_e2e.rs        # AS-6 Stop-before-JSONL-flush race E2E; separate test binary to isolate MOCK_* env (bf-3isy)
 │   ├── integration/
 │   │   └── scenarios.rs              # 20+ mock PTY integration tests (declared via `mod scenarios;` in integration.rs; no mod.rs)
 │   └── fixtures/
