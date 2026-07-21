@@ -209,11 +209,12 @@ claude-print/
 │   ├── test_startup_wedge.sh
 │   ├── verify_fix.sh
 │   └── verify-startup-wedge-fix.sh
-└── test-fixtures/
-    └── mock-claude/
-        ├── Cargo.toml
-        └── src/
-            └── main.rs
+├── test-fixtures/
+│   └── mock-claude/
+│       ├── Cargo.toml
+│       └── src/
+│           └── main.rs
+└── notes/                            # per-bead NEEDLE worker scratch notes (notes/bf-*.md); tracked for history, not product docs
 ```
 
 ## State Machine

@@ -160,3 +160,11 @@ br close <id>
 
 See `CLAUDE.md` (root workspace) for full `br` CLI docs and FrankenSQLite recovery
 procedures.
+
+## Notes
+
+`notes/` holds per-bead NEEDLE worker scratch notes — one file per bead
+(`notes/bf-*.md`) recording what the worker did and verified for that bead.
+These are worker journals, **not** product documentation; they are deliberately
+tracked (kept simple — history is appended, never rewritten) for traceability.
+Product design lives in `docs/plan/plan.md`.
