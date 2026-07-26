@@ -1,6 +1,4 @@
-use std::io::Write as IoWrite;
 use std::time::{Duration, Instant};
-use tempfile::NamedTempFile;
 
 // Trust dialog keyword set — 2+ on a single line → send CR.
 const TRUST_KEYWORDS: &[&str] = &[
@@ -19,10 +17,6 @@ const HARD_TIMEOUT_SECS: u64 = 45;
 /// Default idle-gap: ms of silence after trust-dismiss before injecting prompt.
 /// Resets to zero on every PTY output chunk; fires only after uninterrupted silence.
 pub const DEFAULT_POST_DISMISS_IDLE_MS: u64 = 2000;
-/// Prompts at or below this size are injected inline via bracketed paste.
-/// Larger prompts are written to a temp file and a shell `read` command is
-/// injected instead, avoiding PTY pipe-buffer saturation.
-const INLINE_PROMPT_MAX: usize = 32 * 1024;
 
 /// Action requested by [`StartupSeq`] from the event loop.
 #[derive(Debug)]
@@ -77,9 +71,6 @@ pub struct StartupSeq {
     /// Configurable idle gap (ms).  After trust-dismiss, injection fires only
     /// after this many ms pass with no PTY output.
     idle_gap_ms: u64,
-    /// Temp file holding the prompt for the file-relay path (prompt > 32 KB).
-    /// Kept alive here so the file persists until the session reads it.
-    relay_file: Option<NamedTempFile>,
 }
 
 impl StartupSeq {
@@ -101,7 +92,6 @@ impl StartupSeq {
             trust_dismiss_at: None,
             line_buf: Vec::new(),
             idle_gap_ms,
-            relay_file: None,
         }
     }
 
@@ -204,32 +194,27 @@ impl StartupSeq {
         }
     }
 
-    fn make_prompt_payload(&mut self) -> Vec<u8> {
-        if self.prompt.len() <= INLINE_PROMPT_MAX {
-            let mut out = Vec::with_capacity(self.prompt.len() + 12);
-            out.extend_from_slice(b"\x1b[200~");
-            out.extend_from_slice(&self.prompt);
-            out.extend_from_slice(b"\x1b[201~\r");
-            out
-        } else {
-            self.make_file_relay_payload()
-        }
-    }
-
-    /// Write the prompt to a temp file and return a bracketed-paste payload
-    /// containing a shell `read` command (`$(< path)`) that substitutes the
-    /// file contents.  Avoids saturating the PTY pipe buffer for large prompts.
-    fn make_file_relay_payload(&mut self) -> Vec<u8> {
-        let mut f = NamedTempFile::new().expect("create temp file for large prompt");
-        f.write_all(&self.prompt)
-            .expect("write large prompt to temp file");
-        let path = f.path().to_owned();
-        self.relay_file = Some(f);
-        let mut out = Vec::new();
+    /// Build the bracketed-paste payload that injects `self.prompt` into the
+    /// Claude Code REPL.
+    ///
+    /// The prompt bytes are delivered *verbatim*, wrapped in a single
+    /// bracketed-paste envelope (`ESC[200~` … `ESC[201~`) terminated by `CR`.
+    /// Bracketed paste makes embedded newlines literal (no premature Enter),
+    /// and — critically — its content is inserted into the Ink REPL as-is:
+    /// there is no shell on the paste path to evaluate any command
+    /// substitution.  An earlier revision emitted `$(< <tmpfile>)` here, which
+    /// the model received as the literal string rather than the file contents
+    /// (bf-4rxh); the actual prompt text must therefore be carried in the
+    /// payload itself, regardless of size.
+    ///
+    /// Large payloads (which can far exceed the kernel PTY/pipe buffer) are
+    /// fully drained by the caller's chunked write loop (`write_pty_all` in
+    /// `session.rs`); a single `write(2)` would short-write and silently
+    /// truncate the prompt.
+    fn make_prompt_payload(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.prompt.len() + 12);
         out.extend_from_slice(b"\x1b[200~");
-        out.extend_from_slice(b"$(< ");
-        out.extend_from_slice(path.to_string_lossy().as_bytes());
-        out.push(b')');
+        out.extend_from_slice(&self.prompt);
         out.extend_from_slice(b"\x1b[201~\r");
         out
     }
@@ -451,86 +436,69 @@ mod tests {
         );
     }
 
-    // ── large-prompt file relay ───────────────────────────────────────────────
+    // ── prompt content delivery (bf-4rxh) ─────────────────────────────────────
+    //
+    // An earlier revision emitted `$(< <tmpfile>)` (a shell command-substitution)
+    // for prompts above 32 KB. Bracketed paste delivers its payload to the Ink
+    // REPL verbatim — there is no shell on the paste path to evaluate it — so the
+    // model received the literal string `$(< /tmp/…)` instead of the prompt. The
+    // payload must now carry the prompt bytes themselves at every size.
 
-    /// Prompts at or below INLINE_PROMPT_MAX use the inline bracketed-paste path.
+    /// A prompt larger than the former 32 KB inline threshold is delivered as its
+    /// own *contents* inside the bracketed-paste envelope — never as a shell
+    /// `$(< path)` substitution. (bf-4rxh acceptance criterion.)
     #[test]
-    fn inline_path_used_at_threshold() {
-        let prompt: Vec<u8> = b"Z".repeat(INLINE_PROMPT_MAX);
-        let mut seq = StartupSeq::new(prompt.clone());
+    fn large_prompt_payload_carries_content_not_shell_substitution() {
+        let body: Vec<u8> = b"X".repeat(32 * 1024 + 1);
+        let mut seq = StartupSeq::new(body.clone());
         seq.phase = StartupPhase::TrustDismissed;
         let payload = seq.make_prompt_payload();
-        // Inline: open marker directly followed by prompt content.
-        assert!(
-            payload.starts_with(b"\x1b[200~"),
-            "must start with bracketed-paste open"
-        );
-        assert_eq!(
-            payload[6], b'Z',
-            "prompt byte must follow open marker immediately"
-        );
-        // Must not contain shell substitution syntax.
+
+        // Must not embed the broken shell-substitution expression.
         assert!(
             !payload.windows(4).any(|w| w == b"$(< "),
-            "inline path must not emit shell read command"
+            "payload must not embed a shell read command"
         );
-    }
-
-    /// Prompts above INLINE_PROMPT_MAX write to a temp file and inject a shell
-    /// `$(< path)` substitution via bracketed paste.
-    #[test]
-    fn file_relay_used_above_threshold() {
-        let large_prompt: Vec<u8> = b"A".repeat(INLINE_PROMPT_MAX + 1);
-        let mut seq = StartupSeq::new(large_prompt.clone());
-        seq.phase = StartupPhase::TrustDismissed;
-        let payload = seq.make_prompt_payload();
-        // Must start with the shell substitution inside bracketed paste.
-        assert!(
-            payload.starts_with(b"\x1b[200~$(< "),
-            "large prompt must inject shell read command"
-        );
+        // Wrapped in a single bracketed-paste envelope + CR.
+        assert!(payload.starts_with(b"\x1b[200~"), "missing bracketed-paste open");
         assert!(
             payload.ends_with(b"\x1b[201~\r"),
-            "must end with bracketed-paste close + CR"
+            "missing bracketed-paste close + CR"
         );
-        // The relay_file field must be set (keeping the temp file alive).
-        assert!(seq.relay_file.is_some(), "relay_file must be populated");
-    }
-
-    /// The temp file created by the file-relay path contains the exact prompt bytes.
-    #[test]
-    fn file_relay_temp_file_contains_prompt() {
-        let large_prompt: Vec<u8> = b"B".repeat(INLINE_PROMPT_MAX + 256);
-        let mut seq = StartupSeq::new(large_prompt.clone());
-        seq.phase = StartupPhase::TrustDismissed;
-        let payload = seq.make_prompt_payload();
-
-        // Extract the path from payload: \x1b[200~$(< <path>)\x1b[201~\r
-        let prefix = b"\x1b[200~$(< ";
-        assert!(payload.starts_with(prefix));
-        let after_prefix = &payload[prefix.len()..];
-        let close_paren = after_prefix
-            .iter()
-            .position(|&b| b == b')')
-            .expect("closing paren in payload");
-        let path_bytes = &after_prefix[..close_paren];
-        let path_str = std::str::from_utf8(path_bytes).expect("path is valid UTF-8");
-
-        let file_content =
-            std::fs::read(path_str).expect("temp file must exist while seq is alive");
-        assert_eq!(
-            file_content, large_prompt,
-            "temp file must contain the full prompt"
+        // Must carry the actual prompt bytes, verbatim and contiguous.
+        assert!(
+            payload.windows(body.len()).any(|w| w == body.as_slice()),
+            "payload must contain the prompt content verbatim"
         );
     }
 
-    /// File-relay path integrates end-to-end through the state machine:
-    /// trust dismiss → idle gap → file-relay payload injected.
+    /// Content (not shell substitution) is delivered at and around the former
+    /// 32 KB boundary — the inline/relay split no longer exists.
     #[test]
-    fn file_relay_end_to_end_state_machine() {
+    fn payload_carries_content_across_former_threshold() {
+        for &n in &[32 * 1024 - 1, 32 * 1024, 32 * 1024 + 1] {
+            let body: Vec<u8> = vec![b'Q'; n];
+            let mut seq = StartupSeq::new(body.clone());
+            seq.phase = StartupPhase::TrustDismissed;
+            let payload = seq.make_prompt_payload();
+            assert!(
+                !payload.windows(4).any(|w| w == b"$(< "),
+                "n={n}: payload must not embed a shell read command"
+            );
+            assert!(
+                payload.windows(n).any(|w| w == body.as_slice()),
+                "n={n}: payload must contain the prompt content verbatim"
+            );
+        }
+    }
+
+    /// Large-prompt delivery integrates through the full state machine:
+    /// trust dismiss → idle gap → content payload injected.
+    #[test]
+    fn large_prompt_end_to_end_state_machine() {
         let gap_ms: u64 = 15;
-        let large_prompt: Vec<u8> = b"C".repeat(INLINE_PROMPT_MAX + 1);
-        let mut seq = StartupSeq::with_idle_gap(large_prompt.clone(), gap_ms);
+        let body: Vec<u8> = b"C".repeat(32 * 1024 + 1);
+        let mut seq = StartupSeq::with_idle_gap(body.clone(), gap_ms);
 
         seq.feed(b"trust Allow folder\n");
         assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
@@ -541,8 +509,20 @@ mod tests {
         match action {
             StartupAction::Write(payload) => {
                 assert!(
-                    payload.starts_with(b"\x1b[200~$(< "),
-                    "large prompt must use file-relay injection"
+                    payload.starts_with(b"\x1b[200~"),
+                    "missing bracketed-paste open"
+                );
+                assert!(
+                    payload.ends_with(b"\x1b[201~\r"),
+                    "missing bracketed-paste close + CR"
+                );
+                assert!(
+                    !payload.windows(4).any(|w| w == b"$(< "),
+                    "large prompt must not inject a shell read command"
+                );
+                assert!(
+                    payload.windows(body.len()).any(|w| w == body.as_slice()),
+                    "large prompt payload must contain the content verbatim"
                 );
             }
             _ => panic!("expected Write action from poll_timers for large prompt"),

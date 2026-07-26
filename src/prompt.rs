@@ -8,10 +8,11 @@
 //! type-checked before its contents are slurped, so a caller pointing the flag
 //! at `/dev/zero`, a FIFO, or an enormous file cannot exhaust memory (T-2).
 //!
-//! [`PROMPT_MAX_BYTES`] is deliberately far above the 32 KB inline-paste /
-//! file-relay threshold in [`crate::startup`] (`INLINE_PROMPT_MAX`): prompts
-//! above 32 KB are a legitimate, supported input (relayed to a temp file), so
-//! the cap only bounds the worst case rather than restricting normal use.
+//! [`PROMPT_MAX_BYTES`] is deliberately far above the 32 KB inline-paste
+//! threshold historically used by [`crate::startup`]: prompts above 32 KB are a
+//! legitimate, supported input (delivered verbatim via bracketed paste and
+//! drained in chunks by the writer), so the cap only bounds the worst case
+//! rather than restricting normal use.
 
 use std::io;
 use std::path::{Path, PathBuf};
