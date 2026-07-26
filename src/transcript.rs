@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::verbose::Tracer;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs::File;
@@ -180,14 +181,33 @@ pub fn parse_transcript(path: &Path) -> Result<TranscriptResult> {
     })
 }
 
-/// Read a transcript with retry loop and fallback.
+/// Read a transcript with retry loop and fallback (no `--verbose` tracing).
 ///
-/// Retries up to 40×50 ms when the file is missing or text is empty (Stop-before-JSONL race
-/// window, PO-5). Falls back to `last_assistant_message` if retries are exhausted.
-/// Returns an error if both are empty.
+/// Thin wrapper over [`read_transcript_traced`] with a disabled tracer, for
+/// entry points that are not part of a session run (unit tests, standalone
+/// tools). `session.rs` uses the traced variant so `--verbose` can surface the
+/// retry count.
 pub fn read_transcript(
     path: &Path,
     last_assistant_message: Option<&str>,
+) -> Result<TranscriptResult> {
+    read_transcript_traced(path, last_assistant_message, &Tracer::disabled())
+}
+
+/// Read a transcript with retry loop and fallback, emitting `--verbose` traces
+/// for the retry count (plan §"`--verbose` Trace Points`").
+///
+/// Retries up to 40×50 ms when the file is missing or text is empty
+/// (Stop-before-JSONL race window, PO-5). Falls back to `last_assistant_message`
+/// if retries are exhausted. Returns an error if both are empty.
+///
+/// `tracer` makes the `--verbose` traces best-effort: a disabled tracer (the
+/// default) turns every `trace` call into a cheap no-op, so the hot path is
+/// unchanged when `--verbose` is off.
+pub fn read_transcript_traced(
+    path: &Path,
+    last_assistant_message: Option<&str>,
+    tracer: &Tracer,
 ) -> Result<TranscriptResult> {
     const MAX_RETRIES: usize = 40;
     const RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -205,12 +225,19 @@ pub fn read_transcript(
             }
             last_is_error = r.is_error;
             if !r.text.is_empty() {
+                // --verbose retry-count trace: `attempt + 1` is the 1-based read
+                // number — 1 means success on the first try (no retries needed).
+                tracer.trace(format!("transcript read on attempt {}", attempt + 1));
                 return Ok(r);
             }
         }
     }
 
     if let Some(msg) = last_assistant_message.filter(|s| !s.is_empty()) {
+        tracer.trace(format!(
+            "transcript retry exhausted after {} attempts; using last_assistant_message fallback",
+            MAX_RETRIES + 1
+        ));
         return Ok(TranscriptResult {
             // EC-9: the Stop payload's `last_assistant_message` originates from
             // Claude Code's TUI-facing internals and may carry raw ANSI escapes

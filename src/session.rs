@@ -4,9 +4,10 @@ use crate::event_loop::{EventLoop, ExitReason};
 use crate::hook::HookInstaller;
 use crate::poller::{open_fifo_nonblock, parse_stop_payload, projects_dir_for_cwd, resolve_stop_info};
 use crate::pty::PtySpawner;
-use crate::startup::{StartupAction, StartupSeq};
+use crate::startup::{StartupAction, StartupPhase, StartupSeq};
 use crate::terminal::TerminalEmu;
-use crate::transcript::{read_transcript, TranscriptResult};
+use crate::transcript::{read_transcript_traced, TranscriptResult};
+use crate::verbose::Tracer;
 use crate::watchdog::{TimeoutType, Watchdog, WatchdogConfig};
 use nix::sys::signal::{self, SigHandler};
 use nix::sys::wait::waitpid;
@@ -84,6 +85,10 @@ pub struct LaunchOptions {
     /// to claude-print's stderr when startup is slow or stalls — surfaces
     /// MCP/init wedges for diagnosis.
     pub show_child_stderr: bool,
+    /// Write `[claude-print <ms>ms] <message>` timing traces to stderr across
+    /// the session lifecycle (the `--verbose` flag). When off, the tracer is a
+    /// no-op so the flag costs nothing on the hot path.
+    pub verbose: bool,
 }
 
 /// Bounded ring buffer of the child's raw PTY output (bf-uj0).
@@ -311,8 +316,15 @@ impl Session {
     ) -> Result<SessionResult> {
         let start_time = Instant::now();
 
+        // --verbose timing tracer. Constructed once from the flag + session
+        // start, then threaded through the lifecycle (event-loop closure,
+        // transcript reader). A no-op on every call when `--verbose` is off, so
+        // the default hot path pays only a single `enabled` branch test.
+        let tracer = Tracer::new(launch.verbose, start_time);
+
         // 1. Install hook files (temp dir, hook.sh, stop.fifo).
         let installer = HookInstaller::new()?;
+        tracer.trace(format!("temp dir created at {}", installer.dir_path().display()));
 
         // Store temp dir path globally for cleanup before process::exit()
         let _ = TEMP_DIR_PATH.set(installer.dir_path().to_path_buf());
@@ -405,6 +417,11 @@ impl Session {
 
         // 5. Spawn PTY child.
         let spawner = PtySpawner::spawn(&cmd, &args)?;
+        // openpty() and fork()+execvp() happen atomically inside spawn(); at ms
+        // resolution they are the same instant, so both trace points are emitted
+        // here in the order the plan lists them (pty opened, then child forked).
+        tracer.trace("pty opened");
+        tracer.trace(format!("child forked pid={}", spawner.child_pid));
 
         // 5a. Set up watchdog timeout handling.
         // We have four timeouts:
@@ -454,10 +471,12 @@ impl Session {
         let (_fifo_read, _fifo_keeper) = match open_fifo_nonblock(&installer.fifo_path) {
             Ok((read_fd, keeper)) => {
                 event_loop.add_fifo_fd(read_fd.as_raw_fd());
+                tracer.trace("fifo opened");
                 (Some(read_fd), Some(keeper))
             }
             Err(e) => {
                 eprintln!("warning: failed to open FIFO, continuing without Stop detection: {e}");
+                tracer.trace(format!("fifo open failed: {e}"));
                 (None, None)
             }
         };
@@ -479,6 +498,9 @@ impl Session {
         let watchdog_state_clone = watchdog_state.clone();
         let mut last_phase = startup.phase().clone();
         let stream_json_spawned_clone = stream_json_spawned.clone();
+        // --verbose: cloned (Copy) into the closure so phase transitions are
+        // traced from the same call site that detects them.
+        let tracer_clone = tracer;
         // bf-uj0: capture the child's raw PTY output so --show-child-stderr can
         // surface it on a slow/stall exit. A no-op (empty buffer) until dumped.
         let mut child_capture = ChildCapture::new(launch.show_child_stderr);
@@ -534,8 +556,17 @@ impl Session {
 
             // Check if phase changed to PromptInjected and notify watchdog
             let current_phase = startup.phase();
+            if last_phase != *current_phase {
+                tracer_clone.trace(format!(
+                    "phase transition: {} -> {}",
+                    phase_name(&last_phase),
+                    phase_name(current_phase)
+                ));
+            }
             if last_phase != *current_phase && current_phase.is_prompt_injected() {
                 watchdog_state_clone.mark_prompt_injected();
+                // INV-3: the "prompt injected" trace must follow "fifo opened".
+                tracer_clone.trace("prompt injected");
 
                 // Spawn stream-json reader at PROMPT_INJECTED for stream-json output.
                 //
@@ -595,6 +626,7 @@ impl Session {
                 "claude-print: sending SIGTERM to child pid {}",
                 spawner.child_pid
             );
+            tracer.trace(format!("cleanup reason: timeout ({})", timeout_msg));
 
             // bf-uj0: a watchdog timeout means startup (or the session) stalled;
             // surface what the child emitted so MCP/init wedges are diagnosable.
@@ -652,11 +684,21 @@ impl Session {
                 let stop_payload = parse_stop_payload(&payload)?;
                 let stop_info = resolve_stop_info(stop_payload);
 
+                // --verbose "Stop received" trace (plan §"`--verbose` Trace
+                // Points`"): emit the session id Claude Code reported in the Stop
+                // payload, if any. This marks the instant the model finished its
+                // turn, ahead of the transcript-read retry trace below.
+                tracer.trace(format!(
+                    "stop received session_id={}",
+                    stop_info.session_id.as_deref().unwrap_or("(none)")
+                ));
+
                 // Read transcript. On error, `?` returns and Drop joins the
                 // reader without draining (INV-8, exit-immediately on error).
                 let transcript_path = stop_info.transcript_path.as_ref();
                 let transcript = if let Some(path) = transcript_path {
-                    let t = read_transcript(path, stop_info.last_assistant_message.as_deref())?;
+                    let t =
+                        read_transcript_traced(path, stop_info.last_assistant_message.as_deref(), &tracer)?;
                     // bf-416c: Claude Code's own transcript result event reported
                     // is_error:true (rate limit, tool failure, any assistant-side
                     // error). This is a COMPLETED turn that the assistant itself
@@ -748,6 +790,15 @@ impl Session {
         })?;
 
         Ok(first_line.trim().to_string())
+    }
+}
+
+/// Lowercase name for a [`StartupPhase`], for `--verbose` transition traces.
+fn phase_name(phase: &StartupPhase) -> &'static str {
+    match phase {
+        StartupPhase::Waiting => "waiting",
+        StartupPhase::TrustDismissed => "trust-dismissed",
+        StartupPhase::PromptInjected => "prompt-injected",
     }
 }
 

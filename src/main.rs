@@ -208,6 +208,7 @@ fn main() {
         mcp_configs: cli.mcp_config.clone(),
         pretrust_cwd: cli.pretrust_cwd,
         show_child_stderr: cli.show_child_stderr,
+        verbose: cli.verbose,
     };
 
     // Call session::Session::run()
