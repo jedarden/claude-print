@@ -63,12 +63,29 @@ fn main() {
         .clone()
         .unwrap_or_else(|| PathBuf::from("claude"));
 
-    // AS-5: Check if claude binary exists before calling session::run()
+    // AS-5: Check if claude binary exists before calling session::run(). In text
+    // mode this is a human-readable stderr message (unchanged). In JSON /
+    // stream-json modes it must surface as a structured `result` object with
+    // is_error:true on stdout — the same shape every other error arm emits via
+    // emit_error — so a missing binary does not leave JSON callers with empty
+    // stdout (the binary_e2e AS-5 json regression guard asserts this).
     if which::which(&claude_bin).is_err() {
-        eprintln!(
-            "claude-print: '{}' not found in PATH",
-            claude_bin.to_string_lossy()
-        );
+        let not_found_msg = format!("'{}' not found in PATH", claude_bin.to_string_lossy());
+        if matches!(cli.output_format, claude_print::cli::OutputFormat::Text) {
+            eprintln!("claude-print: {}", not_found_msg);
+        } else {
+            let mut stdout = io::stdout().lock();
+            let mut stderr = io::stderr().lock();
+            let _ = emit_error(
+                &mut stdout,
+                &mut stderr,
+                &ClaudePrintError::Setup(not_found_msg),
+                &cli.output_format,
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                true,
+            );
+        }
         exit_with_cleanup(2);
     }
 
