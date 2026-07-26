@@ -429,11 +429,25 @@ impl Session {
         // 2. Stream-json first-output timeout: if child emits no stream-json events within N seconds (default 90s)
         // 3. Overall timeout: if session exceeds overall deadline (default from CLI, 3600s)
         // 4. Stop hook watchdog timeout: if Stop hook doesn't fire within N seconds after prompt injection (default 120s)
+        //
+        // bf-lu1h: timeout #2 (stream-json first-output) only applies in
+        // stream-json mode. Outside it the child never writes
+        // <temp_dir>/transcript.jsonl (the real transcript lands in
+        // ~/.claude/projects/) and mark_stream_json_output is never called, so
+        // the deadline is unsatisfiable and would SIGTERM any turn >90s. Arm it
+        // (and tell the watchdog the mode) only for stream-json output.
+        let is_stream_json = matches!(output_format, crate::cli::OutputFormat::StreamJson);
+        let stream_json_first_output = if is_stream_json {
+            stream_json_timeout_secs.or(first_output_timeout_secs)
+        } else {
+            Some(0) // explicitly disabled outside stream-json mode
+        };
         let watchdog_config = WatchdogConfig::new(
             first_output_timeout_secs,
-            stream_json_timeout_secs.or(first_output_timeout_secs),
+            stream_json_first_output,
             timeout_secs,
             stop_hook_timeout_secs,
+            is_stream_json,
         );
 
         // Get temp directory path for stream-json monitoring

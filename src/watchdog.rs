@@ -73,11 +73,23 @@ pub struct WatchdogConfig {
     /// Timeout for first PTY output in seconds (0 = disabled).
     pub pty_first_output_timeout_secs: u64,
     /// Timeout for first stream-json output in seconds (0 = disabled).
+    ///
+    /// Only consulted when [`stream_json_mode`](Self::stream_json_mode) is true.
     pub stream_json_first_output_timeout_secs: u64,
     /// Overall session timeout in seconds (0 = disabled).
     pub overall_timeout_secs: u64,
     /// Stop hook watchdog timeout in seconds (0 = disabled).
     pub stop_hook_timeout_secs: u64,
+    /// Whether the child is expected to emit stream-json events.
+    ///
+    /// The stream-json first-output timeout (Phase 2) and its transcript monitor
+    /// only apply in stream-json mode. In text/json mode the child never produces
+    /// a `<temp_dir>/transcript.jsonl` (the real transcript lands in
+    /// `~/.claude/projects/`), and [`WatchdogState::mark_stream_json_output`] is
+    /// never called from production, so arming Phase-2 there would be unsatisfiable
+    /// and SIGTERM any turn that exceeds the deadline (bf-lu1h). Defaults to
+    /// `false` (safe: Phase-2 disabled unless the caller opts in).
+    pub stream_json_mode: bool,
 }
 
 impl Default for WatchdogConfig {
@@ -87,17 +99,24 @@ impl Default for WatchdogConfig {
             stream_json_first_output_timeout_secs: DEFAULT_STREAM_JSON_TIMEOUT_SECS,
             overall_timeout_secs: DEFAULT_OVERALL_TIMEOUT_SECS,
             stop_hook_timeout_secs: DEFAULT_STOP_HOOK_TIMEOUT_SECS,
+            stream_json_mode: false,
         }
     }
 }
 
 impl WatchdogConfig {
     /// Create a new config with custom timeouts.
+    ///
+    /// `stream_json_mode` gates the stream-json first-output timeout (Phase 2) and
+    /// its monitor: pass `true` only when `output_format == stream-json`. In any
+    /// other mode Phase-2 can never be satisfied, so arming it would spuriously
+    /// kill long-running turns (bf-lu1h).
     pub fn new(
         pty_timeout: Option<u64>,
         stream_json_timeout: Option<u64>,
         overall_timeout: Option<u64>,
         stop_hook_timeout: Option<u64>,
+        stream_json_mode: bool,
     ) -> Self {
         Self {
             pty_first_output_timeout_secs: pty_timeout.unwrap_or(DEFAULT_PTY_TIMEOUT_SECS),
@@ -105,6 +124,7 @@ impl WatchdogConfig {
                 .unwrap_or(DEFAULT_STREAM_JSON_TIMEOUT_SECS),
             overall_timeout_secs: overall_timeout.unwrap_or(0),
             stop_hook_timeout_secs: stop_hook_timeout.unwrap_or(DEFAULT_STOP_HOOK_TIMEOUT_SECS),
+            stream_json_mode,
         }
     }
 
@@ -273,14 +293,21 @@ impl Watchdog {
             let session_start_time = Instant::now();
             session_start.store(true, Ordering::SeqCst);
 
-            // Spawn stream-json monitor if temp directory provided
-            // The transcript file will be created at <temp_dir>/transcript.jsonl
-            let _stream_json_monitor = temp_dir_path.as_ref().map(|dir| {
-                spawn_stream_json_monitor_in_dir(
-                    dir.clone(),
-                    Arc::clone(&stream_json_output_received),
-                )
-            });
+            // Spawn stream-json monitor ONLY in stream-json mode (bf-lu1h). In
+            // text/json mode there is no <temp_dir>/transcript.jsonl to watch —
+            // the real transcript lives in ~/.claude/projects/ — so the monitor
+            // would poll forever for a file that never appears, and the Phase-2
+            // deadline it feeds would spuriously SIGTERM the child.
+            let _stream_json_monitor = if config.stream_json_mode {
+                temp_dir_path.as_ref().map(|dir| {
+                    spawn_stream_json_monitor_in_dir(
+                        dir.clone(),
+                        Arc::clone(&stream_json_output_received),
+                    )
+                })
+            } else {
+                None
+            };
 
             loop {
                 // Check if already fired
@@ -313,8 +340,13 @@ impl Watchdog {
                     return;
                 }
 
-                // Check Phase 2: Stream-json first-output timeout
-                if config.stream_json_first_output_timeout_secs > 0
+                // Check Phase 2: Stream-json first-output timeout.
+                // Gated on stream-json mode (bf-lu1h): outside stream-json the
+                // child never produces <temp_dir>/transcript.jsonl and
+                // mark_stream_json_output is never called, so this deadline is
+                // unsatisfiable and must not fire.
+                if config.stream_json_mode
+                    && config.stream_json_first_output_timeout_secs > 0
                     && !has_stream_json_output
                     && elapsed >= Duration::from_secs(config.stream_json_first_output_timeout_secs)
                 {
@@ -490,15 +522,18 @@ mod tests {
             config.stop_hook_timeout_secs,
             DEFAULT_STOP_HOOK_TIMEOUT_SECS
         );
+        // Default must be safe: stream-json Phase-2 disabled unless opted in.
+        assert!(!config.stream_json_mode);
     }
 
     #[test]
     fn test_watchdog_config_custom() {
-        let config = WatchdogConfig::new(Some(30), Some(60), Some(120), Some(90));
+        let config = WatchdogConfig::new(Some(30), Some(60), Some(120), Some(90), true);
         assert_eq!(config.pty_first_output_timeout_secs, 30);
         assert_eq!(config.stream_json_first_output_timeout_secs, 60);
         assert_eq!(config.overall_timeout_secs, 120);
         assert_eq!(config.stop_hook_timeout_secs, 90);
+        assert!(config.stream_json_mode);
     }
 
     #[test]
@@ -525,5 +560,101 @@ mod tests {
             state.get_timeout_type(),
             Some(TimeoutType::StreamJsonFirstOutput)
         );
+    }
+
+    // ── bf-lu1h: Phase-2 stream-json gating ───────────────────────────────────
+    //
+    // The stream-json first-output timeout is unsatisfiable outside stream-json
+    // mode: the child never writes <temp_dir>/transcript.jsonl (the real
+    // transcript lives in ~/.claude/projects/), and mark_stream_json_output is
+    // never called from production. Arming Phase-2 for every output format
+    // therefore SIGTERMs any turn longer than the deadline. These tests pin the
+    // fix: Phase-2 must only fire in stream-json mode.
+
+    /// Spawn a long-lived child the watchdog would SIGTERM if Phase-2 fired.
+    /// Returns the Rust `Child` handle (which owns the pid for cleanup) and the
+    /// `nix::Pid` the watchdog signals.
+    fn spawn_sleep_child() -> (std::process::Child, nix::unistd::Pid) {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("`sleep` should be spawnable on PATH");
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        (child, pid)
+    }
+
+    /// bf-lu1h negative: a configured stream-json timeout must NOT fire outside
+    /// stream-json mode, even after the deadline elapses with no transcript
+    /// present. PTY output is received so Phase-1 is satisfied; only Phase-2
+    /// could fire, and the gate must prevent it — leaving the child alive.
+    #[test]
+    fn stream_json_timeout_does_not_fire_outside_stream_json_mode() {
+        // Stream-json timeout is set (1s), but mode=false (text/json). A real
+        // transcript.jsonl is absent (no temp dir provided → no monitor either).
+        let config = WatchdogConfig::new(Some(60), Some(1), Some(0), Some(0), false);
+        let (mut child, child_pid) = spawn_sleep_child();
+        let watchdog = Watchdog::new(config, child_pid, None, None);
+        let state = watchdog.state();
+        let _handle = watchdog.spawn_timeout_thread();
+
+        // Satisfy Phase-1 so only the gated Phase-2 could fire.
+        state.mark_pty_output();
+
+        // Wait well past the 1s stream-json deadline (100ms poll granularity).
+        std::thread::sleep(Duration::from_millis(2000));
+
+        assert_ne!(
+            state.get_timeout_type(),
+            Some(TimeoutType::StreamJsonFirstOutput),
+            "stream-json timeout fired outside stream-json mode"
+        );
+        assert!(
+            !state.has_timeout_fired(),
+            "no timeout should fire in text mode once PTY output arrived"
+        );
+
+        // The child must still be alive (not killed by a spurious Phase-2 SIGTERM).
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => panic!("child should still be alive, but exited with {status}"),
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+
+        // Cleanup.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// bf-lu1h positive: the same configured stream-json timeout DOES fire in
+    /// stream-json mode when no transcript appears, confirming the gate enables
+    /// Phase-2 (regression guard against the gate becoming always-false).
+    #[test]
+    fn stream_json_timeout_fires_in_stream_json_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // temp dir has NO transcript.jsonl → monitor never sets the flag.
+        let config = WatchdogConfig::new(Some(60), Some(1), Some(0), Some(0), true);
+        let (mut child, child_pid) = spawn_sleep_child();
+        let watchdog =
+            Watchdog::new(config, child_pid, Some(dir.path().to_path_buf()), None);
+        let state = watchdog.state();
+        let _handle = watchdog.spawn_timeout_thread();
+
+        // Satisfy Phase-1 so Phase-2 is the one that fires.
+        state.mark_pty_output();
+
+        std::thread::sleep(Duration::from_millis(2000));
+
+        assert!(
+            state.has_timeout_fired(),
+            "stream-json timeout should fire in stream-json mode with no transcript"
+        );
+        assert_eq!(
+            state.get_timeout_type(),
+            Some(TimeoutType::StreamJsonFirstOutput),
+        );
+
+        // The watchdog SIGTERM'd the child; reap it.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
