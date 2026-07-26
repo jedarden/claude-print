@@ -16,6 +16,9 @@
 //!   * **AS-5** — missing claude binary: exit 2, human-readable stderr naming the
 //!     missing binary (text mode); in json mode a `result` object with
 //!     `is_error=true` on stdout.
+//!   * **AS-6** — `--verbose`: emits `[claude-print <ms>ms]` timing traces to
+//!     stderr that the same run without `--verbose` does not, and the two
+//!     stderrs differ.
 //!   * **stream-json** — every stdout line is valid JSON.
 //!   * **no prompt** — stdin /dev/null and no positional arg → exit 4.
 //!   * **--version** — exit 0, output names `claude-print` and `wrapping`.
@@ -278,6 +281,80 @@ fn as5_missing_binary_json_mode_is_error_true() {
             .unwrap_or(false),
         "AS-5 (json): error_message must name the missing binary, got:\n{}",
         out.stdout
+    );
+}
+
+// ── AS-6: --verbose timing traces (bf-1bg4) ─────────────────────────────────
+//
+// Implements AC1 of the parent bead end-to-end: `--verbose` must be externally
+// observable. The built binary, run against mock-claude, must emit at least one
+// `[claude-print <ms>ms]` timing trace to stderr; the *same* invocation WITHOUT
+// `--verbose` must emit none (the tracer is a no-op on the hot path); and the
+// two stderrs must differ. That last assertion is the regression guard — if a
+// future change moves traces onto the un-flagged path, or drops them from the
+// flagged one, this catches it.
+
+/// True if `stderr` contains at least one `[claude-print <ms>ms] ...` timing
+/// trace line — the exact shape `Tracer::trace` emits (src/verbose.rs). Hand
+/// rolled rather than pulling in the `regex` dev-dependency: the pattern is a
+/// fixed prefix `[claude-print ` + one-or-more ASCII digits + `ms]`.
+fn has_claude_print_trace(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let Some(rest) = line.strip_prefix("[claude-print ") else {
+            return false;
+        };
+        let n = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        n > 0 && rest[n..].starts_with("ms]")
+    })
+}
+
+/// `--verbose` surfaces `[claude-print <ms>ms]` traces; without it, none appear.
+/// AC1 of parent bf-1bg4: the flag must be observable, and the two stderrs must
+/// differ so a regression that silently shifts traces onto (or off of) the
+/// flagged path is caught.
+#[test]
+fn as6_verbose_emits_trace_lines_and_nonverbose_emits_none() {
+    // Verbose run: --verbose must surface at least one timing trace on stderr.
+    let verbose = run(
+        claude_print().arg("--verbose").arg("test prompt"),
+        BUDGET,
+    );
+    assert_eq!(
+        verbose.code,
+        Some(0),
+        "AS-6 (verbose): expected exit 0, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        verbose.code,
+        verbose.stdout,
+        verbose.stderr,
+    );
+    assert!(
+        has_claude_print_trace(&verbose.stderr),
+        "AS-6 (verbose): stderr must contain a `[claude-print <ms>ms]` trace \
+         line, got:\n{}",
+        verbose.stderr,
+    );
+
+    // Same invocation WITHOUT --verbose: no trace lines on stderr.
+    let quiet = run(claude_print().arg("test prompt"), BUDGET);
+    assert_eq!(
+        quiet.code,
+        Some(0),
+        "AS-6 (quiet): expected exit 0, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        quiet.code,
+        quiet.stdout,
+        quiet.stderr,
+    );
+    assert!(
+        !has_claude_print_trace(&quiet.stderr),
+        "AS-6 (quiet): stderr must NOT contain any `[claude-print <ms>ms]` \
+         trace line, got:\n{}",
+        quiet.stderr,
+    );
+
+    // The two stderrs must differ — verbose adds traces the quiet run lacks.
+    assert_ne!(
+        verbose.stderr, quiet.stderr,
+        "AS-6: verbose and non-verbose stderr must differ (verbose adds traces)"
     );
 }
 
