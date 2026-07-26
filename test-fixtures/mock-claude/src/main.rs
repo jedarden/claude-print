@@ -39,14 +39,22 @@ fn main() {
     // arg with no --settings. NB: `--setting-sources=` does NOT match the
     // `--settings=` prefix (the next char is `-`, not `s`), so isolation mode is
     // unaffected.
-    let fifo_path: Option<String> = std::env::args()
-        .find_map(|a| {
-            a.strip_prefix("--settings=").map(|s| {
-                std::path::Path::new(s)
-                    .parent()
-                    .map(|d| d.join("stop.fifo").to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            })
+    //
+    // bf-5206: `--settings=` is present iff claude-print spawned us. We branch on
+    // that to make the mock faithful to real Claude Code in driven mode — emit the
+    // first-run trust dialog and fire Stop only AFTER the prompt is received —
+    // while leaving the legacy direct-spawn mode (a raw FIFO round-trip with no
+    // startup sequencer) firing Stop immediately.
+    let settings_arg: Option<String> = std::env::args()
+        .find_map(|a| a.strip_prefix("--settings=").map(|s| s.to_string()));
+    let driven_by_claude_print = settings_arg.is_some();
+    let fifo_path: Option<String> = settings_arg
+        .as_ref()
+        .map(|s| {
+            std::path::Path::new(s)
+                .parent()
+                .map(|d| d.join("stop.fifo").to_string_lossy().into_owned())
+                .unwrap_or_default()
         })
         .or_else(|| std::env::args().nth(1));
 
@@ -54,7 +62,11 @@ fn main() {
     let mock_silent = env_flag("MOCK_SILENT");
     let mock_exit_before_stop = env_flag("MOCK_EXIT_BEFORE_STOP");
     let mock_delay_stop_ms: u64 = env_u64("MOCK_DELAY_STOP", 0);
-    let mock_trust_dialog = env_flag("MOCK_TRUST_DIALOG");
+    // bf-5206: the trust dialog is ON by default in claude-print-driven mode —
+    // real Claude Code shows a first-run trust prompt, and claude-print's startup
+    // scanner needs those keywords to reach PROMPT_INJECTED. MOCK_TRUST_DIALOG=0
+    // disables it explicitly. (env_bool_default, not env_flag, so unset ⇒ on.)
+    let mock_trust_dialog = env_bool_default("MOCK_TRUST_DIALOG", true);
     let mock_trust_wording = std::env::var("MOCK_TRUST_WORDING").unwrap_or_default();
     let mock_unknown_probe = env_flag("MOCK_UNKNOWN_PROBE");
     let mock_response =
@@ -112,12 +124,15 @@ fn main() {
         std::io::stdout().flush().ok();
     }
 
-    // Optionally emit trust dialog text. Suppressed under MOCK_STOP_BEFORE_INJECT
-    // so the Stop hook (fired below) wins the race against claude-print's startup
-    // scanner — emitting trust keywords here would let the scanner reach
-    // PROMPT_INJECTED and turn the run into a normal success instead of the EC-7
-    // leak this fixture is meant to produce.
-    if mock_trust_dialog && !mock_stop_before_inject {
+    // Emit the trust dialog so claude-print's startup scanner can detect the
+    // keywords, dismiss the dialog, and reach PROMPT_INJECTED — mirroring real
+    // Claude Code's first-run trust prompt. Only in claude-print-driven mode; the
+    // legacy direct-spawn mode (no --settings=) just round-trips the FIFO.
+    // Suppressed under MOCK_STOP_BEFORE_INJECT so the Stop hook (fired below) wins
+    // the race against the scanner — emitting trust keywords here would let the
+    // scanner reach PROMPT_INJECTED and turn the run into a normal success instead
+    // of the EC-7 leak this fixture is meant to produce.
+    if driven_by_claude_print && mock_trust_dialog && !mock_stop_before_inject {
         if mock_trust_wording == "alternate" {
             // Uses "continue" + "folder" as trust keywords
             print!("Do you want to continue and grant permission to this folder?\r\n");
@@ -137,6 +152,25 @@ fn main() {
     // fires immediately (see comment above the trust-dialog emission).
     if mock_delay_stop_ms > 0 && !mock_stop_before_inject {
         thread::sleep(Duration::from_millis(mock_delay_stop_ms));
+    }
+
+    // bf-5206: gate Stop on actual prompt receipt. Real Claude Code only fires
+    // the Stop hook AFTER it receives and processes a user prompt — it never
+    // responds to a prompt that was never sent. mock_claude previously fired Stop
+    // on a fixed path regardless of input, so in the stream-json / text mock runs
+    // Stop landed before claude-print's startup sequencer reached PROMPT_INJECTED,
+    // tripping the EC-7 backstop in session.rs (Stop-before-inject → exit 2 /
+    // is_error) on every happy-path run. claude-print delivers the prompt as a
+    // bracketed-paste envelope (ESC[200~ … ESC[201~ + CR) written to the PTY
+    // master; the slave is in canonical mode, so the trailing CR flushes the whole
+    // envelope to stdin in one line and the close marker arrives intact. We block
+    // here until we observe ESC[201~, then proceed to fire Stop. Earlier input
+    // (the CR that dismisses the trust dialog) is consumed and ignored.
+    //
+    // Skipped under MOCK_STOP_BEFORE_INJECT (the deliberate EC-7 negative case)
+    // and in legacy direct-spawn mode (no claude-print sequencer injects a prompt).
+    if driven_by_claude_print && !mock_stop_before_inject {
+        wait_for_prompt();
     }
 
     let Some(fifo_path) = fifo_path else {
@@ -204,6 +238,58 @@ fn main() {
 
 fn env_flag(key: &str) -> bool {
     std::env::var(key).map(|v| v == "1").unwrap_or(false)
+}
+
+/// Read a boolean env var with an explicit default for the unset case (bf-5206).
+///
+/// Unlike [`env_flag`] (false unless the value is exactly `"1"`), this treats an
+/// unset variable as `default`, `"0"` as false, and any other value as true.
+/// Used for `MOCK_TRUST_DIALOG`, which is ON by default so mock_claude emits the
+/// first-run trust prompt like real Claude Code.
+fn env_bool_default(key: &str, default: bool) -> bool {
+    match std::env::var(key).ok().as_deref() {
+        Some("0") => false,
+        Some("") => default,
+        Some(_) => true,
+        None => default,
+    }
+}
+
+/// Block until claude-print injects the prompt via bracketed paste (bf-5206).
+///
+/// See the call site for why this gating is required. Reads stdin until the
+/// bracketed-paste close marker `ESC[201~` is observed, then returns. EOF or a
+/// read error returns immediately (defensive: there is nothing to wait for if
+/// stdin is closed or not a TTY).
+fn wait_for_prompt() {
+    use std::io::Read;
+    // Bracketed-paste close marker. Its presence on stdin means claude-print has
+    // delivered the prompt.
+    const PASTE_CLOSE: &[u8] = b"\x1b[201~";
+
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut buf = [0u8; 256];
+    // Sliding window of recently-read bytes, capped so a marker split across two
+    // reads is still matched without unbounded growth.
+    let mut tail: Vec<u8> = Vec::with_capacity(PASTE_CLOSE.len() * 4);
+    loop {
+        match handle.read(&mut buf) {
+            Ok(0) | Err(_) => return, // EOF / unreadable stdin: nothing to wait for.
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.windows(PASTE_CLOSE.len()).any(|w| w == PASTE_CLOSE) {
+                    return;
+                }
+                // Keep only enough trailing bytes to detect a marker spanning a
+                // chunk boundary on the next read.
+                if tail.len() > PASTE_CLOSE.len() * 2 {
+                    let drain = tail.len() - PASTE_CLOSE.len() * 2;
+                    tail.drain(..drain);
+                }
+            }
+        }
+    }
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
