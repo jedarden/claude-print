@@ -3,58 +3,123 @@ use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-/// Sweep and remove orphaned temp directories from previous crashed runs.
+/// Sweep and remove orphaned temp directories left behind by crashed runs.
 ///
-/// This looks for directories matching the pattern `claude-print-*` in the
-/// system temp directory and removes any that are older than 60 seconds.
-/// This prevents accumulation of stale temp dirs from crashes.
+/// Scans `$TMPDIR` for `claude-print-<pid>-<rand>` directories older than 60s
+/// and removes them — but ONLY when the PID embedded in the directory name no
+/// longer refers to a running process. A directory whose owner is still alive
+/// is left untouched even when aged past the threshold, so a concurrent
+/// (long-running) claude-print session's `stop.fifo` IPC is never deleted out
+/// from under it. This preserves plan EC-1's no-cross-contamination guarantee
+/// for concurrent instances under the NEEDLE fleet (AS-3).
 ///
 /// This function is called at the start of main() to ensure orphans are
 /// cleaned up on all invocations, not just when a session runs.
 pub fn cleanup_orphans() {
-    let temp_dir = std::env::temp_dir();
+    cleanup_orphans_in(
+        &std::env::temp_dir(),
+        SystemTime::now(),
+        Duration::from_secs(60),
+        &is_live_process,
+    );
+}
 
-    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
+/// Parse the owning PID out of a temp-dir name of the form
+/// `claude-print-<pid>-<rand>` produced by [`HookInstaller::new`]. Returns
+/// `None` when the name doesn't carry a numeric PID.
+fn owner_pid_from_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("claude-print-")?;
+    rest.split('-').next()?.parse::<u32>().ok()
+}
 
-            // Check if the entry name matches our pattern
-            let name = path.file_name().and_then(|n| n.to_str());
-            if let Some(name) = name {
-                if name.starts_with("claude-print-") {
-                    // Check if it's a directory and old enough (> 60 seconds)
-                    if let Ok(metadata) = entry.metadata() {
-                        if metadata.is_dir() {
-                            if let Ok(created) = metadata.created() {
-                                if let Ok(age) = created.elapsed() {
-                                    // Remove if older than 60 seconds
-                                    // Shorter threshold prevents orphans from accumulating
-                                    // while avoiding deletion of active instances
-                                    if age > std::time::Duration::from_secs(60) {
-                                        // Try to remove the FIFO first if it exists
-                                        let fifo_path = path.join("stop.fifo");
-                                        if let Err(e) = std::fs::remove_file(&fifo_path) {
-                                            eprintln!("claude-print: warning: failed to remove FIFO {:?}: {}", fifo_path, e);
-                                        }
-                                        // Remove the entire temp directory
-                                        if let Err(e) = std::fs::remove_dir_all(&path) {
-                                            eprintln!("claude-print: warning: failed to remove orphaned temp dir {:?}: {}", path, e);
-                                        } else {
-                                            eprintln!(
-                                                "claude-print: cleaned up orphaned temp dir: {:?}",
-                                                path
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+/// Returns `true` if `pid` refers to a running process on this host.
+///
+/// Uses the null signal (`kill(pid, 0)`), which probes existence without
+/// delivering a signal. A process owned by another user yields `EPERM` rather
+/// than success — that is also treated as "alive" so we never delete a temp dir
+/// whose owner we cannot positively identify as dead.
+fn is_live_process(pid: u32) -> bool {
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
+    }
+}
+
+/// Pure, injectable core of [`cleanup_orphans`]. Scans `dir` for
+/// `claude-print-*` directories whose mtime is older than `threshold` relative
+/// to `now`, and removes any whose embedded owner PID is not currently running.
+///
+/// The liveness predicate `is_alive` is injected so tests can drive the decision
+/// deterministically; the production entry point passes [`is_live_process`].
+///
+/// Age is computed from `mtime` (not `btime`): `metadata.created()` returns
+/// `Err` on filesystems without birth-time support, which would silently
+/// disable cleanup entirely. `mtime` is universally available and matches the
+/// orphan scan in `check.rs`.
+fn cleanup_orphans_in<F>(dir: &Path, now: SystemTime, threshold: Duration, is_alive: &F)
+where
+    F: Fn(u32) -> bool,
+{
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("claude-print-") {
+            continue;
+        }
+        let Ok(md) = entry.metadata() else {
+            continue;
+        };
+        if !md.is_dir() {
+            continue;
+        }
+        let Ok(modified) = md.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        // Only consider dirs aged past the threshold.
+        if age <= threshold {
+            continue;
+        }
+        // Never delete a temp dir whose owning process is still alive — it may
+        // be a concurrent claude-print session mid-turn. If the name carries no
+        // parseable PID we also leave it alone (can't prove it's orphaned).
+        match owner_pid_from_name(name) {
+            Some(pid) if is_alive(pid) => continue,
+            None => continue,
+            _ => {}
+        }
+        // Aged out AND owner is dead → safe to reclaim. Try the FIFO first (it
+        // may carry different perms) then the whole directory.
+        let fifo_path = path.join("stop.fifo");
+        if let Err(e) = std::fs::remove_file(&fifo_path) {
+            eprintln!(
+                "claude-print: warning: failed to remove FIFO {:?}: {}",
+                fifo_path, e
+            );
+        }
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            eprintln!(
+                "claude-print: warning: failed to remove orphaned temp dir {:?}: {}",
+                path, e
+            );
+        } else {
+            eprintln!(
+                "claude-print: cleaned up orphaned temp dir: {:?}",
+                path
+            );
         }
     }
 }
@@ -274,12 +339,100 @@ mod tests {
         assert!(!dir_path.exists(), "temp dir must be removed after drop");
     }
 
+    /// Set a path's mtime to `target` via FileTimes (works on a read-only fd
+    /// for a dir/file the test process owns, as tempdir-created paths are).
+    /// Mirrors the helper in check.rs.
+    fn set_mtime(path: &Path, target: SystemTime) {
+        let f = std::fs::File::open(path).expect("open for set_times");
+        let times = std::fs::FileTimes::new().set_modified(target);
+        f.set_times(times).expect("set_times");
+    }
+
+    #[test]
+    fn owner_pid_parses_from_dir_name() {
+        assert_eq!(owner_pid_from_name("claude-print-12345-AbCdEf"), Some(12345));
+        assert_eq!(owner_pid_from_name("claude-print-1-x"), Some(1));
+        assert_eq!(owner_pid_from_name("claude-print-notanum-x"), None);
+        assert_eq!(owner_pid_from_name("something-else"), None);
+    }
+
     #[test]
     fn cleanup_orphans_does_not_panic() {
-        // This test verifies that cleanup_orphans() doesn't panic
-        // It's hard to test the actual behavior without creating real orphans,
-        // but we can at least verify it runs without error
+        // Smoke test against the real $TMPDIR — runs the production path.
         crate::hook::cleanup_orphans();
+    }
+
+    /// bf-kk4z: a temp dir aged well past the threshold whose embedded PID is a
+    /// LIVE process (the test process itself) must survive cleanup.
+    #[test]
+    fn cleanup_preserves_temp_dir_with_live_owner_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(60);
+
+        // The test process is always alive — its PID is a live owner.
+        let live_pid = std::process::id();
+        let live_dir = dir.join(format!("claude-print-{}-live", live_pid));
+        std::fs::create_dir(&live_dir).unwrap();
+        set_mtime(&live_dir, now - Duration::from_secs(600));
+
+        cleanup_orphans_in(dir, now, threshold, &is_live_process);
+
+        assert!(
+            live_dir.exists(),
+            "must NOT delete a temp dir whose embedded PID is a live process"
+        );
+    }
+
+    /// bf-kk4z: a temp dir aged past the threshold whose embedded PID is NOT a
+    /// running process (a reaped child) must be removed.
+    #[test]
+    fn cleanup_removes_temp_dir_with_dead_owner_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(60);
+
+        // Spawn a child and reap it → its PID is no longer running. (Reuse
+        // within this microsecond window is astronomically unlikely.)
+        let dead_pid = {
+            let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+            child.wait().expect("wait true");
+            child.id()
+        };
+        assert!(
+            !is_live_process(dead_pid),
+            "precondition: reaped child PID must be dead"
+        );
+
+        let orphan = dir.join(format!("claude-print-{}-dead", dead_pid));
+        std::fs::create_dir(&orphan).unwrap();
+        set_mtime(&orphan, now - Duration::from_secs(600));
+
+        cleanup_orphans_in(dir, now, threshold, &is_live_process);
+
+        assert!(
+            !orphan.exists(),
+            "must delete a temp dir whose owner is dead and which is aged past the threshold"
+        );
+    }
+
+    /// A young dir (under the threshold) is never deleted, regardless of owner.
+    #[test]
+    fn cleanup_leaves_young_dirs_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let threshold = Duration::from_secs(60);
+
+        let young = dir.join("claude-print-999999999-young");
+        std::fs::create_dir(&young).unwrap();
+        // Just-created → age ~0, well under threshold.
+
+        cleanup_orphans_in(dir, now, threshold, &|_| false);
+
+        assert!(young.exists(), "young dirs must be left alone");
     }
 
     #[test]
