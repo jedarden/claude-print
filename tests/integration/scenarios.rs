@@ -7,7 +7,10 @@
 /// format, and that the extra `claude_version` field does not break lenient
 /// callers.
 use claude_print::cli::OutputFormat;
-use claude_print::emitter::{emit_error, emit_success, spawn_stream_json_reader_to};
+use claude_print::emitter::{
+    emit_error, emit_success, snapshot_jsonl_sizes, spawn_stream_json_reader_discover_to,
+    spawn_stream_json_reader_to,
+};
 use claude_print::error::{ClaudePrintError, Error};
 use claude_print::hook::HookInstaller;
 use claude_print::poller::{cwd_to_slug, parse_stop_payload, resolve_stop_info};
@@ -489,6 +492,125 @@ fn stream_json_reader_forwards_lines_incrementally_as_file_grows() {
     );
     assert!(output_lines[0].contains("first chunk"));
     assert!(output_lines[1].contains("second chunk"));
+}
+
+/// Stream-JSON DISCOVER reader tails the session JSONL claude writes under a
+/// projects directory, forwarding lines INCREMENTALLY as the file grows — even
+/// though the exact `<session_id>.jsonl` filename is unknown at spawn time.
+///
+/// This is the bf-3c7c acceptance primitive: it pins the production behavior of
+/// `spawn_stream_json_reader_discover_to` (the reader spawned at PROMPT_INJECTED
+/// in `session.rs`) independent of mock_claude. Real claude and mock_claude both
+/// write the transcript at `~/.claude/projects/<cwd-slug>/<session_id>.jsonl`,
+/// and the `session_id` only surfaces in the Stop payload (after injection), so
+/// the reader cannot be handed a final path. Instead it snapshots the projects
+/// dir, then DISCOVERS the new session file at runtime and tails it.
+///
+/// Mirrors mock_claude's layout (`~/.claude/projects/mock-cwd/<id>.jsonl`):
+///   - a STALE pre-existing session file (present at injection) must be skipped,
+///   - a NEW session file created AFTER spawn (this session) must be discovered
+///     and tailed, line by line, as it grows.
+#[test]
+fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
+    // Projects-dir-style layout matching mock_claude's real write location.
+    let dir = TempDir::new().unwrap();
+    let projects_dir = dir
+        .path()
+        .join(".claude")
+        .join("projects")
+        .join("mock-cwd");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+
+    // A stale session from a PREVIOUS run, present at injection time. The reader
+    // must NOT forward it: it existed in the snapshot and has not grown, so it is
+    // excluded as "not this session".
+    let stale_path = projects_dir.join("stale-session.jsonl");
+    write_jsonl(
+        &stale_path,
+        &[assistant_event("stale", "STALE MUST NOT FORWARD", 1, 1, 0, 0)],
+    );
+
+    // Capture each .jsonl's size at injection — what session.rs hands the reader
+    // alongside the projects dir at PROMPT_INJECTED.
+    let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+    assert!(
+        pre_existing.contains_key(&stale_path),
+        "snapshot must record the pre-existing stale session"
+    );
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+
+    // Spawn the DISCOVER reader. At this instant the new session's file does NOT
+    // exist yet (session_id unknown) — exactly the PROMPT_INJECTED condition. The
+    // reader must discover the file claude creates after this point.
+    let handle =
+        spawn_stream_json_reader_discover_to(projects_dir.clone(), pre_existing, writer);
+
+    // claude now creates THIS session's transcript and writes the first event.
+    // The reader's 50ms discovery loop must find the new file at runtime.
+    let live_path = projects_dir.join("new-session-id.jsonl");
+    write_jsonl(
+        &live_path,
+        &[assistant_event("m1", "discovered chunk", 10, 5, 0, 0)],
+    );
+
+    // Let the live tail discover the file and forward the first line. Discovery
+    // polls every 50ms; 150ms comfortably covers discovery + the first read.
+    std::thread::sleep(Duration::from_millis(150));
+
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("discovered chunk"),
+            "discover reader did not forward the first line of the newly-created \
+             session transcript; got:\n{text}"
+        );
+        assert!(
+            !text.contains("STALE MUST NOT FORWARD"),
+            "discover reader forwarded a pre-existing (stale) session's bytes — \
+             the injection snapshot must exclude it; got:\n{text}"
+        );
+    }
+
+    // Append a second event; the live tail must pick it up without re-discovering.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live_path)
+            .unwrap();
+        writeln!(f, "{}", assistant_event("m2", "appended chunk", 10, 5, 0, 0)).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("appended chunk"),
+            "discover reader did not forward the appended second line; got:\n{text}"
+        );
+    }
+
+    // Drain + join. Final output: both live lines, in order, and no stale line.
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let output_lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        output_lines.len(),
+        2,
+        "expected exactly the two live session lines; got:\n{text}"
+    );
+    assert!(output_lines[0].contains("discovered chunk"));
+    assert!(output_lines[1].contains("appended chunk"));
+    assert!(
+        !text.contains("STALE MUST NOT FORWARD"),
+        "stale pre-existing session line leaked into the final output; got:\n{text}"
+    );
 }
 
 // ── Conformance harness ───────────────────────────────────────────────────────

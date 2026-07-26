@@ -2,7 +2,7 @@ use crate::emitter;
 use crate::error::{Error, Result};
 use crate::event_loop::{EventLoop, ExitReason};
 use crate::hook::HookInstaller;
-use crate::poller::{open_fifo_nonblock, parse_stop_payload, resolve_stop_info};
+use crate::poller::{open_fifo_nonblock, parse_stop_payload, projects_dir_for_cwd, resolve_stop_info};
 use crate::pty::PtySpawner;
 use crate::startup::{StartupAction, StartupSeq};
 use crate::terminal::TerminalEmu;
@@ -471,8 +471,6 @@ impl Session {
         // this function returns (plan invariant INV-8). Only the normal Stop
         // (success) path calls signal_drain() first; all error paths drop the
         // handle without signaling so the reader exits immediately.
-        let temp_dir_path = installer.dir_path().to_path_buf();
-        let transcript_path = temp_dir_path.join("transcript.jsonl");
         let mut stream_json_handle: Option<emitter::StreamJsonHandle> = None;
         let stream_json_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -539,18 +537,32 @@ impl Session {
             if last_phase != *current_phase && current_phase.is_prompt_injected() {
                 watchdog_state_clone.mark_prompt_injected();
 
-                // Spawn stream-json reader at PROMPT_INJECTED for stream-json output
+                // Spawn stream-json reader at PROMPT_INJECTED for stream-json output.
+                //
+                // bf-3c7c: the reader tails the REAL transcript path claude
+                // writes (~/.claude/projects/<cwd-slug>/<session_id>.jsonl). The
+                // session_id — and thus the exact filename — is assigned by claude
+                // and only surfaces in the Stop payload, which arrives AFTER
+                // injection, so the reader cannot be handed a final path here.
+                // Instead point it at the projects dir and let it DISCOVER this
+                // session's JSONL at runtime (newest .jsonl new or grown since the
+                // injection snapshot), reusing the existing 50ms/5s open-retry
+                // loop. The snapshot captures each file's size at injection so the
+                // reader can skip pre-injection events (start_offset).
                 if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
-                    // Calculate byte offset: current transcript file size, or 0 if not exists
-                    let start_offset = std::fs::metadata(&transcript_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-
-                    stream_json_handle = Some(emitter::spawn_stream_json_reader(
-                        transcript_path.clone(),
-                        start_offset,
-                    ));
-                    stream_json_spawned_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(projects_dir) = projects_dir_for_cwd() {
+                        let pre_existing = emitter::snapshot_jsonl_sizes(&projects_dir);
+                        stream_json_handle = Some(emitter::spawn_stream_json_reader_discover(
+                            projects_dir,
+                            pre_existing,
+                        ));
+                        stream_json_spawned_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        eprintln!(
+                            "claude-print: warning: could not derive projects dir for the \
+                             stream-json reader (cwd unreadable); live transcript tailing disabled"
+                        );
+                    }
                 }
             }
             last_phase = current_phase.clone();

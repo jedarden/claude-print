@@ -87,6 +87,21 @@ pub fn cwd_to_slug(cwd: &str) -> String {
     cwd.trim_start_matches('/').replace('/', "-")
 }
 
+/// The projects directory claude writes session transcripts under, derived from
+/// the current working directory: `$HOME/.claude/projects/<cwd-slug>/`.
+///
+/// Used at `PROMPT_INJECTED` to point the live stream-json reader at the
+/// directory it must DISCOVER this session's `<session_id>.jsonl` in — the
+/// `session_id` is unknown until the Stop payload arrives, after injection.
+/// Returns `None` only if the cwd cannot be read, in which case the reader is
+/// not spawned (live tailing disabled for that run).
+pub fn projects_dir_for_cwd() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let slug = cwd_to_slug(&cwd.to_string_lossy());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    Some(PathBuf::from(home).join(".claude").join("projects").join(slug))
+}
+
 /// Open the named FIFO at `path` for non-blocking reading.
 ///
 /// Linux FIFO O_NONBLOCK semantics:
