@@ -19,9 +19,23 @@
 //! env vars it sets are process-global, and a separate binary keeps them from
 //! leaking into `tests/watchdog.rs`'s `MOCK_SILENT` tests when cargo runs test
 //! files in parallel within a single binary.
+//!
+//! The second test below, `as6_forced_retry_trace_visible_only_under_verbose`
+//! (bead bf-1cwt), is the retry-visible-in-verbose half of AS-6. The first test
+//! proves the retry loop *absorbs* the race; this one proves the retry is
+//! *observable* — a `[claude-print <ms>ms] transcript read on attempt N`
+//! (N≥2) trace lands on stderr under `--verbose` and is absent without it. It
+//! runs the *compiled* `claude-print` binary as a subprocess (piped stderr, env
+//! injected into the child only) rather than calling `Session::run` in-process,
+//! so it captures the trace cleanly and mutates no process-global state — it is
+//! parallel-safe alongside the in-process test above. The generic
+//! `--verbose`-emits-a-trace guard in `tests/binary_e2e.rs` (bf-12f1) does not
+//! force a retry; this test does, pinning the retry-count trace specifically.
 
 use claude_print::cli::OutputFormat;
 use claude_print::session::{LaunchOptions, Session};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Locate the mock-claude binary built alongside this test binary by `build.rs`.
@@ -105,9 +119,10 @@ fn as6_transcript_race_delayed_jsonl_write() {
     let _silent_guard = EnvGuard::remove("MOCK_SILENT");
 
     // Redirect HOME at a throwaway temp dir so mock_claude writes its transcript
-    // under `$tmp/.claude/projects/mock-cwd/...` rather than the real `~/.claude/`
+    // under `$tmp/.claude/projects/<cwd-slug>/...` rather than the real `~/.claude/`
     // (which every other default-mock test already pollutes). A tempdir is a
-    // valid HOME stand-in and keeps this test fully hermetic.
+    // valid HOME stand-in and keeps this test fully hermetic. The slug is derived
+    // from cwd (mirroring real Claude Code), so it varies with the workspace path.
     let home = TempDir::new().expect("temp HOME");
     let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
 
@@ -170,12 +185,223 @@ fn as6_transcript_race_delayed_jsonl_write() {
     // Sanity-check the side of the contract AS-6 doesn't directly assert: the
     // file really did land at the advertised transcript_path under the temp HOME
     // (so the mock honored its own Stop payload, and we did not touch real home).
+    // The projects-dir slug is derived from THIS process's cwd — the same way
+    // mock_claude (mirroring real Claude Code) and claude-print's reader do — so
+    // reconstruct it with `poller::cwd_to_slug` rather than a hardcoded name.
+    let cwd_slug = claude_print::poller::cwd_to_slug(
+        &std::env::current_dir()
+            .expect("current_dir")
+            .to_string_lossy(),
+    );
     let transcript_file = home
         .path()
-        .join(".claude/projects/mock-cwd/mock-session-abc123.jsonl");
+        .join(".claude")
+        .join("projects")
+        .join(&cwd_slug)
+        .join("mock-session-abc123.jsonl");
     assert!(
         transcript_file.exists(),
         "AS-6: mock_claude should have written the transcript at {}",
         transcript_file.display()
+    );
+}
+
+// ── AS-6: retry-count trace visible only under --verbose (bf-1cwt) ──────────
+//
+// The in-process test above proves the retry loop *absorbs* the Stop-before-
+// JSONL race. This test proves the retry is *observable* under `--verbose`
+// (plan.md:127: "retry loop fires (visible in `--verbose`)"). It forces ≥1
+// transcript retry with `MOCK_DELAY_JSONL=150` and asserts the retry-count
+// trace `[claude-print <ms>ms] transcript read on attempt N` (N≥2) reaches
+// stderr under `--verbose`, and is absent with the flag off. The generic
+// verbose-trace guard in `tests/binary_e2e.rs` (bf-12f1) does NOT force a
+// retry; this test pins the retry-count trace specifically.
+
+/// Locate a workspace bin built alongside this test binary by `build.rs`.
+///
+/// Test binaries live at `target/<profile>/deps/`; named workspace bins live at
+/// `target/<profile>/`. Same resolution strategy as `mock_claude_bin` above and
+/// `tests/binary_e2e.rs`.
+fn workspace_bin(name: &str) -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("test binary must live under target/<profile>/deps/");
+    profile_dir.join(name)
+}
+
+/// A captured subprocess outcome: exit code (or `None` if killed on timeout)
+/// and decoded stdout/stderr. Mirrors `tests/binary_e2e.rs::Outcome`.
+#[derive(Debug)]
+struct Outcome {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `cmd` to completion, decoding stdout/stderr as UTF-8. If the child has
+/// not exited before `budget` elapses it is killed and the test fails — so a
+/// wedged mock-claude cannot hang the whole `cargo test` run. Mirrors
+/// `tests/binary_e2e.rs::run`.
+fn run(cmd: &mut Command, budget: Duration) -> Outcome {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let start = Instant::now();
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn claude-print: {e}"));
+
+    let deadline = start + budget;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("claude-print did not exit within {:?}", budget);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Reaping error: treat as killed.
+            Err(_) => break None,
+        }
+    };
+
+    let output = child
+        .wait_with_output()
+        .expect("wait_with_output after try_wait");
+    Outcome {
+        code: code.or(output.status.code()),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Per-session wall-clock budget. mock-claude responds within ~2s; the forced
+/// retry adds ~150 ms; 30 s is a generous ceiling that still fails fast on a
+/// wedge. Mirrors `tests/binary_e2e.rs::BUDGET`.
+const BUDGET: Duration = Duration::from_secs(30);
+
+/// Parse the `[claude-print <ms>ms] transcript read on attempt N` retry-count
+/// trace, returning `N` if such a line is present. Hand-rolled rather than
+/// pulling in the `regex` dev-dependency (mirrors
+/// `tests/binary_e2e.rs::has_claude_print_trace`): a fixed `[claude-print `
+/// prefix + ASCII digits + `ms] ` + `transcript read on attempt ` + a u64.
+///
+/// `N` is the 1-based read number `Tracer::trace` stamps in `src/transcript.rs`
+/// — `1` means success on the first try (no retry); `N ≥ 2` means the retry loop
+/// fired at least once. The "transcript retry exhausted" fallback trace does NOT
+/// match (it lacks the `transcript read on attempt ` suffix).
+fn transcript_retry_attempt(stderr: &str) -> Option<u64> {
+    stderr.lines().find_map(|line| {
+        let rest = line.strip_prefix("[claude-print ")?;
+        let n_dig = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if n_dig == 0 {
+            return None;
+        }
+        let rest = rest.get(n_dig..)?;
+        let msg = rest.strip_prefix("ms] ")?;
+        let num = msg.strip_prefix("transcript read on attempt ")?;
+        num.trim().parse::<u64>().ok()
+    })
+}
+
+/// AS-6 (retry-visible-in-verbose): a FORCED transcript retry must surface the
+/// `transcript read on attempt N` (N ≥ 2) trace on stderr ONLY under `--verbose`.
+///
+/// `MOCK_DELAY_JSONL=150` reproduces the plan's AS-6 transcript race (plan.md
+/// :126): mock-claude writes the transcript JSONL 150 ms AFTER the Stop FIFO
+/// payload, so `read_transcript_traced`'s first read (made the instant Stop
+/// arrives) finds no file and the 40×50 ms retry loop must keep retrying until
+/// the write lands (~attempt 4 → N ≈ 4). Under `--verbose` that loop emits the
+/// retry-count trace; with the flag off the tracer is a no-op so the line is
+/// absent.
+///
+/// Env (`HOME`, `MOCK_*`) is injected into the SUBPROCESS only — never the test
+/// process's global env — so this test is parallel-safe alongside the in-process
+/// `as6_transcript_race_delayed_jsonl_write` test above.
+#[test]
+fn as6_forced_retry_trace_visible_only_under_verbose() {
+    let bin = workspace_bin("claude-print");
+    let mock = workspace_bin("mock-claude");
+    if !bin.exists() || !mock.exists() {
+        eprintln!(
+            "Skipping AS-6 retry-trace test: built binaries missing \
+             (claude-print={}, mock-claude={})",
+            bin.display(),
+            mock.display(),
+        );
+        return;
+    }
+
+    // Hermetic HOME so mock-claude's transcript write lands under a tempdir,
+    // never the real ~/.claude.
+    let home = TempDir::new().expect("temp HOME");
+    let home_str = home.path().to_str().unwrap().to_owned();
+    // Distinctive response so we could (if needed) confirm the text came from
+    // the transcript the mock wrote, not its hardcoded default.
+    const RESPONSE: &str = "as6-retry-trace-response";
+    // plan.md:126's exact AS-6 race value: 150 ms gap between Stop and JSONL.
+    const DELAY_MS: &str = "150";
+
+    // ── Verbose run: the forced retry must be observable on stderr. ──────────
+    let mut verbose = Command::new(&bin);
+    verbose
+        .arg("--claude-binary")
+        .arg(&mock)
+        .arg("--verbose")
+        .arg("test prompt")
+        .env("HOME", &home_str)
+        .env("MOCK_DELAY_JSONL", DELAY_MS)
+        .env("MOCK_RESPONSE", RESPONSE);
+    let verbose_out = run(&mut verbose, BUDGET);
+    assert_eq!(
+        verbose_out.code,
+        Some(0),
+        "AS-6 (verbose): forced-retry run must exit 0, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        verbose_out.code,
+        verbose_out.stdout,
+        verbose_out.stderr,
+    );
+    let n = transcript_retry_attempt(&verbose_out.stderr).unwrap_or_else(|| {
+        panic!(
+            "AS-6 (verbose): stderr must contain a `transcript read on attempt N` \
+             retry-count trace after a forced retry, got:\n{}",
+            verbose_out.stderr,
+        )
+    });
+    assert!(
+        n >= 2,
+        "AS-6 (verbose): retry-count trace must show >= 1 retry (attempt >= 2), got \
+         attempt {n}\nstderr:\n{}",
+        verbose_out.stderr,
+    );
+
+    // ── Same forced-retry invocation WITHOUT --verbose: tracer is a no-op. ───
+    let mut quiet = Command::new(&bin);
+    quiet
+        .arg("--claude-binary")
+        .arg(&mock)
+        .arg("test prompt")
+        .env("HOME", &home_str)
+        .env("MOCK_DELAY_JSONL", DELAY_MS)
+        .env("MOCK_RESPONSE", RESPONSE);
+    let quiet_out = run(&mut quiet, BUDGET);
+    assert_eq!(
+        quiet_out.code,
+        Some(0),
+        "AS-6 (quiet): forced-retry run must exit 0, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        quiet_out.code,
+        quiet_out.stdout,
+        quiet_out.stderr,
+    );
+    assert!(
+        transcript_retry_attempt(&quiet_out.stderr).is_none(),
+        "AS-6 (quiet): stderr must NOT contain any `transcript read on attempt N` \
+         trace without --verbose, got:\n{}",
+        quiet_out.stderr,
     );
 }
