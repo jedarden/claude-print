@@ -181,7 +181,9 @@ claude-print/
 │   ├── check.rs                      # --check subcommand: installation self-test
 │   ├── lib.rs                        # library exports for testing
 │   ├── poller.rs                     # stop.fifo poller: IPC read from Stop hook
+│   ├── prompt.rs                     # prompt input validation (NUL byte check, file size limits)
 │   ├── session.rs                    # Session: main orchestration flow (prompt → response)
+│   ├── verbose.rs                    # --verbose timing traces to stderr
 │   └── watchdog.rs                  # Watchdog: no-output/max-turn/stop-hook/stream-json timeout monitoring
 ├── tests/
 │   ├── cli.rs
