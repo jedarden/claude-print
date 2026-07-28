@@ -43,6 +43,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tempfile::TempDir;
+
 /// Lines read from the child's stdout pipe, each with the instant it arrived.
 type LineLog = Arc<Mutex<Vec<(String, Instant)>>>;
 
@@ -112,8 +114,7 @@ fn wait_for_exit(mut child: std::process::Child, deadline: Instant, step: Durati
 /// stream-json events must reach stdout WHILE the session runs, not as a
 /// post-completion burst.
 ///
-/// See the module docs for the bf-3isy / bf-5vm blockers.
-#[ignore = "blocked on bf-3isy (mock_claude writes transcript JSONL + MOCK_DELAY_JSONL) and bf-5vm (live reader tails the real transcript path)"]
+/// See the module docs for the bf-3isy / bf-5vm history.
 #[test]
 fn stream_json_lines_appear_on_stdout_before_session_completes() {
     let claude_print = workspace_bin("claude-print");
@@ -129,6 +130,17 @@ fn stream_json_lines_appear_on_stdout_before_session_completes() {
     }
 
     let start = Instant::now();
+
+    // Hermetic HOME: redirect the child's HOME at a throwaway temp dir so both
+    // the live reader (which scans `~/.claude/projects/<cwd-slug>/` via
+    // `projects_dir_for_cwd`) and mock_claude (which writes the transcript there)
+    // operate on an EMPTY projects dir. Without this, a prior run's
+    // `mock-session-abc123.jsonl` (same filename every run) would already be in
+    // the reader's injection snapshot at the same size — the discovery logic
+    // would treat the overwrite as "not grown" and skip it, so no live lines
+    // would be forwarded. It also keeps the real `~/.claude/projects/` clean.
+    // The TempDir must outlive the child, so it is dropped after `wait_for_exit`.
+    let home = TempDir::new().expect("temp HOME for hermetic stream-json E2E");
 
     let mut child = Command::new(&claude_print)
         .arg("--claude-binary")
@@ -150,6 +162,7 @@ fn stream_json_lines_appear_on_stdout_before_session_completes() {
         .env("MOCK_RESPONSE", "incremental turn alpha")
         .env("MOCK_TURNS", "3")
         .env("MOCK_DELAY_JSONL", "150")
+        .env("HOME", home.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Inherit stderr so diagnostics surface and the stderr pipe can never
