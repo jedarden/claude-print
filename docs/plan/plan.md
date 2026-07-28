@@ -777,7 +777,23 @@ The watchdog prevents indefinite hangs when the child `claude` process wedges. W
 
 **Implementation:** `src/watchdog.rs` runs timeout checks on separate deadlines tracked via `Instant::now()`. Each timeout is independent — if any deadline expires, the watchdog triggers cleanup: SIGTERM child → 2 s grace → SIGKILL → waitpid → emit timeout result and exit.
 
-**Integration with event loop:** The watchdog is consulted on each `poll()` iteration. When a timeout fires, the event loop breaks, cleanup runs, and a timeout result is emitted with the appropriate `subtype` field.
+The watchdog operates through a multi-phase timeout thread that monitors four distinct conditions:
+
+1. **PTY first-output detection**: If the child produces no PTY output within the deadline, the watchdog assumes the process is hung at startup and terminates it.
+
+2. **Stream-json first-output monitoring**: A background monitor thread watches `<temp_dir>/transcript.jsonl` for valid JSON lines. This monitor only runs in `stream-json` output mode (guarded by `stream_json_mode` flag). In text/json modes, this timeout is disabled because the transcript is written directly to `~/.claude/projects/` rather than the temp directory. The monitor wakes every 100ms to check if the file exists and contains valid JSON.
+
+3. **Overall session timeout**: Enforced throughout the entire session duration, regardless of current phase. This prevents indefinite polling of `stop.fifo` if the child wedges during any stage of execution.
+
+4. **Stop hook timeout**: After prompt injection, if the Stop hook doesn't fire within the deadline, the watchdog assumes the child is hung during tool use or model inference and terminates it.
+
+**State tracking**: The watchdog uses atomic flags for thread-safe state coordination:
+- `pty_output_received`: Set when PTY output is detected
+- `stream_json_output_received`: Set when stream-json events are detected  
+- `prompt_injected_at`: Captures the timestamp when prompt injection occurs
+- `timeout_fired` and `timeout_type`: Indicate which timeout triggered
+
+**Integration with event loop:** The watchdog is consulted on each `poll()` iteration. When a timeout fires, the event loop breaks, cleanup runs, and a timeout result is emitted with the appropriate `subtype` field. The watchdog signals the event loop via a self-pipe mechanism — the timeout thread writes a byte to a pipe fd that's included in the `poll()` set, waking the main loop immediately when a timeout occurs.
 
 ### 11. NEEDLE Agent Config
 
