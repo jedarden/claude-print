@@ -741,7 +741,7 @@ pub enum ContentBlock {
 
 `duration_ms`: wall-clock milliseconds from `std::time::Instant::now()` captured at `main()` entry to the moment the emitter writes its final output. This includes all overhead AND model latency — it is the total time a caller waited for a response.
 
-**`stream-json`**: Current implementation (v0.2.0) is post-session replay — after Stop fires and the child exits, the emitter reads the complete transcript from the beginning and forwards all JSONL events to stdout. This provides `claude -p`-compatible output but does not stream events in real-time. Live tailing (real-time forwarding as Claude Code writes events) is tracked as an open work item (bead bf-5vm). When live tailing lands, a reader thread will tail the transcript from the byte offset captured at prompt injection time, forwarding each new line immediately. Until then, the replay implementation forwards all raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`. On normal completion, the final `{"type":"result", "is_error": false, ...}` line in the output is Claude Code's own Result event forwarded verbatim; claude-print does NOT synthesize an additional result line on success. `claude_version` is NOT injected into the forwarded Result event. On error (no Claude Code result), claude-print synthesizes the final result line and injects `claude_version`.
+**`stream-json`**: Current implementation is post-session replay — after Stop fires and the child exits, the emitter (via `src/main.rs` `replay_stream_json`) reads the complete transcript from the beginning and forwards all JSONL events to stdout. This provides `claude -p`-compatible output but does not stream events in real-time. Live tailing (real-time forwarding as Claude Code writes events) is tracked as an open work item (bead bf-5vm). When live tailing lands, a reader thread will tail the transcript from the byte offset captured at prompt injection time, forwarding each new line immediately. Until then, the replay implementation forwards all raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`. On normal completion, the final `{"type":"result", "is_error": false, ...}` line in the output is Claude Code's own Result event forwarded verbatim; claude-print does NOT synthesize an additional result line on success. `claude_version` is NOT injected into the forwarded Result event. On error (no Claude Code result), claude-print synthesizes the final result line and injects `claude_version`.
 
 `session_id` in output: taken directly from the Stop payload if present. If absent from the payload, derive from the transcript file basename (filename without `.jsonl`). If neither is available (no transcript), emit `null`.
 
@@ -1358,9 +1358,9 @@ No data migration required. Transcripts from before the switch remain in `~/.cla
 ### Backward Compatibility Stance
 
 `claude-print` follows **semver** for its own output format:
-- **Patch** (0.1.x): bug fixes; output format unchanged.
-- **Minor** (0.x.0): new optional output fields (additive); new flags. Existing callers unaffected.
-- **Major** (x.0.0): breaking output format change or flag removal. Requires caller update.
+- **Patch** (X.Y.Z): bug fixes; output format unchanged.
+- **Minor** (X.Y.0): new optional output fields (additive); new flags. Existing callers unaffected.
+- **Major** (X.0.0): breaking output format change or flag removal. Requires caller update.
 
 The `claude_version` field is additive (minor) and will not be removed in a major release — it is needed for version-regression debugging.
 
