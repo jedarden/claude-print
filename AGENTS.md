@@ -149,16 +149,16 @@ Beads use the `bf` prefix. Config is at `.beads/config.yaml`.
 
 ```bash
 # List open beads
-br list
+bf list
 
 # Claim a bead
-br claim <id>
+bf claim <id>
 
 # Close a bead (requires a commit first)
-br close <id>
+bf close <id>
 ```
 
-See `CLAUDE.md` (root workspace) for full `br` CLI docs and FrankenSQLite recovery
+See `CLAUDE.md` (root workspace) for full `bf` CLI docs and FrankenSQLite recovery
 procedures.
 
 ## Notes
