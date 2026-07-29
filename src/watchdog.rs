@@ -634,8 +634,7 @@ mod tests {
         // temp dir has NO transcript.jsonl → monitor never sets the flag.
         let config = WatchdogConfig::new(Some(60), Some(1), Some(0), Some(0), true);
         let (mut child, child_pid) = spawn_sleep_child();
-        let watchdog =
-            Watchdog::new(config, child_pid, Some(dir.path().to_path_buf()), None);
+        let watchdog = Watchdog::new(config, child_pid, Some(dir.path().to_path_buf()), None);
         let state = watchdog.state();
         let _handle = watchdog.spawn_timeout_thread();
 

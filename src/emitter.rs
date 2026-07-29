@@ -298,10 +298,7 @@ fn stream_json_reader_loop(
     // signal or channel disconnect. `None` → the file never appeared (or the
     // reader was told to drain/exit first): nothing to forward, return.
     let (file, start_offset): (File, u64) = match source {
-        TranscriptSource::Exact {
-            path,
-            start_offset,
-        } => {
+        TranscriptSource::Exact { path, start_offset } => {
             let Some(file) = open_with_retry(|| File::open(&path).ok(), &drain_rx) else {
                 return;
             };
@@ -311,8 +308,7 @@ fn stream_json_reader_loop(
             projects_dir,
             pre_existing,
         } => {
-            let Some((file, offset)) =
-                discover_with_retry(&projects_dir, &pre_existing, &drain_rx)
+            let Some((file, offset)) = discover_with_retry(&projects_dir, &pre_existing, &drain_rx)
             else {
                 return;
             };

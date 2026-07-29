@@ -99,7 +99,12 @@ pub fn projects_dir_for_cwd() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let slug = cwd_to_slug(&cwd.to_string_lossy());
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    Some(PathBuf::from(home).join(".claude").join("projects").join(slug))
+    Some(
+        PathBuf::from(home)
+            .join(".claude")
+            .join("projects")
+            .join(slug),
+    )
 }
 
 /// Open the named FIFO at `path` for non-blocking reading.

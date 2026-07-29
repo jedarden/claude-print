@@ -2,7 +2,9 @@ use crate::emitter;
 use crate::error::{Error, Result};
 use crate::event_loop::{EventLoop, ExitReason};
 use crate::hook::HookInstaller;
-use crate::poller::{open_fifo_nonblock, parse_stop_payload, projects_dir_for_cwd, resolve_stop_info};
+use crate::poller::{
+    open_fifo_nonblock, parse_stop_payload, projects_dir_for_cwd, resolve_stop_info,
+};
 use crate::pty::PtySpawner;
 use crate::startup::{StartupAction, StartupPhase, StartupSeq};
 use crate::terminal::TerminalEmu;
@@ -324,7 +326,10 @@ impl Session {
 
         // 1. Install hook files (temp dir, hook.sh, stop.fifo).
         let installer = HookInstaller::new()?;
-        tracer.trace(format!("temp dir created at {}", installer.dir_path().display()));
+        tracer.trace(format!(
+            "temp dir created at {}",
+            installer.dir_path().display()
+        ));
 
         // Store temp dir path globally for cleanup before process::exit()
         let _ = TEMP_DIR_PATH.set(installer.dir_path().to_path_buf());
@@ -711,8 +716,11 @@ impl Session {
                 // reader without draining (INV-8, exit-immediately on error).
                 let transcript_path = stop_info.transcript_path.as_ref();
                 let transcript = if let Some(path) = transcript_path {
-                    let t =
-                        read_transcript_traced(path, stop_info.last_assistant_message.as_deref(), &tracer)?;
+                    let t = read_transcript_traced(
+                        path,
+                        stop_info.last_assistant_message.as_deref(),
+                        &tracer,
+                    )?;
                     // bf-416c: Claude Code's own transcript result event reported
                     // is_error:true (rate limit, tool failure, any assistant-side
                     // error). This is a COMPLETED turn that the assistant itself

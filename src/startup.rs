@@ -460,7 +460,10 @@ mod tests {
             "payload must not embed a shell read command"
         );
         // Wrapped in a single bracketed-paste envelope + CR.
-        assert!(payload.starts_with(b"\x1b[200~"), "missing bracketed-paste open");
+        assert!(
+            payload.starts_with(b"\x1b[200~"),
+            "missing bracketed-paste open"
+        );
         assert!(
             payload.ends_with(b"\x1b[201~\r"),
             "missing bracketed-paste close + CR"

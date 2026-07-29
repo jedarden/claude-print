@@ -32,8 +32,11 @@ fn verify_thread_joined() {
 fn test_stream_json_handle_drop_joins_thread_after_drain() {
     // Normal Stop path: signal_drain() is called, then drop() should join.
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let transcript_path = create_temp_transcript(&temp_dir.path().to_path_buf(), r#"{"type":"start"}
-{"type":"end"}"#);
+    let transcript_path = create_temp_transcript(
+        &temp_dir.path().to_path_buf(),
+        r#"{"type":"start"}
+{"type":"end"}"#,
+    );
 
     let handle = claude_print::emitter::spawn_stream_json_reader(transcript_path, 0);
 
@@ -49,8 +52,11 @@ fn test_stream_json_handle_drop_joins_thread_without_drain() {
     // Timeout/SIGINT/child-exit path: drop() is called WITHOUT signal_drain().
     // The reader should exit immediately when channel disconnects.
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let transcript_path = create_temp_transcript(&temp_dir.path().to_path_buf(), r#"{"type":"start"}
-{"type":"end"}"#);
+    let transcript_path = create_temp_transcript(
+        &temp_dir.path().to_path_buf(),
+        r#"{"type":"start"}
+{"type":"end"}"#,
+    );
 
     let handle = claude_print::emitter::spawn_stream_json_reader(transcript_path, 0);
 
@@ -84,7 +90,8 @@ fn test_stream_json_handle_multiple_drop_safe() {
     // Verify that dropping a handle multiple times (or after it's already been dropped)
     // doesn't cause issues. The Option<JoinHandle> pattern makes this safe.
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let transcript_path = create_temp_transcript(&temp_dir.path().to_path_buf(), r#"{"type":"start"}"#);
+    let transcript_path =
+        create_temp_transcript(&temp_dir.path().to_path_buf(), r#"{"type":"start"}"#);
 
     let handle = claude_print::emitter::spawn_stream_json_reader(transcript_path, 0);
 
@@ -106,10 +113,8 @@ fn test_stream_json_discover_reader_drop_joins_thread() {
     let pre_existing = claude_print::emitter::snapshot_jsonl_sizes(&projects_path);
 
     // Spawn the discovery reader
-    let handle = claude_print::emitter::spawn_stream_json_reader_discover(
-        projects_path,
-        pre_existing,
-    );
+    let handle =
+        claude_print::emitter::spawn_stream_json_reader_discover(projects_path, pre_existing);
 
     // Give it time to start polling
     thread::sleep(Duration::from_millis(100));
@@ -124,8 +129,11 @@ fn test_stream_json_discover_reader_drop_joins_thread() {
 fn test_stream_json_handle_cleanup_order() {
     // Verify that disconnect happens before join (otherwise join would hang).
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let transcript_path = create_temp_transcript(&temp_dir.path().to_path_buf(), r#"{"type":"start"}
-{"type":"end"}"#);
+    let transcript_path = create_temp_transcript(
+        &temp_dir.path().to_path_buf(),
+        r#"{"type":"start"}
+{"type":"end"}"#,
+    );
 
     // Spawn a reader
     let handle = claude_print::emitter::spawn_stream_json_reader(transcript_path, 0);
