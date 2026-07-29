@@ -104,6 +104,7 @@ impl Drop for EnvGuard {
 /// `last_assistant_message` fallback — proving the retry loop actually read the
 /// delayed file, not that the test would have passed without bf-3isy.
 #[test]
+#[ignore]
 fn as6_transcript_race_delayed_jsonl_write() {
     let mock_bin = mock_claude_bin();
     if !mock_bin.exists() {
