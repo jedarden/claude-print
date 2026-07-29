@@ -53,6 +53,8 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/watchdog.rs` | Watchdog timeout for silent children (no output + no Stop hook) |
 | `tests/binary_e2e.rs` | Binary-level end-to-end via the *compiled* binary + mock-claude (exit codes, stdout/stderr contract) |
 | `tests/stream_json_incremental.rs` | Incremental stream-json forwarding through the real binary (events emitted mid-session, not post-burst) |
+| `tests/stream_json_cleanup.rs` | Stream-json reader thread cleanup on all exit paths (verifies plan invariant INV-8) |
+| `tests/transcript_race_e2e.rs` | AS-6 end-to-end test: Stop-before-JSONL-flush race (bead bf-3isy) |
 | `tests/fixtures/` | Shared fixture helpers |
 
 ### mock_claude
