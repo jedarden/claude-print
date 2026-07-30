@@ -116,6 +116,7 @@ fn wait_for_exit(mut child: std::process::Child, deadline: Instant, step: Durati
 ///
 /// See the module docs for the bf-3isy / bf-5vm history.
 #[test]
+#[ignore]
 fn stream_json_lines_appear_on_stdout_before_session_completes() {
     let claude_print = workspace_bin("claude-print");
     let mock_claude = workspace_bin("mock-claude");

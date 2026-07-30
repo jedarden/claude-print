@@ -514,11 +514,7 @@ fn stream_json_reader_forwards_lines_incrementally_as_file_grows() {
 fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
     // Projects-dir-style layout matching mock_claude's real write location.
     let dir = TempDir::new().unwrap();
-    let projects_dir = dir
-        .path()
-        .join(".claude")
-        .join("projects")
-        .join("mock-cwd");
+    let projects_dir = dir.path().join(".claude").join("projects").join("mock-cwd");
     std::fs::create_dir_all(&projects_dir).unwrap();
 
     // A stale session from a PREVIOUS run, present at injection time. The reader
@@ -527,7 +523,14 @@ fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
     let stale_path = projects_dir.join("stale-session.jsonl");
     write_jsonl(
         &stale_path,
-        &[assistant_event("stale", "STALE MUST NOT FORWARD", 1, 1, 0, 0)],
+        &[assistant_event(
+            "stale",
+            "STALE MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
     );
 
     // Capture each .jsonl's size at injection — what session.rs hands the reader
@@ -544,8 +547,7 @@ fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
     // Spawn the DISCOVER reader. At this instant the new session's file does NOT
     // exist yet (session_id unknown) — exactly the PROMPT_INJECTED condition. The
     // reader must discover the file claude creates after this point.
-    let handle =
-        spawn_stream_json_reader_discover_to(projects_dir.clone(), pre_existing, writer);
+    let handle = spawn_stream_json_reader_discover_to(projects_dir.clone(), pre_existing, writer);
 
     // claude now creates THIS session's transcript and writes the first event.
     // The reader's 50ms discovery loop must find the new file at runtime.
@@ -580,7 +582,12 @@ fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
             .append(true)
             .open(&live_path)
             .unwrap();
-        writeln!(f, "{}", assistant_event("m2", "appended chunk", 10, 5, 0, 0)).unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant_event("m2", "appended chunk", 10, 5, 0, 0)
+        )
+        .unwrap();
     }
     std::thread::sleep(Duration::from_millis(100));
 

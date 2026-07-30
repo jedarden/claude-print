@@ -181,7 +181,9 @@ claude-print/
 │   ├── check.rs                      # --check subcommand: installation self-test
 │   ├── lib.rs                        # library exports for testing
 │   ├── poller.rs                     # stop.fifo poller: IPC read from Stop hook
+│   ├── prompt.rs                     # prompt input validation (NUL byte check, file size limits)
 │   ├── session.rs                    # Session: main orchestration flow (prompt → response)
+│   ├── verbose.rs                    # --verbose timing traces to stderr
 │   └── watchdog.rs                  # Watchdog: no-output/max-turn/stop-hook/stream-json timeout monitoring
 ├── tests/
 │   ├── cli.rs
@@ -739,7 +741,7 @@ pub enum ContentBlock {
 
 `duration_ms`: wall-clock milliseconds from `std::time::Instant::now()` captured at `main()` entry to the moment the emitter writes its final output. This includes all overhead AND model latency — it is the total time a caller waited for a response.
 
-**`stream-json`**: Current implementation (v0.2.0) is post-session replay — after Stop fires and the child exits, the emitter reads the complete transcript from the beginning and forwards all JSONL events to stdout. This provides `claude -p`-compatible output but does not stream events in real-time. Live tailing (real-time forwarding as Claude Code writes events) is tracked as an open work item (bead bf-5vm). When live tailing lands, a reader thread will tail the transcript from the byte offset captured at prompt injection time, forwarding each new line immediately. Until then, the replay implementation forwards all raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`. On normal completion, the final `{"type":"result", "is_error": false, ...}` line in the output is Claude Code's own Result event forwarded verbatim; claude-print does NOT synthesize an additional result line on success. `claude_version` is NOT injected into the forwarded Result event. On error (no Claude Code result), claude-print synthesizes the final result line and injects `claude_version`.
+**`stream-json`**: Current implementation is post-session replay — after Stop fires and the child exits, the emitter (via `src/main.rs` `replay_stream_json`) reads the complete transcript from the beginning and forwards all JSONL events to stdout. This provides `claude -p`-compatible output but does not stream events in real-time. Live tailing (real-time forwarding as Claude Code writes events) is tracked as an open work item (bead bf-5vm). When live tailing lands, a reader thread will tail the transcript from the byte offset captured at prompt injection time, forwarding each new line immediately. Until then, the replay implementation forwards all raw JSONL lines (no dedup) — this matches `claude -p --output-format stream-json` behavior, which also emits one line per chunk. The dedup logic in §8 Transcript Reader applies only to the `json` and `text` output formats where a single aggregated response is needed. Callers of `stream-json` MUST handle duplicate streaming chunks (same `message.id`, identical `usage`) as they would with `claude -p`. On normal completion, the final `{"type":"result", "is_error": false, ...}` line in the output is Claude Code's own Result event forwarded verbatim; claude-print does NOT synthesize an additional result line on success. `claude_version` is NOT injected into the forwarded Result event. On error (no Claude Code result), claude-print synthesizes the final result line and injects `claude_version`.
 
 `session_id` in output: taken directly from the Stop payload if present. If absent from the payload, derive from the transcript file basename (filename without `.jsonl`). If neither is available (no transcript), emit `null`.
 
@@ -775,7 +777,23 @@ The watchdog prevents indefinite hangs when the child `claude` process wedges. W
 
 **Implementation:** `src/watchdog.rs` runs timeout checks on separate deadlines tracked via `Instant::now()`. Each timeout is independent — if any deadline expires, the watchdog triggers cleanup: SIGTERM child → 2 s grace → SIGKILL → waitpid → emit timeout result and exit.
 
-**Integration with event loop:** The watchdog is consulted on each `poll()` iteration. When a timeout fires, the event loop breaks, cleanup runs, and a timeout result is emitted with the appropriate `subtype` field.
+The watchdog operates through a multi-phase timeout thread that monitors four distinct conditions:
+
+1. **PTY first-output detection**: If the child produces no PTY output within the deadline, the watchdog assumes the process is hung at startup and terminates it.
+
+2. **Stream-json first-output monitoring**: A background monitor thread watches `<temp_dir>/transcript.jsonl` for valid JSON lines. This monitor only runs in `stream-json` output mode (guarded by `stream_json_mode` flag). In text/json modes, this timeout is disabled because the transcript is written directly to `~/.claude/projects/` rather than the temp directory. The monitor wakes every 100ms to check if the file exists and contains valid JSON.
+
+3. **Overall session timeout**: Enforced throughout the entire session duration, regardless of current phase. This prevents indefinite polling of `stop.fifo` if the child wedges during any stage of execution.
+
+4. **Stop hook timeout**: After prompt injection, if the Stop hook doesn't fire within the deadline, the watchdog assumes the child is hung during tool use or model inference and terminates it.
+
+**State tracking**: The watchdog uses atomic flags for thread-safe state coordination:
+- `pty_output_received`: Set when PTY output is detected
+- `stream_json_output_received`: Set when stream-json events are detected  
+- `prompt_injected_at`: Captures the timestamp when prompt injection occurs
+- `timeout_fired` and `timeout_type`: Indicate which timeout triggered
+
+**Integration with event loop:** The watchdog is consulted on each `poll()` iteration. When a timeout fires, the event loop breaks, cleanup runs, and a timeout result is emitted with the appropriate `subtype` field. The watchdog signals the event loop via a self-pipe mechanism — the timeout thread writes a byte to a pipe fd that's included in the `poll()` set, waking the main loop immediately when a timeout occurs.
 
 ### 11. NEEDLE Agent Config
 
@@ -1340,9 +1358,9 @@ No data migration required. Transcripts from before the switch remain in `~/.cla
 ### Backward Compatibility Stance
 
 `claude-print` follows **semver** for its own output format:
-- **Patch** (0.1.x): bug fixes; output format unchanged.
-- **Minor** (0.x.0): new optional output fields (additive); new flags. Existing callers unaffected.
-- **Major** (x.0.0): breaking output format change or flag removal. Requires caller update.
+- **Patch** (X.Y.Z): bug fixes; output format unchanged.
+- **Minor** (X.Y.0): new optional output fields (additive); new flags. Existing callers unaffected.
+- **Major** (X.0.0): breaking output format change or flag removal. Requires caller update.
 
 The `claude_version` field is additive (minor) and will not be removed in a major release — it is needed for version-regression debugging.
 

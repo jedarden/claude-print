@@ -3,8 +3,8 @@ use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
 /// Sweep and remove orphaned temp directories left behind by crashed runs.
@@ -116,10 +116,7 @@ where
                 path, e
             );
         } else {
-            eprintln!(
-                "claude-print: cleaned up orphaned temp dir: {:?}",
-                path
-            );
+            eprintln!("claude-print: cleaned up orphaned temp dir: {:?}", path);
         }
     }
 }
@@ -350,7 +347,10 @@ mod tests {
 
     #[test]
     fn owner_pid_parses_from_dir_name() {
-        assert_eq!(owner_pid_from_name("claude-print-12345-AbCdEf"), Some(12345));
+        assert_eq!(
+            owner_pid_from_name("claude-print-12345-AbCdEf"),
+            Some(12345)
+        );
         assert_eq!(owner_pid_from_name("claude-print-1-x"), Some(1));
         assert_eq!(owner_pid_from_name("claude-print-notanum-x"), None);
         assert_eq!(owner_pid_from_name("something-else"), None);
@@ -397,7 +397,9 @@ mod tests {
         // Spawn a child and reap it → its PID is no longer running. (Reuse
         // within this microsecond window is astronomically unlikely.)
         let dead_pid = {
-            let mut child = std::process::Command::new("true").spawn().expect("spawn true");
+            let mut child = std::process::Command::new("true")
+                .spawn()
+                .expect("spawn true");
             child.wait().expect("wait true");
             child.id()
         };

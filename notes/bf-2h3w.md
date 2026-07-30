@@ -10,13 +10,15 @@ All three acceptance criteria passed.
 
 | Criterion | Result |
 |-----------|--------|
-| `target/release/claude-print` exists | ✅ 1,043,528 bytes, dated Jul 19 17:28 |
-| Binary is executable | ✅ `rwxr-xr-x`, ELF 64-bit (magic `177 E L F`) |
+| Binary exists | ✅ `/home/coding/target/release/claude-print` - 1.3M, dated Jul 28 18:54 |
+| Binary is executable | ✅ `rwxrwxr-x`, ELF 64-bit LSB pie executable |
 | `--version` / `--help` works | ✅ see below |
+
+**Note:** The binary is located at the workspace-level target directory (`/home/coding/target/`) because this is a Cargo workspace with multiple members (`.` and `test-fixtures/mock-claude`).
 
 ### `--version` output
 ```
-claude-print 0.2.0 (wrapping claude 2.1.203 (Claude Code))
+claude-print 0.2.0 (wrapping claude 2.1.220 (Claude Code))
 ```
 
 ### `--help` output (excerpt)

@@ -315,10 +315,7 @@ fn has_claude_print_trace(stderr: &str) -> bool {
 #[test]
 fn as6_verbose_emits_trace_lines_and_nonverbose_emits_none() {
     // Verbose run: --verbose must surface at least one timing trace on stderr.
-    let verbose = run(
-        claude_print().arg("--verbose").arg("test prompt"),
-        BUDGET,
-    );
+    let verbose = run(claude_print().arg("--verbose").arg("test prompt"), BUDGET);
     assert_eq!(
         verbose.code,
         Some(0),

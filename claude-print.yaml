@@ -1,18 +1,61 @@
-name: claude-print
-description: Claude Code interactive mode — subscription billing (cc_entrypoint=cli)
-agent_cli: claude-print
-version_command: "claude-print --version"
-input_method:
-  method: stdin
-invoke_template: "cd {workspace} && claude-print --model {model} --max-turns 30 --output-format json --dangerously-skip-permissions --no-inherit-hooks"
-timeout_secs: 3600
-provider: anthropic
-# Note: --max-turns 30 and --no-inherit-hooks are hardcoded in the template above.
-# --max-turns 30 takes precedence over config.toml's max_turns setting for NEEDLE-dispatched
-# jobs. To change the turn limit for NEEDLE workers, edit invoke_template directly.
-# NEEDLE workers run in isolation mode by default (--no-inherit-hooks is included in
-# the template). To enable user hook inheritance, remove --no-inherit-hooks.
-model: claude-sonnet-4-6
-output_transform: needle-transform-claude
+# NEEDLE Agent Configuration: Claude Code via claude-print (subscription billing) — Sonnet
+# claude-print drives the interactive Claude Code TUI over a PTY so usage bills
+# against the Anthropic subscription pool instead of the metered API.
+# Created 2026-07-04 for the jedarden.com discoverability-plan dispatch
+# (docs/plan/plan.md in that repo); general-purpose beyond it.
+
+# Agent metadata
+name: claude-print-sonnet
+description: Claude Code driven by claude-print (subscription pool), Sonnet model
+version: "1.0"
+
+# CLI identification
+runner: claude-print    # PTY wrapper at ~/.local/bin/claude-print (v0.2.0+, wraps claude 2.1.201+)
+provider: anthropic     # Provider for rate limiting
+model: sonnet           # alias intentionally untagged so it tracks current Sonnet —
+                        # the old claude-anthropic-sonnet adapter went stale pinning claude-sonnet-4-6
+
+# Invocation template
+# Variables: ${WORKSPACE}, ${PROMPT}, ${BEAD_ID}, ${BEAD_TITLE}, ${AGENT_DIR}
+# NOTES:
+# - unset CLAUDECODE prevents nested-session detection when dispatched from inside Claude Code.
+# - claude-print v0.2.x BUFFERS the stream until iteration end: events are valid
+#   stream-json but arrive late. Idle-silence stuck detection must be relaxed for
+#   workspaces using this adapter — rely on Claude Code's live JSONL transcript
+#   tailing (HOOP session tailing) instead of stdout freshness.
+# - --max-turns 100: the claude-print default (30) is too low for refactor or
+#   long-form writing beads.
+# - --timeout 3600 matches the fleet's 1h max-runtime ceiling.
+invoke: |
+  cd ${WORKSPACE} && \
+  unset CLAUDECODE && \
+  claude-print -m sonnet \
+         --max-turns 100 \
+         --timeout 3600 \
+         --output-format stream-json \
+         --dangerously-skip-permissions \
+  <<'NEEDLE_PROMPT' | ${AGENT_DIR}/stream-parser.sh
+  ${PROMPT}
+  NEEDLE_PROMPT
+
+# Input method
+input:
+  method: heredoc      # claude-print reads the prompt from stdin
+
+# Output parsing
+output:
+  format: stream-json
+  streaming_enabled: true   # events arrive buffered until iteration end (see NOTES)
+  success_codes: [0]
+  retry_codes: [1]
+  fail_codes: [2, 137]
+
+# Rate limits (can override global)
+limits:
+  requests_per_minute: 60
+  max_concurrent: 5
+
+# Subscription pool: no marginal dollar cost; quota is use-or-lose within the
+# 5-hour / 7-day windows (HOOP saturation alerting fires at 80%).
 cost:
   type: use_or_lose

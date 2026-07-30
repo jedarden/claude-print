@@ -53,6 +53,8 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/watchdog.rs` | Watchdog timeout for silent children (no output + no Stop hook) |
 | `tests/binary_e2e.rs` | Binary-level end-to-end via the *compiled* binary + mock-claude (exit codes, stdout/stderr contract) |
 | `tests/stream_json_incremental.rs` | Incremental stream-json forwarding through the real binary (events emitted mid-session, not post-burst) |
+| `tests/stream_json_cleanup.rs` | Stream-json reader thread cleanup on all exit paths (verifies plan invariant INV-8) |
+| `tests/transcript_race_e2e.rs` | AS-6 end-to-end test: Stop-before-JSONL-flush race (bead bf-3isy) |
 | `tests/fixtures/` | Shared fixture helpers |
 
 ### mock_claude
@@ -75,6 +77,8 @@ cargo build -p mock-claude
 | `src/cli.rs` | Clap argument definitions (`Cli`, `OutputFormat`) |
 | `src/config.rs` | Loads `~/.claude/claude-print.toml` (model default, etc.) |
 | `src/session.rs` | Session orchestrator: installs hooks, spawns PTY child, runs event loop, reads transcript. `Session::run()` is the top-level entry point for a single prompt→response cycle. |
+| `src/prompt.rs` | Prompt input validation: NUL byte rejection, file size/type checks for `--input-file` (Security T-2, EC-4) |
+| `src/verbose.rs` | `--verbose` timing traces: emits `[claude-print <ms>ms] <message>` to stderr across session lifecycle |
 | `src/pty.rs` | Forks child, opens PTY pair, calls `login_tty`, unsets `CLAUDE_CODE_SESSION_ID` in child, forwards SIGWINCH/SIGINT |
 | `src/startup.rs` | State machine: reads PTY output until trust dialog or idle; auto-dismisses (sends CR), injects prompt via bracketed paste; hard timeout after 45s with <200 bytes |
 | `src/event_loop.rs` | Single-threaded `poll(2)` loop (50ms timeout for timer ticks) over PTY master + self-pipe + stop FIFO; calls callback on each chunk |
@@ -149,16 +153,16 @@ Beads use the `bf` prefix. Config is at `.beads/config.yaml`.
 
 ```bash
 # List open beads
-br list
+bf list
 
 # Claim a bead
-br claim <id>
+bf claim <id>
 
 # Close a bead (requires a commit first)
-br close <id>
+bf close <id>
 ```
 
-See `CLAUDE.md` (root workspace) for full `br` CLI docs and FrankenSQLite recovery
+See `CLAUDE.md` (root workspace) for full `bf` CLI docs and FrankenSQLite recovery
 procedures.
 
 ## Notes
