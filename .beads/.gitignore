@@ -2,3 +2,6 @@ beads.db
 beads.db-shm
 beads.db-wal
 *.backup*
+
+# Bead execution traces (stdout/stderr logs) — local artifacts, not source
+traces/
