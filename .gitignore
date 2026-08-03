@@ -4,6 +4,12 @@ target/
 # Bead-forge database backups
 .beads/beads.db.backup.*
 
+# Bead-forge transient tracking files
+.beads/.bf_history/
+.beads/beads.base.jsonl
+.beads/events.jsonl
+.beads/issues.jsonl
+
 # NEEDLE worker artifacts
 .needle-predispatch-sha
 .force_local
