@@ -254,11 +254,14 @@ mod tests {
         // This test verifies that the FIFO read loop has a hard iteration limit
         // and won't loop forever even if the writer never closes the FIFO.
         const MAX_ITERATIONS: usize = 100;
-        assert!(MAX_ITERATIONS > 0, "iteration limit must be positive");
-        assert!(
-            MAX_ITERATIONS <= 1000,
-            "iteration limit should be reasonable"
-        );
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(MAX_ITERATIONS > 0, "iteration limit must be positive");
+            assert!(
+                MAX_ITERATIONS <= 1000,
+                "iteration limit should be reasonable"
+            );
+        }
     }
 
     #[test]

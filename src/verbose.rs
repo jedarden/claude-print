@@ -92,6 +92,6 @@ mod tests {
         // derive must hold so the no-op path stays allocation-free.
         let t = Tracer::new(false, Instant::now());
         let _copy = t;
-        let _clone = t.clone();
+        let _clone = t;
     }
 }
