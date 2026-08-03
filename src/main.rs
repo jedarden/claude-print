@@ -205,19 +205,19 @@ fn main() {
     // Max-turns precedence: CLI --max-turns flag > config.toml defaults.max_turns > 30.
     // Always forward an explicit --max-turns so the compiled-in default is applied
     // rather than letting the child silently fall back to its own internal default.
-    for arg in build_max_turns_args(&config, cli.max_turns) {
+    for arg in build_max_turns_args(&config, Some(cli.max_turns)) {
         claude_args.push(arg.into());
     }
 
     // Timeout precedence: CLI --timeout flag > config.toml defaults.timeout_secs > 3600.
     // Always forward an explicit --timeout so the compiled-in default is applied
     // rather than letting the child silently fall back to its own internal default.
-    for arg in build_timeout_args(&config, cli.timeout) {
+    for arg in build_timeout_args(&config, Some(cli.timeout)) {
         claude_args.push(arg.into());
     }
 
     // Resolve timeout for session tracking (same precedence as forwarded flag)
-    let resolved_timeout = config.resolve_timeout_secs(cli.timeout);
+    let resolved_timeout = config.resolve_timeout_secs(Some(cli.timeout));
 
     if cli.dangerously_skip_permissions {
         claude_args.push("--dangerously-skip-permissions".into());
