@@ -42,7 +42,7 @@ spec:
 
             # Clone from trusted hardcoded source (ignore webhook payload)
             git clone --depth 1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/jedarden/claude-print.git" \
+              "https://github.com/jedarden/claude-print.git" \
               /workspace
             cd /workspace
 
@@ -136,6 +136,12 @@ spec:
 
             echo "Release v${VERSION} created successfully"
         env:
+          - name: GIT_CONFIG_COUNT
+            value: "1"
+          - name: GIT_CONFIG_KEY_0
+            value: credential.helper
+          - name: GIT_CONFIG_VALUE_0
+            value: '!f() { test "$1" = get && echo "username=x-access-token" && echo "password=$GH_TOKEN"; }; f'
           - name: GH_TOKEN
             valueFrom:
               secretKeyRef:
