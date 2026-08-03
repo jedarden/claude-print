@@ -141,18 +141,28 @@ fn main() {
     } else {
         // stdin (when !stdin.is_terminal())
         if !atty::is(atty::Stream::Stdin) {
-            let mut buffer = Vec::new();
-            if let Err(e) = io::stdin().read_to_end(&mut buffer) {
-                eprintln!("claude-print: failed to read stdin: {}", e);
-                exit_with_cleanup(4);
+            match prompt::read_stdin_with_limit() {
+                Ok(buffer) => {
+                    if buffer.is_empty() {
+                        eprintln!(
+                            "claude-print: no prompt provided (pass as argument, --input-file, or stdin)"
+                        );
+                        exit_with_cleanup(4);
+                    }
+                    buffer
+                }
+                Err(prompt::StdinError::TooLarge { limit }) => {
+                    eprintln!(
+                        "claude-print: stdin is larger than the {}-byte limit",
+                        limit
+                    );
+                    exit_with_cleanup(2);
+                }
+                Err(prompt::StdinError::ReadFailed { source }) => {
+                    eprintln!("claude-print: failed to read stdin: {}", source);
+                    exit_with_cleanup(4);
+                }
             }
-            if buffer.is_empty() {
-                eprintln!(
-                    "claude-print: no prompt provided (pass as argument, --input-file, or stdin)"
-                );
-                exit_with_cleanup(4);
-            }
-            buffer
         } else {
             // None found → exit 4
             eprintln!(
@@ -192,23 +202,22 @@ fn main() {
         claude_args.push(arg.into());
     }
 
-    // Resolve max_turns: CLI --max-turns flag > config defaults.max_turns > 30
-    let resolved_max_turns = config.resolve_max_turns(if cli.max_turns == 30 {
-        None
-    } else {
-        Some(cli.max_turns)
-    });
-    claude_args.push("--max-turns".into());
-    claude_args.push(resolved_max_turns.to_string().into());
+    // Max-turns precedence: CLI --max-turns flag > config.toml defaults.max_turns > 30.
+    // Always forward an explicit --max-turns so the compiled-in default is applied
+    // rather than letting the child silently fall back to its own internal default.
+    for arg in build_max_turns_args(&config, cli.max_turns) {
+        claude_args.push(arg.into());
+    }
 
-    // Resolve timeout: CLI --timeout flag > config defaults.timeout_secs > 3600
-    let resolved_timeout = config.resolve_timeout_secs(if cli.timeout == 3600 {
-        None
-    } else {
-        Some(cli.timeout)
-    });
-    claude_args.push("--timeout".into());
-    claude_args.push(resolved_timeout.to_string().into());
+    // Timeout precedence: CLI --timeout flag > config.toml defaults.timeout_secs > 3600.
+    // Always forward an explicit --timeout so the compiled-in default is applied
+    // rather than letting the child silently fall back to its own internal default.
+    for arg in build_timeout_args(&config, cli.timeout) {
+        claude_args.push(arg.into());
+    }
+
+    // Resolve timeout for session tracking (same precedence as forwarded flag)
+    let resolved_timeout = config.resolve_timeout_secs(cli.timeout);
 
     if cli.dangerously_skip_permissions {
         claude_args.push("--dangerously-skip-permissions".into());
@@ -391,6 +400,34 @@ fn build_model_args(config: &Config, cli_model: Option<String>) -> Vec<String> {
     vec!["--model".to_string(), config.resolve_model(cli_model)]
 }
 
+/// Build the `--max-turns <resolved>` argv pair to forward to the child, applying
+/// the plan's documented precedence: CLI `--max-turns` flag > `config.toml`
+/// `defaults.max_turns` > compiled-in default (30).
+///
+/// Always returns a two-element pair (never empty) so the max-turns forwarded to
+/// the child is always explicit — the compiled-in default is applied here
+/// rather than being left to the child's own internal default.
+fn build_max_turns_args(config: &Config, cli_max_turns: Option<u32>) -> Vec<String> {
+    vec![
+        "--max-turns".to_string(),
+        config.resolve_max_turns(cli_max_turns).to_string(),
+    ]
+}
+
+/// Build the `--timeout <resolved>` argv pair to forward to the child, applying
+/// the plan's documented precedence: CLI `--timeout` flag > `config.toml`
+/// `defaults.timeout_secs` > compiled-in default (3600).
+///
+/// Always returns a two-element pair (never empty) so the timeout forwarded to
+/// the child is always explicit — the compiled-in default is applied here
+/// rather than being left to the child's own internal default.
+fn build_timeout_args(config: &Config, cli_timeout: Option<u64>) -> Vec<String> {
+    vec![
+        "--timeout".to_string(),
+        config.resolve_timeout_secs(cli_timeout).to_string(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +478,105 @@ mod tests {
             args,
             vec!["--model".to_string(), "claude-haiku-4-5".to_string()]
         );
+    }
+
+    // Helper to write config with max_turns
+    fn write_config_max_turns(dir: &std::path::Path, max_turns: Option<u32>) -> std::path::PathBuf {
+        let path = dir.join("claude-print.toml");
+        let contents = match max_turns {
+            Some(m) => format!("[defaults]\nmax_turns = {m}\n"),
+            None => String::new(),
+        };
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // Helper to write config with timeout
+    fn write_config_timeout(dir: &std::path::Path, timeout: Option<u64>) -> std::path::PathBuf {
+        let path = dir.join("claude-print.toml");
+        let contents = match timeout {
+            Some(t) => format!("[defaults]\ntimeout_secs = {t}\n"),
+            None => String::new(),
+        };
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // (a) no --max-turns flag + no config file → compiled-in default (30) forwarded.
+    #[test]
+    fn max_turns_args_compiled_default_when_no_flag_and_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml"));
+        let args = build_max_turns_args(&config, None);
+        assert_eq!(args, vec!["--max-turns".to_string(), "30".to_string()]);
+    }
+
+    // (b) no --max-turns flag + config sets max_turns → config value forwarded.
+    #[test]
+    fn max_turns_args_config_value_when_no_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_max_turns(dir.path(), Some(50));
+        let config = Config::load_or_default(&path);
+        let args = build_max_turns_args(&config, None);
+        assert_eq!(args, vec!["--max-turns".to_string(), "50".to_string()]);
+    }
+
+    // (c) --max-turns 30 flag + config sets max_turns → explicit 30 wins over config.
+    #[test]
+    fn max_turns_args_explicit_30_overrides_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_max_turns(dir.path(), Some(50));
+        let config = Config::load_or_default(&path);
+        let args = build_max_turns_args(&config, Some(30));
+        assert_eq!(args, vec!["--max-turns".to_string(), "30".to_string()]);
+    }
+
+    // (d) --max-turns 5 flag + config sets max_turns → CLI flag wins.
+    #[test]
+    fn max_turns_args_cli_flag_wins_over_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_max_turns(dir.path(), Some(50));
+        let config = Config::load_or_default(&path);
+        let args = build_max_turns_args(&config, Some(5));
+        assert_eq!(args, vec!["--max-turns".to_string(), "5".to_string()]);
+    }
+
+    // (a) no --timeout flag + no config file → compiled-in default (3600) forwarded.
+    #[test]
+    fn timeout_args_compiled_default_when_no_flag_and_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml"));
+        let args = build_timeout_args(&config, None);
+        assert_eq!(args, vec!["--timeout".to_string(), "3600".to_string()]);
+    }
+
+    // (b) no --timeout flag + config sets timeout → config value forwarded.
+    #[test]
+    fn timeout_args_config_value_when_no_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_timeout(dir.path(), Some(1800));
+        let config = Config::load_or_default(&path);
+        let args = build_timeout_args(&config, None);
+        assert_eq!(args, vec!["--timeout".to_string(), "1800".to_string()]);
+    }
+
+    // (c) --timeout 3600 flag + config sets timeout → explicit 3600 wins over config.
+    #[test]
+    fn timeout_args_explicit_3600_overrides_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_timeout(dir.path(), Some(7200));
+        let config = Config::load_or_default(&path);
+        let args = build_timeout_args(&config, Some(3600));
+        assert_eq!(args, vec!["--timeout".to_string(), "3600".to_string()]);
+    }
+
+    // (d) --timeout 7200 flag + config sets timeout → CLI flag wins.
+    #[test]
+    fn timeout_args_cli_flag_wins_over_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config_timeout(dir.path(), Some(1800));
+        let config = Config::load_or_default(&path);
+        let args = build_timeout_args(&config, Some(7200));
+        assert_eq!(args, vec!["--timeout".to_string(), "7200".to_string()]);
     }
 }
