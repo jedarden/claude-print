@@ -8,15 +8,25 @@ metadata:
 spec:
   entrypoint: ci
   serviceAccountName: argo-workflow
+  arguments:
+    parameters:
+      - name: tag
+        value: ""  # Empty = verify-only mode (build from main); set to "vX.Y.Z" for release
   templates:
     - name: ci
       activeDeadlineSeconds: 3600
+      inputs:
+        parameters:
+          - name: tag
+            value: "{{workflow.parameters.tag}}"
       container:
         image: debian:bookworm
         command: [bash, -c]
         args:
           - |
             set -ex
+
+            TAG="{{inputs.parameters.tag}}"
 
             # System dependencies
             apt-get update && apt-get install -y \
@@ -41,9 +51,16 @@ spec:
             cargo install cargo-audit
 
             # Clone from trusted hardcoded source (ignore webhook payload)
-            git clone --depth 1 \
-              "https://github.com/jedarden/claude-print.git" \
-              /workspace
+            # Use --no-tags to avoid fetching all tags; fetch specific tag if needed
+            if [ -n "$TAG" ]; then
+              echo "Release mode: building from tag $TAG"
+              git clone --depth 1 --branch "$TAG" --single-branch \
+                "https://github.com/jedarden/claude-print.git" /workspace
+            else
+              echo "Verify-only mode: building from main"
+              git clone --depth 1 \
+                "https://github.com/jedarden/claude-print.git" /workspace
+            fi
             cd /workspace
 
             COMMIT=$(git rev-parse HEAD)
@@ -72,6 +89,12 @@ spec:
             echo "Running cargo audit..."
             cargo audit
             echo "audit OK (no known vulnerabilities)"
+
+            # In verify-only mode (TAG empty), skip release creation after quality gates
+            if [ -z "$TAG" ]; then
+              echo "Verify-only mode: all quality gates passed, exiting without release"
+              exit 0
+            fi
 
             # Check if release already exists — idempotent re-runs safe
             if gh release view "v${VERSION}" --repo jedarden/claude-print > /dev/null 2>&1; then
