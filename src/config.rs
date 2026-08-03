@@ -286,7 +286,7 @@ model = "claude-opus-4-8""#,
                 timeout_secs: None,
             }),
         };
-        assert_eq!(config.resolve_inherit_hooks(Some(true)), true);
+        assert!(config.resolve_inherit_hooks(Some(true)));
     }
 
     #[test]
@@ -299,7 +299,7 @@ model = "claude-opus-4-8""#,
                 timeout_secs: None,
             }),
         };
-        assert_eq!(config.resolve_inherit_hooks(None), false);
+        assert!(!config.resolve_inherit_hooks(None));
     }
 
     #[test]

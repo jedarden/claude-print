@@ -3,13 +3,45 @@
 //! These tests verify that stdin enforces the same 10MB PROMPT_MAX_BYTES
 //! ceiling as --input-file, rejecting oversized input before full allocation.
 
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// Helper to run claude-print with stdin input and check the result.
+///
+/// Creates a mock claude binary that responds to --version and exits 0,
+/// since we're testing the prompt resolution logic (stdin size limits),
+/// not the full session.
 fn run_with_stdin(input: &[u8]) -> (String, String, i32) {
+    // Create a mock claude script in a temp directory
+    let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+    let mock_binary = temp_dir.path().join("mock-claude");
+
+    // Write a shell script that handles --version and exits 0
+    fs::write(
+        &mock_binary,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "mock-claude 1.0.0"
+    exit 0
+fi
+exit 0
+"#,
+    )
+    .expect("write mock binary");
+
+    // Make it executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&mock_binary).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock_binary, perms).expect("set permissions");
+    }
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_claude-print"))
-        .arg("--check")
+        .arg("--claude-binary")
+        .arg(&mock_binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

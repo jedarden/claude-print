@@ -6,7 +6,7 @@ use claude_print::error::{ClaudePrintError, Error};
 use claude_print::hook;
 use claude_print::prompt;
 use claude_print::session;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
 use std::time::Instant;
