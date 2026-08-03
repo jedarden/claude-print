@@ -75,7 +75,7 @@ cargo build -p mock-claude
 | `src/lib.rs` | Crate root — re-exports public modules for integration tests |
 | `src/main.rs` | Entry point: CLI parse, claude binary resolution, calls `session::Session::run()` |
 | `src/cli.rs` | Clap argument definitions (`Cli`, `OutputFormat`) |
-| `src/config.rs` | Loads `~/.claude/claude-print.toml` (model default, etc.) |
+| `src/config.rs` | Loads `$XDG_CONFIG_HOME/claude-print/config.toml` if set, otherwise `~/.config/claude-print/config.toml` (model default, inherit_hooks, max_turns, timeout_secs) |
 | `src/session.rs` | Session orchestrator: installs hooks, spawns PTY child, runs event loop, reads transcript. `Session::run()` is the top-level entry point for a single prompt→response cycle. |
 | `src/prompt.rs` | Prompt input validation: NUL byte rejection, file size/type checks for `--input-file` (Security T-2, EC-4) |
 | `src/verbose.rs` | `--verbose` timing traces: emits `[claude-print <ms>ms] <message>` to stderr across session lifecycle |

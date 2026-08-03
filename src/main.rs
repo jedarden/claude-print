@@ -192,11 +192,23 @@ fn main() {
         claude_args.push(arg.into());
     }
 
-    if cli.max_turns != 30 {
-        // Only pass if non-default
-        claude_args.push("--max-turns".into());
-        claude_args.push(cli.max_turns.to_string().into());
-    }
+    // Resolve max_turns: CLI --max-turns flag > config defaults.max_turns > 30
+    let resolved_max_turns = config.resolve_max_turns(if cli.max_turns == 30 {
+        None
+    } else {
+        Some(cli.max_turns)
+    });
+    claude_args.push("--max-turns".into());
+    claude_args.push(resolved_max_turns.to_string().into());
+
+    // Resolve timeout: CLI --timeout flag > config defaults.timeout_secs > 3600
+    let resolved_timeout = config.resolve_timeout_secs(if cli.timeout == 3600 {
+        None
+    } else {
+        Some(cli.timeout)
+    });
+    claude_args.push("--timeout".into());
+    claude_args.push(resolved_timeout.to_string().into());
 
     if cli.dangerously_skip_permissions {
         claude_args.push("--dangerously-skip-permissions".into());
@@ -220,8 +232,14 @@ fn main() {
     // surfacing on slow/stall). All default off. The no_inherit_hooks flag is
     // consumed here — session.rs is the single source of truth that decides
     // whether `--setting-sources=` is forwarded to the child (Hard Requirement 5).
+    // Resolve inherit_hooks: CLI --no-inherit-hooks flag > config defaults.inherit_hooks > true
+    let resolved_no_inherit_hooks = !config.resolve_inherit_hooks(if cli.no_inherit_hooks {
+        Some(false)
+    } else {
+        None
+    });
     let launch = session::LaunchOptions {
-        no_inherit_hooks: cli.no_inherit_hooks,
+        no_inherit_hooks: resolved_no_inherit_hooks,
         mcp_configs: cli.mcp_config.clone(),
         pretrust_cwd: cli.pretrust_cwd,
         show_child_stderr: cli.show_child_stderr,
@@ -233,7 +251,7 @@ fn main() {
         &claude_bin,
         &claude_args,
         prompt_bytes,
-        Some(cli.timeout),
+        Some(resolved_timeout),
         Some(cli.first_output_timeout),
         Some(cli.stream_json_timeout),
         Some(cli.stop_hook_timeout),
