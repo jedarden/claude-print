@@ -333,3 +333,57 @@ fn test_stream_json_disconnect_exits_immediately() {
     // immediately. Must not hang.
     drop(handle);
 }
+
+// bf-l69i: Test JSON serialization with very long result text
+#[test]
+fn test_json_long_text_serializes() {
+    let long_text = "x".repeat(100_000);
+    let mut result = make_result(&long_text);
+    let (buf, mut writer) = capture();
+    // Should not panic on unwrap at lines 68 and 105
+    let result = emit_success(&mut writer, &result, &OutputFormat::Json, "1.0", 0);
+    assert!(result.is_ok(), "Should successfully serialize long text");
+    let output = buf.lock().unwrap().clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(v["result"], long_text);
+}
+
+// bf-l69i: Test JSON error serialization with complex error messages
+#[test]
+fn test_json_error_with_special_chars() {
+    let err = ClaudePrintError::Setup("Error with special chars: \n\t\r\"\\'".to_string());
+    let (buf, mut writer) = capture();
+    let (_, mut stderr) = capture();
+    // Should not panic on unwrap at line 105
+    let result = emit_error(
+        &mut writer,
+        &mut stderr,
+        &err,
+        &OutputFormat::Json,
+        "1.0",
+        false,
+    );
+    assert!(result.is_ok(), "Should successfully serialize error with special chars");
+    let output = buf.lock().unwrap().clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(v["error_message"].is_string());
+}
+
+// bf-l69i: Test JSON with all usage fields at maximum values
+#[test]
+fn test_json_max_usage_values() {
+    let mut result = make_result("test");
+    result.usage = AggregatedUsage {
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_creation_input_tokens: u64::MAX,
+        cache_read_input_tokens: u64::MAX,
+    };
+    let (buf, mut writer) = capture();
+    // Should not panic on unwrap at line 68
+    let result = emit_success(&mut writer, &result, &OutputFormat::Json, "1.0", 0);
+    assert!(result.is_ok(), "Should successfully serialize max values");
+    let output = buf.lock().unwrap().clone();
+    let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(v["usage"]["input_tokens"], u64::MAX);
+}
