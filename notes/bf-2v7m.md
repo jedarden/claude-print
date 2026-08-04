@@ -1,44 +1,56 @@
-# Bead bf-2v7m: dangerously-skip-permissions flag verification
+# bf-2v7m: Verification Summary
 
-## Status
-✓ **Already fixed** - No code changes needed
+## Task
+Verify fix for: `--dangerously-skip-permissions` is always forced on the child argv; the CLI flag is inert and duplicated when passed.
 
-## What was verified
+## Acceptance Criteria Verification
 
-### 1. Fix already applied (commit 8bcc030)
-The unconditional push of `--dangerously-skip-permissions` was removed from `src/session.rs`:
-- Line 357 no longer contains `args.push(CString::new("--dangerously-skip-permissions").unwrap());`
-- Capacity reduced from `claude_args.len() + 4` to `claude_args.len() + 3`
+### ✅ 1. Test Coverage
+**Tests exist and pass:**
+- `tests/binary_e2e.rs::dangerously_skip_permissions_flag_absent_when_not_passed` (line 660)
+  - Verifies that when the flag is NOT passed, '--dangerously-skip-permissions' does NOT appear in child argv
+- `tests/binary_e2e.rs::dangerously_skip_permissions_flag_appears_exactly_once_when_passed` (line 702)
+  - Verifies that when the flag IS passed, it appears EXACTLY ONCE in child argv
 
-### 2. Current state (as of this verification)
-- `src/session.rs`: No occurrences of "dangerously-skip-permissions" ✓
-- `src/main.rs:223`: Conditional push only (gated on `cli.dangerously_skip_permissions`) ✓
+**Test results:**
+```
+running 2 tests
+test dangerously_skip_permissions_flag_absent_when_not_passed ... ok
+test dangerously_skip_permissions_flag_appears_exactly_once_when_passed ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored
+```
 
-### 3. Tests already in place (tests/binary_e2e.rs)
-Two comprehensive E2E tests verify the behavior:
+### ✅ 2. No Unconditional Push in session.rs
+```bash
+$ grep -n 'dangerously-skip-permissions' src/session.rs
+# (no output - flag is not present in session.rs)
+```
 
-**Test 1: `dangerously_skip_permissions_flag_absent_when_not_passed`**
-- Runs claude-print WITHOUT the flag
-- Captures child argv via MOCK_RECORD_ARGS
-- Asserts `--dangerously-skip-permissions` does NOT appear
+The unconditional push was removed in commit `8bcc030`. The flag is now only pushed conditionally in `src/main.rs:223` when `cli.dangerously_skip_permissions` is true.
 
-**Test 2: `dangerously_skip_permissions_flag_appears_exactly_once_when_passed`**
-- Runs claude-print WITH the flag
-- Captures child argv via MOCK_RECORD_ARGS
-- Asserts the flag appears EXACTLY ONCE (not duplicated)
+### ✅ 3. Code Quality Checks
+```bash
+$ cargo fmt --check
+# (no output - formatting is clean)
 
-### 4. All acceptance criteria met
-- ✓ Tests construct/observe child argv via mock-claude's MOCK_RECORD_ARGS seam
-- ✓ Tests assert flag absent when not passed
-- ✓ Tests assert flag appears exactly once when passed
-- ✓ `grep -n 'dangerously-skip-permissions' src/session.rs` returns nothing
-- ✓ cargo fmt clean
-- ✓ cargo clippy clean
-- ✓ Tests pass (2 passed in 2.12s)
+$ cargo clippy -- -D warnings
+# (no output - no clippy warnings)
+```
 
-## Original issue
-The bug described in bf-2v7m:
-1. The CLI flag was inert (permissions skipped regardless of whether flag was passed)
-2. When flag WAS passed, it appeared twice in child argv
+## Historical Context
 
-Both issues were resolved by removing the unconditional push from session.rs.
+This issue was previously fixed in:
+- **Commit `8bcc030`** (2026-08-03): Removed unconditional push from `src/session.rs`
+  ```diff
+  - Vec::with_capacity(claude_args.len() + 4 + 2 * launch.mcp_configs.len());
+  - args.push(CString::new("--dangerously-skip-permissions").unwrap());
+  + Vec::with_capacity(claude_args.len() + 3 + 2 * launch.mcp_configs.len());
+  ```
+
+- **Commit `b76fa15`** (2026-06-14): Added conditional forwarding of the flag from `src/main.rs`
+
+- **Tests added** in `tests/binary_e2e.rs` to prevent regression
+
+## Conclusion
+
+All acceptance criteria are satisfied. The fix has been verified and the tests pass. The issue described in the bead (unconditional push in session.rs, CLI flag inert, duplicated when passed) has been resolved.
