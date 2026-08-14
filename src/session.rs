@@ -353,8 +353,7 @@ impl Session {
         let cmd = CString::new(claude_bin.to_string_lossy().as_bytes())
             .map_err(|e| Error::Internal(anyhow::anyhow!("claude_bin path invalid: {e}")))?;
         let mut args: Vec<CString> =
-            Vec::with_capacity(claude_args.len() + 4 + 2 * launch.mcp_configs.len());
-        args.push(CString::new("--dangerously-skip-permissions").unwrap());
+            Vec::with_capacity(claude_args.len() + 3 + 2 * launch.mcp_configs.len());
         args.push(
             CString::new(format!(
                 "--settings={}",

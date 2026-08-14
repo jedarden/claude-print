@@ -65,7 +65,12 @@ pub fn emit_success(
                     "cache_read_input_tokens": result.usage.cache_read_input_tokens,
                 }
             });
-            writeln!(writer, "{}", serde_json::to_string(&obj).unwrap())?;
+            // SAFETY: serde_json::to_string can only fail on very large data structures
+            // or circular references. Our JSON objects are small, plain data structures,
+            // so serialization cannot fail. We map any theoretical error to an IO error.
+            writeln!(writer, "{}", serde_json::to_string(&obj).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("JSON serialization failed: {}", e))
+            })?)?;
         }
         OutputFormat::StreamJson => {
             // Reader thread handles all output; nothing to emit here on success.
@@ -102,7 +107,12 @@ pub fn emit_error(
             "error_message": error.message(),
             "claude_version": claude_version,
         });
-        writeln!(stdout, "{}", serde_json::to_string(&obj).unwrap())?;
+        // SAFETY: serde_json::to_string can only fail on very large data structures
+        // or circular references. Our JSON objects are small, plain data structures,
+        // so serialization cannot fail. We map any theoretical error to an IO error.
+        writeln!(stdout, "{}", serde_json::to_string(&obj).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("JSON serialization failed: {}", e))
+        })?)?;
     } else {
         writeln!(stderr, "error: {}", error.message())?;
     }

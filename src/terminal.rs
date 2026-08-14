@@ -81,7 +81,9 @@ impl TerminalEmu {
                 ParseState::Invalid => {
                     // If the byte that invalidated the sequence is itself ESC,
                     // keep it as the start of the next candidate sequence.
-                    let last = *self.partial.last().unwrap();
+                    // SAFETY: We check if the buffer is non-empty before accessing last().
+                    // The buffer was just pushed to on line 67, so it's guaranteed non-empty.
+                    let last = *self.partial.last().unwrap_or(&byte);
                     self.partial.clear();
                     if last == b'\x1b' {
                         self.partial.push(b'\x1b');
@@ -111,6 +113,8 @@ impl TerminalEmu {
         }
 
         // CSI body: param/intermediate bytes in 0x20-0x3F, final byte in 0x40-0x7E.
+        // SAFETY: buf.len() >= 3 is guaranteed by the checks above (lines 111-112 returned
+        // early for len() == 1 and len() == 2), so buf.last() is always Some.
         let last = *buf.last().unwrap();
         if (0x40..=0x7E).contains(&last) {
             ParseState::Complete

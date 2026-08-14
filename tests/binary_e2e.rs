@@ -645,3 +645,94 @@ fn no_inherit_hooks_forwards_setting_sources_in_child_argv() {
         args
     );
 }
+
+// ── --dangerously-skip-permissions flag (bf-2v7m) ─────────────────────────────────
+//
+// Implements the acceptance criteria for bead bf-2v7m: when the flag is NOT
+// passed, '--dangerously-skip-permissions' must NOT appear in the child argv;
+// when the flag IS passed, it must appear EXACTLY ONCE. This guards against the
+// regression where session.rs unconditionally pushed the flag (making the CLI
+// flag inert) and main.rs duplicated it when passed.
+
+/// WITHOUT `--dangerously-skip-permissions`: the flag must NOT appear in the
+/// child argv at all (permissions are NOT skipped by default).
+#[test]
+fn dangerously_skip_permissions_flag_absent_when_not_passed() {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let record_str = record.to_string_lossy().into_owned();
+
+    let out = run_with(
+        claude_print().arg("test prompt"),
+        BUDGET,
+        Stdio::null(),
+        Some(("MOCK_RECORD_ARGS", record_str.as_str())),
+    );
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "without flag: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    let args = read_recorded_argv(&record);
+
+    // Sanity: the relay --settings=<temp>/settings.json is ALWAYS forwarded.
+    assert!(
+        args.iter().any(|a| a.starts_with("--settings=")),
+        "without flag: relay --settings= must be in child argv, got: {:?}",
+        args
+    );
+    // bf-2v7m: --dangerously-skip-permissions must be ABSENT when not passed.
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.contains("dangerously-skip-permissions")),
+        "without flag: --dangerously-skip-permissions must NOT be in child argv, \
+         got: {:?}",
+        args
+    );
+}
+
+/// WITH `--dangerously-skip-permissions`: the flag MUST appear EXACTLY ONCE in
+/// the child argv (not duplicated, not missing).
+#[test]
+fn dangerously_skip_permissions_flag_appears_exactly_once_when_passed() {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let record_str = record.to_string_lossy().into_owned();
+
+    let out = run_with(
+        claude_print()
+            .arg("--dangerously-skip-permissions")
+            .arg("test prompt"),
+        BUDGET,
+        Stdio::null(),
+        Some(("MOCK_RECORD_ARGS", record_str.as_str())),
+    );
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "with flag: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    let args = read_recorded_argv(&record);
+
+    // Count occurrences of --dangerously-skip-permissions.
+    let count = args
+        .iter()
+        .filter(|a| a.contains("dangerously-skip-permissions"))
+        .count();
+
+    assert_eq!(
+        count, 1,
+        "with flag: --dangerously-skip-permissions must appear EXACTLY ONCE in \
+         child argv, got {} occurrences in {:?}",
+        count, args
+    );
+}

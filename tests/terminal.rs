@@ -72,3 +72,37 @@ fn split_chunk_probe_answered_on_second_read() {
         "probe completed on second read should be answered"
     );
 }
+
+// bf-l69i: Test that overly long sequences don't panic on unwrap()
+#[test]
+fn overly_long_sequence_no_panic() {
+    let mut e = emu();
+    // Feed a sequence that exceeds MAX_PROBE_LEN (32)
+    let long_seq = b"\x1b[".repeat(20);
+    let resp = e.feed(&long_seq);
+    // Should not panic, should return empty response
+    assert_eq!(resp, b"");
+}
+
+// bf-l69i: Test that sequences with invalid bytes don't panic
+#[test]
+fn invalid_bytes_no_panic() {
+    let mut e = emu();
+    // Feed a sequence with invalid intermediate bytes
+    let resp = e.feed(b"\x1b[\xff\xff\xff\xff\xff\xff");
+    // Should not panic on unwrap at line 86
+    assert_eq!(resp, b"");
+}
+
+// bf-l69i: Test empty buffer state is handled correctly
+#[test]
+fn empty_buffer_handled() {
+    let mut e = emu();
+    // Start with a partial sequence
+    let resp1 = e.feed(b"\x1b");
+    assert_eq!(resp1, b"");
+    // Feed an invalid byte that should clear and potentially check for ESC
+    let resp2 = e.feed(b"\xff");
+    // Should not panic on unwrap at line 86
+    assert_eq!(resp2, b"");
+}

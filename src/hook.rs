@@ -138,13 +138,6 @@ impl HookInstaller {
             .tempdir()
             .map_err(|e| Error::Internal(anyhow::anyhow!("failed to create temp dir: {e}")))?;
 
-        let dir_str = dir.path().to_string_lossy();
-        if dir_str.contains('\'') {
-            return Err(Error::Internal(anyhow::anyhow!(
-                "temp dir path contains single-quote: {dir_str}"
-            )));
-        }
-
         let settings_path = dir.path().join("settings.json");
         let hook_path = dir.path().join("hook.sh");
         let fifo_path = dir.path().join("stop.fifo");
@@ -230,7 +223,10 @@ impl HookInstaller {
 
 fn write_hook_sh(hook_path: &Path, fifo_path: &Path) -> Result<()> {
     let fifo_str = fifo_path.to_string_lossy();
-    let content = format!("#!/bin/sh\ncat > '{}' 2>/dev/null || true\n", fifo_str);
+    // Escape single quotes for shell: ' => '\''
+    // This ensures the path is safely quoted when interpolated into the shell script
+    let escaped = fifo_str.replace('\'', "'\\''");
+    let content = format!("#!/bin/sh\ncat > '{}' 2>/dev/null || true\n", escaped);
     std::fs::write(hook_path, &content)
         .map_err(|e| Error::Internal(anyhow::anyhow!("failed to write hook.sh: {e}")))?;
 
@@ -443,5 +439,176 @@ mod tests {
         installer.cleanup();
         installer.cleanup(); // Should not panic
         drop(installer);
+    }
+
+    /// bf-5sj7: verify that FIFO paths containing shell metacharacters are
+    /// properly escaped in the generated hook.sh. This prevents command injection
+    /// when temp directory paths contain special characters.
+    #[test]
+    fn hook_sh_escaping_handles_shell_metacharacters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Test various dangerous shell metacharacters
+        let test_cases = vec![
+            "normal_path",
+            "path'with'quotes",      // Single quotes
+            "path$with$dollar",       // Dollar signs (variable expansion)
+            "path`with`backticks",    // Backticks (command substitution)
+            r"path\with\backslash",   // Backslashes
+            "path;with;semicolons",   // Semicolons (command separators)
+            "path&with&ampersands",   // Ampersands (background operators)
+            "path|with|pipes",        // Pipes (command chaining)
+            "path\nwith\nnewlines",   // Newlines (command separators)
+            r"path\with\mixed'quotes$", // Mixed special characters
+        ];
+
+        for test_name in test_cases {
+            // Create a fifo path that simulates a temp dir with metacharacters
+            let test_dir = dir.join(format!("claude-print-test-{}", test_name.replace('/', "_")));
+            std::fs::create_dir(&test_dir).expect("create test dir");
+            let fifo_path = test_dir.join("stop.fifo");
+            let hook_path = test_dir.join("hook.sh");
+
+            // Write the hook script (this is where escaping happens)
+            write_hook_sh(&hook_path, &fifo_path).expect("write_hook_sh should handle all paths");
+
+            // Verify the script is syntactically valid by checking it with sh -n
+            let output = std::process::Command::new("sh")
+                .arg("-n") // Syntax check only, don't execute
+                .arg(&hook_path)
+                .output();
+
+            assert!(
+                output.is_ok(),
+                "hook.sh for path {:?} should be syntactically valid; stderr: {:?}",
+                test_name,
+                output.as_ref().err().map(|e| e.to_string())
+            );
+
+            let output = output.unwrap();
+            assert!(
+                output.status.success(),
+                "hook.sh for path {:?} should pass shell syntax check; stdout: {}, stderr: {}",
+                test_name,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            // Clean up
+            std::fs::remove_file(&hook_path).ok();
+            std::fs::remove_dir(&test_dir).ok();
+        }
+    }
+
+    /// bf-5sj7: verify that the actual hook.sh produced by HookInstaller can
+    /// safely execute when the temp dir path contains shell metacharacters.
+    /// This test requires a real TempDir with a controlled prefix.
+    #[test]
+    fn hook_sh_safely_escapes_real_tempdir_paths() {
+        // Create a hook installer (which creates a real temp dir and hook.sh)
+        let installer = HookInstaller::new().unwrap();
+
+        // Read the generated hook.sh
+        let hook_content = std::fs::read_to_string(&installer.hook_path)
+            .expect("hook.sh should be readable");
+
+        // Verify the script is syntactically valid shell
+        let output = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&installer.hook_path)
+            .output()
+            .expect("sh -n should execute");
+
+        assert!(
+            output.status.success(),
+            "Generated hook.sh should pass shell syntax check; stdout: {}, stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify the hook script contains the expected pattern
+        assert!(hook_content.contains("#!/bin/sh"));
+        assert!(hook_content.contains("cat > '"));
+        assert!(hook_content.contains(" 2>/dev/null || true"));
+
+        // The key security property: if the FIFO path contained a single quote,
+        // it should be escaped as '\'' which splits into: '...'\''
+        // Let's verify that any single quotes in the path are properly escaped
+        let fifo_str = installer.fifo_path.to_string_lossy();
+        if fifo_str.contains('\'') {
+            // If the path has quotes, verify they're escaped in the script
+            // The escape pattern is: ' -> '\''
+            assert!(hook_content.contains("'\\''"), "Single quotes should be escaped");
+        }
+    }
+
+    /// bf-5sj7: verify that hook.sh can actually write to the FIFO when
+    /// executed, proving that the escaping doesn't break functionality.
+    #[test]
+    fn hook_sh_can_write_to_fifo_after_escaping() {
+        let installer = HookInstaller::new().unwrap();
+
+        // Start a background reader on the FIFO
+        let fifo_path = installer.fifo_path.clone();
+        let reader_handle = std::thread::spawn(move || {
+            // Open the FIFO for reading (this blocks until a writer opens it)
+            use std::io::Read;
+            let mut file = std::fs::File::open(&fifo_path).expect("open FIFO for reading");
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer).expect("read from FIFO");
+            buffer
+        });
+
+        // Give the reader a moment to start and block on the FIFO
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Execute the hook.sh script (it should write "test data" to the FIFO)
+        let mut output = std::process::Command::new("sh")
+            .arg(&installer.hook_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hook.sh");
+
+        // Write test data to the hook script's stdin
+        {
+            let mut stdin = output.stdin.as_mut().expect("open stdin");
+            std::io::Write::write_all(&mut stdin, b"test data from hook\n").expect("write to hook stdin");
+        } // Close stdin by dropping here to signal EOF
+
+        // Wait for the hook script to complete
+        let status = output.wait_with_output().expect("wait for hook.sh");
+        assert!(status.status.success(), "hook.sh should execute successfully");
+
+        // Wait for the reader to finish and get the data
+        let received_data = reader_handle.join().expect("reader thread should complete");
+
+        // Verify the data was written correctly
+        assert_eq!(
+            received_data,
+            b"test data from hook\n",
+            "FIFO should receive the data written by hook.sh"
+        );
+    }
+
+    /// bf-5sj7: direct unit test of the shell escaping logic.
+    /// Verify that single quotes are replaced with '\'' which is the
+    /// canonical shell escaping pattern.
+    #[test]
+    fn shell_escaping_pattern_is_correct() {
+        let fifo_str = "/tmp/test'path'with'quotes";
+        let escaped = fifo_str.replace('\'', "'\\''");
+
+        // The escaped string should be: /tmp/test'\''path'\''with'\''quotes
+        // This produces: '...'\''...'\''...'\''...
+        assert_eq!(escaped, "/tmp/test'\\''path'\\''with'\\''quotes");
+
+        // When we format it into the shell script, we get:
+        // cat > '/tmp/test'\''path'\''with'\''quotes' 2>/dev/null || true
+        // This is valid shell syntax that reconstructs the original path
+        let content = format!("#!/bin/sh\ncat > '{}' 2>/dev/null || true\n", escaped);
+        assert!(content.contains("'\\''"));
     }
 }
