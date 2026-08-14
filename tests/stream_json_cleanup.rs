@@ -3,15 +3,15 @@
 //! These tests verify plan invariant INV-8: the reader thread must be joined
 //! before session exit on ALL paths (success, timeout, SIGINT, child-exit).
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 /// Test helper: create a temporary transcript file with some content.
-fn create_temp_transcript(dir: &PathBuf, content: &str) -> PathBuf {
+fn create_temp_transcript(dir: &Path, content: &str) -> PathBuf {
     let transcript_path = dir.join("transcript.jsonl");
     let mut file = File::create(&transcript_path).unwrap();
     for line in content.lines() {
@@ -33,7 +33,7 @@ fn test_stream_json_handle_drop_joins_thread_after_drain() {
     // Normal Stop path: signal_drain() is called, then drop() should join.
     let temp_dir = tempfile::TempDir::new().unwrap();
     let transcript_path = create_temp_transcript(
-        &temp_dir.path().to_path_buf(),
+        temp_dir.path(),
         r#"{"type":"start"}
 {"type":"end"}"#,
     );
@@ -53,7 +53,7 @@ fn test_stream_json_handle_drop_joins_thread_without_drain() {
     // The reader should exit immediately when channel disconnects.
     let temp_dir = tempfile::TempDir::new().unwrap();
     let transcript_path = create_temp_transcript(
-        &temp_dir.path().to_path_buf(),
+        temp_dir.path(),
         r#"{"type":"start"}
 {"type":"end"}"#,
     );
@@ -71,7 +71,7 @@ fn test_stream_json_handle_drop_joins_thread_mid_read() {
     // Thread is actively reading when drop occurs.
     let temp_dir = tempfile::TempDir::new().unwrap();
     let transcript_path = temp_dir.path().to_path_buf().join("transcript.jsonl");
-    let file = Arc::new(Mutex::new(File::create(&transcript_path).unwrap()));
+    let _file = Arc::new(Mutex::new(File::create(&transcript_path).unwrap()));
 
     // Spawn a reader that will block on empty file
     let handle = claude_print::emitter::spawn_stream_json_reader(transcript_path.clone(), 0);
@@ -130,7 +130,7 @@ fn test_stream_json_handle_cleanup_order() {
     // Verify that disconnect happens before join (otherwise join would hang).
     let temp_dir = tempfile::TempDir::new().unwrap();
     let transcript_path = create_temp_transcript(
-        &temp_dir.path().to_path_buf(),
+        temp_dir.path(),
         r#"{"type":"start"}
 {"type":"end"}"#,
     );

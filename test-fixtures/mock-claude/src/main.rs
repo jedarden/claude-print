@@ -184,6 +184,9 @@ fn main() {
         .unwrap_or_else(|_| "/tmp".to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
 
+    // Compute the cwd slug the same way claude-print does: strip leading / and replace remaining / with -
+    let cwd_slug = cwd.trim_start_matches('/').replace('/', "-");
+
     let last_msg_part = if omit_last_message {
         String::new()
     } else {
@@ -200,7 +203,7 @@ fn main() {
         None
     } else {
         Some(format!(
-            "{home}/.claude/projects/mock-cwd/{session_id}.jsonl"
+            "{home}/.claude/projects/{cwd_slug}/{session_id}.jsonl"
         ))
     };
 

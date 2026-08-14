@@ -6,25 +6,19 @@
 //! STILL RUNNING (incremental, real-time forwarding) — not dumped as a single
 //! post-completion burst.
 //!
-//! # Status — `#[ignore]`'d (acceptance gate for two sibling beads)
+//! # Implementation complete (bf-3isy + bf-5vm)
 //!
-//! This test cannot pass until both land. It is intentionally checked in now so
-//! it serves as the contract those beads must satisfy (remove the `#[ignore]`
-//! attribute once they close):
+//! Both dependencies have landed:
 //!
-//!   * **bf-3isy** — mock_claude must actually WRITE the transcript JSONL file at
-//!     the `transcript_path` it reports in the Stop payload. Today mock_claude
-//!     only sends `last_assistant_message` inline over the Stop FIFO and writes
-//!     no file, so the live reader has nothing to tail. bf-3isy also introduces
-//!     `MOCK_DELAY_JSONL=<ms>` (delayed JSONL write that simulates the
-//!     Stop-before-flush race the transcript retry loop handles).
+//!   * **bf-3isy** — mock_claude now WRITES the transcript JSONL file at
+//!     the `transcript_path` it reports in the Stop payload, including support
+//!     for `MOCK_DELAY_JSONL=<ms>` to simulate the Stop-before-flush race.
 //!
-//!   * **bf-5vm** — the live stream-json reader (`emitter::spawn_stream_json_reader`,
-//!     already spawned at the PROMPT_INJECTED transition in `session.rs`) must
-//!     tail the REAL transcript path mock_claude writes, so lines are forwarded
-//!     DURING the session. The reader currently spawns against a placeholder
-//!     local path that is never written, so stream-json consumers see nothing
-//!     live (this is the known v0.2.0 post-session-replay limitation).
+//!   * **bf-5vm** — the live stream-json reader is spawned at the PROMPT_INJECTED
+//!     transition in `session.rs` and tails the REAL transcript path
+//!     (~/.claude/projects/<cwd-slug>/<session_id>.jsonl) as claude writes it.
+//!     Reader thread cleanup (INV-8) is guaranteed on all exit paths via the
+//!     `StreamJsonHandle::Drop` implementation.
 //!
 //! # How "before completion" is asserted
 //!
@@ -32,9 +26,9 @@
 //! each arrival. The first stream-json line's arrival instant is compared to the
 //! instant the `claude-print` process exits: the line must arrive strictly before
 //! exit. That the forwarding is LIVE tailing (rather than a replay emitted after
-//! Stop) is architecturally guaranteed by bf-5vm, which spawns the reader at
-//! PROMPT_INJECTED instead of replaying after completion. The lower-level,
-//! non-ignored test `stream_json_reader_forwards_lines_incrementally_as_file_grows`
+//! Stop) is architecturally guaranteed by the implementation, which spawns the
+//! reader at PROMPT_INJECTED instead of replaying after completion. The lower-level
+//! test `stream_json_reader_forwards_lines_incrementally_as_file_grows`
 //! (in `tests/integration/scenarios.rs`) deterministically pins the live-tail
 //! behavior of the reader itself, independent of mock_claude.
 
@@ -114,9 +108,12 @@ fn wait_for_exit(mut child: std::process::Child, deadline: Instant, step: Durati
 /// stream-json events must reach stdout WHILE the session runs, not as a
 /// post-completion burst.
 ///
-/// See the module docs for the bf-3isy / bf-5vm history.
+/// This test was gated on bf-3isy (mock_claude writes transcript JSONL) and
+/// bf-5vm (live reader spawns at PROMPT_INJECTED), both of which are now
+/// implemented. The incremental stream-json reader is spawned in session.rs at
+/// the PROMPT_INJECTED transition and tails the real transcript path
+/// (~/.claude/projects/<cwd-slug>/<session_id>.jsonl) as claude writes it.
 #[test]
-#[ignore]
 fn stream_json_lines_appear_on_stdout_before_session_completes() {
     let claude_print = workspace_bin("claude-print");
     let mock_claude = workspace_bin("mock-claude");
