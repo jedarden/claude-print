@@ -927,8 +927,8 @@ fn version_resilience_extra_fields_in_stop_payload_through_pipeline() {
     assert_eq!(payload.session_id.as_deref(), Some("vs-session"));
     assert_eq!(payload.cwd.as_deref(), Some("/home/user/project"));
 
-    let info = resolve_stop_info(payload);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let info = resolve_stop_info(payload).unwrap();
+    let home = std::env::var("HOME").unwrap();
     let expected = std::path::PathBuf::from(&home)
         .join(".claude")
         .join("projects")
@@ -961,7 +961,7 @@ fn stop_payload_explicit_path_used_directly() {
         transcript.display()
     );
     let payload = parse_stop_payload(payload_json.as_bytes()).unwrap();
-    let info = resolve_stop_info(payload);
+    let info = resolve_stop_info(payload).unwrap();
 
     assert_eq!(
         info.transcript_path,
@@ -982,7 +982,7 @@ fn stop_payload_path_derivation_and_transcript_emit() {
     let dir = TempDir::new().unwrap();
     let session_id = "derive-test-session";
     let cwd = "/home/user/myproject";
-    let slug = cwd_to_slug(cwd);
+    let slug = cwd_to_slug(cwd).unwrap();
     let transcript_dir = dir.path().join(".claude").join("projects").join(&slug);
     std::fs::create_dir_all(&transcript_dir).unwrap();
     let transcript = transcript_dir.join(format!("{session_id}.jsonl"));
@@ -1000,7 +1000,7 @@ fn stop_payload_path_derivation_and_transcript_emit() {
     let payload_json =
         format!(r#"{{"hook_event_name":"Stop","session_id":"{session_id}","cwd":"{cwd}"}}"#);
     let payload = parse_stop_payload(payload_json.as_bytes()).unwrap();
-    let info = resolve_stop_info(payload);
+    let info = resolve_stop_info(payload).unwrap();
 
     // Verify derived path uses $HOME — this would differ from our test dir,
     // but we can still verify the slug computation is correct.
@@ -1031,20 +1031,20 @@ fn stop_payload_path_derivation_and_transcript_emit() {
 fn cwd_slug_algorithm_representative_cases() {
     // Documented in plan §8 Transcript Reader
     assert_eq!(
-        cwd_to_slug("/home/coding/myproject"),
+        cwd_to_slug("/home/coding/myproject").unwrap(),
         "home-coding-myproject"
     );
-    assert_eq!(cwd_to_slug("/root/foo/bar"), "root-foo-bar");
-    assert_eq!(cwd_to_slug("/tmp/x"), "tmp-x");
-    assert_eq!(cwd_to_slug("/tmp"), "tmp");
+    assert_eq!(cwd_to_slug("/root/foo/bar").unwrap(), "root-foo-bar");
+    assert_eq!(cwd_to_slug("/tmp/x").unwrap(), "tmp-x");
+    assert_eq!(cwd_to_slug("/tmp").unwrap(), "tmp");
     // Ambiguous case: /home/user/a-b and /home/user-a/b both → home-user-a-b
     assert_eq!(
-        cwd_to_slug("/home/user/a-b"),
+        cwd_to_slug("/home/user/a-b").unwrap(),
         "home-user-a-b",
         "hyphenated dir name"
     );
     assert_eq!(
-        cwd_to_slug("/home/user-a/b"),
+        cwd_to_slug("/home/user-a/b").unwrap(),
         "home-user-a-b",
         "hyphen in parent dir"
     );
@@ -1102,7 +1102,7 @@ fn stop_payload_minimal_fields_derives_path() {
     assert!(payload.transcript_path.is_none());
     assert!(payload.last_assistant_message.is_none());
 
-    let info = resolve_stop_info(payload);
+    let info = resolve_stop_info(payload).unwrap();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let expected = std::path::PathBuf::from(&home)
         .join(".claude")
@@ -1204,5 +1204,314 @@ fn duration_ms_reflects_passed_value() {
     assert_eq!(
         v["duration_ms"], 42_000u64,
         "duration_ms must reflect the passed value"
+    );
+}
+
+// ── Config error handling ────────────────────────────────────────────────────────
+
+/// Config parse error in text mode: error message on stderr, no stdout.
+#[test]
+fn config_parse_error_text_mode_stderr_only() {
+    let err =
+        ClaudePrintError::Setup("invalid config at /path/to/config.toml: expected '='".to_string());
+    let (out_buf, mut stdout) = capture();
+    let (err_buf, mut stderr) = capture();
+
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::Text,
+        "1.0",
+        true,
+    )
+    .unwrap();
+
+    let stdout_output = out_buf.lock().unwrap().clone();
+    let stderr_output = err_buf.lock().unwrap().clone();
+
+    assert!(
+        stdout_output.is_empty(),
+        "text mode config error must not write to stdout"
+    );
+    assert!(
+        !stderr_output.is_empty(),
+        "text mode config error must write to stderr"
+    );
+
+    let stderr_text = std::str::from_utf8(&stderr_output).unwrap();
+    assert!(
+        stderr_text.contains("invalid config"),
+        "stderr must mention config error"
+    );
+}
+
+/// Config parse error in JSON mode: structured error JSON on stdout.
+#[test]
+fn config_parse_error_json_mode_structured_output() {
+    let err = ClaudePrintError::Setup("config validation failed at /path/to/config.toml: max_turns value 0 is invalid: must be at least 1".to_string());
+    let (out_buf, mut stdout) = capture();
+    let (_, mut stderr) = capture();
+
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::Json,
+        "2.1.168",
+        true,
+    )
+    .unwrap();
+
+    let v = read_json(&out_buf);
+
+    assert_eq!(v["type"], "result", "error type must be 'result'");
+    assert_eq!(v["is_error"], true, "error is_error must be true");
+    assert_eq!(
+        v["subtype"], "internal_error",
+        "config error subtype must be 'internal_error'"
+    );
+    assert!(
+        v.get("error_message").is_some(),
+        "error must have error_message field"
+    );
+    assert!(
+        v.get("claude_version").is_some(),
+        "error must have claude_version"
+    );
+
+    let error_msg = v["error_message"].as_str().unwrap();
+    assert!(
+        error_msg.contains("config") || error_msg.contains("max_turns"),
+        "error message must mention config problem: {error_msg}"
+    );
+}
+
+/// Config parse error in stream-json mode after inject: structured JSON on stdout.
+#[test]
+fn config_parse_error_stream_json_mode_structured_output() {
+    let err = ClaudePrintError::Setup(
+        "invalid config at /path/to/config.toml: invalid TOML syntax".to_string(),
+    );
+    let (out_buf, mut stdout) = capture();
+    let (_, mut stderr) = capture();
+
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::StreamJson,
+        "2.0.0",
+        true,
+    )
+    .unwrap();
+
+    let v = read_json(&out_buf);
+
+    assert_eq!(v["type"], "result");
+    assert_eq!(v["is_error"], true);
+    assert_eq!(v["subtype"], "internal_error");
+    assert!(
+        v["error_message"].as_str().unwrap().contains("config"),
+        "stream-json config error must mention config in error message"
+    );
+    assert_eq!(v["claude_version"], "2.0.0");
+}
+
+/// Config parse error exit code is 2 (consistent with other setup errors).
+#[test]
+fn config_parse_error_exit_code_2() {
+    let err = ClaudePrintError::Setup("config validation failed: invalid value".to_string());
+    assert_eq!(
+        err.exit_code(),
+        2,
+        "config parse errors must exit with code 2 (setup error)"
+    );
+}
+
+/// Config parse error with model name validation failure propagates correctly.
+#[test]
+fn config_parse_error_invalid_model_name() {
+    let err = ClaudePrintError::Setup(
+        "config validation failed at /path/config.toml: model name 'bad@model' contains invalid characters".to_string(),
+    );
+
+    let (out_buf, mut stdout) = capture();
+    let (_, mut stderr) = capture();
+
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::Json,
+        "1.0",
+        true,
+    )
+    .unwrap();
+
+    let v = read_json(&out_buf);
+    assert_eq!(v["is_error"], true);
+    assert_eq!(v["subtype"], "internal_error");
+
+    let error_msg = v["error_message"].as_str().unwrap();
+    assert!(
+        error_msg.contains("model") && error_msg.contains("invalid"),
+        "model validation error must mention invalid model: {error_msg}"
+    );
+}
+
+/// Config parse error with timeout validation failure propagates correctly.
+#[test]
+fn config_parse_error_invalid_timeout() {
+    let err = ClaudePrintError::Setup(
+        "config validation failed at /path/config.toml: timeout_secs value 999999 is invalid: must be at most 86400".to_string(),
+    );
+
+    let (out_buf, mut stdout) = capture();
+    let (err_buf, mut stderr) = capture();
+
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::Text,
+        "2.1.168",
+        true,
+    )
+    .unwrap();
+
+    assert!(
+        out_buf.lock().unwrap().is_empty(),
+        "text mode error must not write to stdout"
+    );
+
+    let stderr_output = err_buf.lock().unwrap().clone();
+    let stderr_text = std::str::from_utf8(&stderr_output).unwrap();
+    assert!(
+        stderr_text.contains("timeout") && stderr_text.contains("config"),
+        "timeout validation error must mention both: {stderr_text}"
+    );
+}
+
+/// End-to-end integration test: malformed config file produces structured error.
+///
+/// This test verifies that when claude-print is given a malformed config file,
+/// it exits with code 2 and produces a structured JSON error on stdout, not a
+/// silent fallback. This is the real integration test that uses the helper
+/// functions created in the previous bead.
+///
+/// ACCEPTANCE_CRITERIA:
+/// 1. Test creates a malformed config file (e.g., unclosed bracket, invalid TOML syntax)
+/// 2. Test runs claude-print with --output-format json
+/// 3. Test captures and verifies exit code is 2 (not 0)
+/// 4. Test verifies stderr contains structured error with:
+///    - "type":"result"
+///    - "is_error":true
+///    - "subtype":"internal_error" or "config_error"
+///    - "error_message" mentioning "invalid config" or similar
+/// 5. Test verifies exit code is not 0 (no silent fallback)
+/// 6. Test uses the helper functions created in previous bead
+///
+/// Test should FAIL initially (proving current behavior is wrong).
+#[test]
+fn malformed_config_integration_exit_code_2_and_structured_error() {
+    use super::config_error_helpers::{
+        assert_exits_with_code, assert_json_error, ConfigFixture, run_with_config_and_format,
+    };
+
+    // Step 1: Create a malformed config file with unclosed bracket (invalid TOML syntax)
+    let fixture = ConfigFixture::new();
+    let malformed_config = r#"[defaults
+model = "test""#; // Missing closing bracket
+    fixture.write_config(malformed_config);
+
+    // Step 2: Run claude-print with --output-format json
+    let outcome = run_with_config_and_format(fixture.path(), "json", "test");
+
+    // Step 3: Verify exit code is 2 (not 0)
+    assert_exits_with_code(&outcome, 2);
+
+    // Step 4 & 5: Verify stderr contains structured error with required fields
+    // The error should be "internal_error" for config parse failures
+    let error_json = assert_json_error(&outcome, "internal_error");
+
+    // Verify the error message mentions config problems
+    let error_message = error_json["error_message"]
+        .as_str()
+        .expect("error_message must be a string");
+    assert!(
+        error_message.contains("config") || error_message.contains("invalid"),
+        "error_message must mention config problem: {error_message}"
+    );
+
+    // Verify claude_version is present in error output
+    assert!(
+        error_json.get("claude_version").is_some(),
+        "error must include claude_version field"
+    );
+
+    // Verify we got a non-zero exit code (no silent fallback)
+    assert_ne!(
+        outcome.code,
+        Some(0),
+        "must not exit with code 0 (no silent fallback on config error)"
+    );
+}
+
+/// End-to-end integration test: malformed config with invalid TOML syntax.
+///
+/// Tests another type of TOML syntax error: equals sign in wrong place.
+#[test]
+fn malformed_config_invalid_toml_syntax_structured_error() {
+    use super::config_error_helpers::{
+        assert_exits_with_code, assert_json_error, ConfigFixture, run_with_config_and_format,
+    };
+
+    let fixture = ConfigFixture::new();
+    // Invalid TOML: equals sign without proper key-value structure
+    let malformed_config = r#"[defaults]
+= "test""#;
+    fixture.write_config(malformed_config);
+
+    let outcome = run_with_config_and_format(fixture.path(), "json", "test");
+
+    assert_exits_with_code(&outcome, 2);
+    let error_json = assert_json_error(&outcome, "internal_error");
+
+    let error_message = error_json["error_message"]
+        .as_str()
+        .expect("error_message must be a string");
+    assert!(
+        error_message.contains("config") || error_message.contains("TOML") || error_message.contains("invalid"),
+        "error_message must mention config/TOML problem: {error_message}"
+    );
+}
+
+/// End-to-end integration test: malformed config with unclosed array bracket.
+///
+/// Tests array syntax error.
+#[test]
+fn malformed_config_unclosed_array_bracket_structured_error() {
+    use super::config_error_helpers::{
+        assert_exits_with_code, assert_json_error, ConfigFixture, run_with_config_and_format,
+    };
+
+    let fixture = ConfigFixture::new();
+    // Unclosed array bracket
+    let malformed_config = r#"[defaults]
+model = ["test""#;
+    fixture.write_config(malformed_config);
+
+    let outcome = run_with_config_and_format(fixture.path(), "json", "test");
+
+    assert_exits_with_code(&outcome, 2);
+    let error_json = assert_json_error(&outcome, "internal_error");
+
+    let error_message = error_json["error_message"]
+        .as_str()
+        .expect("error_message must be a string");
+    assert!(
+        error_message.contains("config") || error_message.contains("unclosed") || error_message.contains("invalid"),
+        "error_message must mention config syntax problem: {error_message}"
     );
 }
