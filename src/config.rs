@@ -150,36 +150,29 @@ impl Config {
     }
 
     /// Loads the config file, returning an empty config if the file doesn't exist
-    pub fn load_or_default(path: &PathBuf) -> Self {
+    ///
+    /// Returns an error if the file exists but cannot be parsed or validated.
+    pub fn load_or_default(path: &PathBuf) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let config: Config = match toml::from_str(&contents) {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        eprintln!(
-                            "claude-print: warning: invalid config at {}: {}",
-                            path.display(),
-                            e
-                        );
-                        return Config { defaults: None };
-                    }
-                };
+                let config: Config = toml::from_str(&contents).map_err(|e| {
+                    Error::Config(format!("invalid config at {}: {e}", path.display()))
+                })?;
 
                 // Validate the config after parsing
                 if let Some(ref defaults) = config.defaults {
-                    if let Err(e) = defaults.validate() {
-                        eprintln!(
-                            "claude-print: warning: config validation failed at {}: {}",
+                    defaults.validate().map_err(|e| {
+                        Error::Config(format!(
+                            "config validation failed at {}: {}",
                             path.display(),
                             e
-                        );
-                        return Config { defaults: None };
-                    }
+                        ))
+                    })?;
                 }
 
-                config
+                Ok(config)
             }
-            Err(_) => Config { defaults: None },
+            Err(_) => Ok(Config { defaults: None }),
         }
     }
 
@@ -321,7 +314,7 @@ mod tests {
     fn load_or_default_returns_defaults_when_file_missing() {
         let temp_dir = tempfile::tempdir().unwrap();
         let missing_path = temp_dir.path().join("missing-config.toml");
-        let config = Config::load_or_default(&missing_path);
+        let config = Config::load_or_default(&missing_path).unwrap();
         assert!(config.defaults.is_none());
     }
 
@@ -336,7 +329,7 @@ model = "claude-opus-4-8""#,
         )
         .unwrap();
 
-        let config = Config::load_or_default(&config_path);
+        let config = Config::load_or_default(&config_path).unwrap();
         assert_eq!(config.default_model(), Some("claude-opus-4-8"));
     }
 
@@ -346,8 +339,10 @@ model = "claude-opus-4-8""#,
         let config_path = temp_dir.path().join("invalid-config.toml");
         std::fs::write(&config_path, "invalid toml content [[").unwrap();
 
-        let config = Config::load_or_default(&config_path);
-        assert!(config.defaults.is_none());
+        let result = Config::load_or_default(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"));
     }
 
     #[test]
@@ -520,9 +515,11 @@ unknown_field = "should_fail""#,
         )
         .unwrap();
 
-        let config = Config::load_or_default(&config_path);
-        // Due to deny_unknown_fields, this should return empty config on parse error
-        assert!(config.defaults.is_none());
+        let result = Config::load_or_default(&config_path);
+        // Due to deny_unknown_fields, this should error on parse
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"));
     }
 
     #[test]
@@ -539,7 +536,7 @@ timeout_secs = 1800"#,
         )
         .unwrap();
 
-        let config = Config::load_or_default(&config_path);
+        let config = Config::load_or_default(&config_path).unwrap();
         assert_eq!(config.default_inherit_hooks(), Some(false));
         assert_eq!(config.default_model(), Some("claude-opus-4-8"));
         assert_eq!(config.default_max_turns(), Some(50));
@@ -792,9 +789,11 @@ max_turns = 0"#,
         )
         .unwrap();
 
-        let config = Config::load_or_default(&config_path);
-        // Should return empty config on validation error
-        assert!(config.defaults.is_none());
+        let result = Config::load_or_default(&config_path);
+        // Should return error on validation error
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("max_turns"));
     }
 
     #[test]
@@ -808,9 +807,11 @@ timeout_secs = 999999"#,
         )
         .unwrap();
 
-        let config = Config::load_or_default(&config_path);
-        // Should return empty config on validation error
-        assert!(config.defaults.is_none());
+        let result = Config::load_or_default(&config_path);
+        // Should return error on validation error
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("timeout_secs"));
     }
 
     #[test]
@@ -824,9 +825,11 @@ model = "bad@model""#,
         )
         .unwrap();
 
-        let config = Config::load_or_default(&config_path);
-        // Should return empty config on validation error
-        assert!(config.defaults.is_none());
+        let result = Config::load_or_default(&config_path);
+        // Should return error on validation error
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("model"));
     }
 
     #[test]
