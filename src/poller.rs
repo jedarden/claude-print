@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::util::get_home;
 use serde::Deserialize;
 use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -80,13 +81,11 @@ pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
 ///
 /// # Errors
 /// Returns `Error::Config` if the `HOME` environment variable is not set.
-/// This is intentional: silent fallback to "/root" would fail in chroot
-/// environments where that directory may not exist.
+/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
 pub fn derive_transcript_path(session_id: &str, cwd: &str) -> Result<PathBuf> {
     let slug = cwd_to_slug(cwd)?;
-    let home = std::env::var("HOME")
-        .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
-    Ok(PathBuf::from(home)
+    let home = get_home()?;
+    Ok(home
         .join(".claude")
         .join("projects")
         .join(&slug)
@@ -112,7 +111,9 @@ pub fn cwd_to_slug(cwd: &str) -> Result<String> {
 
     // Check for control characters (except tab)
     if cwd.chars().any(|c| c.is_control() && c != '\t') {
-        return Err(Error::Config("path contains control characters".to_string()));
+        return Err(Error::Config(
+            "path contains control characters".to_string(),
+        ));
     }
 
     // Normalize: trim leading slash, split by '/'
@@ -163,21 +164,13 @@ pub fn cwd_to_slug(cwd: &str) -> Result<String> {
 ///
 /// # Errors
 /// Returns `Error::Config` if the `HOME` environment variable is not set.
-/// This is intentional: silent fallback to "/root" would fail in chroot
-/// environments where that directory may not exist. Also returns `Error::Io`
-/// if the current working directory cannot be read.
+/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
+/// Also returns `Error::Io` if the current working directory cannot be read.
 pub fn projects_dir_for_cwd() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| Error::Io(e))?;
+    let cwd = std::env::current_dir().map_err(Error::Io)?;
     let slug = cwd_to_slug(&cwd.to_string_lossy())?;
-    let home = std::env::var("HOME")
-        .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
-    Ok(
-        PathBuf::from(home)
-            .join(".claude")
-            .join("projects")
-            .join(slug),
-    )
+    let home = get_home()?;
+    Ok(home.join(".claude").join("projects").join(slug))
 }
 
 /// Open the named FIFO at `path` for non-blocking reading.
@@ -472,6 +465,11 @@ mod tests {
 
     #[test]
     fn resolve_derives_path_when_transcript_path_absent() {
+        let original_home = std::env::var("HOME").ok();
+
+        // Ensure HOME is set for this test (production code requires it)
+        std::env::set_var("HOME", "/test/home");
+
         let payload = StopPayload {
             session_id: Some("mysession".to_string()),
             transcript_path: None,
@@ -479,13 +477,19 @@ mod tests {
             last_assistant_message: None,
         };
         let info = resolve_stop_info(payload).unwrap();
-        let home = std::env::var("HOME").unwrap();
-        let expected = PathBuf::from(&home)
+        let expected = PathBuf::from("/test/home")
             .join(".claude")
             .join("projects")
             .join("home-user-myproject")
             .join("mysession.jsonl");
         assert_eq!(info.transcript_path, Some(expected));
+
+        // Restore environment
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     #[test]
@@ -517,7 +521,10 @@ mod tests {
 
         let result = resolve_stop_info(payload);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("HOME environment variable not set"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HOME environment variable not set"));
 
         // Restore HOME
         if let Some(home) = original_home {
@@ -535,7 +542,10 @@ mod tests {
 
         let result = derive_transcript_path("sid123", "/home/user/project");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("HOME environment variable not set"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HOME environment variable not set"));
 
         // Restore HOME
         if let Some(home) = original_home {
@@ -553,7 +563,10 @@ mod tests {
 
         let result = projects_dir_for_cwd();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("HOME environment variable not set"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HOME environment variable not set"));
 
         // Restore HOME
         if let Some(home) = original_home {
@@ -563,22 +576,40 @@ mod tests {
 
     #[test]
     fn derive_transcript_path_builds_correct_path() {
+        let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", "/test/home");
         let result = derive_transcript_path("sess-id", "/project/dir");
         assert!(result.is_ok());
         let path = result.unwrap();
-        assert_eq!(path, PathBuf::from("/test/home/.claude/projects/project-dir/sess-id.jsonl"));
+        assert_eq!(
+            path,
+            PathBuf::from("/test/home/.claude/projects/project-dir/sess-id.jsonl")
+        );
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     #[test]
     fn projects_dir_for_cwd_builds_correct_path() {
+        let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", "/test/home");
         let result = projects_dir_for_cwd();
         assert!(result.is_ok());
         let path = result.unwrap();
         // The actual current directory should be used, not PWD env var
         // Since we're in /home/coding/claude-print, the slug should be home-coding-claude-print
-        assert_eq!(path, PathBuf::from("/test/home/.claude/projects/home-coding-claude-print"));
+        assert_eq!(
+            path,
+            PathBuf::from("/test/home/.claude/projects/home-coding-claude-print")
+        );
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     // ── open_fifo_nonblock (OQ-4: FIFO open race) ─────────────────────────────
