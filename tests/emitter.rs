@@ -363,7 +363,10 @@ fn test_json_error_with_special_chars() {
         "1.0",
         false,
     );
-    assert!(result.is_ok(), "Should successfully serialize error with special chars");
+    assert!(
+        result.is_ok(),
+        "Should successfully serialize error with special chars"
+    );
     let output = buf.lock().unwrap().clone();
     let v: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert!(v["error_message"].is_string());

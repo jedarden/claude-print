@@ -99,13 +99,21 @@ impl TerminalEmu {
     fn check_state(&self) -> ParseState {
         let buf = &self.partial;
 
-        if buf[0] != b'\x1b' {
+        // Check buffer length first to avoid panics on empty buffer
+        let first = match buf.first() {
+            Some(&b) => b,
+            None => return ParseState::Incomplete,
+        };
+
+        if first != b'\x1b' {
             return ParseState::Invalid;
         }
         if buf.len() == 1 {
             return ParseState::Incomplete;
         }
-        if buf[1] != b'[' {
+
+        let second = buf[1]; // Safe: we know len >= 2
+        if second != b'[' {
             return ParseState::Invalid;
         }
         if buf.len() == 2 {
@@ -113,9 +121,11 @@ impl TerminalEmu {
         }
 
         // CSI body: param/intermediate bytes in 0x20-0x3F, final byte in 0x40-0x7E.
-        // SAFETY: buf.len() >= 3 is guaranteed by the checks above (lines 111-112 returned
-        // early for len() == 1 and len() == 2), so buf.last() is always Some.
-        let last = *buf.last().unwrap();
+        // At this point buf.len() >= 3, so buf.last() always returns Some.
+        let last = match buf.last() {
+            Some(&b) => b,
+            None => return ParseState::Invalid, // Should never happen, but defensive
+        };
         if (0x40..=0x7E).contains(&last) {
             ParseState::Complete
         } else if (0x20..=0x3F).contains(&last) {

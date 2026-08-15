@@ -106,3 +106,48 @@ fn empty_buffer_handled() {
     // Should not panic on unwrap at line 86
     assert_eq!(resp2, b"");
 }
+
+// Test that feeding empty chunks doesn't panic
+#[test]
+fn empty_chunk_no_panic() {
+    let mut e = emu();
+    // Feed empty chunk - should not panic on buf.first() in check_state
+    let resp = e.feed(b"");
+    assert_eq!(resp, b"");
+}
+
+// Test that single byte chunks are handled correctly
+#[test]
+fn single_byte_chunk_no_panic() {
+    let mut e = emu();
+    // Feed just ESC - should return incomplete, not panic
+    let resp = e.feed(b"\x1b");
+    assert_eq!(resp, b"");
+
+    // Feed a random non-ESC byte - should not accumulate or panic
+    let resp2 = e.feed(b"X");
+    assert_eq!(resp2, b"");
+}
+
+// Test two-byte sequences that start CSI but are incomplete
+#[test]
+fn two_byte_csi_incomplete_no_panic() {
+    let mut e = emu();
+    // Feed just CSI start (ESC + [) - should return incomplete
+    let resp = e.feed(b"\x1b[");
+    assert_eq!(resp, b"");
+
+    // Verify it's waiting for more data
+    let resp2 = e.feed(b"c");
+    assert_eq!(resp2, b"\x1b[?6c");
+}
+
+// Test that malformed CSI sequences don't panic
+#[test]
+fn malformed_csi_no_panic() {
+    let mut e = emu();
+    // Invalid byte in CSI parameter position
+    let resp = e.feed(b"\x1b[\x00\x00c");
+    // Should not panic, just return empty
+    assert_eq!(resp, b"");
+}
