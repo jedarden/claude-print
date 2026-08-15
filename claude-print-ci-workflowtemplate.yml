@@ -134,7 +134,28 @@ spec:
             verify_static "./${CLAUDE_PRINT_ASSET}"
             verify_static "./${MOCK_ASSET}"
 
-            # Create GitHub release with both binaries
+            # === Binary-size gate (plan-mandated: < 10 MB) ===
+            BINARY_SIZE_BYTES=$(stat -c%s "./${CLAUDE_PRINT_ASSET}")
+            BINARY_SIZE_MB=$(echo "scale=2; $BINARY_SIZE_BYTES / (1024*1024)" | bc)
+            MAX_SIZE_MB=10
+            echo "Binary size: ${BINARY_SIZE_MB} MB (max: ${MAX_SIZE_MB} MB)"
+            if [ "$BINARY_SIZE_BYTES" -gt "$((MAX_SIZE_MB * 1024 * 1024))" ]; then
+              echo "ERROR: Binary size ${BINARY_SIZE_MB} MB exceeds ${MAX_SIZE_MB} MB limit" >&2
+              exit 1
+            fi
+
+            # === last-claude-version.txt artifact (plan-mandated for CI diff tracking) ===
+            # Record the Claude version being wrapped for version-regression detection
+            if CLAUDE_BIN=$(which claude 2>/dev/null); then
+              CLAUDE_VERSION_OUTPUT=$("$CLAUDE_BIN" --version 2>&1)
+              echo "$CLAUDE_VERSION_OUTPUT" > last-claude-version.txt
+              echo "Recorded Claude version: $CLAUDE_VERSION_OUTPUT"
+            else
+              echo "WARNING: claude binary not found on PATH; cannot record version" >&2
+              echo "unknown" > last-claude-version.txt
+            fi
+
+            # Create GitHub release with both binaries and version artifact
             gh release create "v${VERSION}" \
               --repo jedarden/claude-print \
               --title "claude-print v${VERSION}" \
@@ -152,10 +173,12 @@ spec:
 
             - \`claude-print-${TARGET}\` — main binary
             - \`mock_claude-${TARGET}\` — test fixture binary
+            - \`last-claude-version.txt\` — Claude version this release was built and tested against
             " \
               --target main \
               "./${CLAUDE_PRINT_ASSET}" \
-              "./${MOCK_ASSET}"
+              "./${MOCK_ASSET}" \
+              "./last-claude-version.txt"
 
             echo "Release v${VERSION} created successfully"
         env:
