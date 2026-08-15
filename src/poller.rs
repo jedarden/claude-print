@@ -44,25 +44,32 @@ pub fn parse_stop_payload(bytes: &[u8]) -> Result<StopPayload> {
 
 /// Resolve a [`StopPayload`] into [`StopInfo`], deriving the transcript path
 /// when `transcript_path` is absent but `session_id` and `cwd` are present.
-pub fn resolve_stop_info(payload: StopPayload) -> StopInfo {
+///
+/// # Errors
+/// Returns `Error::Config` if the `HOME` environment variable is not set.
+pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
     let explicit_path = payload
         .transcript_path
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
-    let transcript_path = explicit_path.or_else(|| match (&payload.session_id, &payload.cwd) {
-        (Some(sid), Some(cwd)) if !sid.is_empty() && !cwd.is_empty() => {
-            Some(derive_transcript_path(sid, cwd))
+    let transcript_path = if explicit_path.is_some() {
+        explicit_path
+    } else {
+        match (&payload.session_id, &payload.cwd) {
+            (Some(sid), Some(cwd)) if !sid.is_empty() && !cwd.is_empty() => {
+                Some(derive_transcript_path(sid, cwd)?)
+            }
+            _ => None,
         }
-        _ => None,
-    });
+    };
 
-    StopInfo {
+    Ok(StopInfo {
         session_id: payload.session_id,
         transcript_path,
         last_assistant_message: payload.last_assistant_message,
-    }
+    })
 }
 
 /// Build the full transcript path from `session_id` and `cwd`.
@@ -70,21 +77,81 @@ pub fn resolve_stop_info(payload: StopPayload) -> StopInfo {
 /// Slug algorithm: strip the leading `/` from `cwd`, replace remaining `/` with `-`.
 /// Example: `/home/coding/myproject` → slug `home-coding-myproject`
 /// Full path: `$HOME/.claude/projects/<slug>/<session_id>.jsonl`
-pub fn derive_transcript_path(session_id: &str, cwd: &str) -> PathBuf {
-    let slug = cwd_to_slug(cwd);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    PathBuf::from(home)
+///
+/// # Errors
+/// Returns `Error::Config` if the `HOME` environment variable is not set.
+/// This is intentional: silent fallback to "/root" would fail in chroot
+/// environments where that directory may not exist.
+pub fn derive_transcript_path(session_id: &str, cwd: &str) -> Result<PathBuf> {
+    let slug = cwd_to_slug(cwd)?;
+    let home = std::env::var("HOME")
+        .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
+    Ok(PathBuf::from(home)
         .join(".claude")
         .join("projects")
         .join(&slug)
-        .join(format!("{session_id}.jsonl"))
+        .join(format!("{session_id}.jsonl")))
 }
 
 /// Convert a filesystem `cwd` path to a JSONL directory slug.
 ///
 /// Strip the leading `/`, then replace all `/` with `-`.
-pub fn cwd_to_slug(cwd: &str) -> String {
-    cwd.trim_start_matches('/').replace('/', "-")
+///
+/// # Errors
+/// Returns `Error::Config` if the path contains:
+/// - Path traversal components (`.` or `..`)
+/// - Components longer than 255 characters (filesystem limit)
+/// - Null bytes or control characters
+/// - Empty components (from `//` or trailing `/`)
+/// - Empty path or root path
+pub fn cwd_to_slug(cwd: &str) -> Result<String> {
+    // Check for null bytes
+    if cwd.contains('\0') {
+        return Err(Error::Config("path contains null byte".to_string()));
+    }
+
+    // Check for control characters (except tab)
+    if cwd.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(Error::Config("path contains control characters".to_string()));
+    }
+
+    // Normalize: trim leading slash, split by '/'
+    let normalized = cwd.trim_start_matches('/');
+
+    // Empty path is invalid
+    if normalized.is_empty() {
+        return Err(Error::Config("path is empty or root".to_string()));
+    }
+
+    // Split into components and validate each
+    let components: Vec<&str> = normalized.split('/').collect();
+
+    for component in &components {
+        // Check for empty components (from // or trailing /)
+        if component.is_empty() {
+            return Err(Error::Config(
+                "path contains empty component (consecutive or trailing slashes)".to_string(),
+            ));
+        }
+
+        // Check for path traversal attempts
+        if *component == "." || *component == ".." {
+            return Err(Error::Config(
+                "path contains '.' or '..' components (path traversal not allowed)".to_string(),
+            ));
+        }
+
+        // Check component length (ext4, xfs, and most filesystems limit to 255 bytes)
+        if component.len() > 255 {
+            return Err(Error::Config(format!(
+                "path component exceeds filesystem limit of 255 characters (found {} characters)",
+                component.len()
+            )));
+        }
+    }
+
+    // Join validated components with '-'
+    Ok(components.join("-"))
 }
 
 /// The projects directory claude writes session transcripts under, derived from
@@ -93,13 +160,19 @@ pub fn cwd_to_slug(cwd: &str) -> String {
 /// Used at `PROMPT_INJECTED` to point the live stream-json reader at the
 /// directory it must DISCOVER this session's `<session_id>.jsonl` in — the
 /// `session_id` is unknown until the Stop payload arrives, after injection.
-/// Returns `None` only if the cwd cannot be read, in which case the reader is
-/// not spawned (live tailing disabled for that run).
-pub fn projects_dir_for_cwd() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let slug = cwd_to_slug(&cwd.to_string_lossy());
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    Some(
+///
+/// # Errors
+/// Returns `Error::Config` if the `HOME` environment variable is not set.
+/// This is intentional: silent fallback to "/root" would fail in chroot
+/// environments where that directory may not exist. Also returns `Error::Io`
+/// if the current working directory cannot be read.
+pub fn projects_dir_for_cwd() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::Io(e))?;
+    let slug = cwd_to_slug(&cwd.to_string_lossy())?;
+    let home = std::env::var("HOME")
+        .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
+    Ok(
         PathBuf::from(home)
             .join(".claude")
             .join("projects")
@@ -169,29 +242,164 @@ mod tests {
     #[test]
     fn cwd_to_slug_home_coding_myproject() {
         assert_eq!(
-            cwd_to_slug("/home/coding/myproject"),
+            cwd_to_slug("/home/coding/myproject").unwrap(),
             "home-coding-myproject"
         );
     }
 
     #[test]
     fn cwd_to_slug_root_foo_bar() {
-        assert_eq!(cwd_to_slug("/root/foo/bar"), "root-foo-bar");
+        assert_eq!(cwd_to_slug("/root/foo/bar").unwrap(), "root-foo-bar");
     }
 
     #[test]
     fn cwd_to_slug_tmp() {
-        assert_eq!(cwd_to_slug("/tmp"), "tmp");
+        assert_eq!(cwd_to_slug("/tmp").unwrap(), "tmp");
     }
 
     #[test]
     fn cwd_to_slug_tmp_x() {
-        assert_eq!(cwd_to_slug("/tmp/x"), "tmp-x");
+        assert_eq!(cwd_to_slug("/tmp/x").unwrap(), "tmp-x");
     }
 
     #[test]
     fn cwd_to_slug_no_leading_slash() {
-        assert_eq!(cwd_to_slug("tmp/foo"), "tmp-foo");
+        assert_eq!(cwd_to_slug("tmp/foo").unwrap(), "tmp-foo");
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_null_bytes() {
+        let result = cwd_to_slug("/home/coding/\0project");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("null byte"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_control_characters() {
+        // Control characters (except tab) should be rejected
+        let result = cwd_to_slug("/home/coding\x01project");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_path_traversal_dot() {
+        let result = cwd_to_slug("/home/./coding/project");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("'.'"));
+        assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_path_traversal_dotdot() {
+        let result = cwd_to_slug("/home/../etc/passwd");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("'..'"));
+        assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_component_exceeding_255_chars() {
+        let long_component = "a".repeat(256);
+        let result = cwd_to_slug(&format!("/home/{}", long_component));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("exceeds filesystem limit"));
+        assert!(err.to_string().contains("255 characters"));
+    }
+
+    #[test]
+    fn cwd_to_slug_accepts_component_exactly_255_chars() {
+        let long_component = "a".repeat(255);
+        let result = cwd_to_slug(&format!("/home/{}", long_component));
+        assert!(result.is_ok());
+        // The slug should be valid and the component preserved
+        assert!(result.unwrap().contains(&long_component[..50])); // Check prefix
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_consecutive_slashes() {
+        let result = cwd_to_slug("/home//coding/project");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("empty component"));
+        assert!(err.to_string().contains("consecutive"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_trailing_slash() {
+        let result = cwd_to_slug("/home/coding/project/");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("empty component"));
+        assert!(err.to_string().contains("trailing"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_empty_path() {
+        let result = cwd_to_slug("");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("empty or root"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_root_path() {
+        let result = cwd_to_slug("/");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("empty or root"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_only_slashes() {
+        let result = cwd_to_slug("///");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("empty or root"));
+    }
+
+    #[test]
+    fn cwd_to_slug_allows_tab_character() {
+        // Tab is allowed (it's a control character but we explicitly allow it)
+        let result = cwd_to_slug("/home/coding\tproject");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "home-coding\tproject");
+    }
+
+    #[test]
+    fn cwd_to_slug_valid_multi_component_path() {
+        let result = cwd_to_slug("/usr/local/bin/project");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "usr-local-bin-project");
+    }
+
+    #[test]
+    fn cwd_to_slug_allows_unicode_characters() {
+        let result = cwd_to_slug("/home/coding/projet-тест");
+        assert!(result.is_ok());
+        // Unicode characters are allowed
+        assert!(result.unwrap().contains("тест"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_newline() {
+        let result = cwd_to_slug("/home/coding\n/project");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn cwd_to_slug_rejects_carriage_return() {
+        let result = cwd_to_slug("/home/coding\r/project");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("control characters"));
     }
 
     // ── parse_stop_payload ────────────────────────────────────────────────────
@@ -255,7 +463,7 @@ mod tests {
             cwd: Some("/some/cwd".to_string()),
             last_assistant_message: None,
         };
-        let info = resolve_stop_info(payload);
+        let info = resolve_stop_info(payload).unwrap();
         assert_eq!(
             info.transcript_path,
             Some(PathBuf::from("/explicit/path.jsonl"))
@@ -270,8 +478,8 @@ mod tests {
             cwd: Some("/home/user/myproject".to_string()),
             last_assistant_message: None,
         };
-        let info = resolve_stop_info(payload);
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let info = resolve_stop_info(payload).unwrap();
+        let home = std::env::var("HOME").unwrap();
         let expected = PathBuf::from(&home)
             .join(".claude")
             .join("projects")
@@ -288,8 +496,89 @@ mod tests {
             cwd: None, // cwd absent: cannot derive
             last_assistant_message: None,
         };
-        let info = resolve_stop_info(payload);
+        let info = resolve_stop_info(payload).unwrap();
         assert!(info.transcript_path.is_none());
+    }
+
+    #[test]
+    fn resolve_fails_when_home_not_set() {
+        // Save original HOME
+        let original_home = std::env::var("HOME").ok();
+
+        // Unset HOME
+        std::env::remove_var("HOME");
+
+        let payload = StopPayload {
+            session_id: Some("sid".to_string()),
+            transcript_path: None,
+            cwd: Some("/home/user/myproject".to_string()),
+            last_assistant_message: None,
+        };
+
+        let result = resolve_stop_info(payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("HOME environment variable not set"));
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn derive_transcript_path_fails_when_home_not_set() {
+        // Save original HOME
+        let original_home = std::env::var("HOME").ok();
+
+        // Unset HOME
+        std::env::remove_var("HOME");
+
+        let result = derive_transcript_path("sid123", "/home/user/project");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("HOME environment variable not set"));
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn projects_dir_for_cwd_fails_when_home_not_set() {
+        // Save original HOME
+        let original_home = std::env::var("HOME").ok();
+
+        // Unset HOME
+        std::env::remove_var("HOME");
+
+        let result = projects_dir_for_cwd();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("HOME environment variable not set"));
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn derive_transcript_path_builds_correct_path() {
+        std::env::set_var("HOME", "/test/home");
+        let result = derive_transcript_path("sess-id", "/project/dir");
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path, PathBuf::from("/test/home/.claude/projects/project-dir/sess-id.jsonl"));
+    }
+
+    #[test]
+    fn projects_dir_for_cwd_builds_correct_path() {
+        std::env::set_var("HOME", "/test/home");
+        let result = projects_dir_for_cwd();
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        // The actual current directory should be used, not PWD env var
+        // Since we're in /home/coding/claude-print, the slug should be home-coding-claude-print
+        assert_eq!(path, PathBuf::from("/test/home/.claude/projects/home-coding-claude-print"));
     }
 
     // ── open_fifo_nonblock (OQ-4: FIFO open race) ─────────────────────────────
