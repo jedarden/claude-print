@@ -50,9 +50,7 @@ impl Defaults {
     /// Model names must start with "claude-" or be a known alias.
     fn validate_model(&self, model: &str) -> Result<()> {
         if model.is_empty() {
-            return Err(Error::Config(format!(
-                "model name cannot be empty"
-            )));
+            return Err(Error::Config("model name cannot be empty".to_string()));
         }
 
         if model.len() > 100 {
@@ -141,6 +139,11 @@ impl Config {
     /// Path priority:
     /// 1. $XDG_CONFIG_HOME/claude-print/config.toml if XDG_CONFIG_HOME is set
     /// 2. ~/.config/claude-print/config.toml otherwise
+    ///
+    /// # Errors
+    /// Returns `Error::Config` if the `HOME` environment variable is not set.
+    /// This is intentional: silent fallback to "/root" would fail in chroot
+    /// environments where that directory may not exist.
     pub fn default_path() -> Result<PathBuf> {
         // Try XDG_CONFIG_HOME first
         if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
@@ -160,7 +163,7 @@ impl Config {
 
     /// Loads the config file, returning an empty config if the file doesn't exist
     ///
-    /// Returns an error if the file exists but cannot be parsed or validated.
+    /// Returns an error if the file exists but cannot be read, parsed, or validated.
     pub fn load_or_default(path: &PathBuf) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
@@ -181,7 +184,12 @@ impl Config {
 
                 Ok(config)
             }
-            Err(_) => Ok(Config { defaults: None }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config { defaults: None }),
+            Err(e) => Err(Error::Config(format!(
+                "cannot read config at {}: {}",
+                path.display(),
+                e
+            ))),
         }
     }
 
@@ -193,9 +201,13 @@ impl Config {
 
         // Validate the config after parsing
         if let Some(ref defaults) = config.defaults {
-            defaults
-                .validate()
-                .map_err(|e| Error::Config(format!("config validation failed at {}: {}", path.display(), e)))?;
+            defaults.validate().map_err(|e| {
+                Error::Config(format!(
+                    "config validation failed at {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
         }
 
         Ok(config)
@@ -343,7 +355,7 @@ model = "claude-opus-4-8""#,
     }
 
     #[test]
-    fn load_or_default_returns_defaults_on_invalid_toml() {
+    fn load_or_default_errors_on_invalid_toml() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_path = temp_dir.path().join("invalid-config.toml");
         std::fs::write(&config_path, "invalid toml content [[").unwrap();
@@ -352,6 +364,19 @@ model = "claude-opus-4-8""#,
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("invalid config"));
+    }
+
+    #[test]
+    fn load_or_default_errors_on_io_error_not_found_excluded() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Try to read from a directory (which will cause an IO error other than NotFound)
+        let dir_path = temp_dir.path().join("config-dir");
+        std::fs::create_dir(&dir_path).unwrap();
+
+        let result = Config::load_or_default(&dir_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("cannot read config"));
     }
 
     #[test]
@@ -981,5 +1006,331 @@ max_turns = 0"#,
         let err_msg = result.unwrap_err().to_string();
         // Error message should explain why the value is invalid
         assert!(err_msg.contains("must be at least 1"));
+    }
+
+    #[test]
+    fn default_path_fails_when_home_not_set() {
+        // Save original HOME
+        let original_home = std::env::var("HOME").ok();
+
+        // Unset HOME
+        std::env::remove_var("HOME");
+
+        // Ensure XDG_CONFIG_HOME is also unset so we fall back to HOME
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        let result = Config::default_path();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("HOME environment variable not set"));
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    // Config parse error tests - verify malformed configs produce proper errors
+    // These tests should FAIL initially (expecting current buggy behavior),
+    // then pass after proper error propagation is implemented.
+
+    #[test]
+    fn load_rejects_invalid_toml_syntax_mismatched_brackets() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults
+model = "claude-opus-4-8""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject TOML with mismatched brackets");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_invalid_toml_syntax_unclosed_string() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude-opus-4-8"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject TOML with unclosed string");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_invalid_toml_syntax_invalid_escape() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude-opus-4\-8""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject TOML with invalid escape sequence");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_invalid_toml_syntax_double_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude-opus-4-8"
+model = "claude-haiku-4-5""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject TOML with duplicate keys");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_model_as_integer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = 123"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject model field as integer (wrong type)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_model_as_boolean() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = true"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject model field as boolean (wrong type)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_inherit_hooks_as_string() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+inherit_hooks = "true""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject inherit_hooks field as string (wrong type)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_max_turns_as_string() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = "50""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject max_turns field as string (wrong type)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_max_turns_as_float() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 50.5"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject max_turns field as float (wrong type)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_timeout_secs_as_string() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = "3600""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject timeout_secs field as string (wrong type)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_wrong_type_timeout_secs_as_boolean() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = true"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject timeout_secs field as boolean (wrong type)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_negative_max_turns() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = -10"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject negative max_turns (u32 can't be negative)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_rejects_negative_timeout_secs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = -100"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err(), "Should reject negative timeout_secs (u64 can't be negative)");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_or_default_rejects_invalid_toml_syntax() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(&config_path, r#"[defaults"#).unwrap();
+
+        let result = Config::load_or_default(&config_path);
+        assert!(result.is_err(), "Should not silently fallback to defaults on invalid TOML");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_or_default_rejects_wrong_type_model() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = 456"#,
+        )
+        .unwrap();
+
+        let result = Config::load_or_default(&config_path);
+        assert!(result.is_err(), "Should not silently fallback to defaults on wrong type");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_or_default_rejects_wrong_type_max_turns() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = "not-a-number""#,
+        )
+        .unwrap();
+
+        let result = Config::load_or_default(&config_path);
+        assert!(result.is_err(), "Should not silently fallback to defaults on wrong type");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+    }
+
+    #[test]
+    fn load_or_default_rejects_validation_error_in_model() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "gpt-4""#,
+        )
+        .unwrap();
+
+        let result = Config::load_or_default(&config_path);
+        assert!(result.is_err(), "Should not silently fallback on validation error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("config validation failed"), "Error should mention validation failure");
+    }
+
+    #[test]
+    fn load_or_default_accepts_minimal_valid_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]"#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_default(&config_path).unwrap();
+        assert!(config.defaults.is_some(), "Should accept minimal valid defaults section");
+        assert!(config.defaults.unwrap().model.is_none(), "Model should be None when not specified");
     }
 }
