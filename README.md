@@ -173,9 +173,10 @@ Before cutting a release tag:
 1. Run `./scripts/check-billing.sh` to verify billing conformance (requires credentials)
 2. Run `cargo test` to ensure all mocked tests pass
 3. Run `claude-print --check` to verify PTY and Stop hook mechanics
-4. Update version in `Cargo.toml`
-5. Commit and push: `git tag v0.x.y && git push origin v0.x.y`
-6. Monitor the `claude-print-ci` Argo Workflow for successful build and GitHub release
+4. **Check Claude Code version currency**: if the installed Claude Code version (`claude --version`) has changed since the last release, capture a real session transcript and add it as `tests/fixtures/transcript_vX.Y.Z.jsonl` with corresponding regression tests in `tests/version_compat.rs`
+5. Update version in `Cargo.toml`
+6. Commit and push: `git tag v0.x.y && git push origin v0.x.y`
+7. Monitor the `claude-print-ci` Argo Workflow for successful build and GitHub release
 
 ## Structure
 
