@@ -14,6 +14,9 @@ target/
 .needle-predispatch-sha
 .force_local
 
+# NEEDLE worker worktrees ( Claude Code session isolation)
+.claude/worktrees/
+
 # Escaped-home-path hazard: a worker bug can create a literal '~' directory at
 # the repo root. If that gets committed, a careless 'rm -rf ~' run from the repo
 # root becomes catastrophic. Anchored to root so only a repo-root '~' is ignored
