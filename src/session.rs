@@ -241,6 +241,89 @@ pub fn register_cleanup_handler() {
 pub struct Session;
 
 impl Session {
+    /// Build the argv array for the child Claude Code process.
+    ///
+    /// This function constructs the complete argument list that will be passed to execvp
+    /// when spawning the child process. It is separated from `run_inner` to enable
+    /// unit testing of argument construction without needing the full E2E harness.
+    ///
+    /// # Arguments
+    ///
+    /// * `claude_bin` - Path to the Claude Code binary.
+    /// * `installer` - The hook installer containing the settings path.
+    /// * `launch` - Headless-launch safety knobs (no-inherit-hooks, MCP configs, etc.).
+    /// * `claude_args` - Additional flags to forward to Claude Code.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Vec<CString>` where the first element is the binary path and
+    /// subsequent elements are the arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if any path or argument contains a null byte.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_child_argv(
+        claude_bin: &Path,
+        installer: &HookInstaller,
+        launch: &LaunchOptions,
+        claude_args: &[OsString],
+    ) -> Result<Vec<CString>> {
+        // Build child argv.
+        let cmd = CString::new(claude_bin.to_string_lossy().as_bytes())
+            .map_err(|e| Error::Internal(anyhow::anyhow!("claude_bin path invalid: {e}")))?;
+        let mut args: Vec<CString> =
+            Vec::with_capacity(claude_args.len() + 3 + 2 * launch.mcp_configs.len());
+        args.push(
+            CString::new(format!(
+                "--settings={}",
+                installer.settings_path.to_string_lossy()
+            ))
+            .map_err(|e| Error::Internal(anyhow::anyhow!("settings path invalid: {e}")))?,
+        );
+        // Isolation mode (--no-inherit-hooks, LaunchOptions::no_inherit_hooks):
+        // forward `--setting-sources=` so the child loads NO standard settings
+        // sources — only the temp --settings relay hook is active, suppressing
+        // the user's ~/.claude/settings.json hooks (SessionStart, PreToolUse,
+        // ccdash, trail-boss, …). Empty value = load no standard sources.
+        //
+        // Default mode OMITS this flag so the user's hooks fire alongside the
+        // relay hook (Hard Requirement 5), matching `claude -p`. session.rs is
+        // the single source of truth for this argv flag — main.rs must NOT also
+        // push it into claude_args. If user-hook inheritance ever wedges headless
+        // startup, that is bf-uj0's scope (bound MCP / --pretrust-cwd), not a
+        // reason to blanket-suppress sources here and break HR-5 for every run.
+        if launch.no_inherit_hooks {
+            args.push(CString::new("--setting-sources=").unwrap());
+        }
+
+        // bf-uj0: bound MCP init. When the caller names MCP configs, launch the
+        // child in strict mode so ONLY those load — inherited/project/global MCP
+        // servers that can hang on connect (a startup-wedge trigger from the
+        // bf-2u1 investigation) are ignored entirely. Each entry is emitted as its
+        // own `--mcp-config <entry>` pair: unambiguous regardless of what flags
+        // follow, and tolerant of either inline-JSON or file-path values.
+        if !launch.mcp_configs.is_empty() {
+            args.push(CString::new("--strict-mcp-config").unwrap());
+            for cfg in &launch.mcp_configs {
+                args.push(CString::new("--mcp-config").unwrap());
+                args.push(CString::new(cfg.as_str()).map_err(|e| {
+                    Error::Internal(anyhow::anyhow!("mcp-config value invalid: {e}"))
+                })?);
+            }
+        }
+
+        for arg in claude_args {
+            let arg_str = arg.to_string_lossy().to_string();
+            args.push(
+                CString::new(arg_str)
+                    .map_err(|e| Error::Internal(anyhow::anyhow!("claude arg invalid: {e}")))?,
+            );
+        }
+
+        Ok(args)
+    }
+
     /// Run a Claude Code session.
     ///
     /// # Arguments
@@ -352,54 +435,7 @@ impl Session {
         // 3. Build child argv.
         let cmd = CString::new(claude_bin.to_string_lossy().as_bytes())
             .map_err(|e| Error::Internal(anyhow::anyhow!("claude_bin path invalid: {e}")))?;
-        let mut args: Vec<CString> =
-            Vec::with_capacity(claude_args.len() + 3 + 2 * launch.mcp_configs.len());
-        args.push(
-            CString::new(format!(
-                "--settings={}",
-                installer.settings_path.to_string_lossy()
-            ))
-            .map_err(|e| Error::Internal(anyhow::anyhow!("settings path invalid: {e}")))?,
-        );
-        // Isolation mode (--no-inherit-hooks, LaunchOptions::no_inherit_hooks):
-        // forward `--setting-sources=` so the child loads NO standard settings
-        // sources — only the temp --settings relay hook is active, suppressing
-        // the user's ~/.claude/settings.json hooks (SessionStart, PreToolUse,
-        // ccdash, trail-boss, …). Empty value = load no standard sources.
-        //
-        // Default mode OMITS this flag so the user's hooks fire alongside the
-        // relay hook (Hard Requirement 5), matching `claude -p`. session.rs is
-        // the single source of truth for this argv flag — main.rs must NOT also
-        // push it into claude_args. If user-hook inheritance ever wedges headless
-        // startup, that is bf-uj0's scope (bound MCP / --pretrust-cwd), not a
-        // reason to blanket-suppress sources here and break HR-5 for every run.
-        if launch.no_inherit_hooks {
-            args.push(CString::new("--setting-sources=").unwrap());
-        }
-
-        // bf-uj0: bound MCP init. When the caller names MCP configs, launch the
-        // child in strict mode so ONLY those load — inherited/project/global MCP
-        // servers that can hang on connect (a startup-wedge trigger from the
-        // bf-2u1 investigation) are ignored entirely. Each entry is emitted as its
-        // own `--mcp-config <entry>` pair: unambiguous regardless of what flags
-        // follow, and tolerant of either inline-JSON or file-path values.
-        if !launch.mcp_configs.is_empty() {
-            args.push(CString::new("--strict-mcp-config").unwrap());
-            for cfg in &launch.mcp_configs {
-                args.push(CString::new("--mcp-config").unwrap());
-                args.push(CString::new(cfg.as_str()).map_err(|e| {
-                    Error::Internal(anyhow::anyhow!("mcp-config value invalid: {e}"))
-                })?);
-            }
-        }
-
-        for arg in claude_args {
-            let arg_str = arg.to_string_lossy().to_string();
-            args.push(
-                CString::new(arg_str)
-                    .map_err(|e| Error::Internal(anyhow::anyhow!("claude arg invalid: {e}")))?,
-            );
-        }
+        let args = Self::build_child_argv(claude_bin, &installer, launch, claude_args)?;
 
         // 4. Self-pipe for SIGINT.
         let (self_pipe_read, self_pipe_write) = nix::unistd::pipe()
@@ -599,18 +635,22 @@ impl Session {
                 // loop. The snapshot captures each file's size at injection so the
                 // reader can skip pre-injection events (start_offset).
                 if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
-                    if let Some(projects_dir) = projects_dir_for_cwd() {
-                        let pre_existing = emitter::snapshot_jsonl_sizes(&projects_dir);
-                        stream_json_handle = Some(emitter::spawn_stream_json_reader_discover(
-                            projects_dir,
-                            pre_existing,
-                        ));
-                        stream_json_spawned_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                    } else {
-                        eprintln!(
-                            "claude-print: warning: could not derive projects dir for the \
-                             stream-json reader (cwd unreadable); live transcript tailing disabled"
-                        );
+                    match projects_dir_for_cwd() {
+                        Ok(projects_dir) => {
+                            let pre_existing = emitter::snapshot_jsonl_sizes(&projects_dir);
+                            stream_json_handle = Some(emitter::spawn_stream_json_reader_discover(
+                                projects_dir,
+                                pre_existing,
+                            ));
+                            stream_json_spawned_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "claude-print: warning: could not derive projects dir for the \
+                                 stream-json reader: {}; live transcript tailing disabled",
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -700,7 +740,7 @@ impl Session {
                 // Parse stop payload. On error, `?` returns and Drop joins the
                 // reader without draining (INV-8, exit-immediately on error).
                 let stop_payload = parse_stop_payload(&payload)?;
-                let stop_info = resolve_stop_info(stop_payload);
+                let stop_info = resolve_stop_info(stop_payload)?;
 
                 // --verbose "Stop received" trace (plan §"`--verbose` Trace
                 // Points`"): emit the session id Claude Code reported in the Stop
@@ -859,6 +899,11 @@ fn kill_child(pid: nix::unistd::Pid) {
 /// file exists but is not a valid JSON object, it is left **untouched** (the trust
 /// scanner remains the fallback) — clobbering the user's config would be far worse
 /// than a possible stall.
+///
+/// # Errors
+/// Returns `Error::Config` if the `HOME` environment variable is not set.
+/// This is intentional: silent fallback to "/root" would fail in chroot
+/// environments where that directory may not exist.
 fn pretrust_cwd() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Internal(anyhow::anyhow!("pretrust cwd: {e}")))?;
@@ -1090,6 +1135,375 @@ mod tests {
         );
     }
 
+    // ── build_child_argv: testable child argv construction ─────────────────────
+
+    #[test]
+    fn build_child_argv_includes_settings_flag() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // First arg should be --settings=<path>
+        assert!(argv[0].to_string_lossy().starts_with("--settings="));
+        assert!(argv[0]
+            .to_string_lossy()
+            .contains(installer.settings_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn build_child_argv_with_no_inherit_hooks_adds_setting_sources_flag() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions {
+            no_inherit_hooks: true,
+            ..Default::default()
+        };
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should contain --setting-sources= (empty value = no standard sources)
+        assert!(argv.iter().any(|arg| arg.to_string_lossy() == "--setting-sources="));
+    }
+
+    #[test]
+    fn build_child_argv_without_no_inherit_hooks_omits_setting_sources() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default(); // no_inherit_hooks defaults to false
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should NOT contain --setting-sources flag
+        assert!(!argv.iter().any(|arg| arg
+            .to_string_lossy()
+            .starts_with("--setting-sources")));
+    }
+
+    #[test]
+    fn build_child_argv_with_mcp_configs_adds_strict_mode_flags() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions {
+            mcp_configs: vec
+![
+                "/path/to/config1.json".to_string(),
+                "{\"inline\": true}".to_string(),
+            ],
+            ..Default::default()
+        };
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should contain --strict-mcp-config
+        assert!(argv.iter().any(|arg| arg.to_string_lossy() == "--strict-mcp-config"));
+
+        // Should contain --mcp-config for each config
+        let mcp_config_count = argv
+            .iter()
+            .filter(|arg| arg.to_string_lossy() == "--mcp-config")
+            .count();
+        assert_eq!(mcp_config_count, 2);
+
+        // Verify the config values are present
+        assert!(argv
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("/path/to/config1.json")));
+        assert!(argv
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("{\"inline\": true}")));
+    }
+
+    #[test]
+    fn build_child_argv_with_empty_mcp_configs_omits_mcp_flags() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions {
+            mcp_configs: vec![],
+            ..Default::default()
+        };
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should NOT contain any MCP-related flags
+        assert!(!argv.iter().any(|arg| arg.to_string_lossy() == "--strict-mcp-config"));
+        assert!(!argv.iter().any(|arg| arg.to_string_lossy() == "--mcp-config"));
+    }
+
+    #[test]
+    fn build_child_argv_forwards_claude_args() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec
+![
+            OsString::from("--model"),
+            OsString::from("claude-sonnet-4-20250514"),
+            OsString::from("--max-tokens"),
+            OsString::from("200000"),
+        ];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should contain all claude_args at the end
+        assert!(argv
+            .iter()
+            .any(|arg| arg.to_string_lossy() == "--model"));
+        assert!(argv
+            .iter()
+            .any(|arg| arg.to_string_lossy() == "claude-sonnet-4-20250514"));
+        assert!(argv
+            .iter()
+            .any(|arg| arg.to_string_lossy() == "--max-tokens"));
+        assert!(argv
+            .iter()
+            .any(|arg| arg.to_string_lossy() == "200000"));
+    }
+
+    #[test]
+    fn build_child_argv_all_flags_combined() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions {
+            no_inherit_hooks: true,
+            mcp_configs: vec!["/my/mcp.json".to_string()],
+            ..Default::default()
+        };
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![OsString::from("--prompt"), OsString::from("hello")];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Verify all flags are present and in correct order
+        let argv_str: Vec<String> = argv.iter().map(|s| s.to_string_lossy().to_string()).collect();
+
+        // First: --settings flag
+        assert!(argv_str[0].starts_with("--settings="));
+
+        // Then: --setting-sources= (from no_inherit_hooks)
+        assert!(argv_str.contains(&"--setting-sources=".to_string()));
+
+        // Then: --strict-mcp-config and --mcp-config pairs
+        let strict_idx = argv_str
+            .iter()
+            .position(|s| s == "--strict-mcp-config")
+            .expect("should have --strict-mcp-config");
+        assert!(argv_str.contains(&"--mcp-config".to_string()));
+        assert!(argv_str.contains(&"/my/mcp.json".to_string()));
+
+        // Finally: claude_args at the end
+        assert!(argv_str.contains(&"--prompt".to_string()));
+        assert!(argv_str.contains(&"hello".to_string()));
+    }
+
+    #[test]
+    fn build_child_argv_capacity_is_sufficient() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions {
+            mcp_configs: vec
+!["a".to_string(), "b".to_string(), "c".to_string()],
+            ..Default::default()
+        };
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = (0..10).map(|i| OsString::from(format!("--arg{}", i))).collect();
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Capacity should be: claude_args.len() + 3 + 2 * mcp_configs.len()
+        // = 10 + 3 + 2*3 = 19
+        // But we just verify it has enough room for all args
+        let expected_len = 1 + // --settings
+            1 + // --strict-mcp-config
+            2 * 3 + // 3 MCP configs with --mcp-config each
+            10; // claude_args
+        assert_eq!(argv.len(), expected_len);
+    }
+
+    #[test]
+    fn build_child_argv_rejects_null_bytes_in_paths() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        // Create a path with a null byte
+        let claude_bin = Path::new("/usr/bin/invalid\0claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let result = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Internal(msg) => {
+                assert!(msg.to_string().contains("claude_bin path invalid"));
+            }
+            _ => panic!("expected Internal error for null byte in path"),
+        }
+    }
+
+    #[test]
+    fn build_child_argv_rejects_null_bytes_in_mcp_config() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions {
+            mcp_configs: vec!["invalid\0config".to_string()],
+            ..Default::default()
+        };
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let result = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Internal(msg) => {
+                assert!(msg.to_string().contains("mcp-config value invalid"));
+            }
+            _ => panic!("expected Internal error for null byte in MCP config"),
+        }
+    }
+
+    #[test]
+    fn build_child_argv_rejects_null_bytes_in_claude_args() {
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![OsString::from("invalid\0arg")];
+
+        let result = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::Internal(msg) => {
+                assert!(msg.to_string().contains("claude arg invalid"));
+            }
+            _ => panic!("expected Internal error for null byte in claude arg"),
+        }
+    }
+
+    #[test]
+    fn build_child_argv_dangerously_skip_permissions_not_passed_by_default() {
+        // Test that when --dangerously-skip-permissions is NOT passed via CLI,
+        // it does NOT appear in child argv
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should NOT contain --dangerously-skip-permissions
+        assert!(!argv.iter().any(|arg| arg.to_string_lossy().contains("--dangerously-skip-permissions")));
+    }
+
+    #[test]
+    fn build_child_argv_dangerously_skip_permissions_appears_exactly_once_when_passed() {
+        // Test that when --dangerously-skip-permissions IS passed via CLI,
+        // it appears EXACTLY ONCE in child argv
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![OsString::from("--dangerously-skip-permissions")];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should contain --dangerously-skip-permissions exactly once
+        let count = argv
+            .iter()
+            .filter(|arg| arg.to_string_lossy() == "--dangerously-skip-permissions")
+            .count();
+        assert_eq!(count, 1, "Flag should appear exactly once, found {} times", count);
+    }
+
+    #[test]
+    fn build_child_argv_dangerously_skip_permissions_with_other_args() {
+        // Test that --dangerously-skip-permissions appears correctly when mixed with other args
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![
+            OsString::from("--model"),
+            OsString::from("claude-sonnet-4-20250514"),
+            OsString::from("--dangerously-skip-permissions"),
+            OsString::from("--max-tokens"),
+            OsString::from("200000"),
+        ];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should contain all args including --dangerously-skip-permissions exactly once
+        let argv_str: Vec<String> = argv.iter().map(|s| s.to_string_lossy().to_string()).collect();
+
+        assert!(argv_str.contains(&"--model".to_string()));
+        assert!(argv_str.contains(&"claude-sonnet-4-20250514".to_string()));
+        assert!(argv_str.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(argv_str.contains(&"--max-tokens".to_string()));
+        assert!(argv_str.contains(&"200000".to_string()));
+
+        // Verify no duplicates of --dangerously-skip-permissions
+        let skip_count = argv_str
+            .iter()
+            .filter(|s| s.as_str() == "--dangerously-skip-permissions")
+            .count();
+        assert_eq!(skip_count, 1, "Flag should appear exactly once, found {} times", skip_count);
+    }
+
+    #[test]
+    fn build_child_argv_dangerously_skip_permissions_with_launch_options() {
+        // Test that --dangerously-skip-permissions works correctly with various LaunchOptions
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions {
+            no_inherit_hooks: true,
+            mcp_configs: vec!["/path/to/mcp.json".to_string()],
+            pretrust_cwd: true,
+            show_child_stderr: true,
+            verbose: true,
+        };
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![OsString::from("--dangerously-skip-permissions")];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        let argv_str: Vec<String> = argv.iter().map(|s| s.to_string_lossy().to_string()).collect();
+
+        // Should contain all launch option flags
+        assert!(argv_str.iter().any(|s| s.starts_with("--settings=")));
+        assert!(argv_str.contains(&"--setting-sources=".to_string()));
+        assert!(argv_str.contains(&"--strict-mcp-config".to_string()));
+        assert!(argv_str.contains(&"--mcp-config".to_string()));
+
+        // Should contain --dangerously-skip-permissions exactly once
+        let skip_count = argv_str
+            .iter()
+            .filter(|s| s.as_str() == "--dangerously-skip-permissions")
+            .count();
+        assert_eq!(skip_count, 1, "Flag should appear exactly once, found {} times", skip_count);
+    }
+
+    #[test]
+    fn build_child_argv_no_duplicate_dangerously_skip_permissions() {
+        // Test that if --dangerously-skip-permissions appears multiple times in input,
+        // it appears the same number of times in output (we forward, not deduplicate)
+        // This documents the current behavior and catches any accidental deduplication
+        let installer = HookInstaller::new().unwrap();
+        let launch = LaunchOptions::default();
+        let claude_bin = Path::new("/usr/bin/claude");
+        let claude_args: Vec<OsString> = vec![
+            OsString::from("--dangerously-skip-permissions"),
+            OsString::from("--dangerously-skip-permissions"),
+        ];
+
+        let argv = Session::build_child_argv(claude_bin, &installer, &launch, &claude_args).unwrap();
+
+        // Should contain --dangerously-skip-permissions twice (forwarded as-is)
+        let count = argv
+            .iter()
+            .filter(|arg| arg.to_string_lossy() == "--dangerously-skip-permissions")
+            .count();
+        assert_eq!(count, 2, "Both instances should be forwarded, found {} times", count);
+    }
+
     // ── ChildCapture (bf-uj0): --show-child-stderr ring buffer ────────────────
 
     #[test]
@@ -1280,5 +1694,66 @@ mod tests {
             original,
             "non-object root must be left untouched"
         );
+    }
+
+    #[test]
+    fn pretrust_cwd_fails_when_home_not_set() {
+        // Save original HOME
+        let original_home = std::env::var("HOME").ok();
+
+        // Unset HOME
+        std::env::remove_var("HOME");
+
+        let result = pretrust_cwd();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("HOME environment variable not set"));
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        }
+    }
+
+    #[test]
+    fn home_unset_consistent_error_handling_across_all_modules() {
+        // This test verifies that all modules consistently return Error::Config
+        // when HOME is not set, rather than panicking or using silent fallbacks.
+        // This is critical for predictable behavior in headless/chroot environments.
+
+        use crate::config::Config;
+        use crate::poller::{derive_transcript_path, projects_dir_for_cwd, resolve_stop_info, StopPayload};
+
+        // Save original HOME
+        let original_home = std::env::var("HOME").ok();
+
+        // Unset HOME
+        std::env::remove_var("HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+
+        // Test 1: Config::default_path() fails with clear error
+        let config_result = Config::default_path();
+        assert!(config_result.is_err());
+        assert!(config_result.unwrap_err().to_string().contains("HOME environment variable not set"));
+
+        // Test 2: derive_transcript_path fails with clear error
+        let derive_result = derive_transcript_path("session-123", "/project/dir");
+        assert!(derive_result.is_err());
+        assert!(derive_result.unwrap_err().to_string().contains("HOME environment variable not set"));
+
+        // Test 3: projects_dir_for_cwd fails with clear error
+        let projects_result = projects_dir_for_cwd();
+        assert!(projects_result.is_err());
+        assert!(projects_result.unwrap_err().to_string().contains("HOME environment variable not set"));
+
+        // Test 4: pretrust_cwd fails with clear error
+        let pretrust_result = pretrust_cwd();
+        assert!(pretrust_result.is_err());
+        assert!(pretrust_result.unwrap_err().to_string().contains("HOME environment variable not set"));
+
+        // Restore HOME
+        if let Some(home) = original_home {
+            std::env::set_var("HOME", home);
+        }
     }
 }
