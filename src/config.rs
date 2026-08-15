@@ -47,6 +47,7 @@ impl Defaults {
 
     /// Validates model name format.
     /// Model names should be non-empty and contain only alphanumeric characters, hyphens, and underscores.
+    /// Model names must start with "claude-" or be a known alias.
     fn validate_model(&self, model: &str) -> Result<()> {
         if model.is_empty() {
             return Err(Error::Config(format!(
@@ -69,6 +70,14 @@ impl Defaults {
         if !valid_chars {
             return Err(Error::Config(format!(
                 "model name '{}' contains invalid characters (allowed: alphanumeric, '-', '_', '.')",
+                model
+            )));
+        }
+
+        // Model names must start with "claude-" to ensure proper Claude model identification
+        if !model.starts_with("claude-") {
+            return Err(Error::Config(format!(
+                "model name '{}' must start with 'claude-'",
                 model
             )));
         }
@@ -580,6 +589,24 @@ max_turns = 1001"#,
     }
 
     #[test]
+    fn load_rejects_max_turns_absurdly_large() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 1000000"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("max_turns"));
+        assert!(err_msg.contains("at most 1000"));
+    }
+
+    #[test]
     fn load_accepts_max_turns_at_lower_bound() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_path = temp_dir.path().join("test-config.toml");
@@ -755,12 +782,12 @@ model = "claude-opus-4-8""#,
         std::fs::write(
             &config_path,
             r#"[defaults]
-model = "claude_sonnet_4_6""#,
+model = "claude-opus_4_8_testing""#,
         )
         .unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        assert_eq!(config.default_model(), Some("claude_sonnet_4_6"));
+        assert_eq!(config.default_model(), Some("claude-opus_4_8_testing"));
     }
 
     #[test]
@@ -770,12 +797,78 @@ model = "claude_sonnet_4_6""#,
         std::fs::write(
             &config_path,
             r#"[defaults]
-model = "claude.sonnet.4.6""#,
+model = "claude-opus.4.8.testing""#,
         )
         .unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        assert_eq!(config.default_model(), Some("claude.sonnet.4.6"));
+        assert_eq!(config.default_model(), Some("claude-opus.4.8.testing"));
+    }
+
+    #[test]
+    fn load_rejects_model_name_not_starting_with_claude() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "gpt-4""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("model"));
+        assert!(err_msg.contains("must start with 'claude-'"));
+    }
+
+    #[test]
+    fn load_rejects_model_name_starting_with_uppercase_claude() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "Claude-opus-4-8""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("model"));
+        assert!(err_msg.contains("must start with 'claude-'"));
+    }
+
+    #[test]
+    fn load_accepts_model_name_starting_with_claude_hyphen() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude-opus-4-8""#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_model(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn load_accepts_model_name_claude_haiku() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude-haiku-4-5-20251001""#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_model(), Some("claude-haiku-4-5-20251001"));
     }
 
     #[test]
