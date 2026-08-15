@@ -24,6 +24,103 @@ pub struct Defaults {
     pub timeout_secs: Option<u64>,
 }
 
+impl Defaults {
+    /// Validates all config fields, returning an error if any are invalid.
+    pub fn validate(&self) -> Result<()> {
+        // Validate model name format
+        if let Some(model) = &self.model {
+            self.validate_model(model)?;
+        }
+
+        // Validate max_turns range
+        if let Some(max_turns) = self.max_turns {
+            self.validate_max_turns(max_turns)?;
+        }
+
+        // Validate timeout_secs range
+        if let Some(timeout_secs) = self.timeout_secs {
+            self.validate_timeout_secs(timeout_secs)?;
+        }
+
+        Ok(())
+    }
+
+    /// Validates model name format.
+    /// Model names should be non-empty and contain only alphanumeric characters, hyphens, and underscores.
+    fn validate_model(&self, model: &str) -> Result<()> {
+        if model.is_empty() {
+            return Err(Error::Config(format!(
+                "model name cannot be empty"
+            )));
+        }
+
+        if model.len() > 100 {
+            return Err(Error::Config(format!(
+                "model name '{}' is too long (max 100 characters)",
+                model
+            )));
+        }
+
+        // Model names should contain only valid characters: alphanumeric, hyphen, underscore, dot
+        let valid_chars = model
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
+
+        if !valid_chars {
+            return Err(Error::Config(format!(
+                "model name '{}' contains invalid characters (allowed: alphanumeric, '-', '_', '.')",
+                model
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates max_turns is within acceptable range [1, 1000].
+    fn validate_max_turns(&self, max_turns: u32) -> Result<()> {
+        const MIN_MAX_TURNS: u32 = 1;
+        const MAX_MAX_TURNS: u32 = 1000;
+
+        if max_turns < MIN_MAX_TURNS {
+            return Err(Error::Config(format!(
+                "max_turns value {} is invalid: must be at least {}",
+                max_turns, MIN_MAX_TURNS
+            )));
+        }
+
+        if max_turns > MAX_MAX_TURNS {
+            return Err(Error::Config(format!(
+                "max_turns value {} is invalid: must be at most {}",
+                max_turns, MAX_MAX_TURNS
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates timeout_secs is within acceptable range [1, 86400] (24 hours).
+    fn validate_timeout_secs(&self, timeout_secs: u64) -> Result<()> {
+        const MIN_TIMEOUT_SECS: u64 = 1;
+        const MAX_TIMEOUT_SECS: u64 = 86400; // 24 hours
+
+        if timeout_secs < MIN_TIMEOUT_SECS {
+            return Err(Error::Config(format!(
+                "timeout_secs value {} is invalid: must be at least {}",
+                timeout_secs, MIN_TIMEOUT_SECS
+            )));
+        }
+
+        if timeout_secs > MAX_TIMEOUT_SECS {
+            return Err(Error::Config(format!(
+                "timeout_secs value {} is invalid: must be at most {} (24 hours)",
+                timeout_secs, MAX_TIMEOUT_SECS
+            )));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub defaults: Option<Defaults>,
@@ -55,14 +152,33 @@ impl Config {
     /// Loads the config file, returning an empty config if the file doesn't exist
     pub fn load_or_default(path: &PathBuf) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_else(|e| {
-                eprintln!(
-                    "claude-print: warning: invalid config at {}: {}",
-                    path.display(),
-                    e
-                );
-                Config { defaults: None }
-            }),
+            Ok(contents) => {
+                let config: Config = match toml::from_str(&contents) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        eprintln!(
+                            "claude-print: warning: invalid config at {}: {}",
+                            path.display(),
+                            e
+                        );
+                        return Config { defaults: None };
+                    }
+                };
+
+                // Validate the config after parsing
+                if let Some(ref defaults) = config.defaults {
+                    if let Err(e) = defaults.validate() {
+                        eprintln!(
+                            "claude-print: warning: config validation failed at {}: {}",
+                            path.display(),
+                            e
+                        );
+                        return Config { defaults: None };
+                    }
+                }
+
+                config
+            }
             Err(_) => Config { defaults: None },
         }
     }
@@ -72,6 +188,14 @@ impl Config {
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
         let config: Config = toml::from_str(&contents)
             .map_err(|e| Error::Config(format!("invalid config at {}: {e}", path.display())))?;
+
+        // Validate the config after parsing
+        if let Some(ref defaults) = config.defaults {
+            defaults
+                .validate()
+                .map_err(|e| Error::Config(format!("config validation failed at {}: {}", path.display(), e)))?;
+        }
+
         Ok(config)
     }
 
@@ -305,7 +429,7 @@ model = "claude-opus-4-8""#,
     #[test]
     fn resolve_inherit_hooks_defaults_to_true() {
         let config = Config { defaults: None };
-        assert_eq!(config.resolve_inherit_hooks(None), true);
+        assert!(config.resolve_inherit_hooks(None));
     }
 
     #[test]
@@ -420,5 +544,346 @@ timeout_secs = 1800"#,
         assert_eq!(config.default_model(), Some("claude-opus-4-8"));
         assert_eq!(config.default_max_turns(), Some(50));
         assert_eq!(config.default_timeout_secs(), Some(1800));
+    }
+
+    #[test]
+    fn load_rejects_max_turns_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 0"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("max_turns"));
+        assert!(err_msg.contains("at least 1"));
+    }
+
+    #[test]
+    fn load_rejects_max_turns_too_large() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 1001"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("max_turns"));
+        assert!(err_msg.contains("at most 1000"));
+    }
+
+    #[test]
+    fn load_accepts_max_turns_at_lower_bound() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 1"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_max_turns(), Some(1));
+    }
+
+    #[test]
+    fn load_accepts_max_turns_at_upper_bound() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 1000"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_max_turns(), Some(1000));
+    }
+
+    #[test]
+    fn load_rejects_timeout_secs_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = 0"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("timeout_secs"));
+        assert!(err_msg.contains("at least 1"));
+    }
+
+    #[test]
+    fn load_rejects_timeout_secs_too_large() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = 86401"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("timeout_secs"));
+        assert!(err_msg.contains("at most 86400"));
+    }
+
+    #[test]
+    fn load_accepts_timeout_secs_at_lower_bound() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = 1"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_timeout_secs(), Some(1));
+    }
+
+    #[test]
+    fn load_accepts_timeout_secs_at_upper_bound() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = 86400"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_timeout_secs(), Some(86400));
+    }
+
+    #[test]
+    fn load_rejects_empty_model_name() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = ''"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("model"));
+        assert!(err_msg.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn load_rejects_model_name_with_invalid_chars() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "model@bad""#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("model"));
+        assert!(err_msg.contains("invalid characters"));
+    }
+
+    #[test]
+    fn load_rejects_model_name_too_long() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        let long_model = "a".repeat(101);
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[defaults]
+model = "{}""#,
+                long_model
+            ),
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("model"));
+        assert!(err_msg.contains("too long"));
+    }
+
+    #[test]
+    fn load_accepts_model_name_with_hyphens() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude-opus-4-8""#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_model(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn load_accepts_model_name_with_underscores() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude_sonnet_4_6""#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_model(), Some("claude_sonnet_4_6"));
+    }
+
+    #[test]
+    fn load_accepts_model_name_with_dots() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "claude.sonnet.4.6""#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.default_model(), Some("claude.sonnet.4.6"));
+    }
+
+    #[test]
+    fn load_or_default_warns_on_invalid_max_turns() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 0"#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_default(&config_path);
+        // Should return empty config on validation error
+        assert!(config.defaults.is_none());
+    }
+
+    #[test]
+    fn load_or_default_warns_on_invalid_timeout_secs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+timeout_secs = 999999"#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_default(&config_path);
+        // Should return empty config on validation error
+        assert!(config.defaults.is_none());
+    }
+
+    #[test]
+    fn load_or_default_warns_on_invalid_model_name() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = "bad@model""#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_default(&config_path);
+        // Should return empty config on validation error
+        assert!(config.defaults.is_none());
+    }
+
+    #[test]
+    fn load_rejects_multiple_invalid_fields() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+model = ""
+max_turns = 0
+timeout_secs = 0"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        // Should report the first validation error encountered
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("config validation failed"));
+    }
+
+    #[test]
+    fn load_error_message_includes_field_name() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 50
+timeout_secs = 100000"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Error message should clearly state which field is invalid
+        assert!(err_msg.contains("timeout_secs"));
+        assert!(err_msg.contains("at most 86400"));
+    }
+
+    #[test]
+    fn load_error_message_includes_reason() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("test-config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[defaults]
+max_turns = 0"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Error message should explain why the value is invalid
+        assert!(err_msg.contains("must be at least 1"));
     }
 }
