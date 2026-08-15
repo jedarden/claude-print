@@ -596,17 +596,20 @@ Each probe type is acknowledged at most once per session (dedup bitmask).
 The trust dialog asks the user to confirm before allowing tool use. Detection uses keyword scanning, not exact string match, to survive UI text changes across Claude Code versions:
 
 - If any output line contains two or more of: `trust`, `Allow`, `continue`, `folder`, `permission`, `proceed` → send `\r` immediately
-- Fallback: after 0.8 s with no new PTY bytes and ≥ 200 bytes received total → send `\r` (covers any welcome/confirmation prompt)
+- Fallback: after 0.4 s with no new PTY bytes and ≥ 200 bytes received total → send `\r` (covers any welcome/confirmation prompt)
+  - **Adaptive extension (2026-08-15):** If PTY output continues to arrive during the idle period, the wait extends up to 0.8 s before firing. This reduces latency for fast cases while maintaining safety for slow-starting Claude processes.
 - Hard timeout: if the process has been in WAITING state for 45 s and fewer than 200 bytes have been received → exit 2 (binary not found or hung, or partial-output hang)
 
 The idle/byte fallback is a one-shot: once any trigger (keyword or idle) fires and transitions to TRUST_DISMISSED, the fallback timer is deactivated and cannot re-fire.
 
 **Phase 2 — Prompt injection:**
 
-- After Phase 1 CR, wait until PTY is idle for 2.0 s (REPL re-renders) (If the PTY never goes idle for 2.0 s — e.g., claude streams continuous progress output — the wall-clock `--timeout` is the only exit path. This is expected behavior; the phase has no dedicated sub-timeout. `--verbose` logs a warning if TRUST_DISMISSED persists > 10 s.)
+- After Phase 1 CR, wait until PTY is idle for 1.0 s (REPL re-renders)
+  - **Adaptive extension (2026-08-15):** If PTY output continues to arrive during the idle period, the wait extends up to 2.0 s before firing. The idle gap resets on every PTY chunk received via `feed()`, so injection fires only after uninterrupted silence. This reduces latency for fast cases while handling TUI redraws after the dismiss.
+- (If the PTY never goes idle for 1.0 s — e.g., claude streams continuous progress output — the wall-clock `--timeout` is the only exit path. This is expected behavior; the phase has no dedicated sub-timeout. `--verbose` logs a warning if TRUST_DISMISSED persists > 10 s.)
 - Send via bracketed paste: `\x1b[200~<prompt>\x1b[201~\r`
 - Bracketed paste treats embedded `\n` as literals (no premature Enter)
-- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After sending `/read <path>\r`, the startup sequencer re-enters the idle-wait loop (same as after trust dismiss, 2.0s idle threshold). Claude Code reads the file contents and begins processing — no system acknowledgment is emitted before the response. The response extraction path is identical to inline injection: Stop hook fires after the response, transcript JSONL is read normally. See EC-5 for sandboxing note.)
+- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After sending `/read <path>\r`, the startup sequencer re-enters the idle-wait loop (same as after trust dismiss, 1.0s idle threshold, adaptive up to 2.0s). Claude Code reads the file contents and begins processing — no system acknowledgment is emitted before the response. The response extraction path is identical to inline injection: Stop hook fires after the response, transcript JSONL is read normally. See EC-5 for sandboxing note.)
 
 ### 7. Stop Poller
 

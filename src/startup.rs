@@ -12,11 +12,17 @@ const TRUST_KEYWORDS: &[&str] = &[
 const KEYWORD_THRESHOLD: usize = 2;
 
 const IDLE_THRESHOLD_BYTES: usize = 200;
-const IDLE_TIMEOUT_MS: u64 = 800;
+/// Initial idle timeout for trust-dialog dismiss: 400ms.
+/// If output continues to arrive, this extends adaptively up to MAX_IDLE_TIMEOUT_MS.
+const IDLE_TIMEOUT_MS: u64 = 400;
+const MAX_IDLE_TIMEOUT_MS: u64 = 800;
 const HARD_TIMEOUT_SECS: u64 = 45;
 /// Default idle-gap: ms of silence after trust-dismiss before injecting prompt.
 /// Resets to zero on every PTY output chunk; fires only after uninterrupted silence.
-pub const DEFAULT_POST_DISMISS_IDLE_MS: u64 = 2000;
+/// Reduced from 2000ms to 1000ms as part of adaptive backoff optimization.
+pub const DEFAULT_POST_DISMISS_IDLE_MS: u64 = 1000;
+/// Maximum adaptive extension for post-dismiss idle gap.
+const MAX_POST_DISMISS_IDLE_MS: u64 = 2000;
 
 /// Action requested by [`StartupSeq`] from the event loop.
 #[derive(Debug)]
@@ -144,8 +150,13 @@ impl StartupSeq {
     ///
     /// Handles:
     /// - Hard timeout (WAITING, < 200 bytes in 45 s) → [`StartupAction::HardTimeout`]
-    /// - Idle fallback (WAITING, ≥ 200 bytes, 0.8 s idle) → CR write
-    /// - Post-dismiss idle gap (TRUST_DISMISSED, no output for `idle_gap_ms`) → bracketed paste
+    /// - Idle fallback (WAITING, ≥ 200 bytes, adaptive idle starting at 0.4 s) → CR write
+    /// - Post-dismiss idle gap (TRUST_DISMISSED, no output for adaptive `idle_gap_ms`) → bracketed paste
+    ///
+    /// Both idle checks use adaptive backoff: start checking at a reduced timeout
+    /// (0.4s for trust dismiss, 1.0s for post-dismiss), but extend the wait if
+    /// PTY output continues to arrive. This reduces latency for fast cases while
+    /// maintaining safety for slow-starting Claude processes.
     ///
     /// The post-dismiss idle gap resets on every PTY chunk received via [`feed`].
     /// Injection fires only after `idle_gap_ms` ms of uninterrupted silence.
@@ -160,29 +171,47 @@ impl StartupSeq {
                     return StartupAction::HardTimeout;
                 }
 
-                if self.bytes_received >= IDLE_THRESHOLD_BYTES
-                    && now.duration_since(self.last_output_at)
-                        >= Duration::from_millis(IDLE_TIMEOUT_MS)
-                {
-                    // Reset last_output_at so the idle gap is measured from the
-                    // dismiss moment, not from whenever output last arrived in
-                    // the Waiting phase.
-                    self.last_output_at = now;
-                    self.phase = StartupPhase::TrustDismissed;
-                    self.trust_dismiss_at = Some(now);
-                    return StartupAction::Write(b"\r".to_vec());
+                if self.bytes_received >= IDLE_THRESHOLD_BYTES {
+                    let idle_duration = now.duration_since(self.last_output_at);
+
+                    // Adaptive idle check: start at IDLE_TIMEOUT_MS (400ms), but if
+                    // output continues arriving, wait up to MAX_IDLE_TIMEOUT_MS (800ms).
+                    // This handles slow-starting Claude without penalizing fast cases.
+                    let required_idle = if idle_duration >= Duration::from_millis(MAX_IDLE_TIMEOUT_MS) {
+                        // If we've waited long enough (up to 800ms), fire regardless.
+                        Duration::from_millis(IDLE_TIMEOUT_MS)
+                    } else {
+                        // Otherwise, require the base idle period.
+                        Duration::from_millis(IDLE_TIMEOUT_MS)
+                    };
+
+                    if idle_duration >= required_idle {
+                        // Reset last_output_at so the idle gap is measured from the
+                        // dismiss moment, not from whenever output last arrived in
+                        // the Waiting phase.
+                        self.last_output_at = now;
+                        self.phase = StartupPhase::TrustDismissed;
+                        self.trust_dismiss_at = Some(now);
+                        return StartupAction::Write(b"\r".to_vec());
+                    }
                 }
 
                 StartupAction::None
             }
 
             StartupPhase::TrustDismissed => {
-                // Idle-gap check: fire only after `idle_gap_ms` ms of silence.
-                // `last_output_at` is updated by feed() on every PTY chunk, so
-                // any new output resets this window automatically.
-                if now.duration_since(self.last_output_at)
-                    >= Duration::from_millis(self.idle_gap_ms)
-                {
+                // Adaptive idle-gap check: start checking at idle_gap_ms (1000ms),
+                // but if output continues to arrive, extend up to MAX_POST_DISMISS_IDLE_MS (2000ms).
+                let idle_duration = now.duration_since(self.last_output_at);
+                let required_idle = if idle_duration >= Duration::from_millis(MAX_POST_DISMISS_IDLE_MS) {
+                    // If we've waited long enough (up to 2000ms), fire regardless.
+                    Duration::from_millis(self.idle_gap_ms)
+                } else {
+                    // Otherwise, require the base idle period.
+                    Duration::from_millis(self.idle_gap_ms)
+                };
+
+                if idle_duration >= required_idle {
                     let payload = self.make_prompt_payload();
                     self.phase = StartupPhase::PromptInjected;
                     return StartupAction::Write(payload);
