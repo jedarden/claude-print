@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -20,6 +20,25 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run the pool daemon (ADR-005 warm PTY pool)
+    #[command(name = "serve")]
+    Serve {
+        /// Number of workers to maintain in the pool
+        #[arg(long, default_value = "1")]
+        pool_size: usize,
+
+        /// Socket path to listen on (default: /tmp/claude-print-pool.sock)
+        #[arg(long)]
+        socket: Option<String>,
+
+        /// Verbose logging
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "claude-print",
@@ -29,7 +48,12 @@ impl std::fmt::Display for OutputFormat {
     disable_version_flag = true,
 )]
 pub struct Cli {
+    /// Subcommand (serve, etc.)
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Prompt string (mutually exclusive with --input-file and stdin)
+    #[arg(value_name = "PROMPT", required = false)]
     pub prompt: Option<String>,
 
     /// Read prompt from file
@@ -119,6 +143,14 @@ pub struct Cli {
     /// Print version and exit
     #[arg(long = "version", short = 'V')]
     pub version: bool,
+
+    /// Connect to a pool daemon at this socket path (ADR-005 warm PTY pool)
+    #[arg(long = "pool-socket")]
+    pub pool_socket: Option<std::path::PathBuf>,
+
+    /// Path to config file (default: $XDG_CONFIG_HOME/claude-print/config.toml or ~/.config/claude-print/config.toml)
+    #[arg(long = "config")]
+    pub config: Option<std::path::PathBuf>,
 }
 
 pub fn version_string(claude_version: Option<&str>) -> String {
