@@ -84,13 +84,37 @@ impl PtySpawner {
                 if unsafe { libc::login_tty(slave_fd) } != 0 {
                     unsafe { libc::_exit(127) };
                 }
-                // Unset the parent session ID so the child creates a fresh session.
-                // Without this, the child inherits CLAUDE_CODE_SESSION_ID and may
-                // write events into the parent's transcript or skip Stop hook dispatch.
-                // Keep CLAUDECODE and CLAUDE_CODE_ENTRYPOINT — those are needed for
-                // the child to run as Claude Code and create a session JSONL.
+                // Unset Claude Code session environment variables so the child creates
+                // a fresh session. Without this, the child inherits the parent's session
+                // state and may write events into the parent's transcript, skip Stop hook
+                // dispatch, or behave as a subagent with an alternate transcript format.
+                //
+                // - CLAUDE_CODE_SESSION_ID: must be unset to prevent the child from
+                //   writing into the parent's transcript.
+                // - CLAUDECODE: must be unset when inherited from a parent Claude Code
+                //   session. If left set, the child treats the invocation as a nested/
+                //   subagent call and may write a subagent-style transcript instead of
+                //   a normal top-level session JSONL, causing session_id to be null and
+                //   num_turns to be 0 in the output.
+                // - CLAUDE_CODE_ENTRYPOINT: set to "cli" so the child runs in TUI
+                //   mode (required for subscription billing; cc_entrypoint=cli invariant).
+                //   Must be explicitly set — the parent may have inherited sdk-cli from a
+                //   prior Claude Code session, and simply "keeping" it would propagate
+                //   the wrong billing classification.
                 unsafe {
                     libc::unsetenv(c"CLAUDE_CODE_SESSION_ID".as_ptr() as *const libc::c_char);
+                    libc::unsetenv(c"CLAUDECODE".as_ptr() as *const libc::c_char);
+                    // Debug: verify setenv succeeds
+                    let result = libc::setenv(
+                        c"CLAUDE_CODE_ENTRYPOINT".as_ptr() as *const libc::c_char,
+                        c"cli".as_ptr() as *const libc::c_char,
+                        1,
+                    );
+                    if result != 0 {
+                        // Write to stderr (fd 2) which should be available
+                        let msg = b"setenv CLAUDE_CODE_ENTRYPOINT=cli failed\n";
+                        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                    }
                 }
                 // Build full argv: [cmd, args...].
                 let mut argv: Vec<&CStr> = Vec::with_capacity(args.len() + 1);
