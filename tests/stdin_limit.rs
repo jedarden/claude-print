@@ -9,15 +9,13 @@ use std::process::{Command, Stdio};
 
 /// Helper to run claude-print with stdin input and check the result.
 ///
-/// Creates a mock claude binary that responds to --version and exits 0,
-/// since we're testing the prompt resolution logic (stdin size limits),
-/// not the full session.
+/// Creates a mock Claude binary that exits before firing the Stop hook. Reaching
+/// that session error proves the stdin prompt passed validation; rejection for
+/// size, emptiness, or a NUL byte happens before the child is spawned.
 fn run_with_stdin(input: &[u8]) -> (String, String, i32) {
-    // Create a mock claude script in a temp directory
     let temp_dir = tempfile::TempDir::new().expect("create temp dir");
     let mock_binary = temp_dir.path().join("mock-claude");
 
-    // Write a shell script that handles --version and exits 0
     fs::write(
         &mock_binary,
         r#"#!/bin/sh
@@ -30,7 +28,6 @@ exit 0
     )
     .expect("write mock binary");
 
-    // Make it executable
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -61,31 +58,37 @@ exit 0
     (stdout, stderr, exit_code)
 }
 
-#[test]
-fn stdin_small_input_succeeds() {
-    // A small stdin input (under the 10MB limit) should succeed.
-    let small_input = b"hello world";
-    let (_stdout, stderr, exit_code) = run_with_stdin(small_input);
-
-    // Should succeed (check mode exits 0 on success)
+fn assert_stdin_was_accepted(stderr: &str, exit_code: i32) {
     assert_eq!(
-        exit_code, 0,
-        "expected exit 0 for small stdin, got exit {}\nstderr: {}",
-        exit_code, stderr
+        exit_code, 2,
+        "accepted stdin should reach the deliberately incomplete session mock; got exit {exit_code}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("claude exited before Stop hook fired"),
+        "accepted stdin should reach session startup, got stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("limit"),
+        "accepted stdin must not be rejected by the size limit: {stderr}"
     );
 }
 
 #[test]
-fn stdin_at_limit_boundary_succeeds() {
+fn stdin_small_input_is_accepted() {
+    // A small stdin input (under the 10MB limit) should succeed.
+    let small_input = b"hello world";
+    let (_stdout, stderr, exit_code) = run_with_stdin(small_input);
+
+    assert_stdin_was_accepted(&stderr, exit_code);
+}
+
+#[test]
+fn stdin_at_limit_boundary_is_accepted() {
     // Exactly 10MB should be accepted (size > limit is the rule).
     let at_limit = vec![b'X'; 10 * 1024 * 1024];
     let (_stdout, stderr, exit_code) = run_with_stdin(&at_limit);
 
-    assert_eq!(
-        exit_code, 0,
-        "expected exit 0 for stdin at 10MB limit, got exit {}\nstderr: {}",
-        exit_code, stderr
-    );
+    assert_stdin_was_accepted(&stderr, exit_code);
 }
 
 #[test]
@@ -146,16 +149,12 @@ fn stdin_with_null_byte_rejected() {
 }
 
 #[test]
-fn stdin_large_but_valid_succeeds() {
+fn stdin_large_but_valid_is_accepted() {
     // A large input under the limit (e.g., 5MB) should succeed.
     let large_valid = vec![b'Z'; 5 * 1024 * 1024];
     let (_stdout, stderr, exit_code) = run_with_stdin(&large_valid);
 
-    assert_eq!(
-        exit_code, 0,
-        "expected exit 0 for large but valid stdin, got exit {}\nstderr: {}",
-        exit_code, stderr
-    );
+    assert_stdin_was_accepted(&stderr, exit_code);
 }
 
 #[test]

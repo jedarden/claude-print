@@ -87,15 +87,9 @@ fn default_acquire_timeout() -> u64 {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PoolResponse {
     /// Worker successfully assigned (PTY fd sent as SCM_RIGHTS)
-    WorkerAssigned {
-        worker_id: String,
-        message: String,
-    },
+    WorkerAssigned { worker_id: String, message: String },
     /// Error response
-    Error {
-        error: String,
-        code: ErrorCode,
-    },
+    Error { error: String, code: ErrorCode },
 }
 
 impl From<serde_json::Error> for PoolResponse {
@@ -181,11 +175,7 @@ pub struct PoolManager {
 
 impl PoolManager {
     /// Create a new pool manager
-    pub fn new(
-        target_size: usize,
-        claude_bin: std::path::PathBuf,
-        verbose: bool,
-    ) -> Self {
+    pub fn new(target_size: usize, claude_bin: std::path::PathBuf, verbose: bool) -> Self {
         let (warmup_tx, warmup_rx) = mpsc::channel();
 
         Self {
@@ -211,10 +201,7 @@ impl PoolManager {
 
     /// Count workers in a given state
     fn count_state(&self, state: WorkerState) -> usize {
-        self.workers
-            .values()
-            .filter(|w| w.state == state)
-            .count()
+        self.workers.values().filter(|w| w.state == state).count()
     }
 
     /// Get a ready worker if one exists
@@ -275,8 +262,7 @@ impl PoolManager {
                 // Wait up to 2 seconds for graceful exit
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(2) {
-                    match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG))
-                    {
+                    match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
                         Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
                         Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
                         Err(_) => break,
@@ -287,8 +273,7 @@ impl PoolManager {
                     }
                 }
                 // If still running, force kill
-                let _ =
-                    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
                 let _ = nix::sys::wait::waitpid(pid, None);
             }
             Err(_) => {
@@ -313,9 +298,7 @@ impl PoolManager {
         if self.verbose {
             eprintln!(
                 "[claude-print pool] Pool status: {}/{} ready, {} warming",
-                ready_count,
-                self.target_size,
-                warming_count
+                ready_count, self.target_size, warming_count
             );
         }
 
@@ -368,7 +351,13 @@ impl PoolManager {
         let warmup_tx = self.warmup_tx.clone();
         let verbose = self.verbose;
         std::thread::spawn(move || {
-            Self::warm_worker_background(worker_id_clone, master_fd, shutdown_flag, warmup_tx, verbose);
+            Self::warm_worker_background(
+                worker_id_clone,
+                master_fd,
+                shutdown_flag,
+                warmup_tx,
+                verbose,
+            );
         });
 
         Ok(())
@@ -423,7 +412,10 @@ impl PoolManager {
         }
 
         if verbose {
-            eprintln!("[claude-print pool] Starting warmup for worker {}", worker_id);
+            eprintln!(
+                "[claude-print pool] Starting warmup for worker {}",
+                worker_id
+            );
         }
 
         // Create a self-pipe for signal handling (minimal setup)
@@ -460,22 +452,29 @@ impl PoolManager {
             // Check shutdown flag
             if shutdown_flag.load(Ordering::SeqCst) {
                 if verbose {
-                    eprintln!("[claude-print pool] Worker {} warmup cancelled (shutdown)", worker_id);
+                    eprintln!(
+                        "[claude-print pool] Worker {} warmup cancelled (shutdown)",
+                        worker_id
+                    );
                 }
                 let _ = nix::unistd::close(pipe_r_raw);
                 let _ = nix::unistd::close(pipe_w_raw);
-                let _ = std::mem::forget(pipe_r); // Avoid double-close
-                let _ = std::mem::forget(pipe_w);
+                std::mem::forget(pipe_r); // Avoid double-close
+                std::mem::forget(pipe_w);
                 return;
             }
 
             // Check warmup timeout
             if warmup_start.elapsed() > warmup_timeout {
-                eprintln!("[claude-print pool] Worker {} warmup timeout after {:.1}s", worker_id, warmup_start.elapsed().as_secs_f64());
+                eprintln!(
+                    "[claude-print pool] Worker {} warmup timeout after {:.1}s",
+                    worker_id,
+                    warmup_start.elapsed().as_secs_f64()
+                );
                 let _ = nix::unistd::close(pipe_r_raw);
                 let _ = nix::unistd::close(pipe_w_raw);
-                let _ = std::mem::forget(pipe_r);
-                let _ = std::mem::forget(pipe_w);
+                std::mem::forget(pipe_r);
+                std::mem::forget(pipe_w);
                 return;
             }
 
@@ -508,7 +507,10 @@ impl PoolManager {
                         }
                         crate::startup::StartupAction::None => {}
                         crate::startup::StartupAction::HardTimeout => {
-                            eprintln!("[claude-print pool] Worker {} hard timeout during warmup", worker_id);
+                            eprintln!(
+                                "[claude-print pool] Worker {} hard timeout during warmup",
+                                worker_id
+                            );
                             warmup_phase = WarmupPhase::Failed;
                         }
                     }
@@ -528,14 +530,20 @@ impl PoolManager {
                     }
                     crate::startup::StartupAction::None => {}
                     crate::startup::StartupAction::HardTimeout => {
-                        eprintln!("[claude-print pool] Worker {} hard timeout during warmup", worker_id);
+                        eprintln!(
+                            "[claude-print pool] Worker {} hard timeout during warmup",
+                            worker_id
+                        );
                         warmup_phase = WarmupPhase::Failed;
                     }
                 }
             }) {
                 Ok(crate::event_loop::ExitReason::ChildExited) => {
                     // Child exited during warmup - this is a failure
-                    eprintln!("[claude-print pool] Worker {} child exited during warmup", worker_id);
+                    eprintln!(
+                        "[claude-print pool] Worker {} child exited during warmup",
+                        worker_id
+                    );
                     let _ = nix::unistd::close(pipe_r_raw);
                     let _ = nix::unistd::close(pipe_w_raw);
                     return;
@@ -543,7 +551,10 @@ impl PoolManager {
                 Ok(crate::event_loop::ExitReason::Interrupted) => {
                     // SIGINT/SIGTERM - exit gracefully
                     if verbose {
-                        eprintln!("[claude-print pool] Worker {} warmup interrupted", worker_id);
+                        eprintln!(
+                            "[claude-print pool] Worker {} warmup interrupted",
+                            worker_id
+                        );
                     }
                     let _ = nix::unistd::close(pipe_r_raw);
                     let _ = nix::unistd::close(pipe_w_raw);
@@ -551,10 +562,16 @@ impl PoolManager {
                 }
                 Ok(crate::event_loop::ExitReason::FifoPayload(_)) => {
                     // Should not happen during warmup (FIFO not opened yet)
-                    eprintln!("[claude-print pool] Worker {} unexpected FIFO payload during warmup", worker_id);
+                    eprintln!(
+                        "[claude-print pool] Worker {} unexpected FIFO payload during warmup",
+                        worker_id
+                    );
                 }
                 Err(e) => {
-                    eprintln!("[claude-print pool] Worker {} warmup event loop error: {}", worker_id, e);
+                    eprintln!(
+                        "[claude-print pool] Worker {} warmup event loop error: {}",
+                        worker_id, e
+                    );
                     let _ = nix::unistd::close(pipe_r_raw);
                     let _ = nix::unistd::close(pipe_w_raw);
                     return;
@@ -567,7 +584,10 @@ impl PoolManager {
                 if startup_seq.phase() == &crate::startup::StartupPhase::TrustDismissed {
                     warmup_phase = WarmupPhase::Settling;
                     if verbose {
-                        eprintln!("[claude-print pool] Worker {} trust dismissed, settling...", worker_id);
+                        eprintln!(
+                            "[claude-print pool] Worker {} trust dismissed, settling...",
+                            worker_id
+                        );
                     }
                 }
             } else if warmup_phase == WarmupPhase::Settling {
@@ -611,14 +631,21 @@ impl PoolManager {
         if !shutdown_flag.load(Ordering::SeqCst) && warmup_phase == WarmupPhase::Ready {
             let _ = warmup_tx.send(worker_id.clone());
             if verbose {
-                eprintln!("[claude-print pool] Worker {} warmup complete in {:.1}s", worker_id, warmup_start.elapsed().as_secs_f64());
+                eprintln!(
+                    "[claude-print pool] Worker {} warmup complete in {:.1}s",
+                    worker_id,
+                    warmup_start.elapsed().as_secs_f64()
+                );
             }
         }
     }
 
     /// Clean up all workers on shutdown
     pub fn shutdown_all(&mut self) {
-        eprintln!("[claude-print pool] Shutting down, cleaning up {} workers", self.workers.len());
+        eprintln!(
+            "[claude-print pool] Shutting down, cleaning up {} workers",
+            self.workers.len()
+        );
 
         let workers: Vec<_> = self.workers.drain().map(|(_, w)| w).collect();
 
@@ -888,12 +915,15 @@ impl PoolServer {
             msg.msg_controllen = cmsg.cmsg_len;
 
             // Copy the fd into the cmsg data
-            let cmsg_data = (msg.msg_control as *mut u8).offset(std::mem::size_of::<libc::cmsghdr>() as isize);
+            let cmsg_data = (msg.msg_control as *mut u8).add(std::mem::size_of::<libc::cmsghdr>());
             *(cmsg_data as *mut RawFd) = fd;
 
             let ret = libc::sendmsg(socket_fd, &msg, 0);
             if ret < 0 {
-                return Err(anyhow::anyhow!("sendmsg failed: {}", nix::errno::Errno::last()));
+                return Err(anyhow::anyhow!(
+                    "sendmsg failed: {}",
+                    nix::errno::Errno::last()
+                ));
             }
         }
 
@@ -934,10 +964,15 @@ impl PoolClient {
     ///
     /// Returns the worker ID and PTY master fd
     pub fn acquire(&self, timeout_secs: u64) -> Result<(String, RawFd), PoolResponse> {
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket_path)
-            .map_err(|_| PoolResponse::Error {
-                error: format!("Failed to connect to pool at {}", self.socket_path.display()),
-                code: ErrorCode::InternalError,
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&self.socket_path).map_err(|_| {
+                PoolResponse::Error {
+                    error: format!(
+                        "Failed to connect to pool at {}",
+                        self.socket_path.display()
+                    ),
+                    code: ErrorCode::InternalError,
+                }
             })?;
 
         // Send acquire request
@@ -946,10 +981,12 @@ impl PoolClient {
 
         // Send length + JSON
         let len_buf = (json.len() as u32).to_be_bytes();
-        stream.write_all(&len_buf).map_err(|_| PoolResponse::Error {
-            error: "Failed to send request".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        stream
+            .write_all(&len_buf)
+            .map_err(|_| PoolResponse::Error {
+                error: "Failed to send request".to_string(),
+                code: ErrorCode::InternalError,
+            })?;
         stream.write_all(&json).map_err(|_| PoolResponse::Error {
             error: "Failed to send request".to_string(),
             code: ErrorCode::InternalError,
@@ -957,18 +994,22 @@ impl PoolClient {
 
         // Receive response length
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).map_err(|_| PoolResponse::Error {
-            error: "Failed to read response".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        stream
+            .read_exact(&mut len_buf)
+            .map_err(|_| PoolResponse::Error {
+                error: "Failed to read response".to_string(),
+                code: ErrorCode::InternalError,
+            })?;
         let msg_len = u32::from_be_bytes(len_buf) as usize;
 
         // Receive response JSON
         let mut buf = vec![0u8; msg_len];
-        stream.read_exact(&mut buf).map_err(|_| PoolResponse::Error {
-            error: "Failed to read response".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        stream
+            .read_exact(&mut buf)
+            .map_err(|_| PoolResponse::Error {
+                error: "Failed to read response".to_string(),
+                code: ErrorCode::InternalError,
+            })?;
 
         let response: PoolResponse = serde_json::from_slice(&buf)?;
 
@@ -978,18 +1019,21 @@ impl PoolClient {
                 let fd = Self::recv_fd(&stream)?;
                 Ok((worker_id, fd))
             }
-            PoolResponse::Error { .. } => {
-                Err(response)
-            }
+            PoolResponse::Error { .. } => Err(response),
         }
     }
 
     /// Release a worker back to the pool
     pub fn release(&self, worker_id: &str) -> Result<(), PoolResponse> {
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket_path)
-            .map_err(|_| PoolResponse::Error {
-                error: format!("Failed to connect to pool at {}", self.socket_path.display()),
-                code: ErrorCode::InternalError,
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&self.socket_path).map_err(|_| {
+                PoolResponse::Error {
+                    error: format!(
+                        "Failed to connect to pool at {}",
+                        self.socket_path.display()
+                    ),
+                    code: ErrorCode::InternalError,
+                }
             })?;
 
         let request = PoolRequest::Release {
@@ -998,27 +1042,33 @@ impl PoolClient {
         let json = serde_json::to_vec(&request)?;
 
         let len_buf = (json.len() as u32).to_be_bytes();
-        stream.write_all(&len_buf).map_err(|_| PoolResponse::Error {
-            error: "Failed to send request".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        stream
+            .write_all(&len_buf)
+            .map_err(|_| PoolResponse::Error {
+                error: "Failed to send request".to_string(),
+                code: ErrorCode::InternalError,
+            })?;
         stream.write_all(&json).map_err(|_| PoolResponse::Error {
             error: "Failed to send request".to_string(),
             code: ErrorCode::InternalError,
         })?;
 
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).map_err(|_| PoolResponse::Error {
-            error: "Failed to read response".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        stream
+            .read_exact(&mut len_buf)
+            .map_err(|_| PoolResponse::Error {
+                error: "Failed to read response".to_string(),
+                code: ErrorCode::InternalError,
+            })?;
         let msg_len = u32::from_be_bytes(len_buf) as usize;
 
         let mut buf = vec![0u8; msg_len];
-        stream.read_exact(&mut buf).map_err(|_| PoolResponse::Error {
-            error: "Failed to read response".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        stream
+            .read_exact(&mut buf)
+            .map_err(|_| PoolResponse::Error {
+                error: "Failed to read response".to_string(),
+                code: ErrorCode::InternalError,
+            })?;
 
         let response: PoolResponse = serde_json::from_slice(&buf)?;
 
@@ -1048,7 +1098,7 @@ impl PoolClient {
             msg.msg_controllen = std::mem::size_of::<libc::cmsghdr>() + 1024;
 
             let fd_buf: [RawFd; 1] = [-1];
-            let cmsg_data = (msg.msg_control as *mut u8).offset(std::mem::size_of::<libc::cmsghdr>() as isize);
+            let cmsg_data = (msg.msg_control as *mut u8).add(std::mem::size_of::<libc::cmsghdr>());
             *(cmsg_data as *mut RawFd) = fd_buf[0];
 
             let ret = libc::recvmsg(socket_fd, &mut msg, 0);
@@ -1061,7 +1111,8 @@ impl PoolClient {
 
             // Extract fd from cmsghdr
             if cmsg.cmsg_type == libc::SCM_RIGHTS {
-                let data_ptr = (msg.msg_control as *const u8).offset(std::mem::size_of::<libc::cmsghdr>() as isize);
+                let data_ptr =
+                    (msg.msg_control as *const u8).add(std::mem::size_of::<libc::cmsghdr>());
                 let fd = *(data_ptr as *const RawFd);
                 if fd >= 0 {
                     return Ok(fd);
@@ -1127,21 +1178,13 @@ mod tests {
 
     #[test]
     fn test_pool_manager_target_size() {
-        let manager = PoolManager::new(
-            2,
-            std::path::PathBuf::from("/usr/bin/claude"),
-            false,
-        );
+        let manager = PoolManager::new(2, std::path::PathBuf::from("/usr/bin/claude"), false);
         assert_eq!(manager.target_size, 2);
     }
 
     #[test]
     fn test_shutdown_flag() {
-        let manager = PoolManager::new(
-            1,
-            std::path::PathBuf::from("/usr/bin/claude"),
-            false,
-        );
+        let manager = PoolManager::new(1, std::path::PathBuf::from("/usr/bin/claude"), false);
         let flag = manager.shutdown_flag();
         assert!(!flag.load(Ordering::SeqCst));
 
