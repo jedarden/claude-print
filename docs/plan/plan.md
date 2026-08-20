@@ -112,10 +112,10 @@ Named scenarios that define correct system behavior. Pass/fail criteria are test
 **Fail:** NEEDLE cannot parse output; `session_id` absent; exit non-zero.
 
 ### AS-4: Billing Classification
-**Action:** Any invocation, followed by inspection of the most recent JSONL in `~/.claude/projects/`.
-**Pass:** The file contains a line with `"entrypoint": "cli"`.
+**Action:** A daily systemd user timer runs one minimal claude-print invocation, resolves the resulting transcript by returned `session_id`, and passes that exact JSONL to `scripts/check-billing.sh`. Run the original newest-transcript check manually before each release as a second layer.
+**Pass:** The exact canary transcript contains a line with `"entrypoint": "cli"`; the canary exits 0 and atomically writes a fresh `PASS` result file.
 **Fail:** `entrypoint` is `"sdk-cli"` or absent.
-*(Credential-required; run manually and before each release.)*
+*(Credential-required; automated daily on production hosts and run manually before each release.)*
 
 ### AS-5: Error Surface — `claude` Not Found
 **Action:** `PATH= claude-print "hello"` (or `--claude-binary /nonexistent`).
@@ -129,7 +129,7 @@ Named scenarios that define correct system behavior. Pass/fail criteria are test
 
 ## Success Metrics
 
-**Functionality:** AS-1 through AS-6 all pass on every commit; AS-4 passes before every release; all mock integration scenarios (at minimum, the scenarios listed in the integration test table) exit with expected codes.
+**Functionality:** AS-1 through AS-6 all pass on every commit; credential-backed AS-4 passes daily on production hosts and manually before every release; all mock integration scenarios (at minimum, the scenarios listed in the integration test table) exit with expected codes.
 
 **Performance:** `claude-print` overhead (invocation to prompt injection) < 5 s on a cold start; transcript reader produces output within 2 s of Stop hook firing; binary size < 10 MB.
 
@@ -206,6 +206,10 @@ claude-print/
 │       └── transcript_v2.1.168.jsonl
 ├── scripts/
 │   ├── check-billing.sh              # AS-4 billing conformance verification
+│   ├── billing-canary.sh              # Daily AS-4 canary (exact transcript by session id)
+│   ├── install-billing-canary.sh      # Installs and enables the systemd user timer
+│   ├── claude-print-billing-canary.service
+│   ├── claude-print-billing-canary.timer
 │   ├── test_exact_claude_print_scenario.sh
 │   ├── test_sessionstart_hook.sh
 │   ├── test_startup_wedge.sh
@@ -958,7 +962,7 @@ Named invariants that MUST hold on all exit paths. Each is testable.
 | INV-3 | FIFO read-end opened before prompt injection | `--verbose` trace: `"fifo opened"` timestamp precedes `"prompt injected"` |
 | INV-4 | `master_fd` closed before `waitpid` | `lsof` in integration test: no master fd open after child exits |
 | INV-5 | No write-opens to `~/.claude/` by the `claude-print` process itself | `strace -e openat` shows no writes; verified in hook inheritance tests |
-| INV-6 | `cc_entrypoint=cli` in every generated transcript | AS-4 scenario; run before every release |
+| INV-6 | `cc_entrypoint=cli` in every generated transcript | AS-4 daily canary plus the manual pre-release gate |
 | INV-7 | Exit code matches the Error Handling table | Each error condition tested with mock_claude; exit code asserted |
 | INV-8 | Reader thread (stream-json) joined before process exit | Join coverage in stream-json integration test |
 
@@ -984,7 +988,7 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 | Phases 1–11 module implementation | **COMPLETE** — all module-level deliverables committed |
 | `main()` session orchestration | **COMPLETE** — src/main.rs and src/session.rs orchestration shipped as v0.2.0 |
 | Binary-level E2E tests (AS-1, AS-2, AS-5) | **COMPLETE** — tests passing (bf-46x) |
-| AS-4 billing classification | **PENDING** manual verification (requires live credentials) |
+| AS-4 billing classification | **AUTOMATED DAILY** on production hosts; manual pre-release verification remains required |
 | CI release binary | **PENDING** — `claude-print-ci` WorkflowTemplate synced to ArgoCD; no release tag cut yet |
 
 Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's completion criterion is met.
@@ -1254,7 +1258,7 @@ The `test_output_format_wire_compat` test verifies `claude-print` JSON output is
 3. Assert `is_error=false`, `type=result`, `usage` object has all four token fields as integers
 4. The extra `claude_version` field MUST NOT cause a parse failure in a strict JSON parser (tested with `serde_json` `deny_unknown_fields` on a `claude -p`-shaped struct)
 
-For billing conformance (AS-4, credential-required), the `scripts/check-billing.sh` script inspects the most recent JSONL and asserts `entrypoint: cli`. Run before every release.
+For billing conformance (AS-4, credential-required), the daily canary passes its exact session transcript to `scripts/check-billing.sh` and records a machine-readable PASS/FAIL result. With no path argument, `check-billing.sh` still inspects the most recent JSONL; run that manual form before every release.
 
 ### Definition of Done
 
@@ -1369,16 +1373,14 @@ The `claude_version` field is additive (minor) and will not be removed in a majo
 
 ### Rollout / Rollback Criteria
 
-- **Promote to stable:** AS-1 through AS-6 pass; AS-4 (billing) verified manually; no open P0 bugs.
+- **Promote to stable:** AS-1 through AS-6 pass; the daily AS-4 canary is healthy and AS-4 is verified manually; no open P0 bugs.
 - **Roll back:** If AS-4 fails (entrypoint is `sdk-cli`), immediately pull the release from the CI artifact store and revert the install. The previous binary is always preserved as `claude-print.prev` by `install.sh`.
 
 ### Monitoring and Alerting
 
-`claude-print` emits no metrics itself. Billing-classification failures are detected by:
-1. Manually running `scripts/check-billing.sh` after each release (asserts `entrypoint: cli`)
-2. Reviewing NEEDLE worker session transcripts for unexpected `entrypoint: sdk-cli` lines
+`claude-print` emits no metrics itself. A daily systemd user timer on ex44 and lab runs one cheap Haiku session, checks its exact transcript with `scripts/check-billing.sh`, and writes an atomic result to `~/.local/state/claude-print/billing-canary/last-result`. Every run also emits a `CLAUDE_PRINT_BILLING_CANARY status=PASS|FAIL` journal line and exits non-zero on failure. Operators or a heartbeat monitor alert when the result is `FAIL`, missing, or older than 48 hours.
 
-No automated alerting in v1.0. If billing classification fails silently in production, it is an incident (see Risk Register R-1).
+The manual `scripts/check-billing.sh` release gate remains required as a belt-and-suspenders second layer. Reviewing NEEDLE transcripts for unexpected `entrypoint: sdk-cli` remains useful corroboration.
 
 ### Doctor Command (`--check`)
 
@@ -1396,7 +1398,7 @@ No automated alerting in v1.0. If billing classification fails silently in produ
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|------|-----------|--------|-----------|
-| R-1 | Claude Code update changes `isatty()` detection logic; `cc_entrypoint` silently becomes `sdk-cli` | Low | Critical (billing regression, all sessions misclassified) | AS-4 check before every release; `--verbose` shows PTY slave assigned; `--check` verifies PTY opens |
+| R-1 | Claude Code update changes `isatty()` detection logic; `cc_entrypoint` silently becomes `sdk-cli` | Low | Critical (billing regression, all sessions misclassified) | Daily credential-backed AS-4 canary with PASS/FAIL state and journal output; manual AS-4 check before every release; `--verbose` shows PTY slave assigned; `--check` verifies PTY opens |
 | R-2 | `--settings` merge behavior changes in a Claude Code update; user hooks stop firing | Medium | Medium (user hooks silently broken) | PO-1 verified before Phase 2; version-compat tests track `claude --version`; CI alert on version change |
 | R-3 | Ink adds a new mandatory terminal probe; session hangs indefinitely | Low | High (complete outage for new Claude Code versions) | Unknown probes are ignored; session falls through to idle timeout; `MOCK_UNKNOWN_PROBE` integration test verifies resilience |
 | R-4 | `login_tty` absent in musl-libc | Low | High (binary fails to build) | Inline implementation (PO-3 recovery) is 4 syscalls; verified before Phase 2 |

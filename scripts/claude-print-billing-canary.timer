@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Claude Print AS-4 billing canary daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=6h
+AccuracySec=15m
+Persistent=true
+Unit=claude-print-billing-canary.service
+
+[Install]
+WantedBy=timers.target
