@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # billing-canary.sh - Automated AS-4 billing-classification canary
 
 set -eu

@@ -4,6 +4,6 @@ Description=Claude Print AS-4 billing-classification canary
 [Service]
 Type=oneshot
 ExecStart=%h/.local/libexec/claude-print/billing-canary.sh
-Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 UMask=0077
 TimeoutStartSec=10min

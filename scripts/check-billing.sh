@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # check-billing.sh - AS-4 billing conformance check
 #
 # With no argument, inspect the newest Claude transcript (the manual release

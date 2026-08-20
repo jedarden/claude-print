@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Install and enable the daily AS-4 canary as a systemd user timer.
 
 set -eu
