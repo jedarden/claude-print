@@ -129,6 +129,17 @@ fn run_with(
 /// ceiling that still fails fast on a wedge.
 const BUDGET: Duration = Duration::from_secs(30);
 
+/// Set up a temporary config directory with a malformed config file.
+/// Returns the temp dir; caller must keep it alive for the test duration.
+fn setup_malformed_config(config_content: &str) -> TempDir {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp config dir");
+    let config_dir = temp_dir.path().join("claude-print");
+    std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    std::fs::write(config_dir.join("config.toml"), config_content)
+        .expect("failed to create malformed config file");
+    temp_dir
+}
+
 // ── AS-1: default text mode ─────────────────────────────────────────────────
 
 /// `claude-print --claude-binary <mock> 'test prompt'` → exit 0, non-empty text
@@ -734,5 +745,236 @@ fn dangerously_skip_permissions_flag_appears_exactly_once_when_passed() {
         "with flag: --dangerously-skip-permissions must appear EXACTLY ONCE in \
          child argv, got {} occurrences in {:?}",
         count, args
+    );
+}
+
+// ── Config parse error handling ────────────────────────────────────────────────
+
+/// Malformed config file with unclosed bracket → exit 2, structured JSON error.
+///
+/// AC1-AC5 of bead claudepr-ea80e6b2:
+/// 1. Creates malformed config file (unclosed bracket, invalid TOML)
+/// 2. Runs claude-print with --output-format json
+/// 3. Captures exit code (must be 2, not 0)
+/// 4. Verifies stdout contains structured error JSON with required fields
+/// 5. Verifies NO silent fallback occurs (exit code is 2, not 0)
+///
+/// This test is expected to FAIL initially, proving the current behavior is wrong
+/// (likely silent fallback to defaults with exit 0).
+#[test]
+fn config_parse_error_unclosed_bracket_exit2_structured_json() {
+    // Create a malformed config file with an unclosed bracket
+    let malformed_config = r#"[defaults
+model = "claude-opus-4-8""#;
+    let temp_dir = setup_malformed_config(malformed_config);
+
+    let mut cmd = Command::new(workspace_bin("claude-print"));
+    cmd.arg("--claude-binary")
+        .arg(workspace_bin("mock-claude"))
+        .arg("--output-format")
+        .arg("json")
+        .arg("test prompt");
+    // Set XDG_CONFIG_HOME to point to the temp config directory
+    cmd.env("XDG_CONFIG_HOME", temp_dir.path());
+
+    let out = run(&mut cmd, BUDGET);
+
+    // AC3: Exit code must be 2 (Setup error), not 0 (silent fallback)
+    assert_eq!(
+        out.code,
+        Some(2),
+        "config parse error: expected exit 2, got {:?}\n\
+         stdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+
+    // AC4: Verify stdout contains structured error JSON
+    let trimmed = out.stdout.trim();
+    let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!(
+            "config parse error: stdout must be valid JSON, got parse error: {e}\n  \
+             raw stdout:\n{}",
+            out.stdout
+        )
+    });
+
+    // AC4a: Must contain "type":"result"
+    assert_eq!(
+        v["type"], "result",
+        "config parse error: JSON type must be 'result', got: {:?}\nstdout:\n{}",
+        v["type"], out.stdout
+    );
+
+    // AC4b: Must contain "is_error":true
+    assert_eq!(
+        v["is_error"], true,
+        "config parse error: is_error must be true, got: {:?}\nstdout:\n{}",
+        v["is_error"], out.stdout
+    );
+
+    // AC4c: Must contain "subtype":"internal_error" (Setup errors map to internal_error)
+    assert_eq!(
+        v["subtype"], "internal_error",
+        "config parse error: subtype must be 'internal_error', got: {:?}\nstdout:\n{}",
+        v["subtype"], out.stdout
+    );
+
+    // AC4d: Must contain "error_message" with "invalid config" or similar
+    assert!(
+        v.get("error_message")
+            .and_then(|m| m.as_str())
+            .map(|m| m.contains("invalid config") || m.contains("config"))
+            .unwrap_or(false),
+        "config parse error: error_message must mention 'config', got: {:?}\nstdout:\n{}",
+        v.get("error_message"),
+        out.stdout
+    );
+
+    // AC4e: Must contain claude_version field
+    assert!(
+        v.get("claude_version").and_then(|v| v.as_str()).is_some(),
+        "config parse error: must include claude_version field, got: {:?}\nstdout:\n{}",
+        v.get("claude_version"),
+        out.stdout
+    );
+}
+
+/// Malformed config with invalid TOML syntax (duplicate keys) → exit 2, structured error.
+#[test]
+fn config_parse_error_duplicate_keys_exit2_structured_json() {
+    let malformed_config = r#"[defaults]
+model = "claude-opus-4-8"
+model = "claude-haiku-4-5""#;
+    let temp_dir = setup_malformed_config(malformed_config);
+
+    let mut cmd = Command::new(workspace_bin("claude-print"));
+    cmd.arg("--claude-binary")
+        .arg(workspace_bin("mock-claude"))
+        .arg("--output-format")
+        .arg("json")
+        .arg("test prompt");
+    cmd.env("XDG_CONFIG_HOME", temp_dir.path());
+
+    let out = run(&mut cmd, BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "duplicate keys config error: expected exit 2, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+
+    let trimmed = out.stdout.trim();
+    let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!(
+            "duplicate keys error: stdout must be valid JSON: {e}\n  raw:\n{}",
+            out.stdout
+        )
+    });
+
+    assert_eq!(v["type"], "result");
+    assert_eq!(v["is_error"], true);
+    assert_eq!(v["subtype"], "internal_error");
+}
+
+/// Config validation error (model name doesn't start with "claude-") → exit 2.
+#[test]
+fn config_validation_error_invalid_model_name_exit2_structured_json() {
+    let invalid_config = r#"[defaults]
+model = "gpt-4""#;
+    let temp_dir = setup_malformed_config(invalid_config);
+
+    let mut cmd = Command::new(workspace_bin("claude-print"));
+    cmd.arg("--claude-binary")
+        .arg(workspace_bin("mock-claude"))
+        .arg("--output-format")
+        .arg("json")
+        .arg("test prompt");
+    cmd.env("XDG_CONFIG_HOME", temp_dir.path());
+
+    let out = run(&mut cmd, BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "model validation error: expected exit 2, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+
+    let trimmed = out.stdout.trim();
+    let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!(
+            "model validation error: stdout must be valid JSON: {e}\n  raw:\n{}",
+            out.stdout
+        )
+    });
+
+    assert_eq!(v["type"], "result");
+    assert_eq!(v["is_error"], true);
+    assert_eq!(v["subtype"], "internal_error");
+
+    // Error message should mention model validation problem
+    assert!(
+        v.get("error_message")
+            .and_then(|m| m.as_str())
+            .map(|m| m.contains("model"))
+            .unwrap_or(false),
+        "model validation error: error_message must mention 'model', got: {:?}",
+        v.get("error_message")
+    );
+}
+
+/// Config validation error (max_turns out of range) → exit 2.
+#[test]
+fn config_validation_error_max_turns_out_of_range_exit2_structured_json() {
+    let invalid_config = r#"[defaults]
+max_turns = 0"#;
+    let temp_dir = setup_malformed_config(invalid_config);
+
+    let mut cmd = Command::new(workspace_bin("claude-print"));
+    cmd.arg("--claude-binary")
+        .arg(workspace_bin("mock-claude"))
+        .arg("--output-format")
+        .arg("json")
+        .arg("test prompt");
+    cmd.env("XDG_CONFIG_HOME", temp_dir.path());
+
+    let out = run(&mut cmd, BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "max_turns validation error: expected exit 2, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+
+    let trimmed = out.stdout.trim();
+    let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!(
+            "max_turns validation error: stdout must be valid JSON: {e}\n  raw:\n{}",
+            out.stdout
+        )
+    });
+
+    assert_eq!(v["type"], "result");
+    assert_eq!(v["is_error"], true);
+    assert_eq!(v["subtype"], "internal_error");
+
+    // Error message should mention max_turns validation problem
+    assert!(
+        v.get("error_message")
+            .and_then(|m| m.as_str())
+            .map(|m| m.contains("max_turns"))
+            .unwrap_or(false),
+        "max_turns validation error: error_message must mention 'max_turns', got: {:?}",
+        v.get("error_message")
     );
 }
