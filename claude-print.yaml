@@ -19,10 +19,8 @@ model: sonnet           # alias intentionally untagged so it tracks current Sonn
 # Variables: ${WORKSPACE}, ${PROMPT}, ${BEAD_ID}, ${BEAD_TITLE}, ${AGENT_DIR}
 # NOTES:
 # - unset CLAUDECODE prevents nested-session detection when dispatched from inside Claude Code.
-# - claude-print v0.2.x BUFFERS the stream until iteration end: events are valid
-#   stream-json but arrive late. Idle-silence stuck detection must be relaxed for
-#   workspaces using this adapter — rely on Claude Code's live JSONL transcript
-#   tailing (HOOP session tailing) instead of stdout freshness.
+# - claude-print forwards stream-json events incrementally while the session runs,
+#   so idle-silence stuck detection can use stdout freshness.
 # - --max-turns 100: the claude-print default (30) is too low for refactor or
 #   long-form writing beads.
 # - --timeout 3600 matches the fleet's 1h max-runtime ceiling.
@@ -45,7 +43,7 @@ input:
 # Output parsing
 output:
   format: stream-json
-  streaming_enabled: true   # events arrive buffered until iteration end (see NOTES)
+  streaming_enabled: true   # events are forwarded incrementally during the session
   success_codes: [0]
   retry_codes: [1]
   fail_codes: [2, 137]
