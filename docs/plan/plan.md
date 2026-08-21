@@ -182,22 +182,31 @@ claude-print/
 │   ├── lib.rs                        # library exports for testing
 │   ├── poller.rs                     # stop.fifo poller: IPC read from Stop hook
 │   ├── prompt.rs                     # prompt input validation (NUL byte check, file size limits)
+│   ├── pool.rs                       # optional warm PTY pool and Unix-socket protocol (ADR-005)
 │   ├── session.rs                    # Session: main orchestration flow (prompt → response)
+│   ├── util.rs                       # shared HOME resolution and path helpers
 │   ├── verbose.rs                    # --verbose timing traces to stderr
 │   └── watchdog.rs                  # Watchdog: no-output/max-turn/stop-hook/stream-json timeout monitoring
 ├── tests/
+│   ├── billing_canary.rs             # billing-canary script integration tests
 │   ├── cli.rs
+│   ├── config_error_helpers.rs       # shared helpers for config-error integration tests
+│   ├── config_startup_errors.rs       # CLI startup behavior for invalid config files
 │   ├── terminal.rs
 │   ├── transcript.rs
 │   ├── emitter.rs
+│   ├── home_unset.rs                 # strict HOME-resolution contract tests
 │   ├── startup.rs
 │   ├── version_compat.rs
 │   ├── hooks.rs                      # hook inheritance tests
 │   ├── integration.rs                # integration test module entry point
+│   ├── nested_session.rs             # inherited Claude session-variable regression tests
 │   ├── pty_integration.rs            # PTY-specific integration tests
+│   ├── stdin_limit.rs                # stdin prompt-size limit tests
 │   ├── stop_poller.rs                # stop.fifo polling tests
 │   ├── watchdog.rs                   # watchdog timeout tests
-│   ├── binary_e2e.rs                 # binary-level E2E: AS-1/AS-2/AS-5 + stream-json + no-prompt exit 4 (compiled claude-print + mock-claude subprocess; bf-46x)
+│   ├── binary_e2e.rs                 # binary-level E2E: AS-1/AS-2/AS-5 + stream-json + no-prompt exit 4 (compiled claude-print + mock-claude subprocess)
+│   ├── stream_json_cleanup.rs        # stream-json reader cleanup on every exit path (INV-8)
 │   ├── stream_json_incremental.rs    # incremental (real-time) stream-json E2E test (bf-5xw); #[ignore]'d pending bf-3isy + bf-5vm
 │   ├── transcript_race_e2e.rs        # AS-6 Stop-before-JSONL-flush race E2E; separate test binary to isolate MOCK_* env (bf-3isy)
 │   ├── integration/
@@ -989,9 +998,9 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 |------|-------|
 | Phases 1–11 module implementation | **COMPLETE** — all module-level deliverables committed |
 | `main()` session orchestration | **COMPLETE** — src/main.rs and src/session.rs orchestration shipped as v0.2.0 |
-| Binary-level E2E tests (AS-1, AS-2, AS-5) | **COMPLETE** — tests passing (bf-46x) |
+| Binary-level E2E tests (AS-1, AS-2, AS-5) | **COMPLETE** — tests passing (claudepr-6ab03b22) |
 | AS-4 billing classification | **AUTOMATED DAILY** on production hosts; manual pre-release verification remains required |
-| CI release binary | **PARTIAL** — v0.2.0 has both static musl binaries and clean-prefix `install.sh` E2E passes; a fresh tagged CI run is blocked by `cargo fmt --check` on the immutable tag |
+| CI release binary | **PENDING** — fresh tagged CI release tracked separately |
 
 Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's completion criterion is met.
 
