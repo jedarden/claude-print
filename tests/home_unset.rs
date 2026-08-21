@@ -18,6 +18,8 @@ use std::sync::{Mutex, MutexGuard};
 
 const HOME_ERROR_DETAIL: &str =
     "HOME environment variable not set or empty; set HOME to the user's home directory";
+const HOME_ERROR_STDERR: &str =
+    "error: invalid config: HOME environment variable not set or empty; set HOME to the user's home directory\n";
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -247,6 +249,86 @@ fn env_u_home_version_fails_with_actionable_error() {
         !stdout.contains("claude-print "),
         "--version printed a success version despite missing HOME: {stdout}"
     );
+}
+
+/// Run the compiled CLI with HOME removed from the child environment and pin
+/// the complete text-mode failure contract shared by every HOME-dependent
+/// startup path.
+fn assert_cli_home_unset_error(command: &mut Command, case: &str) {
+    let output = command
+        .env_remove("HOME")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("{case}: run claude-print with HOME unset: {error}"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{case}: expected setup exit 2, stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "{case}: text-mode setup failure must not write stdout: {stdout:?}"
+    );
+    assert_eq!(
+        stderr, HOME_ERROR_STDERR,
+        "{case}: stderr must name HOME and explain how to set it"
+    );
+}
+
+#[test]
+fn cli_home_unset_default_config_path_has_strict_error_contract() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_claude-print"));
+    let unused_backend = std::env::current_exe().expect("locate test executable");
+
+    let mut command = Command::new(binary);
+    command
+        .arg("--claude-binary")
+        .arg(unused_backend)
+        .arg("test prompt")
+        // Force the default config path to depend on HOME. This is equivalent
+        // to `env -u HOME -u XDG_CONFIG_HOME claude-print ...` and cannot read
+        // the invoking user's actual home directory.
+        .env_remove("XDG_CONFIG_HOME");
+
+    assert_cli_home_unset_error(&mut command, "default config path");
+}
+
+#[test]
+fn cli_home_unset_xdg_config_and_transcript_discovery_share_strict_error_contract() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_claude-print"));
+    let mock_claude = binary.with_file_name("mock-claude");
+    assert!(
+        mock_claude.exists(),
+        "mock-claude binary missing at {}",
+        mock_claude.display()
+    );
+
+    // A complete XDG path bypasses HOME for config lookup. If startup reaches
+    // the Stop payload, omitting transcript_path selects poller's HOME-backed
+    // transcript discovery branch. The CLI's process-wide HOME validation may
+    // reject this environment earlier, but the externally visible strict
+    // policy must remain identical to the default-config path above.
+    let xdg = tempfile::tempdir().expect("create temporary XDG_CONFIG_HOME");
+    let config_dir = xdg.path().join("claude-print");
+    std::fs::create_dir(&config_dir).expect("create temporary config directory");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[defaults]\nmodel = \"claude-haiku-4-5\"\n",
+    )
+    .expect("write valid temporary config");
+
+    let mut command = Command::new(binary);
+    command
+        .arg("--claude-binary")
+        .arg(mock_claude)
+        .arg("test prompt")
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .env("MOCK_OMIT_TRANSCRIPT_PATH", "1");
+
+    assert_cli_home_unset_error(&mut command, "XDG config and transcript discovery");
 }
 
 #[test]
