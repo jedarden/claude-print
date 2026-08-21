@@ -345,7 +345,10 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Config` if `HOME` is unset or empty.
+    /// Returns `Error::Config` if `HOME` is unset, empty, inaccessible, not a
+    /// directory, or not writable. Session startup never guesses `/root` or
+    /// another fallback. See [`get_home`](crate::util::get_home) for the canonical
+    /// strict-policy rationale and exact error forms.
     /// Returns `Error::NoResponse` if the child exits without sending a Stop payload.
     /// Returns `Error::Timeout` if the timeout expires (no output or overall timeout).
     /// Returns `Error::Interrupted` if a SIGINT is received.
@@ -909,8 +912,13 @@ fn kill_child(pid: nix::unistd::Pid) {
 /// than a possible stall.
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
-/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
+///
+/// Returns `Error::Config` if `HOME` is unset, empty, inaccessible, not a
+/// directory, or not writable. The function does not guess a location for the
+/// user's trust file. See [`get_home`](crate::util::get_home) for the canonical
+/// strict-policy rationale and exact error forms. Failure to read the current
+/// directory returns `Error::Internal`; file mutation failures are also reported
+/// as `Error::Internal`.
 fn pretrust_cwd() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Internal(anyhow::anyhow!("pretrust cwd: {e}")))?;

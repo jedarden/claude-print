@@ -182,8 +182,11 @@ fn main() {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/tmp".to_string());
-    // This standalone fixture cannot call claude_print::util::get_home(), so it
-    // mirrors the shared strict contract instead of inventing a /root fallback.
+    // This standalone workspace member cannot call claude_print::util::get_home(),
+    // whose docs are the canonical HOME-policy source. Production launches have
+    // already validated that HOME exists and is writable; direct fixture launches
+    // only mirror the unset/empty rejection here, then surface any filesystem
+    // failure while writing. Neither path invents a /root fallback.
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)

@@ -135,16 +135,25 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns the path to the config file
+    /// Returns the path to the config file.
     ///
     /// Path priority:
-    /// 1. $XDG_CONFIG_HOME/claude-print/config.toml if XDG_CONFIG_HOME is set
-    /// 2. ~/.config/claude-print/config.toml otherwise
+    /// 1. `$XDG_CONFIG_HOME/claude-print/config.toml` if `XDG_CONFIG_HOME` is set
+    /// 2. `$HOME/.config/claude-print/config.toml` otherwise
+    ///
+    /// The fallback uses [`get_home`](crate::util::get_home); it never substitutes
+    /// `/root`, the passwd database, or the current directory. This keeps config
+    /// lookup consistent with transcript and trust-state paths. An explicit
+    /// `XDG_CONFIG_HOME` is already a complete path, so direct library calls do
+    /// not need `HOME` for this function in that case. The CLI still validates
+    /// `HOME` as a process-wide prerequisite before dispatch.
     ///
     /// # Errors
+    ///
     /// When `XDG_CONFIG_HOME` is unavailable, returns `Error::Config` if `HOME`
-    /// is unset or empty. `HOME` is not consulted when `XDG_CONFIG_HOME` is set.
-    /// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
+    /// is unset, empty, inaccessible, not a directory, or not writable. See
+    /// [`get_home`](crate::util::get_home) for the canonical strict-policy
+    /// rationale and exact error forms.
     pub fn default_path() -> Result<PathBuf> {
         // Try XDG_CONFIG_HOME first
         if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {

@@ -47,9 +47,13 @@ pub fn parse_stop_payload(bytes: &[u8]) -> Result<StopPayload> {
 /// when `transcript_path` is absent but `session_id` and `cwd` are present.
 ///
 /// # Errors
+///
 /// If the transcript path must be derived, returns `Error::Config` when `HOME`
-/// is unset or empty. An explicit transcript path does not require `HOME`.
-/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
+/// is unset, empty, inaccessible, not a directory, or not writable. An explicit
+/// transcript path is already authoritative, so direct library calls do not read
+/// `HOME` in that branch. The CLI nevertheless validates `HOME` before dispatch.
+/// See [`get_home`](crate::util::get_home) for the canonical strict-policy
+/// rationale and exact error forms.
 pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
     let explicit_path = payload
         .transcript_path
@@ -82,8 +86,11 @@ pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
 /// Full path: `$HOME/.claude/projects/<slug>/<session_id>.jsonl`
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
-/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
+///
+/// Returns `Error::Config` if `HOME` is unset, empty, inaccessible, not a
+/// directory, or not writable. No fallback directory is attempted. See
+/// [`get_home`](crate::util::get_home) for the canonical strict-policy rationale
+/// and exact error forms. Invalid `cwd` values also return `Error::Config`.
 pub fn derive_transcript_path(session_id: &str, cwd: &str) -> Result<PathBuf> {
     let slug = cwd_to_slug(cwd)?;
     let home = get_home()?;
@@ -165,9 +172,12 @@ pub fn cwd_to_slug(cwd: &str) -> Result<String> {
 /// `session_id` is unknown until the Stop payload arrives, after injection.
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
-/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
-/// Also returns `Error::Io` if the current working directory cannot be read.
+///
+/// Returns `Error::Config` if `HOME` is unset, empty, inaccessible, not a
+/// directory, or not writable. No fallback directory is attempted. See
+/// [`get_home`](crate::util::get_home) for the canonical strict-policy rationale
+/// and exact error forms. Invalid working-directory values also return
+/// `Error::Config`; failure to read the current directory returns `Error::Io`.
 pub fn projects_dir_for_cwd() -> Result<PathBuf> {
     let cwd = std::env::current_dir().map_err(Error::Io)?;
     let slug = cwd_to_slug(&cwd.to_string_lossy())?;

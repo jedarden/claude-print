@@ -152,7 +152,10 @@ pub struct Cli {
     #[arg(long = "pool-socket")]
     pub pool_socket: Option<std::path::PathBuf>,
 
-    /// Path to config file (default: $XDG_CONFIG_HOME/claude-print/config.toml or ~/.config/claude-print/config.toml)
+    /// Path to the config file (default: `$XDG_CONFIG_HOME/claude-print/config.toml`
+    /// or `$HOME/.config/claude-print/config.toml`). The CLI requires a valid
+    /// `HOME` even when this option supplies an explicit path; see
+    /// [`get_home`](crate::util::get_home) for the canonical strict policy.
     #[arg(long = "config")]
     pub config: Option<std::path::PathBuf>,
 }

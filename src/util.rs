@@ -5,13 +5,20 @@ use std::path::{Path, PathBuf};
 
 /// Resolves the current user's home directory from `HOME`.
 ///
-/// HOME handling is intentionally strict. Claude's configuration and transcripts
-/// belong to the current user, so guessing a directory could read or write another
-/// user's data. In particular, `/root` is not a portable fallback: it can be absent
-/// in a chroot or container and is incorrect whenever the process is not root.
-/// Callers therefore receive a clear configuration error instead of a guessed path.
-/// This helper is the sole production access to `HOME`; modules that resolve
-/// user-owned paths must use it so the policy cannot drift between call sites.
+/// `HOME` handling is intentionally strict rather than lenient. Claude's
+/// configuration and transcripts belong to the current user, so guessing a
+/// directory could read or write another user's data. In particular, `/root` is
+/// not a portable fallback: it can be absent in a chroot or container and is
+/// incorrect whenever the process is not root. Callers therefore receive a clear
+/// configuration error instead of a guessed path.
+///
+/// This documentation is the canonical source for the project's `HOME` policy.
+/// This helper is the sole production access to the variable; modules that resolve
+/// user-owned paths must call it so validation and errors cannot drift between call
+/// sites. Tests set `HOME` to temporary directories rather than relying on the
+/// developer's account. Applying the same strict resolver in tests and production
+/// makes hidden host dependencies visible and keeps test runs from touching real
+/// Claude state.
 ///
 /// Chroots and minimal containers must provision `HOME` before starting
 /// `claude-print`. The path must already exist, be a directory, and permit a
@@ -24,10 +31,23 @@ use std::path::{Path, PathBuf};
 ///
 /// [`var_os`](std::env::var_os) is used so valid non-UTF-8 Unix paths are preserved.
 ///
+/// # Example
+///
+/// ```no_run
+/// use claude_print::util::get_home;
+///
+/// let projects_dir = get_home()?.join(".claude").join("projects");
+/// # Ok::<(), claude_print::error::Error>(())
+/// ```
+///
 /// # Errors
 ///
-/// Returns [`Error::Config`] when `HOME` is unset or empty, does not name an
-/// accessible directory, or is not writable.
+/// Returns [`Error::Config`] using one of these forms:
+///
+/// - `HOME environment variable not set or empty; set HOME to the user's home directory`
+/// - `HOME path '<path>' is not accessible: <OS error>; set HOME to an existing, writable directory`
+/// - `HOME path '<path>' is not a directory; set HOME to an existing, writable directory`
+/// - `HOME path '<path>' is not writable: <reason>; grant write permission or set HOME to an existing, writable directory`
 pub fn get_home() -> Result<PathBuf> {
     // Keep the environment read here so every production caller gets the strict
     // validation and none can introduce an implicit fallback.
@@ -36,6 +56,17 @@ pub fn get_home() -> Result<PathBuf> {
     Ok(home)
 }
 
+/// Converts an injected `HOME` value to a path without guessing a fallback.
+///
+/// Keeping environment decoding separate makes unset, empty, and non-UTF-8 values
+/// deterministic to test. Filesystem validation remains the responsibility of
+/// [`get_home`], the canonical source for the complete strict policy.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] with
+/// `HOME environment variable not set or empty; set HOME to the user's home directory`
+/// when the value is absent or empty.
 fn home_from_env_value(home: Option<OsString>) -> Result<PathBuf> {
     home.filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -47,10 +78,20 @@ fn home_from_env_value(home: Option<OsString>) -> Result<PathBuf> {
         })
 }
 
+/// Applies [`get_home`]'s existing-directory and writability requirements.
+///
+/// The production probe is deliberately routed through
+/// [`validate_home_path_with_probe`] so tests can simulate filesystem failures
+/// that are difficult or unsafe to create on the host.
 fn validate_home_path(home: &Path) -> Result<()> {
     validate_home_path_with_probe(home, write_home_probe)
 }
 
+/// Validates a candidate `HOME` using an injectable write probe.
+///
+/// The injected probe keeps tests deterministic for conditions such as a
+/// read-only mount while preserving the exact production error mapping. See
+/// [`get_home`] for the strict-policy rationale and error forms.
 fn validate_home_path_with_probe(
     home: &Path,
     write_probe: impl FnOnce(&Path) -> std::io::Result<()>,
@@ -86,6 +127,11 @@ fn validate_home_path_with_probe(
     Ok(())
 }
 
+/// Creates, writes, and removes the temporary file used to verify `HOME`.
+///
+/// The file lives directly under `home`, matching the minimum create/write
+/// capability Claude Code needs. [`NamedTempFile::close`](tempfile::NamedTempFile::close)
+/// removes it before successful return.
 fn write_home_probe(home: &Path) -> std::io::Result<()> {
     let mut probe = tempfile::Builder::new()
         .prefix(".claude-print-home-check-")
@@ -94,6 +140,10 @@ fn write_home_probe(home: &Path) -> std::io::Result<()> {
     probe.close()
 }
 
+/// Builds the canonical configuration error for a non-writable `HOME` path.
+///
+/// Centralizing this message keeps real-probe and injected-probe failures
+/// consistent; [`get_home`] documents the complete public error contract.
 fn home_not_writable(home: &Path, reason: &str) -> Error {
     Error::Config(format!(
         "HOME path '{}' is not writable: {reason}; grant write permission or set HOME to an existing, writable directory",
