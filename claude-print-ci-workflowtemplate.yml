@@ -6,6 +6,20 @@ metadata:
   labels:
     app: claude-print-ci
 spec:
+  # Limit to one concurrent run per repo -- repeated pushes queue instead
+  # of running N concurrent workflows that compete for iad-ci's limited
+  # capacity (15 allocatable CPU across 6 nodes). Matches the pattern
+  # already proven on needle-ci (see needle-ci-semaphore-configmap.yml).
+  synchronization:
+    mutexes:
+      - name: claude-print-ci
+  # Backstop against a run that hangs before its pod ever starts (unbound
+  # PVC, unschedulable, missing secret). Per-step activeDeadlineSeconds does
+  # not cover that case: on 2026-08-07 five needle-ci runs sat Running for
+  # 8h against a 3600s step limit. ttlStrategy only reaps COMPLETED runs, so
+  # without a workflow-level cap they are never terminated and never GCd.
+  # Basis: sum of per-step deadlines x attempts = 3600s, +50% headroom.
+  activeDeadlineSeconds: 7200
   entrypoint: ci
   serviceAccountName: argo-workflow
   arguments:
@@ -96,9 +110,28 @@ spec:
               exit 0
             fi
 
-            # Check if release already exists — idempotent re-runs safe
-            if gh release view "v${VERSION}" --repo jedarden/claude-print > /dev/null 2>&1; then
-              echo "Release v${VERSION} already exists — skipping"
+            # Tag-to-Forgejo (draft-revert root-cause fix, 2026-08-16): the
+            # GitHub repo is a Forgejo push mirror, and every mirror sync
+            # PRUNES refs that exist only on GitHub. GitHub demotes a
+            # published release to draft when its tag is deleted, so the tag
+            # must exist on Forgejo BEFORE any GitHub release references it.
+            git tag "v${VERSION}" 2>/dev/null || [ "$(git rev-parse "refs/tags/v${VERSION}^{commit}")" = "$(git rev-parse HEAD)" ]
+            echo "Pushing tag v${VERSION} to Forgejo"
+            set +x
+            git push "https://x-token:${FORGEJO_TOKEN}@git.ardenone.com/jedarden/claude-print.git" "refs/tags/v${VERSION}"
+            set -x
+
+            # Skip only if the version is genuinely PUBLISHED (not a draft) —
+            # a drafted release must be published in place, not skipped.
+            IS_DRAFT=$(gh release view "v${VERSION}" --repo jedarden/claude-print --json isDraft --jq '.isDraft' 2>/dev/null || echo "absent")
+            if [ "$IS_DRAFT" = "false" ]; then
+              echo "Release v${VERSION} already published — skipping"
+              exit 0
+            fi
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "Release v${VERSION} exists as a DRAFT — publishing it in place"
+              gh release edit "v${VERSION}" --repo jedarden/claude-print --draft=false
+              echo "Release v${VERSION} published"
               exit 0
             fi
 
@@ -134,28 +167,28 @@ spec:
             verify_static "./${CLAUDE_PRINT_ASSET}"
             verify_static "./${MOCK_ASSET}"
 
-            # === Binary-size gate (plan-mandated: < 10 MB) ===
+            # Enforce the plan's <10 MiB binary-size requirement.
             BINARY_SIZE_BYTES=$(stat -c%s "./${CLAUDE_PRINT_ASSET}")
-            BINARY_SIZE_MB=$(echo "scale=2; $BINARY_SIZE_BYTES / (1024*1024)" | bc)
-            MAX_SIZE_MB=10
-            echo "Binary size: ${BINARY_SIZE_MB} MB (max: ${MAX_SIZE_MB} MB)"
-            if [ "$BINARY_SIZE_BYTES" -gt "$((MAX_SIZE_MB * 1024 * 1024))" ]; then
-              echo "ERROR: Binary size ${BINARY_SIZE_MB} MB exceeds ${MAX_SIZE_MB} MB limit" >&2
+            MAX_SIZE_BYTES=$((10 * 1024 * 1024))
+            echo "Binary size: ${BINARY_SIZE_BYTES} bytes (max: ${MAX_SIZE_BYTES} bytes)"
+            if [ "$BINARY_SIZE_BYTES" -gt "$MAX_SIZE_BYTES" ]; then
+              echo "ERROR: Binary size ${BINARY_SIZE_BYTES} bytes exceeds ${MAX_SIZE_BYTES} byte limit" >&2
               exit 1
             fi
 
-            # === last-claude-version.txt artifact (plan-mandated for CI diff tracking) ===
-            # Record the Claude version being wrapped for version-regression detection
-            if CLAUDE_BIN=$(which claude 2>/dev/null); then
+            # Record the wrapped Claude version when available. The release
+            # image does not currently install Claude, so retain an explicit
+            # unknown marker rather than omitting the artifact.
+            if CLAUDE_BIN=$(command -v claude 2>/dev/null); then
               CLAUDE_VERSION_OUTPUT=$("$CLAUDE_BIN" --version 2>&1)
               echo "$CLAUDE_VERSION_OUTPUT" > last-claude-version.txt
               echo "Recorded Claude version: $CLAUDE_VERSION_OUTPUT"
             else
-              echo "WARNING: claude binary not found on PATH; cannot record version" >&2
+              echo "WARNING: claude binary not found on PATH; recording unknown" >&2
               echo "unknown" > last-claude-version.txt
             fi
 
-            # Create GitHub release with both binaries and version artifact
+            # Create GitHub release with both binaries and the version artifact
             gh release create "v${VERSION}" \
               --repo jedarden/claude-print \
               --title "claude-print v${VERSION}" \
@@ -193,10 +226,15 @@ spec:
               secretKeyRef:
                 name: github-webhook-secret
                 key: token
+          - name: FORGEJO_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: forgejo-webhook-token
+                key: token
         resources:
           requests:
             cpu: 2000m
             memory: 4Gi
           limits:
-            cpu: 4000m
-            memory: 8Gi
+            cpu: 3500m
+            memory: 6Gi

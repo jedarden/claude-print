@@ -989,7 +989,7 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 | `main()` session orchestration | **COMPLETE** — src/main.rs and src/session.rs orchestration shipped as v0.2.0 |
 | Binary-level E2E tests (AS-1, AS-2, AS-5) | **COMPLETE** — tests passing (bf-46x) |
 | AS-4 billing classification | **AUTOMATED DAILY** on production hosts; manual pre-release verification remains required |
-| CI release binary | **PENDING** — `claude-print-ci` WorkflowTemplate synced to ArgoCD; no release tag cut yet |
+| CI release binary | **COMPLETE** — v0.2.0 is published with both static musl binaries; clean-prefix `install.sh` E2E passes |
 
 Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's completion criterion is met.
 
@@ -1062,12 +1062,12 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 **Phase 11: CI (~YAML only)**
 *Entry:* Phase 10 complete.
 - [x] `claude-print-ci` Argo WorkflowTemplate: fmt + clippy + test + musl release binary + artifact upload
-  *(Note: the `claude-print-ci` WorkflowTemplate is committed to `jedarden/declarative-config` and confirmed Synced in ArgoCD. The WorkflowTemplate covers verify + build-musl + github-release steps. No release tag has been cut yet — the install.sh end-to-end download test is blocked on a release binary existing, which requires `main()` session orchestration to be complete first.)*
+  *(Verified with v0.2.0: the tagged CI path runs the quality gates and publishes both static musl binaries. The repo-root reference and `jedarden/declarative-config` copy are kept identical.)*
 - [x] CI also builds `mock_claude` binary (musl) and uploads it as a release artifact alongside `claude-print`
 
 - [x] Confirm `cargo audit` runs on every push (either via `rust-verify` or as an explicit CI step)
 - [x] Run install.sh end-to-end download test: download release artifact from GitHub Release URL and verify install.sh exits 0 and `claude-print --check` passes
-  *(Deferred: blocked on a release binary existing. Will unblock once `main()` is complete and a release tag is cut.)*
+  *(Verified against the v0.2.0 GitHub release on a clean prefix; both assets download and `claude-print --check` exits 0.)*
 
 *Complete when:* CI run on main branch produces release binary; `last-claude-version.txt` artifact present; binary passes `claude-print --check` (credential-free) via `install.sh`; install.sh end-to-end download test (deferred from Phase 9) passes; full AS-1 is verified manually before each release tag is pushed.
 
@@ -1535,20 +1535,20 @@ container:
     git -C /workspace checkout {{inputs.parameters.revision}} &&
     cd /workspace &&
     cargo build --release --target x86_64-unknown-linux-musl &&
-    mv /workspace/target/x86_64-unknown-linux-musl/release/claude-print /workspace/claude-print-linux-amd64 &&
-    mv /workspace/target/x86_64-unknown-linux-musl/release/mock_claude /workspace/mock-claude-linux-amd64"]
+    mv /workspace/target/x86_64-unknown-linux-musl/release/claude-print /workspace/claude-print-x86_64-linux &&
+    mv /workspace/target/x86_64-unknown-linux-musl/release/mock_claude /workspace/mock_claude-x86_64-linux"]
   env:
     - name: CARGO_TERM_COLOR
       value: never
 outputs:
   artifacts:
     - name: binary
-      path: /workspace/claude-print-linux-amd64
+      path: /workspace/claude-print-x86_64-linux
     - name: mock-binary
-      path: /workspace/mock-claude-linux-amd64
+      path: /workspace/mock_claude-x86_64-linux
 ```
 
-The `cargo build` step also builds `mock_claude` from the `test-fixtures/mock-claude/` workspace member (it is declared as a workspace member in the root `Cargo.toml`, so a single `cargo build --release` compiles both). After the build, both binaries are renamed for upload: `claude-print` → `claude-print-linux-amd64`, `mock_claude` → `mock-claude-linux-amd64`.
+The `cargo build` step also builds `mock_claude` from the `test-fixtures/mock-claude/` workspace member (it is declared as a workspace member in the root `Cargo.toml`, so a single `cargo build --release` compiles both). After the build, both binaries are renamed for upload: `claude-print` → `claude-print-x86_64-linux`, `mock_claude` → `mock_claude-x86_64-linux`.
 
 Both binaries MUST be statically linked and self-contained. Verify with `file <binary>` — must say "statically linked".
 
@@ -1561,11 +1561,11 @@ gh release create "${TAG}" \
   --repo jedarden/claude-print \
   --title "${TAG}" \
   --notes "Release ${TAG}" \
-  claude-print-linux-amd64 \
-  mock-claude-linux-amd64
+  claude-print-x86_64-linux \
+  mock_claude-x86_64-linux
 ```
 
-Asset naming convention: `claude-print-linux-amd64` and `mock-claude-linux-amd64` (no version in filenames — the release tag provides the version). This simplifies install scripts that pin to a known URL pattern.
+Asset naming convention: `claude-print-x86_64-linux` and `mock_claude-x86_64-linux` (no version in filenames — the release tag provides the version). This matches `install.sh`'s `${ARCH}-linux` target naming.
 
 ### Release Tag Convention
 
@@ -1612,7 +1612,7 @@ The repository README targets two audiences: (a) a human who wants to install an
 
 2. **Installation** — `curl`-based one-liner pulling the latest GitHub release asset:
    ```sh
-   curl -fsSL https://github.com/jedarden/claude-print/releases/latest/download/claude-print-linux-amd64 \
+   curl -fsSL https://github.com/jedarden/claude-print/releases/latest/download/claude-print-x86_64-linux \
      -o ~/.local/bin/claude-print && chmod +x ~/.local/bin/claude-print
    ```
    And the `install.sh` variant (from the repo) for NEEDLE agent YAML setup.
