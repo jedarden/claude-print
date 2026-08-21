@@ -107,6 +107,7 @@ claude-print --timeout 30 "quick question"
 | `--no-inherit-hooks` | | | Disable user hook inheritance |
 | `--verbose` | | | Write timing traces to stderr |
 | `--check` | | | Run installation self-test and exit |
+| `--clean` | | | With `--check`, remove orphaned temp directories older than one hour |
 | `--version` | `-V` | | Print version and exit |
 | `--help` | `-h` | | Print help |
 

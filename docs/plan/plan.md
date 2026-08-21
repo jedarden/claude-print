@@ -1401,7 +1401,7 @@ The manual `scripts/check-billing.sh` release gate remains required as a belt-an
 2. Verify `openpty()` succeeds and returns two valid fds
 3. Verify `mkfifo` works in `$TMPDIR`
 4. Spawn `mock_claude` (installed alongside the main binary by `install.sh`) and verify a basic PTY round-trip — `mock_claude` is resolved from the same directory as `claude-print` itself, not hardcoded to `~/.local/bin/`. If `claude-print` is at `~/.local/bin/claude-print`, `mock_claude` is expected at `~/.local/bin/mock_claude`. If `mock_claude` is not found at the expected path (e.g., because `SKIP_MOCK_CLAUDE=1` was used during install), step 4 emits a warning `mock_claude not found — skipping PTY round-trip test` and proceeds. The `--check` exits 0 with steps 1–3 verified.
-5. Scan `$TMPDIR` for leftover `claude-print-*` directories older than 1 hour and report them as warnings (does not fail the check). Example message: `WARNING: found orphaned temp dir /tmp/claude-print-12345-abc (1.2h old) — run rm -rf to clean up`.
+5. Scan `$TMPDIR` for leftover `claude-print-*` directories older than 1 hour and report them as warnings (does not fail the check). Example message: `WARNING: found orphaned temp dir /tmp/claude-print-12345-abc (1.2h old) — run rm -rf to clean up`. Passing `--check --clean` removes the directories matched by this same scan and prints a `CLEANED` line for each one. `--clean` is rejected without `--check`, keeping the default self-test non-destructive and safe for scripts and CI.
 6. Print `OK` or a specific failure message per step
 
 `install.sh` runs `--check` after installation. `--check` exits 0 on success, 2 on failure.

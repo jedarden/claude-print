@@ -39,12 +39,14 @@ fn main() {
     // including external signals that trigger Rust's default handler.
     session::register_cleanup_handler();
 
-    // Clean up orphaned temp dirs from previous crashed runs.
-    // This runs on all invocations, not just when a session runs,
-    // ensuring orphans are eventually removed.
-    hook::cleanup_orphans();
-
     let cli = Cli::parse();
+
+    // Ordinary invocations retain the automatic best-effort orphan sweep.
+    // Check mode owns its scan so plain --check stays warn-only and only an
+    // explicit --check --clean removes the directories it reports.
+    if !cli.check {
+        hook::cleanup_orphans();
+    }
 
     // HOME is a process-wide prerequisite, including for early-exit entry
     // points such as --version. Validate it before dispatch so the CLI,
@@ -70,7 +72,7 @@ fn main() {
     }
 
     if cli.check {
-        let code = claude_print::check::run(cli.claude_binary.as_deref());
+        let code = claude_print::check::run_with_clean(cli.claude_binary.as_deref(), cli.clean);
         exit_with_cleanup(code);
     }
 

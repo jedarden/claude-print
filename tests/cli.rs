@@ -137,6 +137,19 @@ fn cli_verbose_flag() {
 }
 
 #[test]
+fn cli_check_clean_flags() {
+    let cli = Cli::try_parse_from(["claude-print", "--check", "--clean"]).unwrap();
+    assert!(cli.check);
+    assert!(cli.clean);
+}
+
+#[test]
+fn cli_clean_requires_check() {
+    let result = Cli::try_parse_from(["claude-print", "--clean"]);
+    assert!(result.is_err(), "--clean without --check must be rejected");
+}
+
+#[test]
 fn cli_dangerously_skip_permissions_flag() {
     let cli = Cli::try_parse_from(["claude-print", "--dangerously-skip-permissions"]).unwrap();
     assert!(cli.dangerously_skip_permissions);

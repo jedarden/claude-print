@@ -12,6 +12,16 @@ struct Row {
     detail: String,
 }
 
+struct Orphan {
+    path: PathBuf,
+    age: Duration,
+}
+
+struct OrphanReport {
+    messages: Vec<String>,
+    all_removed: bool,
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
@@ -64,18 +74,26 @@ fn format_orphan_warning(path: &Path, age: Duration) -> String {
     )
 }
 
+fn format_orphan_removed(path: &Path, age: Duration) -> String {
+    let hours = age.as_secs_f64() / 3600.0;
+    format!(
+        "CLEANED: removed orphaned temp dir {} ({:.1}h old)",
+        path.display(),
+        hours
+    )
+}
+
 /// Scan `dir` for `claude-print-*` directories whose mtime is older than
-/// `threshold` relative to `now`, returning one warning string per orphan.
+/// `threshold` relative to `now`.
 ///
 /// Pure/injectable (dir + clock supplied by caller) so tests can supply an
 /// artificial TMPDIR and a fixed `now` instead of touching real env. This is
-/// the logic `run()` uses to emit step-5 warnings; the warnings never affect
-/// the check's PASS/FAIL or exit code.
-fn orphan_warnings_in(dir: &Path, now: SystemTime, threshold: Duration) -> Vec<String> {
-    let mut warnings = Vec::new();
+/// the shared scan used by both warn-only and cleanup modes.
+fn find_orphans_in(dir: &Path, now: SystemTime, threshold: Duration) -> Vec<Orphan> {
+    let mut orphans = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return warnings,
+        Err(_) => return orphans,
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -98,20 +116,56 @@ fn orphan_warnings_in(dir: &Path, now: SystemTime, threshold: Duration) -> Vec<S
             continue;
         };
         if age >= threshold {
-            warnings.push(format_orphan_warning(&path, age));
+            orphans.push(Orphan { path, age });
         }
     }
-    warnings
+    orphans.sort_by(|a, b| a.path.cmp(&b.path));
+    orphans
+}
+
+fn process_orphans_in(
+    dir: &Path,
+    now: SystemTime,
+    threshold: Duration,
+    clean: bool,
+) -> OrphanReport {
+    let mut messages = Vec::new();
+    let mut all_removed = true;
+
+    for orphan in find_orphans_in(dir, now, threshold) {
+        if !clean {
+            messages.push(format_orphan_warning(&orphan.path, orphan.age));
+            continue;
+        }
+
+        match std::fs::remove_dir_all(&orphan.path) {
+            Ok(()) => messages.push(format_orphan_removed(&orphan.path, orphan.age)),
+            Err(error) => {
+                all_removed = false;
+                messages.push(format!(
+                    "WARNING: failed to remove orphaned temp dir {}: {}",
+                    orphan.path.display(),
+                    error
+                ));
+            }
+        }
+    }
+
+    OrphanReport {
+        messages,
+        all_removed,
+    }
 }
 
 /// Plan step 5: scan the real `$TMPDIR` for orphaned `claude-print-*` dirs
-/// older than one hour. Distinct from `hook::cleanup_orphans`, which *silently
-/// deletes* old dirs as a side effect of every invocation — this only *warns*.
-fn orphan_warnings() -> Vec<String> {
-    orphan_warnings_in(
+/// older than one hour. Plain `--check` only warns; `--check --clean` removes
+/// the same matches and reports each successful removal.
+fn process_orphans(clean: bool) -> OrphanReport {
+    process_orphans_in(
         &std::env::temp_dir(),
         SystemTime::now(),
         Duration::from_secs(3600),
+        clean,
     )
 }
 
@@ -280,6 +334,10 @@ fn probe_mock_claude_pty(mock_path: &Path) -> Row {
 }
 
 pub fn run(claude_binary: Option<&Path>) -> i32 {
+    run_with_clean(claude_binary, false)
+}
+
+pub fn run_with_clean(claude_binary: Option<&Path>, clean: bool) -> i32 {
     let mut rows: Vec<Row> = Vec::new();
     let mut all_pass = true;
 
@@ -334,11 +392,15 @@ pub fn run(claude_binary: Option<&Path>) -> i32 {
         );
     }
 
-    // Step 5: warn (never fail) about orphaned temp dirs older than 1h.
-    let warnings = orphan_warnings();
+    // Step 5: warn about old temp dirs, or remove them when explicitly asked.
+    // Warn-only findings never fail the check; a requested removal failure does.
+    let orphan_report = process_orphans(clean);
+    if clean && !orphan_report.all_removed {
+        all_pass = false;
+    }
     println!();
-    for w in &warnings {
-        println!("{w}");
+    for message in &orphan_report.messages {
+        println!("{message}");
     }
 
     // Step 6: final verdict.
@@ -396,13 +458,9 @@ mod tests {
         std::fs::create_dir(&other).unwrap();
         set_mtime(&other, now - Duration::from_secs(2 * 3600));
 
-        let warnings = orphan_warnings_in(dir, now, Duration::from_secs(3600));
-        assert_eq!(
-            warnings.len(),
-            1,
-            "only the one old claude-print-* dir: {warnings:?}"
-        );
-        let w = &warnings[0];
+        let orphans = find_orphans_in(dir, now, Duration::from_secs(3600));
+        assert_eq!(orphans.len(), 1, "only the one old claude-print-* dir");
+        let w = format_orphan_warning(&orphans[0].path, orphans[0].age);
         assert!(
             w.contains("claude-print-12345-abc"),
             "names the orphan: {w}"
@@ -426,8 +484,62 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         set_mtime(&file, now - Duration::from_secs(2 * 3600));
 
-        let warnings = orphan_warnings_in(dir, now, Duration::from_secs(3600));
-        assert!(warnings.is_empty(), "no orphans expected: {warnings:?}");
+        let orphans = find_orphans_in(dir, now, Duration::from_secs(3600));
+        assert!(orphans.is_empty(), "no orphans expected");
+    }
+
+    #[test]
+    fn warn_only_scan_does_not_remove_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let orphan = dir.join("claude-print-12345-old");
+        std::fs::create_dir(&orphan).unwrap();
+        set_mtime(&orphan, now - Duration::from_secs(2 * 3600));
+
+        let report = process_orphans_in(dir, now, Duration::from_secs(3600), false);
+
+        assert!(orphan.exists(), "warn-only mode must be non-destructive");
+        assert!(report.all_removed);
+        assert_eq!(report.messages.len(), 1);
+        assert!(report.messages[0].starts_with("WARNING: found orphaned temp dir"));
+    }
+
+    #[test]
+    fn clean_scan_removes_only_old_matching_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+
+        let orphan = dir.join("claude-print-12345-old");
+        std::fs::create_dir(&orphan).unwrap();
+        std::fs::write(orphan.join("stop.fifo"), b"fixture").unwrap();
+        set_mtime(&orphan, now - Duration::from_secs(2 * 3600));
+
+        let recent = dir.join("claude-print-99999-recent");
+        std::fs::create_dir(&recent).unwrap();
+
+        let unrelated = dir.join("unrelated-old-dir");
+        std::fs::create_dir(&unrelated).unwrap();
+        set_mtime(&unrelated, now - Duration::from_secs(2 * 3600));
+
+        let report = process_orphans_in(dir, now, Duration::from_secs(3600), true);
+
+        assert!(!orphan.exists(), "old matching directory should be removed");
+        assert!(
+            recent.exists(),
+            "recent matching directory must be preserved"
+        );
+        assert!(unrelated.exists(), "unrelated directory must be preserved");
+        assert!(report.all_removed);
+        assert_eq!(report.messages.len(), 1);
+        assert_eq!(
+            report.messages[0],
+            format!(
+                "CLEANED: removed orphaned temp dir {} (2.0h old)",
+                orphan.display()
+            )
+        );
     }
 
     #[test]

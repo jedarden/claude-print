@@ -140,6 +140,10 @@ pub struct Cli {
     #[arg(long)]
     pub check: bool,
 
+    /// Remove orphaned temp directories found by --check
+    #[arg(long, requires = "check")]
+    pub clean: bool,
+
     /// Print version and exit
     #[arg(long = "version", short = 'V')]
     pub version: bool,
