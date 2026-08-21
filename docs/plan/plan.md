@@ -989,7 +989,7 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 | `main()` session orchestration | **COMPLETE** — src/main.rs and src/session.rs orchestration shipped as v0.2.0 |
 | Binary-level E2E tests (AS-1, AS-2, AS-5) | **COMPLETE** — tests passing (bf-46x) |
 | AS-4 billing classification | **AUTOMATED DAILY** on production hosts; manual pre-release verification remains required |
-| CI release binary | **COMPLETE** — v0.2.0 is published with both static musl binaries; clean-prefix `install.sh` E2E passes |
+| CI release binary | **PARTIAL** — v0.2.0 has both static musl binaries and clean-prefix `install.sh` E2E passes; a fresh tagged CI run is blocked by `cargo fmt --check` on the immutable tag |
 
 Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's completion criterion is met.
 
@@ -1062,7 +1062,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 **Phase 11: CI (~YAML only)**
 *Entry:* Phase 10 complete.
 - [x] `claude-print-ci` Argo WorkflowTemplate: fmt + clippy + test + musl release binary + artifact upload
-  *(Verified with v0.2.0: the tagged CI path runs the quality gates and publishes both static musl binaries. The repo-root reference and `jedarden/declarative-config` copy are kept identical.)*
+  *(The repo-root reference and `jedarden/declarative-config` copy are identical and the live WorkflowTemplate is Synced. The existing v0.2.0 assets are static, but a fresh tagged CI submission fails at `cargo fmt --check` on that immutable tag; a new rustfmt-clean release tag is required to verify end-to-end CI provenance.)*
 - [x] CI also builds `mock_claude` binary (musl) and uploads it as a release artifact alongside `claude-print`
 
 - [x] Confirm `cargo audit` runs on every push (either via `rust-verify` or as an explicit CI step)
