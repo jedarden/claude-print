@@ -218,6 +218,151 @@ fn chroot_like_layout_never_falls_back_to_root_home() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn command_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn copy_file_into_chroot(source: &Path, destination: &Path, chroot: &Path) {
+    let relative_destination = destination.strip_prefix("/").unwrap_or_else(|_| {
+        panic!(
+            "chroot destination must be absolute: {}",
+            destination.display()
+        )
+    });
+    let destination = chroot.join(relative_destination);
+    std::fs::create_dir_all(destination.parent().expect("destination has parent"))
+        .unwrap_or_else(|error| panic!("create {}: {error}", destination.display()));
+    std::fs::copy(source, &destination).unwrap_or_else(|error| {
+        panic!(
+            "copy {} into chroot at {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    });
+}
+
+/// Copy every absolute dependency reported by `ldd`, including the ELF
+/// interpreter. Static binaries need no additional files.
+#[cfg(target_os = "linux")]
+fn install_binary_in_chroot(binary: &Path, ldd: &Path, chroot: &Path) {
+    copy_file_into_chroot(binary, Path::new("/bin/claude-print"), chroot);
+
+    let output = Command::new(ldd)
+        .arg(binary)
+        .output()
+        .unwrap_or_else(|error| panic!("inspect {} with ldd: {error}", binary.display()));
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        if report.contains("not a dynamic executable") || report.contains("statically linked") {
+            return;
+        }
+        panic!("ldd failed for {}: {report}", binary.display());
+    }
+    assert!(
+        !report.contains("=> not found"),
+        "cannot construct chroot; ldd reported a missing dependency: {report}"
+    );
+
+    let mut copied = std::collections::HashSet::new();
+    for dependency in report
+        .split_whitespace()
+        .map(Path::new)
+        .filter(|path| path.is_absolute() && path.exists())
+    {
+        if copied.insert(dependency.to_path_buf()) {
+            copy_file_into_chroot(dependency, dependency, chroot);
+        }
+    }
+}
+
+/// Exercise the compiled CLI after a real `chroot(2)`, not merely with paths
+/// that resemble a jail. The minimal root intentionally has no `/root`.
+///
+/// Platform prerequisites are Linux, `unshare`, `chroot`, and `ldd`, plus an
+/// enabled unprivileged user namespace with mount-namespace support. The test
+/// emits a skip reason when the host cannot provide that isolation facility.
+#[cfg(target_os = "linux")]
+#[test]
+fn actual_chroot_without_root_home_matches_unset_home_error() {
+    let Some(unshare) = command_on_path("unshare") else {
+        eprintln!("skipping real-chroot HOME test: unshare is not installed");
+        return;
+    };
+    let Some(chroot_command) = command_on_path("chroot") else {
+        eprintln!("skipping real-chroot HOME test: chroot is not installed");
+        return;
+    };
+    let Some(ldd) = command_on_path("ldd") else {
+        eprintln!("skipping real-chroot HOME test: ldd is not installed");
+        return;
+    };
+
+    // Probe before building the fixture. `--map-root-user` grants
+    // CAP_SYS_CHROOT only inside the new user namespace; it does not require or
+    // grant host root privileges.
+    let namespace_probe = Command::new(&unshare)
+        .args(["--user", "--map-root-user", "--mount", "--"])
+        .arg(&chroot_command)
+        .args(["/", "/bin/true"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("probe user-namespace chroot support");
+    if !namespace_probe.status.success() {
+        eprintln!(
+            "skipping real-chroot HOME test: user/mount namespaces are unavailable: {}",
+            String::from_utf8_lossy(&namespace_probe.stderr).trim()
+        );
+        return;
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_claude-print"));
+    let jail = tempfile::tempdir().expect("create isolated chroot");
+    install_binary_in_chroot(&binary, &ldd, jail.path());
+    assert!(
+        !jail.path().join("root").exists(),
+        "fixture must not create /root"
+    );
+
+    let outside = Command::new(&binary)
+        .arg("--version")
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run non-chroot missing-HOME baseline");
+    let inside = Command::new(&unshare)
+        .args(["--user", "--map-root-user", "--mount", "--"])
+        .arg(&chroot_command)
+        .arg(jail.path())
+        .args(["/bin/claude-print", "--version"])
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run claude-print in chroot without /root");
+
+    assert_eq!(outside.status.code(), Some(2));
+    assert!(outside.stdout.is_empty());
+    assert_eq!(outside.stderr, HOME_ERROR_STDERR.as_bytes());
+    assert_eq!(inside.status.code(), outside.status.code());
+    assert_eq!(inside.stdout, outside.stdout);
+    assert_eq!(inside.stderr, outside.stderr);
+    assert!(
+        !jail.path().join("root").exists(),
+        "claude-print must not synthesize /root as a HOME fallback"
+    );
+}
+
 #[test]
 fn env_u_home_version_fails_with_actionable_error() {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_claude-print"));

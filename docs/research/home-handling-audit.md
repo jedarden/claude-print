@@ -1,6 +1,6 @@
 # HOME Environment Variable Handling Audit
 
-**Audited:** 2026-08-20
+**Audited:** 2026-08-21
 **Scope:** Production HOME reads and path-resolution call sites
 
 ## Finding
@@ -31,6 +31,20 @@ operations are test fixtures that deliberately set, unset, restore, or redirect
 the environment. Those accesses are documented at their call sites and do not
 provide a fallback.
 
+The final repository-wide audit also checked shell utilities, documentation,
+and the `mock-claude` fixture. Shell installers and diagnostic scripts expand
+their own process HOME but do not resolve paths for the `claude-print` runtime.
+`mock-claude` reads HOME only after production startup has validated it, and its
+fixture comment explicitly rejects a `/root` fallback. No additional Rust
+runtime HOME resolver exists.
+
+In particular, `config.rs` and `poller.rs` both import
+`crate::util::get_home`: `Config::default_path()` calls it for the non-XDG
+branch, while `derive_transcript_path()` and `projects_dir_for_cwd()` call it
+for transcript discovery. `resolve_stop_info()` delegates derived paths to
+`derive_transcript_path()`. Their comments link back to the canonical strict
+policy and promise the same configuration errors.
+
 ## Rationale
 
 Claude configuration, trust state, and transcripts belong to the invoking
@@ -47,6 +61,13 @@ is referenced by the config, poller, and session doc comments.
 ```bash
 # Expected: get_home() plus deliberate set/unset/restore operations in tests.
 rg -n 'var(?:_os)?\("HOME"\)' src
+
+# Inspect every repository HOME read or expansion and every /root mention.
+rg -n 'HOME|/root' --glob '!target/**' --glob '!.git/**' .
+
+# Expected production path consumers: config, poller, and session all import
+# and call the shared helper; no module defines another HOME resolver.
+rg -n 'get_home' src
 
 # Review every HOME-related Rust comment against its call site.
 rg -n '^\s*(//!|///|//).*HOME' src tests
