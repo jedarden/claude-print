@@ -142,7 +142,8 @@ impl Config {
     /// 2. ~/.config/claude-print/config.toml otherwise
     ///
     /// # Errors
-    /// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
+    /// When `XDG_CONFIG_HOME` is unavailable, returns `Error::Config` if `HOME`
+    /// is unset or empty. `HOME` is not consulted when `XDG_CONFIG_HOME` is set.
     /// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
     pub fn default_path() -> Result<PathBuf> {
         // Try XDG_CONFIG_HOME first
@@ -407,7 +408,8 @@ model = "claude-opus-4-8""#,
     fn default_path_fallback_to_home_config_when_xdg_not_set() {
         std::env::remove_var("XDG_CONFIG_HOME");
         let path = Config::default_path().unwrap();
-        // Should be ~/.config/claude-print/config.toml
+        // Test-only direct read mirrors the environment used by get_home();
+        // production path resolution uses the shared strict helper above.
         let expected = std::env::var("HOME")
             .map(|h| {
                 PathBuf::from(h)

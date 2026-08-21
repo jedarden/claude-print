@@ -4,6 +4,7 @@
 /// dir lifecycle works correctly.  These tests correspond to the "Hook
 /// Inheritance Tests" section of the plan.
 use claude_print::hook::HookInstaller;
+use claude_print::util::get_home;
 use std::os::unix::fs::PermissionsExt;
 
 // ── settings.json structure ───────────────────────────────────────────────────
@@ -174,10 +175,11 @@ fn settings_json_is_valid_json() {
 #[test]
 fn hook_installer_temp_dir_is_independent_of_home() {
     let installer = HookInstaller::new().unwrap();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    // Follow the production contract: an unset HOME is an error, never /root.
+    let home = get_home().expect("test requires HOME");
     let temp_path = installer.dir_path().to_str().unwrap_or("");
     assert!(
-        !temp_path.starts_with(&home) || temp_path.contains("tmp"),
+        !installer.dir_path().starts_with(&home) || temp_path.contains("tmp"),
         "temp dir should not be inside HOME/.claude (would break isolation)"
     );
 }

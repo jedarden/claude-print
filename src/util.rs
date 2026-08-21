@@ -9,6 +9,8 @@ use std::path::PathBuf;
 /// user's data. In particular, `/root` is not a portable fallback: it can be absent
 /// in a chroot or container and is incorrect whenever the process is not root.
 /// Callers therefore receive a clear configuration error instead of a guessed path.
+/// This helper is the sole production access to `HOME`; modules that resolve
+/// user-owned paths must use it so the policy cannot drift between call sites.
 ///
 /// [`var_os`](std::env::var_os) is used so valid non-UTF-8 Unix paths are preserved.
 ///
@@ -16,6 +18,8 @@ use std::path::PathBuf;
 ///
 /// Returns [`Error::Config`] when `HOME` is unset or empty.
 pub fn get_home() -> Result<PathBuf> {
+    // Keep the environment read here so every production caller gets the strict
+    // unset-or-empty check and none can introduce an implicit fallback.
     home_from_env_value(std::env::var_os("HOME"))
 }
 

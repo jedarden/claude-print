@@ -44,6 +44,7 @@ fn run_canary(root: &Path, fake: &Path, entrypoint: &str) -> Output {
     let state = root.join("state");
     fs::create_dir_all(&home).unwrap();
 
+    // Redirect HOME only in the child so the canary uses an isolated hierarchy.
     Command::new("bash")
         .arg(repo_path("scripts/billing-canary.sh"))
         .env("HOME", &home)
@@ -102,6 +103,7 @@ fn canary_finds_its_dedicated_transcript_when_result_session_id_is_null() {
     let state = root.path().join("state");
     fs::create_dir_all(&home).unwrap();
 
+    // Redirect HOME only in the child so the canary uses an isolated hierarchy.
     let output = Command::new("bash")
         .arg(repo_path("scripts/billing-canary.sh"))
         .env("HOME", &home)
@@ -133,6 +135,7 @@ fn canary_records_invocation_failures() {
     let state = root.path().join("state");
     fs::create_dir_all(&home).unwrap();
 
+    // Redirect HOME only in the child so the canary uses an isolated hierarchy.
     let output = Command::new("bash")
         .arg(repo_path("scripts/billing-canary.sh"))
         .env("HOME", &home)

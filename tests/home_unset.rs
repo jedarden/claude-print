@@ -203,6 +203,7 @@ fn binary_reports_actionable_home_error_in_every_output_format() {
     assert!(binary.exists(), "missing binary at {}", binary.display());
 
     for format in ["text", "json", "stream-json"] {
+        // Remove HOME only from the child to exercise the strict CLI error path.
         let output = Command::new(&binary)
             .arg("--claude-binary")
             .arg(&unused_backend)

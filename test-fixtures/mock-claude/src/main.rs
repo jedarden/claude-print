@@ -182,7 +182,12 @@ fn main() {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/tmp".to_string());
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    // This standalone fixture cannot call claude_print::util::get_home(), so it
+    // mirrors the shared strict contract instead of inventing a /root fallback.
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .expect("HOME must be set and non-empty");
 
     // Compute the cwd slug the same way claude-print does: strip leading / and replace remaining / with -
     let cwd_slug = cwd.trim_start_matches('/').replace('/', "-");
@@ -202,9 +207,14 @@ fn main() {
     let transcript_path: Option<String> = if omit_transcript_path {
         None
     } else {
-        Some(format!(
-            "{home}/.claude/projects/{cwd_slug}/{session_id}.jsonl"
-        ))
+        Some(
+            home.join(".claude")
+                .join("projects")
+                .join(&cwd_slug)
+                .join(format!("{session_id}.jsonl"))
+                .to_string_lossy()
+                .into_owned(),
+        )
     };
 
     let transcript_path_part = match &transcript_path {

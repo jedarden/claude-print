@@ -47,7 +47,9 @@ pub fn parse_stop_payload(bytes: &[u8]) -> Result<StopPayload> {
 /// when `transcript_path` is absent but `session_id` and `cwd` are present.
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
+/// If the transcript path must be derived, returns `Error::Config` when `HOME`
+/// is unset or empty. An explicit transcript path does not require `HOME`.
+/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
 pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
     let explicit_path = payload
         .transcript_path
@@ -465,9 +467,10 @@ mod tests {
 
     #[test]
     fn resolve_derives_path_when_transcript_path_absent() {
+        // Direct mutation selects the derivation branch's strict HOME behavior;
+        // the original value is restored below.
         let original_home = std::env::var("HOME").ok();
 
-        // Ensure HOME is set for this test (production code requires it)
         std::env::set_var("HOME", "/test/home");
 
         let payload = StopPayload {
@@ -576,6 +579,7 @@ mod tests {
 
     #[test]
     fn derive_transcript_path_builds_correct_path() {
+        // Direct mutation supplies a deterministic HOME and is restored below.
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", "/test/home");
         let result = derive_transcript_path("sess-id", "/project/dir");
@@ -594,6 +598,7 @@ mod tests {
 
     #[test]
     fn projects_dir_for_cwd_builds_correct_path() {
+        // Direct mutation supplies a deterministic HOME and is restored below.
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", "/test/home");
         let result = projects_dir_for_cwd();

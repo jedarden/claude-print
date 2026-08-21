@@ -928,8 +928,9 @@ fn version_resilience_extra_fields_in_stop_payload_through_pipeline() {
     assert_eq!(payload.cwd.as_deref(), Some("/home/user/project"));
 
     let info = resolve_stop_info(payload).unwrap();
-    let home = std::env::var("HOME").unwrap();
-    let expected = std::path::PathBuf::from(&home)
+    // Follow the production contract instead of reading HOME independently.
+    let home = claude_print::util::get_home().expect("test requires HOME");
+    let expected = home
         .join(".claude")
         .join("projects")
         .join("home-user-project")
@@ -978,7 +979,8 @@ fn stop_payload_explicit_path_used_directly() {
 /// Missing transcript_path → derive from session_id + cwd → transcript read → emit.
 #[test]
 fn stop_payload_path_derivation_and_transcript_emit() {
-    let _home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    // Path derivation uses the shared strict resolver and must not invent /root.
+    let _home = claude_print::util::get_home().expect("test requires HOME");
     let dir = TempDir::new().unwrap();
     let session_id = "derive-test-session";
     let cwd = "/home/user/myproject";
@@ -1079,8 +1081,10 @@ fn invariant_temp_dir_drop_removes_all_artifacts() {
 /// INV-5: Hook artifacts are NOT placed inside ~/.claude/ or the user's home dir.
 #[test]
 fn invariant_hook_artifacts_not_in_home_claude_dir() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let claude_dir = std::path::PathBuf::from(&home).join(".claude");
+    // Match production HOME resolution while checking the hook's isolation.
+    let claude_dir = claude_print::util::get_home()
+        .expect("test requires HOME")
+        .join(".claude");
 
     let installer = HookInstaller::new().unwrap();
     let dir = installer.dir_path();
@@ -1103,8 +1107,9 @@ fn stop_payload_minimal_fields_derives_path() {
     assert!(payload.last_assistant_message.is_none());
 
     let info = resolve_stop_info(payload).unwrap();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let expected = std::path::PathBuf::from(&home)
+    // Follow the production contract: an unset HOME is an error, never /root.
+    let home = claude_print::util::get_home().expect("test requires HOME");
+    let expected = home
         .join(".claude")
         .join("projects")
         .join("tmp-min")

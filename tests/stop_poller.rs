@@ -1,6 +1,7 @@
 use claude_print::event_loop::{EventLoop, ExitReason};
 use claude_print::hook::HookInstaller;
 use claude_print::poller::{open_fifo_nonblock, parse_stop_payload, resolve_stop_info};
+use claude_print::util::get_home;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 
@@ -126,8 +127,9 @@ fn test_missing_transcript_path_derived() {
     let info = resolve_stop_info(stop);
 
     // Derived slug: /home/user/myproject → home-user-myproject
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let expected = std::path::PathBuf::from(&home)
+    // Follow the production contract: an unset HOME is an error, never /root.
+    let home = get_home().expect("test requires HOME");
+    let expected = home
         .join(".claude")
         .join("projects")
         .join("home-user-myproject")
