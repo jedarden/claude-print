@@ -232,10 +232,10 @@ Two orthogonal state machines run inside the event loop.
 ```
 WAITING
   │  trust keywords found in PTY line
-  │  OR (bytes_received ≥ 200 AND PTY idle ≥ 0.8 s)
+  │  OR (bytes_received ≥ 200 AND PTY quiet ≥ 0.4 s)
   ▼
 TRUST_DISMISSED   ← CR sent
-  │  PTY idle ≥ 2.0 s after CR write
+  │  PTY quiet ≥ 1.0 s (window restarts on every PTY chunk)
   ▼
 PROMPT_INJECTED   ← bracketed paste sent; FIFO read-end opened
   │  FIFO becomes readable (Stop hook fired)
@@ -251,7 +251,7 @@ From any state:
 
 Guard conditions:
 - `WAITING → TRUST_DISMISSED`: **either** trust keywords OR the idle/byte threshold. Not both required. One-shot: once the WAITING → TRUST_DISMISSED transition occurs for any reason (keyword or idle), the idle fallback is deactivated.
-- `TRUST_DISMISSED → PROMPT_INJECTED`: idle gap measured from the CR write timestamp, not from last PTY output — avoids re-triggering on buffered output that arrives after CR.
+- `TRUST_DISMISSED → PROMPT_INJECTED`: the quiet window starts at the CR write and restarts on every subsequent PTY output chunk, so buffered redraw output delays rather than races prompt injection.
 - FIFO read end opened at the `TRUST_DISMISSED → PROMPT_INJECTED` transition, **before** the bracketed paste is written (EC-3).
 
 ### FIFO Poller States
@@ -601,19 +601,21 @@ The trust dialog asks the user to confirm before allowing tool use. Detection us
 
 - If any output line contains two or more of: `trust`, `Allow`, `continue`, `folder`, `permission`, `proceed` → send `\r` immediately
 - Fallback: after 0.4 s with no new PTY bytes and ≥ 200 bytes received total → send `\r` (covers any welcome/confirmation prompt)
-  - **Adaptive extension (2026-08-15):** If PTY output continues to arrive during the idle period, the wait extends up to 0.8 s before firing. This reduces latency for fast cases while maintaining safety for slow-starting Claude processes.
+  - **Reduced quiet window (2026-08-20):** This was 0.8 s. The 0.4 s value is an uninterrupted-silence requirement, not a wall-clock deadline: every PTY chunk restarts it. A settled TUI advances 0.4 s sooner, while a TUI that is still rendering continues to defer the fallback.
 - Hard timeout: if the process has been in WAITING state for 45 s and fewer than 200 bytes have been received → exit 2 (binary not found or hung, or partial-output hang)
 
 The idle/byte fallback is a one-shot: once any trigger (keyword or idle) fires and transitions to TRUST_DISMISSED, the fallback timer is deactivated and cannot re-fire.
 
 **Phase 2 — Prompt injection:**
 
-- After Phase 1 CR, wait until PTY is idle for 1.0 s (REPL re-renders)
-  - **Adaptive extension (2026-08-15):** If PTY output continues to arrive during the idle period, the wait extends up to 2.0 s before firing. The idle gap resets on every PTY chunk received via `feed()`, so injection fires only after uninterrupted silence. This reduces latency for fast cases while handling TUI redraws after the dismiss.
+- After Phase 1 CR, wait until the PTY is quiet for 1.0 s (REPL re-renders)
+  - **Reduced quiet window (2026-08-20):** This was 2.0 s. The window restarts on every PTY chunk received via `feed()`, so prompt injection still requires a full second of silence after the final redraw rather than merely one second since the CR.
 - (If the PTY never goes idle for 1.0 s — e.g., claude streams continuous progress output — the wall-clock `--timeout` is the only exit path. This is expected behavior; the phase has no dedicated sub-timeout. `--verbose` logs a warning if TRUST_DISMISSED persists > 10 s.)
 - Send via bracketed paste: `\x1b[200~<prompt>\x1b[201~\r`
 - Bracketed paste treats embedded `\n` as literals (no premature Enter)
-- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After sending `/read <path>\r`, the startup sequencer re-enters the idle-wait loop (same as after trust dismiss, 1.0s idle threshold, adaptive up to 2.0s). Claude Code reads the file contents and begins processing — no system acknowledgment is emitted before the response. The response extraction path is identical to inline injection: Stop hook fires after the response, transcript JSONL is read normally. See EC-5 for sandboxing note.)
+- Prompts > 32 KB: write to `$TMPDIR/claude-print-.../prompt.txt`; send `/read <path>\r` (`/read` is a built-in slash command, not an MCP tool. Prompt file written as UTF-8 with no BOM. After sending `/read <path>\r`, the startup sequencer re-enters the idle-wait loop (the same 1.0s quiet window, restarted by PTY output). Claude Code reads the file contents and begins processing — no system acknowledgment is emitted before the response. The response extraction path is identical to inline injection: Stop hook fires after the response, transcript JSONL is read normally. See EC-5 for sandboxing note.)
+
+The reduced quiet windows leave the race guards intact: EC-7 still rejects a Stop event before `PROMPT_INJECTED`; EC-8 retains its 200-byte gate and 45 s hard timeout; and INV-3 still opens the FIFO before any prompt injection. Deterministic startup tests cover both quiet-window boundaries and verify that new PTY output restarts each window.
 
 ### 7. Stop Poller
 
@@ -1119,10 +1121,11 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - Trust keywords `trust` + `Allow` in same line → CR sent immediately
 - Trust keywords in different lines of same chunk → CR sent
 - **Alternative wording `continue` + `folder` → CR sent** (keyword union logic)
-- **Arbitrary unknown welcome text (no keywords) → fallback: CR after 0.8 s idle**
-- WAITING state persists for 45 s with fewer than 200 bytes received → error returned (covers zero-byte case and partial-output hang; if ≥ 200 bytes arrive before 45s, the idle fallback at 0.8s fires first)
-- 199 bytes received then idle 0.8 s → no CR yet (minimum 200 bytes enforced)
-- 200 bytes received then idle 0.8 s → CR sent
+- **Arbitrary unknown welcome text (no keywords) → fallback: CR after 0.4 s quiet**
+- WAITING state persists for 45 s with fewer than 200 bytes received → error returned (covers zero-byte case and partial-output hang; if ≥ 200 bytes arrive before 45s, the idle fallback fires after 0.4s of quiet)
+- 199 bytes received then quiet for 0.4 s → no CR yet (minimum 200 bytes enforced)
+- 200 bytes received then quiet for 0.4 s → CR sent
+- Additional PTY output before either quiet window expires → restart that window; do not dismiss or inject while the TUI is still rendering
 
 **CLI** (`tests/cli.rs`):
 - Positional prompt → forwarded correctly
@@ -1455,7 +1458,7 @@ The manual `scripts/check-billing.sh` release gate remains required as a belt-an
 
 **Decision:** Add a new, entirely opt-in `claude-print serve --pool-size N` daemon mode that pre-forks and pre-warms `claude` PTY processes (through trust-dismiss and idle-settle, but never past prompt injection) and hands them out over a local Unix domain socket to ordinary `claude-print` invocations that pass `--pool-socket <path>` (or find a default socket). If no pool is reachable, `claude-print` behaves exactly as it does today — this is additive, not a replacement for the default stateless path. Scoped as v2 / future work: this ADR records the decision and rationale; implementation is tracked via beads, not built in this pass.
 
-**Context:** `claude-print`'s real production usage is not one-off ad-hoc calls — it is the NEEDLE fleet's `claude-print-sonnet.yaml` adapter (`~/.needle/agents/claude-print-sonnet.yaml`), which dispatches a fresh `claude-print` invocation per bead, across up to ~20 concurrent workers (the documented Scalability Limits ceiling), all day. Every single invocation today pays the full cost from zero: `fork()`, `openpty()`, `execvp(claude)`, Claude Code's own startup (including MCP server init), the trust-dialog wait, and the 2.0s post-CR idle settle — none of it is amortized across invocations.
+**Context:** `claude-print`'s real production usage is not one-off ad-hoc calls — it is the NEEDLE fleet's `claude-print-sonnet.yaml` adapter (`~/.needle/agents/claude-print-sonnet.yaml`), which dispatches a fresh `claude-print` invocation per bead, across up to ~20 concurrent workers (the documented Scalability Limits ceiling), all day. At the time of this decision, every invocation paid the full cost from zero: `fork()`, `openpty()`, `execvp(claude)`, Claude Code's own startup (including MCP server init), the trust-dialog wait, and the then-2.0s post-CR idle settle — none of it was amortized across invocations.
 
 Empirical measurement (2026-07-20, this audit, wrapping locally-installed `claude-print` 0.2.0 / `claude` 2.1.215): a maximally trivial round trip —
 ```
@@ -1466,7 +1469,7 @@ echo "Reply with exactly one word: pong" | claude-print --output-format json --t
 **Alternatives Considered:**
 1. **Do nothing / accept the cost.** Rejected — the cost is paid on every one of potentially hundreds of daily NEEDLE dispatches; it is the dominant lever for fleet throughput, not a minor rough edge.
 2. **True multi-turn reuse — keep one `claude` REPL alive and `/clear` + resubmit for each new bead, instead of spawning fresh processes.** Rejected — this would violate the explicit Non-Goal "Multi-turn interactive sessions," and more concretely risks context/prompt bleed between unrelated beads if a `/clear` is incomplete or races with tool output — a correctness/isolation regression far worse than the latency it would save. Process-per-session isolation is a feature, not overhead to be optimized away.
-3. **Shrink the fixed idle-wait constants (0.8s trust-dismiss fallback, 2.0s post-CR settle) instead of pooling.** Not rejected outright — filed as a separate, smaller bead (see below) — but rejected as the *primary* fix: most of the observed 10–13s is `claude`'s own startup/MCP-init and model inference, not these two constants, so shaving them saves at most ~1–2s and does nothing for the dominant cost.
+3. **Shrink the fixed idle-wait constants (0.8s trust-dismiss fallback, 2.0s post-CR settle) instead of pooling.** Not rejected as an independent improvement, but rejected as the *primary* fix: most of the observed 10–13s is `claude`'s own startup/MCP-init and model inference, not these two constants. This follow-up subsequently reduced them to 0.4s/1.0s quiet windows that restart on PTY output, preserving the redraw race guards while saving up to 1.4s in settled fast-start cases; it does not address the dominant cost that motivated pooling.
 4. **Embed pool logic in every `claude-print` invocation (self-electing leader/coordinator) instead of a separate long-lived manager process.** Rejected — adds locking/coordination complexity (concurrent invocations racing to become "the pool") for no benefit over one long-lived `serve` process, and cuts against the simplicity bias already established by ADR-002 (synchronous `poll()` over an async runtime).
 
 **Consequences:**

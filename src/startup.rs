@@ -12,17 +12,12 @@ const TRUST_KEYWORDS: &[&str] = &[
 const KEYWORD_THRESHOLD: usize = 2;
 
 const IDLE_THRESHOLD_BYTES: usize = 200;
-/// Initial idle timeout for trust-dialog dismiss: 400ms.
-/// If output continues to arrive, this extends adaptively up to MAX_IDLE_TIMEOUT_MS.
+/// Quiet period required before the trust-dialog fallback dismisses unknown output.
 const IDLE_TIMEOUT_MS: u64 = 400;
-const MAX_IDLE_TIMEOUT_MS: u64 = 800;
 const HARD_TIMEOUT_SECS: u64 = 45;
 /// Default idle-gap: ms of silence after trust-dismiss before injecting prompt.
 /// Resets to zero on every PTY output chunk; fires only after uninterrupted silence.
-/// Reduced from 2000ms to 1000ms as part of adaptive backoff optimization.
 pub const DEFAULT_POST_DISMISS_IDLE_MS: u64 = 1000;
-/// Maximum adaptive extension for post-dismiss idle gap.
-const MAX_POST_DISMISS_IDLE_MS: u64 = 2000;
 
 /// Action requested by [`StartupSeq`] from the event loop.
 #[derive(Debug)]
@@ -40,7 +35,7 @@ pub enum StartupAction {
 pub enum StartupPhase {
     /// Waiting for trust dialog keywords or idle fallback.
     Waiting,
-    /// CR was sent to dismiss trust dialog; waiting for the 2 s idle before injection.
+    /// CR was sent to dismiss trust dialog; waiting for quiet before injection.
     TrustDismissed,
     /// Bracketed paste was sent; waiting for the Stop hook.
     PromptInjected,
@@ -86,7 +81,7 @@ impl StartupSeq {
 
     /// Construct with a custom post-dismiss idle gap in milliseconds.
     ///
-    /// Primarily used in tests to avoid sleeping for 2 s.
+    /// Primarily used in tests to avoid waiting for the default quiet period.
     pub fn with_idle_gap(prompt: Vec<u8>, idle_gap_ms: u64) -> Self {
         let now = Instant::now();
         Self {
@@ -121,7 +116,10 @@ impl StartupSeq {
     /// containing `b"\r"` on the first line that matches; no-ops in all other phases.
     /// Call [`poll_timers`] separately to handle deadline-driven transitions.
     pub fn feed(&mut self, chunk: &[u8]) -> StartupAction {
-        let now = Instant::now();
+        self.feed_at(chunk, Instant::now())
+    }
+
+    fn feed_at(&mut self, chunk: &[u8], now: Instant) -> StartupAction {
         self.bytes_received += chunk.len();
         self.last_output_at = now;
 
@@ -150,19 +148,17 @@ impl StartupSeq {
     ///
     /// Handles:
     /// - Hard timeout (WAITING, < 200 bytes in 45 s) → [`StartupAction::HardTimeout`]
-    /// - Idle fallback (WAITING, ≥ 200 bytes, adaptive idle starting at 0.4 s) → CR write
-    /// - Post-dismiss idle gap (TRUST_DISMISSED, no output for adaptive `idle_gap_ms`) → bracketed paste
+    /// - Idle fallback (WAITING, ≥ 200 bytes, 0.4 s quiet) → CR write
+    /// - Post-dismiss idle gap (TRUST_DISMISSED, no output for `idle_gap_ms`) → bracketed paste
     ///
-    /// Both idle checks use adaptive backoff: start checking at a reduced timeout
-    /// (0.4s for trust dismiss, 1.0s for post-dismiss), but extend the wait if
-    /// PTY output continues to arrive. This reduces latency for fast cases while
-    /// maintaining safety for slow-starting Claude processes.
-    ///
-    /// The post-dismiss idle gap resets on every PTY chunk received via [`feed`].
-    /// Injection fires only after `idle_gap_ms` ms of uninterrupted silence.
+    /// Both transitions require uninterrupted silence. Every PTY chunk received
+    /// via [`feed`] restarts the current quiet window, so a settled TUI advances
+    /// after 0.4 s / 1.0 s while an actively rendering TUI continues to wait.
     pub fn poll_timers(&mut self) -> StartupAction {
-        let now = Instant::now();
+        self.poll_timers_at(Instant::now())
+    }
 
+    fn poll_timers_at(&mut self, now: Instant) -> StartupAction {
         match self.phase {
             StartupPhase::Waiting => {
                 if now.duration_since(self.phase_start) >= Duration::from_secs(HARD_TIMEOUT_SECS)
@@ -171,47 +167,25 @@ impl StartupSeq {
                     return StartupAction::HardTimeout;
                 }
 
-                if self.bytes_received >= IDLE_THRESHOLD_BYTES {
-                    let idle_duration = now.duration_since(self.last_output_at);
-
-                    // Adaptive idle check: start at IDLE_TIMEOUT_MS (400ms), but if
-                    // output continues arriving, wait up to MAX_IDLE_TIMEOUT_MS (800ms).
-                    // This handles slow-starting Claude without penalizing fast cases.
-                    let required_idle = if idle_duration >= Duration::from_millis(MAX_IDLE_TIMEOUT_MS) {
-                        // If we've waited long enough (up to 800ms), fire regardless.
-                        Duration::from_millis(IDLE_TIMEOUT_MS)
-                    } else {
-                        // Otherwise, require the base idle period.
-                        Duration::from_millis(IDLE_TIMEOUT_MS)
-                    };
-
-                    if idle_duration >= required_idle {
-                        // Reset last_output_at so the idle gap is measured from the
-                        // dismiss moment, not from whenever output last arrived in
-                        // the Waiting phase.
-                        self.last_output_at = now;
-                        self.phase = StartupPhase::TrustDismissed;
-                        self.trust_dismiss_at = Some(now);
-                        return StartupAction::Write(b"\r".to_vec());
-                    }
+                if self.bytes_received >= IDLE_THRESHOLD_BYTES
+                    && now.duration_since(self.last_output_at)
+                        >= Duration::from_millis(IDLE_TIMEOUT_MS)
+                {
+                    // Reset last_output_at so the next quiet window starts at the
+                    // dismiss moment, not at the final Waiting-phase output.
+                    self.last_output_at = now;
+                    self.phase = StartupPhase::TrustDismissed;
+                    self.trust_dismiss_at = Some(now);
+                    return StartupAction::Write(b"\r".to_vec());
                 }
 
                 StartupAction::None
             }
 
             StartupPhase::TrustDismissed => {
-                // Adaptive idle-gap check: start checking at idle_gap_ms (1000ms),
-                // but if output continues to arrive, extend up to MAX_POST_DISMISS_IDLE_MS (2000ms).
-                let idle_duration = now.duration_since(self.last_output_at);
-                let required_idle = if idle_duration >= Duration::from_millis(MAX_POST_DISMISS_IDLE_MS) {
-                    // If we've waited long enough (up to 2000ms), fire regardless.
-                    Duration::from_millis(self.idle_gap_ms)
-                } else {
-                    // Otherwise, require the base idle period.
-                    Duration::from_millis(self.idle_gap_ms)
-                };
-
-                if idle_duration >= required_idle {
+                if now.duration_since(self.last_output_at)
+                    >= Duration::from_millis(self.idle_gap_ms)
+                {
                     let payload = self.make_prompt_payload();
                     self.phase = StartupPhase::PromptInjected;
                     return StartupAction::Write(payload);
@@ -343,6 +317,66 @@ mod tests {
     }
 
     // ── idle-gap timer tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn idle_fallback_fires_after_400ms_of_silence() {
+        let mut seq = StartupSeq::new(b"prompt".to_vec());
+        let start = seq.phase_start;
+
+        assert!(matches!(
+            seq.feed_at(&vec![b'x'; IDLE_THRESHOLD_BYTES], start),
+            StartupAction::None
+        ));
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(IDLE_TIMEOUT_MS - 1)),
+            StartupAction::None
+        ));
+
+        match seq.poll_timers_at(start + Duration::from_millis(IDLE_TIMEOUT_MS)) {
+            StartupAction::Write(bytes) => assert_eq!(bytes, b"\r"),
+            other => panic!("expected idle fallback at 400ms, got {other:?}"),
+        }
+        assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
+    }
+
+    #[test]
+    fn idle_fallback_output_restarts_quiet_window() {
+        let mut seq = StartupSeq::new(b"prompt".to_vec());
+        let start = seq.phase_start;
+
+        seq.feed_at(&vec![b'x'; IDLE_THRESHOLD_BYTES], start);
+        seq.feed_at(b"still rendering", start + Duration::from_millis(350));
+
+        // More than 400ms has elapsed overall, but only 150ms has been quiet.
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(500)),
+            StartupAction::None
+        ));
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(750)),
+            StartupAction::Write(bytes) if bytes == b"\r"
+        ));
+    }
+
+    #[test]
+    fn default_post_dismiss_output_restarts_one_second_quiet_window() {
+        let mut seq = StartupSeq::new(b"prompt".to_vec());
+        let start = seq.phase_start;
+
+        seq.feed_at(b"trust Allow folder\n", start);
+        seq.feed_at(b"TUI redraw", start + Duration::from_millis(800));
+
+        // One second has elapsed since CR, but only 200ms since the redraw.
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(1000)),
+            StartupAction::None
+        ));
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(1800)),
+            StartupAction::Write(payload) if payload.starts_with(b"\x1b[200~")
+        ));
+        assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
+    }
 
     /// After trust-dismiss, new PTY output resets the idle gap so the timer
     /// does not fire while the TUI is still redrawing.

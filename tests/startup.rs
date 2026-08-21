@@ -186,16 +186,15 @@ fn test_trust_dialog_prompt_payload_uses_bracketed_paste() {
     );
 }
 
-// ── Idle fallback (≥ 200 bytes + 0.8 s silence) ──────────────────────────────
+// ── Idle fallback (≥ 200 bytes + 0.4 s silence) ──────────────────────────────
 
-/// 200 bytes received, then 0.8 s idle → CR sent via idle fallback (no keywords needed).
+/// 200 bytes received, then 0.4 s idle → CR sent via idle fallback (no keywords needed).
 ///
 /// This verifies the plan's "arbitrary unknown welcome text" path: claude emits
 /// ≥ 200 bytes of startup noise with no keywords, then goes quiet — claude-print
 /// must still dismiss the trust phase via the idle fallback.
 #[test]
 fn test_idle_fallback_fires_after_200_bytes_and_silence() {
-    // Use a very short idle timeout so the test doesn't sleep 0.8 s.
     let gap_ms: u64 = 30;
     let mut seq = StartupSeq::with_idle_gap(b"prompt".to_vec(), gap_ms);
 
@@ -213,17 +212,14 @@ fn test_idle_fallback_fires_after_200_bytes_and_silence() {
         "still Waiting after byte dump"
     );
 
-    // Now wait for the IDLE_TIMEOUT_MS (0.8 s normally, gap_ms here for speed).
-    // We use with_idle_gap which sets the post-dismiss idle, but the WAITING idle
-    // threshold is hardcoded at 800 ms. For test speed we sleep a short time and
-    // instead test the feed-based path; the actual 800 ms timer is covered in unit tests.
-    // Here we directly call poll_timers after sleeping past the idle window.
-    std::thread::sleep(Duration::from_millis(900)); // past 800 ms
+    // The WAITING idle threshold is fixed at 400ms; `gap_ms` configures only
+    // the later post-dismiss quiet period.
+    std::thread::sleep(Duration::from_millis(500));
     let action = seq.poll_timers();
     match action {
         StartupAction::Write(bytes) => assert_eq!(bytes, b"\r", "idle fallback must send CR"),
         StartupAction::HardTimeout => panic!("hard timeout should not fire — ≥ 200 bytes received"),
-        StartupAction::None => panic!("idle fallback must fire after 0.8 s with ≥ 200 bytes"),
+        StartupAction::None => panic!("idle fallback must fire after 0.4 s with ≥ 200 bytes"),
     }
     assert_eq!(
         *seq.phase(),
@@ -232,7 +228,7 @@ fn test_idle_fallback_fires_after_200_bytes_and_silence() {
     );
 }
 
-/// Fewer than 200 bytes received → idle fallback must NOT fire even after 0.8 s.
+/// Fewer than 200 bytes received → idle fallback must NOT fire even after 0.4 s.
 /// This verifies the 200-byte minimum is enforced before the idle fallback.
 #[test]
 fn test_idle_fallback_does_not_fire_below_200_bytes() {
@@ -244,7 +240,7 @@ fn test_idle_fallback_does_not_fire_below_200_bytes() {
     assert_eq!(*seq.phase(), StartupPhase::Waiting);
 
     // Wait past the idle window.
-    std::thread::sleep(Duration::from_millis(900));
+    std::thread::sleep(Duration::from_millis(500));
 
     let action = seq.poll_timers();
     // Must not fire the idle fallback (< 200 bytes).
