@@ -98,6 +98,9 @@ pub enum ClaudePrintError {
     /// Setup failure - missing prerequisites, binary not found, etc. (exit 2)
     Setup(String),
 
+    /// Configuration failure detected before a session starts (exit 2).
+    Config(String),
+
     /// Timeout - operation exceeded deadline (exit 124, matching GNU timeout).
     Timeout,
 
@@ -117,7 +120,7 @@ impl ClaudePrintError {
     /// - AssistantError: 1 (generic error)
     pub fn exit_code(&self) -> i32 {
         match self {
-            ClaudePrintError::Setup(_) => 2,
+            ClaudePrintError::Setup(_) | ClaudePrintError::Config(_) => 2,
             ClaudePrintError::Timeout => 124,
             ClaudePrintError::Interrupted => 130,
             ClaudePrintError::AssistantError(_) => 1,
@@ -127,7 +130,7 @@ impl ClaudePrintError {
     /// Returns the JSON subtype for this error (used in JSON/stream-json output modes).
     pub fn subtype(&self) -> &'static str {
         match self {
-            ClaudePrintError::Setup(_) => "internal_error",
+            ClaudePrintError::Setup(_) | ClaudePrintError::Config(_) => "internal_error",
             ClaudePrintError::Timeout => "timeout",
             ClaudePrintError::Interrupted => "interrupted",
             ClaudePrintError::AssistantError(_) => "assistant_error",
@@ -137,7 +140,7 @@ impl ClaudePrintError {
     /// Returns the human-readable error message.
     pub fn message(&self) -> &str {
         match self {
-            ClaudePrintError::Setup(m) => m,
+            ClaudePrintError::Setup(m) | ClaudePrintError::Config(m) => m,
             ClaudePrintError::Timeout => "operation timed out",
             ClaudePrintError::Interrupted => "interrupted by signal",
             ClaudePrintError::AssistantError(m) => m,
@@ -151,14 +154,21 @@ impl From<Error> for ClaudePrintError {
     /// This conversion maps technical errors to appropriate user-facing
     /// categories with clear messages.
     fn from(err: Error) -> Self {
-        match &err {
+        match err {
             Error::Timeout(_) => ClaudePrintError::Timeout,
             Error::Interrupted(_) => ClaudePrintError::Interrupted,
-            Error::AssistantError(msg) => ClaudePrintError::AssistantError(msg.clone()),
-            Error::Internal(_) | Error::HookSetupFailed(_) | Error::BinaryResolutionFailed(_) => {
-                ClaudePrintError::Setup(err.to_string())
+            Error::AssistantError(msg) => ClaudePrintError::AssistantError(msg),
+            Error::Config(message) => {
+                let message = if let Some(detail) = message.strip_prefix("invalid config at ") {
+                    format!("invalid config: {detail}")
+                } else if message.starts_with("invalid config:") {
+                    message
+                } else {
+                    format!("invalid config: {message}")
+                };
+                ClaudePrintError::Config(message)
             }
-            _ => ClaudePrintError::Setup(err.to_string()),
+            other => ClaudePrintError::Setup(other.to_string()),
         }
     }
 }
@@ -301,6 +311,20 @@ mod tests {
         }
         assert_eq!(user_facing.exit_code(), 1);
         assert_eq!(user_facing.subtype(), "assistant_error");
+    }
+
+    #[test]
+    fn config_error_converts_to_typed_startup_error() {
+        let internal = Error::Config("invalid config at /tmp/config.toml: bad TOML".to_string());
+        let user_facing: ClaudePrintError = internal.into();
+
+        assert!(matches!(user_facing, ClaudePrintError::Config(_)));
+        assert_eq!(user_facing.exit_code(), 2);
+        assert_eq!(user_facing.subtype(), "internal_error");
+        assert_eq!(
+            user_facing.message(),
+            "invalid config: /tmp/config.toml: bad TOML"
+        );
     }
 
     #[test]

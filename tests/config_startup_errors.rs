@@ -4,13 +4,17 @@
 mod config_error_helpers;
 
 use config_error_helpers::{
-    assert_exits_with_code, assert_json_error, assert_stderr_contains, assert_stdout_empty,
+    assert_exits_with_code, assert_stderr_contains, assert_stdout_empty,
     run_with_config_and_format, ConfigFixture, Outcome,
 };
 
 fn assert_structured_config_error(outcome: &Outcome) {
     assert_exits_with_code(outcome, 2);
-    let error = assert_json_error(outcome, "internal_error");
+    assert_stdout_empty(outcome);
+    let error = outcome.parse_json_stderr();
+    assert_eq!(error["type"], "result");
+    assert_eq!(error["is_error"], true);
+    assert_eq!(error["subtype"], "internal_error");
     let message = error["error_message"]
         .as_str()
         .expect("config error response must contain a string error_message");
@@ -44,36 +48,25 @@ fn malformed_config_is_structured_in_json_mode() {
 
 #[test]
 fn malformed_config_json_error_is_structured_on_stderr() {
-    let fixture = ConfigFixture::new();
-    fixture.write_config("[defaults\nmodel = \"claude-sonnet-4-6\"\n");
+    let malformed_configs = [
+        ("unclosed bracket", "[["),
+        ("assignment without key", "= \"value\""),
+        ("array instead of table", "defaults = []"),
+    ];
 
-    let outcome = run_with_config_and_format(fixture.path(), "json", "test prompt");
+    for (case, contents) in malformed_configs {
+        let fixture = ConfigFixture::new();
+        fixture.write_config(contents);
 
-    assert_exits_with_code(&outcome, 2);
-    assert_ne!(
-        outcome.code,
-        Some(0),
-        "malformed config must not silently fall back to defaults"
-    );
+        let outcome = run_with_config_and_format(fixture.path(), "json", "test prompt");
 
-    let error = outcome.parse_json_stderr();
-    assert_eq!(error["type"], "result");
-    assert_eq!(error["is_error"], true);
-    assert!(
-        matches!(
-            error["subtype"].as_str(),
-            Some("internal_error" | "config_error")
-        ),
-        "unexpected config error subtype: {:?}",
-        error["subtype"]
-    );
-    let message = error["error_message"]
-        .as_str()
-        .expect("config error response must contain a string error_message");
-    assert!(
-        message.contains("invalid config"),
-        "error_message should identify the invalid config, got: {message:?}"
-    );
+        assert_structured_config_error(&outcome);
+        assert_ne!(
+            outcome.code,
+            Some(0),
+            "{case}: malformed config must not silently fall back to defaults"
+        );
+    }
 }
 
 #[test]

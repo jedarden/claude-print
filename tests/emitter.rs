@@ -164,6 +164,7 @@ fn test_error_result_is_error_true_and_subtype() {
 #[test]
 fn test_error_exit_code_nonzero() {
     assert_ne!(ClaudePrintError::Setup("x".to_string()).exit_code(), 0);
+    assert_ne!(ClaudePrintError::Config("x".to_string()).exit_code(), 0);
     assert_ne!(ClaudePrintError::Timeout.exit_code(), 0);
     assert_ne!(ClaudePrintError::Interrupted.exit_code(), 0);
     assert_ne!(
@@ -178,6 +179,10 @@ fn test_error_subtypes() {
         ClaudePrintError::Setup("x".to_string()).subtype(),
         "internal_error"
     );
+    assert_eq!(
+        ClaudePrintError::Config("x".to_string()).subtype(),
+        "internal_error"
+    );
     assert_eq!(ClaudePrintError::Timeout.subtype(), "timeout");
     assert_eq!(ClaudePrintError::Interrupted.subtype(), "interrupted");
     assert_eq!(
@@ -189,6 +194,7 @@ fn test_error_subtypes() {
 #[test]
 fn test_error_exit_codes() {
     assert_eq!(ClaudePrintError::Setup("x".to_string()).exit_code(), 2);
+    assert_eq!(ClaudePrintError::Config("x".to_string()).exit_code(), 2);
     assert_eq!(ClaudePrintError::Timeout.exit_code(), 124);
     assert_eq!(ClaudePrintError::Interrupted.exit_code(), 130);
     assert_eq!(
@@ -219,6 +225,34 @@ fn test_text_error_goes_to_stderr_not_stdout() {
         !err_buf.lock().unwrap().is_empty(),
         "text error must write to stderr"
     );
+}
+
+#[test]
+fn test_json_config_error_is_structured_on_stderr() {
+    let err = ClaudePrintError::Config("invalid config: malformed TOML".to_string());
+    let (out_buf, mut stdout) = capture();
+    let (err_buf, mut stderr) = capture();
+
+    emit_error(
+        &mut stdout,
+        &mut stderr,
+        &err,
+        &OutputFormat::Json,
+        "1.0",
+        false,
+    )
+    .unwrap();
+
+    assert!(out_buf.lock().unwrap().is_empty());
+    let output = err_buf.lock().unwrap().clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["type"], "result");
+    assert_eq!(value["is_error"], true);
+    assert_eq!(value["subtype"], "internal_error");
+    assert!(value["error_message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid config"));
 }
 
 // ── zero token counts ─────────────────────────────────────────────────────────

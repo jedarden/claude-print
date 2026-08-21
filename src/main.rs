@@ -215,16 +215,17 @@ fn main() {
         Err(e) => {
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
+            let error: ClaudePrintError = e.into();
             let _ = emit_error(
                 &mut stdout,
                 &mut stderr,
-                &ClaudePrintError::Setup(e.to_string()),
+                &error,
                 &cli.output_format,
                 &resolve_claude_version(cli.claude_binary.as_deref())
                     .unwrap_or_else(|| "unknown".to_string()),
                 true,
             );
-            exit_with_cleanup(2);
+            exit_with_cleanup(error.exit_code());
         }
     };
 
