@@ -184,8 +184,8 @@ fn main() {
     }
 
     // Load the config file once at startup (plan.md "Configuration File").
-    // A missing or invalid file is a hard error (exit code 2, structured
-    // error in JSON modes).
+    // A missing file uses defaults; path resolution, read, parse, and validation
+    // failures are hard errors (exit code 2, structured error in JSON modes).
     let config = match cli
         .config
         .clone()
