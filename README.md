@@ -14,6 +14,7 @@ The billing path is determined by an `isatty` check inside the `claude` binary: 
 
 - **Claude Code** must be installed and authenticated. See [claude.ai/code](https://claude.ai/code).
 - An active **Claude subscription** (Pro or Max plan) is required. The whole point is to bill against subscription, not credits.
+- **`HOME` must be set to a non-empty value** for the user running `claude-print`. Claude Code configuration, trust state, and transcripts are resolved beneath this directory.
 - Linux only. PTY support requires POSIX — no Windows ConPTY.
 
 ## Install
@@ -146,6 +147,57 @@ If you use NEEDLE for LLM fleet dispatch, `install.sh` automatically copies `cla
 - **Startup latency ~2–5s** — the PTY handshake and Claude Code startup add overhead versus a direct HTTP call.
 
 ## Troubleshooting
+
+### HOME in containers and chroots
+
+Running a session, `--check`, or `--version` requires `HOME` to contain the
+current user's home directory. `claude-print` deliberately does not guess
+`/root` or consult the passwd database: choosing the wrong directory could read
+or write another user's Claude Code configuration and transcripts.
+
+If `HOME` is unset or empty, text output exits with status 2 and reports:
+
+```text
+error: invalid config: HOME environment variable not set or empty; set HOME to the user's home directory
+```
+
+The `json` and `stream-json` output formats also exit with status 2 and put the
+same message in the result object's `error_message` field. Setting
+`XDG_CONFIG_HOME` does not remove the `HOME` requirement: it can relocate
+`claude-print`'s config file, but Claude Code state and transcripts still live
+under `$HOME`.
+
+In a container, chroot, or service unit, set `HOME` explicitly to the home of
+the account that runs `claude-print`. Create that directory with the correct
+ownership and mount or provision the user's authenticated Claude Code state
+there. For example:
+
+```dockerfile
+ENV HOME=/home/claude
+```
+
+```yaml
+# Kubernetes container specification
+env:
+  - name: HOME
+    value: /home/claude
+```
+
+For a chroot or one-off service invocation, the equivalent is
+`HOME=/home/service claude-print "..."`. Do not use `/root` unless the process
+actually runs as root and `/root` is intentionally where its Claude Code state
+is stored. The startup check accepts any non-empty path without probing the
+filesystem, but a real session still needs the directory and relevant state to
+be accessible and writable.
+
+**Migration note:** Older builds checked `HOME` only while resolving particular
+paths, accepted an empty value at some call sites, and could run early-exit
+commands such as `--version` without it. Current builds enforce one consistent,
+non-empty `HOME` contract before session startup, `--check`, and `--version`.
+When upgrading existing containers or service definitions, add an explicit
+`HOME`; update health checks that invoke `--version` in a stripped environment
+as well. Argument-parser help (`--help`) is still rendered before runtime HOME
+validation.
 
 ### Billing classification verification
 
