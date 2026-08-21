@@ -46,6 +46,23 @@ fn main() {
 
     let cli = Cli::parse();
 
+    // HOME is a process-wide prerequisite, including for early-exit entry
+    // points such as --version. Validate it before dispatch so the CLI,
+    // config, poller, and direct Session callers share one strict contract.
+    if let Err(error) = claude_print::util::get_home() {
+        let mut stdout = io::stdout().lock();
+        let mut stderr = io::stderr().lock();
+        let _ = emit_error(
+            &mut stdout,
+            &mut stderr,
+            &ClaudePrintError::Setup(error.to_string()),
+            &cli.output_format,
+            "unknown",
+            true,
+        );
+        exit_with_cleanup(2);
+    }
+
     if cli.version {
         let claude_version = resolve_claude_version(cli.claude_binary.as_deref());
         println!("{}", version_string(claude_version.as_deref()));

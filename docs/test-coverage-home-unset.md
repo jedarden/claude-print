@@ -2,7 +2,7 @@
 
 The focused regression suite is `tests/home_unset.rs`. It verifies the shared
 strict HOME contract across config path resolution, transcript path derivation,
-the live projects directory, and binary error output.
+the live projects directory, direct session startup, and binary error output.
 
 ## Expected behavior
 
@@ -27,11 +27,12 @@ There are two conditional cases:
 
 | Test | Coverage |
 | --- | --- |
-| `unset_home_is_rejected_identically_by_config_and_poller` | Config and both poller path helpers return the same strict error |
+| `unset_home_is_rejected_identically_by_config_poller_and_session` | Config, both poller path helpers, and direct session startup return the same strict error |
 | `empty_home_is_equivalent_to_unset_home` | Empty HOME has the same result as missing HOME |
 | `valid_home_roots_every_derived_path` | All derived user paths remain under the configured HOME |
 | `nonexistent_home_is_accepted_consistently_without_eager_io` | Resolution preserves a not-yet-created HOME path |
 | `chroot_like_layout_never_falls_back_to_root_home` | An isolated layout cannot escape to `/root` |
+| `env_u_home_version_fails_with_actionable_error` | The literal `env -u HOME claude-print --version` scenario exits 2 without printing a success version |
 | `binary_reports_actionable_home_error_in_every_output_format` | Text, JSON, and stream-JSON modes exit with setup code 2 and the actionable message |
 
 The helper's unit tests additionally cover non-UTF-8 Unix paths.

@@ -345,6 +345,7 @@ impl Session {
     ///
     /// # Errors
     ///
+    /// Returns `Error::Config` if `HOME` is unset or empty.
     /// Returns `Error::NoResponse` if the child exits without sending a Stop payload.
     /// Returns `Error::Timeout` if the timeout expires (no output or overall timeout).
     /// Returns `Error::Interrupted` if a SIGINT is received.
@@ -360,6 +361,11 @@ impl Session {
         output_format: crate::cli::OutputFormat,
         launch: &LaunchOptions,
     ) -> Result<SessionResult> {
+        // Keep direct library callers consistent with the CLI and every module
+        // that derives user-scoped paths. Fail before creating hook artifacts
+        // or inspecting the child binary.
+        get_home()?;
+
         // Use a catch_unwind to ensure cleanup happens even on panics
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::run_inner(

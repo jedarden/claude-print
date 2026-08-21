@@ -8,8 +8,10 @@
 //! Tests which mutate this process's environment take one lock. Binary tests
 //! use child-only environment overrides, matching `env -u HOME claude-print`.
 
+use claude_print::cli::OutputFormat;
 use claude_print::config::Config;
 use claude_print::poller::{derive_transcript_path, projects_dir_for_cwd};
+use claude_print::session::{LaunchOptions, Session};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -83,16 +85,30 @@ fn assert_shared_home_error() {
         .unwrap_err()
         .to_string();
     let projects_error = projects_dir_for_cwd().unwrap_err().to_string();
+    let session_error = Session::run(
+        Path::new("/unused/claude"),
+        &[],
+        b"unused prompt".to_vec(),
+        None,
+        None,
+        None,
+        None,
+        OutputFormat::Text,
+        &LaunchOptions::default(),
+    )
+    .unwrap_err()
+    .to_string();
 
     // Regression guard for the original inconsistency: config used to reject a
-    // missing HOME while poller silently derived transcript paths under /root.
+    // missing HOME while other paths could continue or derive paths under /root.
     assert!(config_error.contains(HOME_ERROR_DETAIL));
     assert_eq!(transcript_error, config_error);
     assert_eq!(projects_error, config_error);
+    assert_eq!(session_error, config_error);
 }
 
 #[test]
-fn unset_home_is_rejected_identically_by_config_and_poller() {
+fn unset_home_is_rejected_identically_by_config_poller_and_session() {
     let _lock = env_lock();
     let _home = EnvGuard::remove("HOME");
     let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
@@ -191,6 +207,39 @@ fn chroot_like_layout_never_falls_back_to_root_home() {
             path.display()
         );
     }
+}
+
+#[test]
+fn env_u_home_version_fails_with_actionable_error() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_claude-print"));
+    assert!(binary.exists(), "missing binary at {}", binary.display());
+
+    // Exercise the acceptance scenario literally rather than relying on an
+    // in-process environment mutation: env -u HOME claude-print --version.
+    let output = Command::new("env")
+        .arg("-u")
+        .arg("HOME")
+        .arg(&binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run env -u HOME claude-print --version");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--version unexpectedly succeeded without HOME: stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(HOME_ERROR_DETAIL),
+        "--version error did not explain how to fix HOME: {stderr}"
+    );
+    assert!(
+        !stdout.contains("claude-print "),
+        "--version printed a success version despite missing HOME: {stdout}"
+    );
 }
 
 #[test]
