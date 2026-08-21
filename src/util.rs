@@ -45,9 +45,12 @@ mod tests {
     #[test]
     fn rejects_unset_home() {
         let error = home_from_env_value(None).unwrap_err();
+        let Error::Config(message) = error else {
+            panic!("unset HOME should produce Error::Config, got {error:?}");
+        };
         assert_eq!(
-            error.to_string(),
-            "config error: HOME environment variable not set or empty; set HOME to the user's home directory"
+            message,
+            "HOME environment variable not set or empty; set HOME to the user's home directory"
         );
     }
 
@@ -57,5 +60,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("HOME environment variable not set"));
+    }
+
+    #[test]
+    fn preserves_nonexistent_home_without_eager_filesystem_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_home = root.path().join("not-mounted/home/service");
+        assert!(!missing_home.exists());
+
+        assert_eq!(
+            home_from_env_value(Some(missing_home.as_os_str().to_owned())).unwrap(),
+            missing_home
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_home_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let home = OsString::from_vec(b"/home/non-utf8-\xff".to_vec());
+        assert_eq!(
+            home_from_env_value(Some(home.clone())).unwrap(),
+            PathBuf::from(home)
+        );
     }
 }
