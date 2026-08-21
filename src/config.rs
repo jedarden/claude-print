@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::util::get_home;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -141,9 +142,8 @@ impl Config {
     /// 2. ~/.config/claude-print/config.toml otherwise
     ///
     /// # Errors
-    /// Returns `Error::Config` if the `HOME` environment variable is not set.
-    /// This is intentional: silent fallback to "/root" would fail in chroot
-    /// environments where that directory may not exist.
+    /// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
+    /// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
     pub fn default_path() -> Result<PathBuf> {
         // Try XDG_CONFIG_HOME first
         if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
@@ -153,12 +153,8 @@ impl Config {
         }
 
         // Fall back to ~/.config
-        let home = std::env::var("HOME")
-            .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
-        Ok(PathBuf::from(home)
-            .join(".config")
-            .join(CONFIG_DIR)
-            .join(CONFIG_FILENAME))
+        let home = get_home()?;
+        Ok(home.join(".config").join(CONFIG_DIR).join(CONFIG_FILENAME))
     }
 
     /// Loads the config file, returning an empty config if the file doesn't exist

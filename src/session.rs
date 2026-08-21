@@ -9,6 +9,7 @@ use crate::pty::PtySpawner;
 use crate::startup::{StartupAction, StartupPhase, StartupSeq};
 use crate::terminal::TerminalEmu;
 use crate::transcript::{read_transcript_traced, TranscriptResult};
+use crate::util::get_home;
 use crate::verbose::Tracer;
 use crate::watchdog::{TimeoutType, Watchdog, WatchdogConfig};
 use nix::sys::signal::{self, SigHandler};
@@ -901,15 +902,13 @@ fn kill_child(pid: nix::unistd::Pid) {
 /// than a possible stall.
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is not set.
-/// This is intentional: silent fallback to "/root" would fail in chroot
-/// environments where that directory may not exist.
+/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
+/// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
 fn pretrust_cwd() -> Result<()> {
     let cwd = std::env::current_dir()
         .map_err(|e| Error::Internal(anyhow::anyhow!("pretrust cwd: {e}")))?;
-    let home = std::env::var("HOME")
-        .map_err(|_| Error::Config("HOME environment variable not set".to_string()))?;
-    let claude_json = PathBuf::from(&home).join(".claude.json");
+    let home = get_home()?;
+    let claude_json = home.join(".claude.json");
     pretrust_cwd_at(&claude_json, cwd.to_string_lossy().as_ref())
 }
 

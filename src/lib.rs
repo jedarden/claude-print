@@ -12,5 +12,6 @@ pub mod session;
 pub mod startup;
 pub mod terminal;
 pub mod transcript;
+pub mod util;
 pub mod verbose;
 pub mod watchdog;

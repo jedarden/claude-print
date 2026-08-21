@@ -47,7 +47,7 @@ pub fn parse_stop_payload(bytes: &[u8]) -> Result<StopPayload> {
 /// when `transcript_path` is absent but `session_id` and `cwd` are present.
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is not set.
+/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
 pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
     let explicit_path = payload
         .transcript_path
@@ -80,7 +80,7 @@ pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
 /// Full path: `$HOME/.claude/projects/<slug>/<session_id>.jsonl`
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is not set.
+/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
 /// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
 pub fn derive_transcript_path(session_id: &str, cwd: &str) -> Result<PathBuf> {
     let slug = cwd_to_slug(cwd)?;
@@ -163,7 +163,7 @@ pub fn cwd_to_slug(cwd: &str) -> Result<String> {
 /// `session_id` is unknown until the Stop payload arrives, after injection.
 ///
 /// # Errors
-/// Returns `Error::Config` if the `HOME` environment variable is not set.
+/// Returns `Error::Config` if the `HOME` environment variable is unset or empty.
 /// See [`get_home`](crate::util::get_home) for rationale on the strict approach.
 /// Also returns `Error::Io` if the current working directory cannot be read.
 pub fn projects_dir_for_cwd() -> Result<PathBuf> {
