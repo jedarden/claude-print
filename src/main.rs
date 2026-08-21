@@ -183,12 +183,31 @@ fn main() {
         exit_with_cleanup(2);
     }
 
-    // Load the config file once at startup (plan.md "Configuration File"). A
-    // missing $HOME or a missing/invalid file yields an empty config, so this
-    // never aborts the run — it just means no config-derived defaults apply.
-    let config = Config::default_path()
-        .map(|path| Config::load_or_default(&path))
-        .unwrap_or_default();
+    // Load the config file once at startup (plan.md "Configuration File").
+    // A missing or invalid file is a hard error (exit code 2, structured
+    // error in JSON modes).
+    let config = match cli
+        .config
+        .clone()
+        .map_or_else(Config::default_path, Ok)
+        .and_then(|path| Config::load_or_default(&path))
+    {
+        Ok(config) => config,
+        Err(e) => {
+            let mut stdout = io::stdout().lock();
+            let mut stderr = io::stderr().lock();
+            let _ = emit_error(
+                &mut stdout,
+                &mut stderr,
+                &ClaudePrintError::Setup(e.to_string()),
+                &cli.output_format,
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                true,
+            );
+            exit_with_cleanup(2);
+        }
+    };
 
     // Build claude_args: collect flags to forward to child
     let mut claude_args: Vec<std::ffi::OsString> = Vec::new();
@@ -446,7 +465,7 @@ mod tests {
     #[test]
     fn model_args_compiled_default_when_no_flag_and_no_config() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml"));
+        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml")).unwrap();
         let args = build_model_args(&config, None);
         assert_eq!(
             args,
@@ -459,7 +478,7 @@ mod tests {
     fn model_args_config_model_when_no_flag() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), Some("claude-opus-4-8"));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_model_args(&config, None);
         assert_eq!(
             args,
@@ -472,7 +491,7 @@ mod tests {
     fn model_args_cli_flag_wins_over_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), Some("claude-opus-4-8"));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_model_args(&config, Some("claude-haiku-4-5".to_string()));
         assert_eq!(
             args,
@@ -506,7 +525,7 @@ mod tests {
     #[test]
     fn max_turns_args_compiled_default_when_no_flag_and_no_config() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml"));
+        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml")).unwrap();
         let args = build_max_turns_args(&config, None);
         assert_eq!(args, vec!["--max-turns".to_string(), "30".to_string()]);
     }
@@ -516,7 +535,7 @@ mod tests {
     fn max_turns_args_config_value_when_no_flag() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config_max_turns(dir.path(), Some(50));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_max_turns_args(&config, None);
         assert_eq!(args, vec!["--max-turns".to_string(), "50".to_string()]);
     }
@@ -526,7 +545,7 @@ mod tests {
     fn max_turns_args_explicit_30_overrides_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config_max_turns(dir.path(), Some(50));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_max_turns_args(&config, Some(30));
         assert_eq!(args, vec!["--max-turns".to_string(), "30".to_string()]);
     }
@@ -536,7 +555,7 @@ mod tests {
     fn max_turns_args_cli_flag_wins_over_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config_max_turns(dir.path(), Some(50));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_max_turns_args(&config, Some(5));
         assert_eq!(args, vec!["--max-turns".to_string(), "5".to_string()]);
     }
@@ -545,7 +564,7 @@ mod tests {
     #[test]
     fn timeout_args_compiled_default_when_no_flag_and_no_config() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml"));
+        let config = Config::load_or_default(&dir.path().join("does-not-exist.toml")).unwrap();
         let args = build_timeout_args(&config, None);
         assert_eq!(args, vec!["--timeout".to_string(), "3600".to_string()]);
     }
@@ -555,7 +574,7 @@ mod tests {
     fn timeout_args_config_value_when_no_flag() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config_timeout(dir.path(), Some(1800));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_timeout_args(&config, None);
         assert_eq!(args, vec!["--timeout".to_string(), "1800".to_string()]);
     }
@@ -565,7 +584,7 @@ mod tests {
     fn timeout_args_explicit_3600_overrides_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config_timeout(dir.path(), Some(7200));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_timeout_args(&config, Some(3600));
         assert_eq!(args, vec!["--timeout".to_string(), "3600".to_string()]);
     }
@@ -575,7 +594,7 @@ mod tests {
     fn timeout_args_cli_flag_wins_over_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config_timeout(dir.path(), Some(1800));
-        let config = Config::load_or_default(&path);
+        let config = Config::load_or_default(&path).unwrap();
         let args = build_timeout_args(&config, Some(7200));
         assert_eq!(args, vec!["--timeout".to_string(), "7200".to_string()]);
     }
