@@ -43,6 +43,40 @@ fn malformed_config_is_structured_in_json_mode() {
 }
 
 #[test]
+fn malformed_config_json_error_is_structured_on_stderr() {
+    let fixture = ConfigFixture::new();
+    fixture.write_config("[defaults\nmodel = \"claude-sonnet-4-6\"\n");
+
+    let outcome = run_with_config_and_format(fixture.path(), "json", "test prompt");
+
+    assert_exits_with_code(&outcome, 2);
+    assert_ne!(
+        outcome.code,
+        Some(0),
+        "malformed config must not silently fall back to defaults"
+    );
+
+    let error = outcome.parse_json_stderr();
+    assert_eq!(error["type"], "result");
+    assert_eq!(error["is_error"], true);
+    assert!(
+        matches!(
+            error["subtype"].as_str(),
+            Some("internal_error" | "config_error")
+        ),
+        "unexpected config error subtype: {:?}",
+        error["subtype"]
+    );
+    let message = error["error_message"]
+        .as_str()
+        .expect("config error response must contain a string error_message");
+    assert!(
+        message.contains("invalid config"),
+        "error_message should identify the invalid config, got: {message:?}"
+    );
+}
+
+#[test]
 fn wrong_config_type_is_structured_in_stream_json_mode() {
     let fixture = ConfigFixture::new();
     fixture.write_config("[defaults]\nmax_turns = \"thirty\"\n");
