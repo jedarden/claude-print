@@ -256,7 +256,12 @@ mod tests {
         const MAX_ITERATIONS: usize = 100;
         // Compile-time assertions - these constants are validated at build time
         const { assert!(MAX_ITERATIONS > 0, "iteration limit must be positive") };
-        const { assert!(MAX_ITERATIONS <= 1000, "iteration limit should be reasonable") };
+        const {
+            assert!(
+                MAX_ITERATIONS <= 1000,
+                "iteration limit should be reasonable"
+            )
+        };
     }
 
     #[test]

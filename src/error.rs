@@ -23,7 +23,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     /// Configuration file error - malformed or missing config values.
-    #[error("config error: {0}")]
+    #[error("invalid config: {0}")]
     Config(String),
 
     /// PTY spawn failure - openpty(3) failed to allocate a pseudo-terminal.

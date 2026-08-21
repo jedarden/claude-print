@@ -90,8 +90,7 @@ fn test_stream_json_handle_multiple_drop_safe() {
     // Verify that dropping a handle multiple times (or after it's already been dropped)
     // doesn't cause issues. The Option<JoinHandle> pattern makes this safe.
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let transcript_path =
-        create_temp_transcript(&temp_dir.path().to_path_buf(), r#"{"type":"start"}"#);
+    let transcript_path = create_temp_transcript(temp_dir.path(), r#"{"type":"start"}"#);
 
     let handle = claude_print::emitter::spawn_stream_json_reader(transcript_path, 0);
 

@@ -12,7 +12,7 @@ const CONFIG_FILENAME: &str = "config.toml";
 /// Config directory name under XDG_CONFIG_HOME or ~/.config
 const CONFIG_DIR: &str = "claude-print";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// Whether to inherit user hooks (default: true)
@@ -129,7 +129,7 @@ impl Defaults {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Config {
     pub defaults: Option<Defaults>,
 }
@@ -158,36 +158,42 @@ impl Config {
         Ok(home.join(".config").join(CONFIG_DIR).join(CONFIG_FILENAME))
     }
 
-    /// Loads the config file, returning an empty config if the file doesn't exist
+    /// Loads the config file, using defaults if the file doesn't exist
     ///
+    /// Returns the loaded config if the file exists and is valid.
+    /// Returns default config if the file doesn't exist (allows running without config).
     /// Returns an error if the file exists but cannot be read, parsed, or validated.
     pub fn load_or_default(path: &PathBuf) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => {
-                let config: Config = toml::from_str(&contents).map_err(|e| {
-                    Error::Config(format!("invalid config at {}: {e}", path.display()))
-                })?;
-
-                // Validate the config after parsing
-                if let Some(ref defaults) = config.defaults {
-                    defaults.validate().map_err(|e| {
-                        Error::Config(format!(
-                            "config validation failed at {}: {}",
-                            path.display(),
-                            e
-                        ))
-                    })?;
-                }
-
-                Ok(config)
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Config file doesn't exist — use defaults
+                return Ok(Config::default());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config { defaults: None }),
-            Err(e) => Err(Error::Config(format!(
-                "cannot read config at {}: {}",
-                path.display(),
-                e
-            ))),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "cannot read config at {}: {}",
+                    path.display(),
+                    e
+                )));
+            }
+        };
+
+        let config: Config = toml::from_str(&contents)
+            .map_err(|e| Error::Config(format!("invalid config at {}: {e}", path.display())))?;
+
+        // Validate the config after parsing
+        if let Some(ref defaults) = config.defaults {
+            defaults.validate().map_err(|e| {
+                Error::Config(format!(
+                    "config validation failed at {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
         }
+
+        Ok(config)
     }
 
     pub fn load(path: &PathBuf) -> Result<Self> {
@@ -264,6 +270,50 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::set_var(key, value);
+            guard
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let guard = Self {
+                key,
+                previous: std::env::var_os(key),
+            };
+            std::env::remove_var(key);
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn default_model_none_when_no_defaults() {
@@ -332,8 +382,13 @@ mod tests {
     fn load_or_default_returns_defaults_when_file_missing() {
         let temp_dir = tempfile::tempdir().unwrap();
         let missing_path = temp_dir.path().join("missing-config.toml");
-        let config = Config::load_or_default(&missing_path).unwrap();
-        assert!(config.defaults.is_none());
+        let result = Config::load_or_default(&missing_path);
+        assert!(
+            result.is_ok(),
+            "missing config file should return defaults, not error"
+        );
+        let config = result.unwrap();
+        assert_eq!(config, Config::default());
     }
 
     #[test]
@@ -394,30 +449,28 @@ model = "claude-opus-4-8""#,
 
     #[test]
     fn default_path_uses_xdg_config_home_when_set() {
+        let _lock = env_lock();
         let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", temp_dir.path());
+        let _xdg = EnvGuard::set("XDG_CONFIG_HOME", temp_dir.path());
         let path = Config::default_path().unwrap();
         assert_eq!(
             path,
             temp_dir.path().join("claude-print").join("config.toml")
         );
-        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
     fn default_path_fallback_to_home_config_when_xdg_not_set() {
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let _lock = env_lock();
+        let _home = EnvGuard::set("HOME", "/test/home");
+        let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
+
         let path = Config::default_path().unwrap();
-        // Test-only direct read mirrors the environment used by get_home();
-        // production path resolution uses the shared strict helper above.
-        let expected = std::env::var("HOME")
-            .map(|h| {
-                PathBuf::from(h)
-                    .join(".config")
-                    .join("claude-print")
-                    .join("config.toml")
-            })
-            .unwrap();
+        // Should be ~/.config/claude-print/config.toml
+        let expected = PathBuf::from("/test/home")
+            .join(".config")
+            .join("claude-print")
+            .join("config.toml");
         assert_eq!(path, expected);
     }
 
@@ -1008,24 +1061,14 @@ max_turns = 0"#,
 
     #[test]
     fn default_path_fails_when_home_not_set() {
-        // Save original HOME
-        let original_home = std::env::var("HOME").ok();
-
-        // Unset HOME
-        std::env::remove_var("HOME");
-
-        // Ensure XDG_CONFIG_HOME is also unset so we fall back to HOME
-        std::env::remove_var("XDG_CONFIG_HOME");
+        let _lock = env_lock();
+        let _home = EnvGuard::remove("HOME");
+        let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
 
         let result = Config::default_path();
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("HOME environment variable not set"));
-
-        // Restore HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        }
     }
 
     // Config parse error tests - verify malformed configs produce proper errors
@@ -1044,9 +1087,15 @@ model = "claude-opus-4-8""#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject TOML with mismatched brackets");
+        assert!(
+            result.is_err(),
+            "Should reject TOML with mismatched brackets"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1063,7 +1112,10 @@ model = "claude-opus-4-8"#,
         let result = Config::load(&config_path);
         assert!(result.is_err(), "Should reject TOML with unclosed string");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1078,9 +1130,15 @@ model = "claude-opus-4\-8""#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject TOML with invalid escape sequence");
+        assert!(
+            result.is_err(),
+            "Should reject TOML with invalid escape sequence"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1098,7 +1156,10 @@ model = "claude-haiku-4-5""#,
         let result = Config::load(&config_path);
         assert!(result.is_err(), "Should reject TOML with duplicate keys");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1113,9 +1174,15 @@ model = 123"#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject model field as integer (wrong type)");
+        assert!(
+            result.is_err(),
+            "Should reject model field as integer (wrong type)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1130,9 +1197,15 @@ model = true"#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject model field as boolean (wrong type)");
+        assert!(
+            result.is_err(),
+            "Should reject model field as boolean (wrong type)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1147,9 +1220,15 @@ inherit_hooks = "true""#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject inherit_hooks field as string (wrong type)");
+        assert!(
+            result.is_err(),
+            "Should reject inherit_hooks field as string (wrong type)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1164,9 +1243,15 @@ max_turns = "50""#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject max_turns field as string (wrong type)");
+        assert!(
+            result.is_err(),
+            "Should reject max_turns field as string (wrong type)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1181,9 +1266,15 @@ max_turns = 50.5"#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject max_turns field as float (wrong type)");
+        assert!(
+            result.is_err(),
+            "Should reject max_turns field as float (wrong type)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1198,9 +1289,15 @@ timeout_secs = "3600""#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject timeout_secs field as string (wrong type)");
+        assert!(
+            result.is_err(),
+            "Should reject timeout_secs field as string (wrong type)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1215,9 +1312,15 @@ timeout_secs = true"#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject timeout_secs field as boolean (wrong type)");
+        assert!(
+            result.is_err(),
+            "Should reject timeout_secs field as boolean (wrong type)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1232,9 +1335,15 @@ max_turns = -10"#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject negative max_turns (u32 can't be negative)");
+        assert!(
+            result.is_err(),
+            "Should reject negative max_turns (u32 can't be negative)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1249,9 +1358,15 @@ timeout_secs = -100"#,
         .unwrap();
 
         let result = Config::load(&config_path);
-        assert!(result.is_err(), "Should reject negative timeout_secs (u64 can't be negative)");
+        assert!(
+            result.is_err(),
+            "Should reject negative timeout_secs (u64 can't be negative)"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1261,9 +1376,15 @@ timeout_secs = -100"#,
         std::fs::write(&config_path, r#"[defaults"#).unwrap();
 
         let result = Config::load_or_default(&config_path);
-        assert!(result.is_err(), "Should not silently fallback to defaults on invalid TOML");
+        assert!(
+            result.is_err(),
+            "Should not silently fallback to defaults on invalid TOML"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1278,9 +1399,15 @@ model = 456"#,
         .unwrap();
 
         let result = Config::load_or_default(&config_path);
-        assert!(result.is_err(), "Should not silently fallback to defaults on wrong type");
+        assert!(
+            result.is_err(),
+            "Should not silently fallback to defaults on wrong type"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1295,9 +1422,15 @@ max_turns = "not-a-number""#,
         .unwrap();
 
         let result = Config::load_or_default(&config_path);
-        assert!(result.is_err(), "Should not silently fallback to defaults on wrong type");
+        assert!(
+            result.is_err(),
+            "Should not silently fallback to defaults on wrong type"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("invalid config"), "Error should mention invalid config");
+        assert!(
+            err_msg.contains("invalid config"),
+            "Error should mention invalid config"
+        );
     }
 
     #[test]
@@ -1312,23 +1445,31 @@ model = "gpt-4""#,
         .unwrap();
 
         let result = Config::load_or_default(&config_path);
-        assert!(result.is_err(), "Should not silently fallback on validation error");
+        assert!(
+            result.is_err(),
+            "Should not silently fallback on validation error"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("config validation failed"), "Error should mention validation failure");
+        assert!(
+            err_msg.contains("config validation failed"),
+            "Error should mention validation failure"
+        );
     }
 
     #[test]
     fn load_or_default_accepts_minimal_valid_config() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_path = temp_dir.path().join("test-config.toml");
-        std::fs::write(
-            &config_path,
-            r#"[defaults]"#,
-        )
-        .unwrap();
+        std::fs::write(&config_path, r#"[defaults]"#).unwrap();
 
         let config = Config::load_or_default(&config_path).unwrap();
-        assert!(config.defaults.is_some(), "Should accept minimal valid defaults section");
-        assert!(config.defaults.unwrap().model.is_none(), "Model should be None when not specified");
+        assert!(
+            config.defaults.is_some(),
+            "Should accept minimal valid defaults section"
+        );
+        assert!(
+            config.defaults.unwrap().model.is_none(),
+            "Model should be None when not specified"
+        );
     }
 }

@@ -53,7 +53,6 @@ fn test_claudecode_env_var_propagation_without_fix() {
     "#;
 
     eprintln!("{}", expected_symptoms);
-    assert!(true, "documentation test");
 }
 
 #[test]

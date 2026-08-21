@@ -129,6 +129,16 @@ fn run_with(
 /// ceiling that still fails fast on a wedge.
 const BUDGET: Duration = Duration::from_secs(30);
 
+/// Set up a temporary config directory for a test and return the temp dir.
+/// The caller must keep the TempDir alive for the duration of the test.
+fn setup_temp_config() -> TempDir {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp config dir");
+    let config_dir = temp_dir.path().join("claude-print");
+    std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    std::fs::write(config_dir.join("config.toml"), "").expect("failed to create config file");
+    temp_dir
+}
+
 /// Set up a temporary config directory with a malformed config file.
 /// Returns the temp dir; caller must keep it alive for the test duration.
 fn setup_malformed_config(config_content: &str) -> TempDir {
@@ -146,6 +156,7 @@ fn setup_malformed_config(config_content: &str) -> TempDir {
 /// on stdout, and the output must not be valid JSON.
 #[test]
 fn as1_text_mode_exit0_nonempty_not_json() {
+    let _temp_config = setup_temp_config();
     let out = run(claude_print().arg("test prompt"), BUDGET);
 
     assert_eq!(
@@ -174,6 +185,7 @@ fn as1_text_mode_exit0_nonempty_not_json() {
 /// exit 0 and a single-line `result` object with every required field.
 #[test]
 fn as2_json_mode_exit0_valid_result_object() {
+    let _temp_config = setup_temp_config();
     let out = run(
         claude_print()
             .arg("--output-format")
@@ -325,6 +337,7 @@ fn has_claude_print_trace(stderr: &str) -> bool {
 /// flagged path is caught.
 #[test]
 fn as6_verbose_emits_trace_lines_and_nonverbose_emits_none() {
+    let _temp_config = setup_temp_config();
     // Verbose run: --verbose must surface at least one timing trace on stderr.
     let verbose = run(claude_print().arg("--verbose").arg("test prompt"), BUDGET);
     assert_eq!(
@@ -382,6 +395,7 @@ fn as6_verbose_emits_trace_lines_and_nonverbose_emits_none() {
 /// empty (no response text leaks through for an unsent prompt).
 #[test]
 fn ec7_stop_before_inject_text_mode_exit2_stderr() {
+    let _temp_config = setup_temp_config();
     let out = run_with(
         claude_print().arg("test prompt"),
         BUDGET,
@@ -414,6 +428,7 @@ fn ec7_stop_before_inject_text_mode_exit2_stderr() {
 /// contract ("exit 2, is_error: true in output").
 #[test]
 fn ec7_stop_before_inject_json_mode_is_error_true() {
+    let _temp_config = setup_temp_config();
     let out = run_with(
         claude_print()
             .arg("--output-format")
@@ -756,11 +771,8 @@ fn dangerously_skip_permissions_flag_appears_exactly_once_when_passed() {
 /// 1. Creates malformed config file (unclosed bracket, invalid TOML)
 /// 2. Runs claude-print with --output-format json
 /// 3. Captures exit code (must be 2, not 0)
-/// 4. Verifies stdout contains structured error JSON with required fields
+/// 4. Verifies stderr contains structured error JSON with required fields
 /// 5. Verifies NO silent fallback occurs (exit code is 2, not 0)
-///
-/// This test is expected to FAIL initially, proving the current behavior is wrong
-/// (likely silent fallback to defaults with exit 0).
 #[test]
 fn config_parse_error_unclosed_bracket_exit2_structured_json() {
     // Create a malformed config file with an unclosed bracket
@@ -790,35 +802,40 @@ model = "claude-opus-4-8""#;
         out.stderr
     );
 
-    // AC4: Verify stdout contains structured error JSON
-    let trimmed = out.stdout.trim();
+    // AC4: Verify stderr contains structured error JSON and stdout stays empty.
+    assert!(
+        out.stdout.is_empty(),
+        "config parse error: stdout must be empty, got:\n{}",
+        out.stdout
+    );
+    let trimmed = out.stderr.trim();
     let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
         panic!(
-            "config parse error: stdout must be valid JSON, got parse error: {e}\n  \
-             raw stdout:\n{}",
-            out.stdout
+            "config parse error: stderr must be valid JSON, got parse error: {e}\n  \
+             raw stderr:\n{}",
+            out.stderr
         )
     });
 
     // AC4a: Must contain "type":"result"
     assert_eq!(
         v["type"], "result",
-        "config parse error: JSON type must be 'result', got: {:?}\nstdout:\n{}",
-        v["type"], out.stdout
+        "config parse error: JSON type must be 'result', got: {:?}\nstderr:\n{}",
+        v["type"], out.stderr
     );
 
     // AC4b: Must contain "is_error":true
     assert_eq!(
         v["is_error"], true,
-        "config parse error: is_error must be true, got: {:?}\nstdout:\n{}",
-        v["is_error"], out.stdout
+        "config parse error: is_error must be true, got: {:?}\nstderr:\n{}",
+        v["is_error"], out.stderr
     );
 
     // AC4c: Must contain "subtype":"internal_error" (Setup errors map to internal_error)
     assert_eq!(
         v["subtype"], "internal_error",
-        "config parse error: subtype must be 'internal_error', got: {:?}\nstdout:\n{}",
-        v["subtype"], out.stdout
+        "config parse error: subtype must be 'internal_error', got: {:?}\nstderr:\n{}",
+        v["subtype"], out.stderr
     );
 
     // AC4d: Must contain "error_message" with "invalid config" or similar
@@ -827,17 +844,17 @@ model = "claude-opus-4-8""#;
             .and_then(|m| m.as_str())
             .map(|m| m.contains("invalid config") || m.contains("config"))
             .unwrap_or(false),
-        "config parse error: error_message must mention 'config', got: {:?}\nstdout:\n{}",
+        "config parse error: error_message must mention 'config', got: {:?}\nstderr:\n{}",
         v.get("error_message"),
-        out.stdout
+        out.stderr
     );
 
     // AC4e: Must contain claude_version field
     assert!(
         v.get("claude_version").and_then(|v| v.as_str()).is_some(),
-        "config parse error: must include claude_version field, got: {:?}\nstdout:\n{}",
+        "config parse error: must include claude_version field, got: {:?}\nstderr:\n{}",
         v.get("claude_version"),
-        out.stdout
+        out.stderr
     );
 }
 
@@ -868,11 +885,12 @@ model = "claude-haiku-4-5""#;
         out.stderr
     );
 
-    let trimmed = out.stdout.trim();
+    assert!(out.stdout.is_empty(), "config error stdout must be empty");
+    let trimmed = out.stderr.trim();
     let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
         panic!(
-            "duplicate keys error: stdout must be valid JSON: {e}\n  raw:\n{}",
-            out.stdout
+            "duplicate keys error: stderr must be valid JSON: {e}\n  raw:\n{}",
+            out.stderr
         )
     });
 
@@ -907,11 +925,12 @@ model = "gpt-4""#;
         out.stderr
     );
 
-    let trimmed = out.stdout.trim();
+    assert!(out.stdout.is_empty(), "config error stdout must be empty");
+    let trimmed = out.stderr.trim();
     let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
         panic!(
-            "model validation error: stdout must be valid JSON: {e}\n  raw:\n{}",
-            out.stdout
+            "model validation error: stderr must be valid JSON: {e}\n  raw:\n{}",
+            out.stderr
         )
     });
 
@@ -956,11 +975,12 @@ max_turns = 0"#;
         out.stderr
     );
 
-    let trimmed = out.stdout.trim();
+    assert!(out.stdout.is_empty(), "config error stdout must be empty");
+    let trimmed = out.stderr.trim();
     let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
         panic!(
-            "max_turns validation error: stdout must be valid JSON: {e}\n  raw:\n{}",
-            out.stdout
+            "max_turns validation error: stderr must be valid JSON: {e}\n  raw:\n{}",
+            out.stderr
         )
     });
 

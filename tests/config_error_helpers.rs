@@ -3,6 +3,7 @@
 //! This module provides reusable functions for running claude-print with malformed configs
 //! and capturing structured output. Use these helpers to write config error tests
 //! that are consistent and maintainable.
+#![allow(dead_code)] // Compiled both as a helper module and a standalone integration target.
 //!
 //! ## Example
 //!
@@ -57,10 +58,7 @@ pub fn run_with_config_and_format<P: AsRef<Path>>(
     format: &str,
     prompt: &str,
 ) -> Outcome {
-    run_with_config(
-        config_path,
-        &["--output-format", format, prompt],
-    )
+    run_with_config(config_path, &["--output-format", format, prompt])
 }
 
 /// Fixture builder for creating temporary malformed config files.
@@ -80,6 +78,12 @@ pub fn run_with_config_and_format<P: AsRef<Path>>(
 pub struct ConfigFixture {
     temp_dir: TempDir,
     config_name: String,
+}
+
+impl Default for ConfigFixture {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConfigFixture {
@@ -145,22 +149,25 @@ impl Outcome {
 /// Panics with a detailed message if the code doesn't match.
 pub fn assert_exits_with_code(outcome: &Outcome, expected: i32) {
     assert_eq!(
-        outcome.code, Some(expected),
+        outcome.code,
+        Some(expected),
         "expected exit code {expected}, got {:?}",
         outcome.code
     );
 }
 
-/// Assert that the outcome's stdout contains a valid JSON error response.
+/// Assert that the outcome's stderr contains a valid config-error response.
 ///
 /// Checks for:
+/// - stdout is empty
 /// - `type == "result"`
 /// - `is_error == true`
 /// - `subtype` matches the expected value
 ///
 /// Returns the parsed JSON value for further inspection.
 pub fn assert_json_error(outcome: &Outcome, expected_subtype: &str) -> serde_json::Value {
-    let v = outcome.parse_json();
+    assert_stdout_empty(outcome);
+    let v = outcome.parse_json_stderr();
     assert_eq!(
         v["type"], "result",
         "error response must have type='result', got {:?}",
@@ -212,10 +219,7 @@ pub fn assert_stdout_empty(outcome: &Outcome) {
 
 /// Assert that stderr is not empty.
 pub fn assert_stderr_not_empty(outcome: &Outcome) {
-    assert!(
-        !outcome.stderr.is_empty(),
-        "stderr should not be empty"
-    );
+    assert!(!outcome.stderr.is_empty(), "stderr should not be empty");
 }
 
 // ── Internal Helpers ─────────────────────────────────────────────────────────────
@@ -290,9 +294,8 @@ fn run(cmd: &mut Command, budget: Duration) -> Outcome {
 }
 
 fn parse_json_output(output: &str) -> serde_json::Value {
-    serde_json::from_str(output).unwrap_or_else(|e| {
-        panic!("output was not valid JSON: {e}\n  raw: {output:?}")
-    })
+    serde_json::from_str(output)
+        .unwrap_or_else(|e| panic!("output was not valid JSON: {e}\n  raw: {output:?}"))
 }
 
 #[cfg(test)]
@@ -326,4 +329,3 @@ mod tests {
 // ── Example Usage (documentation only) ──────────────────────────────────────────────
 // The helper functions above are ready to use. Example usage tests will be added
 // in a separate bead focused on actual config error testing scenarios.
-

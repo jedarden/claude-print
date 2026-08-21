@@ -324,7 +324,7 @@ mod tests {
         let start = seq.phase_start;
 
         assert!(matches!(
-            seq.feed_at(&vec![b'x'; IDLE_THRESHOLD_BYTES], start),
+            seq.feed_at(&[b'x'; IDLE_THRESHOLD_BYTES], start),
             StartupAction::None
         ));
         assert!(matches!(
@@ -344,7 +344,7 @@ mod tests {
         let mut seq = StartupSeq::new(b"prompt".to_vec());
         let start = seq.phase_start;
 
-        seq.feed_at(&vec![b'x'; IDLE_THRESHOLD_BYTES], start);
+        seq.feed_at(&[b'x'; IDLE_THRESHOLD_BYTES], start);
         seq.feed_at(b"still rendering", start + Duration::from_millis(350));
 
         // More than 400ms has elapsed overall, but only 150ms has been quiet.

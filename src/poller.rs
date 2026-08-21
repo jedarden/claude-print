@@ -605,10 +605,11 @@ mod tests {
         assert!(result.is_ok());
         let path = result.unwrap();
         // The actual current directory should be used, not PWD env var
-        // Since we're in /home/coding/claude-print, the slug should be home-coding-claude-print
+        let cwd = std::env::current_dir().expect("current_dir");
+        let cwd_slug = cwd_to_slug(&cwd.to_string_lossy()).expect("cwd_to_slug");
         assert_eq!(
             path,
-            PathBuf::from("/test/home/.claude/projects/home-coding-claude-print")
+            PathBuf::from("/test/home/.claude/projects").join(cwd_slug)
         );
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);

@@ -193,7 +193,8 @@ fn as6_transcript_race_delayed_jsonl_write() {
         &std::env::current_dir()
             .expect("current_dir")
             .to_string_lossy(),
-    );
+    )
+    .expect("cwd_to_slug");
     let transcript_file = home
         .path()
         .join(".claude")

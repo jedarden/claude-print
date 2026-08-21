@@ -452,14 +452,14 @@ mod tests {
         // Test various dangerous shell metacharacters
         let test_cases = vec![
             "normal_path",
-            "path'with'quotes",      // Single quotes
-            "path$with$dollar",       // Dollar signs (variable expansion)
-            "path`with`backticks",    // Backticks (command substitution)
-            r"path\with\backslash",   // Backslashes
-            "path;with;semicolons",   // Semicolons (command separators)
-            "path&with&ampersands",   // Ampersands (background operators)
-            "path|with|pipes",        // Pipes (command chaining)
-            "path\nwith\nnewlines",   // Newlines (command separators)
+            "path'with'quotes",         // Single quotes
+            "path$with$dollar",         // Dollar signs (variable expansion)
+            "path`with`backticks",      // Backticks (command substitution)
+            r"path\with\backslash",     // Backslashes
+            "path;with;semicolons",     // Semicolons (command separators)
+            "path&with&ampersands",     // Ampersands (background operators)
+            "path|with|pipes",          // Pipes (command chaining)
+            "path\nwith\nnewlines",     // Newlines (command separators)
             r"path\with\mixed'quotes$", // Mixed special characters
         ];
 
@@ -510,8 +510,8 @@ mod tests {
         let installer = HookInstaller::new().unwrap();
 
         // Read the generated hook.sh
-        let hook_content = std::fs::read_to_string(&installer.hook_path)
-            .expect("hook.sh should be readable");
+        let hook_content =
+            std::fs::read_to_string(&installer.hook_path).expect("hook.sh should be readable");
 
         // Verify the script is syntactically valid shell
         let output = std::process::Command::new("sh")
@@ -539,7 +539,10 @@ mod tests {
         if fifo_str.contains('\'') {
             // If the path has quotes, verify they're escaped in the script
             // The escape pattern is: ' -> '\''
-            assert!(hook_content.contains("'\\''"), "Single quotes should be escaped");
+            assert!(
+                hook_content.contains("'\\''"),
+                "Single quotes should be escaped"
+            );
         }
     }
 
@@ -575,20 +578,23 @@ mod tests {
         // Write test data to the hook script's stdin
         {
             let mut stdin = output.stdin.as_mut().expect("open stdin");
-            std::io::Write::write_all(&mut stdin, b"test data from hook\n").expect("write to hook stdin");
+            std::io::Write::write_all(&mut stdin, b"test data from hook\n")
+                .expect("write to hook stdin");
         } // Close stdin by dropping here to signal EOF
 
         // Wait for the hook script to complete
         let status = output.wait_with_output().expect("wait for hook.sh");
-        assert!(status.status.success(), "hook.sh should execute successfully");
+        assert!(
+            status.status.success(),
+            "hook.sh should execute successfully"
+        );
 
         // Wait for the reader to finish and get the data
         let received_data = reader_handle.join().expect("reader thread should complete");
 
         // Verify the data was written correctly
         assert_eq!(
-            received_data,
-            b"test data from hook\n",
+            received_data, b"test data from hook\n",
             "FIFO should receive the data written by hook.sh"
         );
     }

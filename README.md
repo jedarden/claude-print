@@ -104,12 +104,57 @@ claude-print --timeout 30 "quick question"
 | `--stream-json-timeout <SECS>` | | `90` | Stream-json first-output timeout in seconds |
 | `--stop-hook-timeout <SECS>` | | `120` | Stop hook watchdog timeout in seconds |
 | `--claude-binary <PATH>` | | PATH lookup | Path to claude binary |
+| `--config <FILE>` | | XDG or user config | Read configuration from an explicit TOML file |
 | `--no-inherit-hooks` | | | Disable user hook inheritance |
 | `--verbose` | | | Write timing traces to stderr |
 | `--check` | | | Run installation self-test and exit |
 | `--clean` | | | With `--check`, remove orphaned temp directories older than one hour |
 | `--version` | `-V` | | Print version and exit |
 | `--help` | `-h` | | Print help |
+
+## Configuration
+
+By default, `claude-print` reads `$XDG_CONFIG_HOME/claude-print/config.toml`
+when `XDG_CONFIG_HOME` is set, or `~/.config/claude-print/config.toml`
+otherwise. Use `--config <FILE>` to select another file. The file is optional;
+when it is missing, the built-in defaults are used.
+
+Configuration uses TOML. Every key is optional, so partial configurations are
+valid:
+
+```toml
+[defaults]
+model = "claude-sonnet-4-6"
+inherit_hooks = true
+max_turns = 30
+timeout_secs = 3600
+```
+
+`model` must start with `claude-` and may contain letters, numbers, hyphens,
+underscores, and dots. `max_turns` must be from 1 through 1000, and
+`timeout_secs` must be from 1 through 86400. Unknown keys, invalid value types,
+out-of-range values, and malformed TOML are rejected.
+
+Only a missing file falls back to defaults. If an existing config cannot be
+read, parsed, or validated, `claude-print` exits with status 2 instead of
+continuing with a warning. In `json` and `stream-json` modes, a configuration
+failure leaves stdout empty and writes a structured result to stderr, for
+example:
+
+```json
+{"claude_version":"2.1.238 (Claude Code)","error_message":"invalid config: /tmp/config.toml: TOML parse error ...","is_error":true,"subtype":"internal_error","type":"result"}
+```
+
+For a quick check without touching the default config:
+
+```bash
+bad_config="$(mktemp)"
+printf '[[\n' > "$bad_config"
+claude-print --config "$bad_config" --output-format json "test prompt" 2>config-error.json
+status=$? # 2
+jq . config-error.json
+rm "$bad_config" config-error.json
+```
 
 ## Output formats
 

@@ -1,6 +1,5 @@
 //! End-to-end coverage for configuration failures during CLI startup.
 
-#[allow(dead_code)]
 mod config_error_helpers;
 
 use config_error_helpers::{

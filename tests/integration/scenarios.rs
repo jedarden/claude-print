@@ -1401,7 +1401,7 @@ fn config_parse_error_invalid_timeout() {
 /// End-to-end integration test: malformed config file produces structured error.
 ///
 /// This test verifies that when claude-print is given a malformed config file,
-/// it exits with code 2 and produces a structured JSON error on stdout, not a
+/// it exits with code 2 and produces a structured JSON error on stderr, not a
 /// silent fallback. This is the real integration test that uses the helper
 /// functions created in the previous bead.
 ///
@@ -1417,37 +1417,13 @@ fn config_parse_error_invalid_timeout() {
 /// 5. Test verifies exit code is not 0 (no silent fallback)
 /// 6. Test uses the helper functions created in previous bead
 ///
-/// Test should FAIL initially (proving current behavior is wrong).
-///
-/// # Current Behavior (bead: claudepr-1fc249b9)
-///
-/// The test currently FAILS with "output was not valid JSON: EOF while parsing a value"
-/// because:
-///
-/// 1. The `--config` flag does not exist in the CLI yet
-/// 2. When invoked with `--config`, the CLI parser prints:
-///    ```
-///    error: unexpected argument '--config' found
-///    ```
-/// 3. The binary exits with code 2 (correct exit code, wrong reason)
-/// 4. stdout is empty (no JSON output), so JSON parsing fails
-///
-/// Current actual behavior when running:
-/// ```bash
-/// $ claude-print --config /tmp/malformed.toml --output-format json test
-/// error: unexpected argument '--config' found
-/// Exit code: 2
-/// ```
-///
-/// # Expected Behavior (after fix)
-///
-/// Once the `--config` flag is implemented and config parsing is added:
+/// # Expected behavior
 ///
 /// 1. The `--config` flag is accepted by the CLI
 /// 2. When a malformed config is provided:
 ///    - The config parser detects the TOML syntax error
 ///    - The program exits with code 2 (Setup error)
-///    - stdout contains a structured JSON error response:
+///    - stderr contains a structured JSON error response:
 ///      ```json
 ///      {
 ///        "type": "result",
@@ -1460,12 +1436,11 @@ fn config_parse_error_invalid_timeout() {
 /// 3. The error_message field mentions the config problem
 /// 4. All JSON fields are present and valid
 ///
-/// This test pins the expected behavior; once the flag is implemented, this test
-/// will pass and prove the error handling works correctly.
+/// This test pins the config-error channel and structured output contract.
 #[test]
 fn malformed_config_integration_exit_code_2_and_structured_error() {
     use super::config_error_helpers::{
-        assert_exits_with_code, assert_json_error, ConfigFixture, run_with_config_and_format,
+        assert_exits_with_code, assert_json_error, run_with_config_and_format, ConfigFixture,
     };
 
     // Step 1: Create a malformed config file with unclosed bracket (invalid TOML syntax)
@@ -1509,22 +1484,12 @@ model = "test""#; // Missing closing bracket
 
 /// End-to-end integration test: malformed config with invalid TOML syntax.
 ///
-/// Tests another type of TOML syntax error: equals sign in wrong place.
-///
-/// # Current Behavior (bead: claudepr-1fc249b9)
-///
-/// Same as `malformed_config_integration_exit_code_2_and_structured_error`:
-/// The `--config` flag doesn't exist yet, so the CLI rejects it before we can
-/// test the actual config parsing.
-///
-/// # Expected Behavior (after fix)
-///
-/// Once `--config` is implemented, this test verifies that different types of
-/// TOML syntax errors all produce structured JSON errors with exit code 2.
+/// Tests that an equals sign without a key produces structured JSON on stderr
+/// and exits with code 2.
 #[test]
 fn malformed_config_invalid_toml_syntax_structured_error() {
     use super::config_error_helpers::{
-        assert_exits_with_code, assert_json_error, ConfigFixture, run_with_config_and_format,
+        assert_exits_with_code, assert_json_error, run_with_config_and_format, ConfigFixture,
     };
 
     let fixture = ConfigFixture::new();
@@ -1542,29 +1507,21 @@ fn malformed_config_invalid_toml_syntax_structured_error() {
         .as_str()
         .expect("error_message must be a string");
     assert!(
-        error_message.contains("config") || error_message.contains("TOML") || error_message.contains("invalid"),
+        error_message.contains("config")
+            || error_message.contains("TOML")
+            || error_message.contains("invalid"),
         "error_message must mention config/TOML problem: {error_message}"
     );
 }
 
 /// End-to-end integration test: malformed config with unclosed array bracket.
 ///
-/// Tests array syntax error.
-///
-/// # Current Behavior (bead: claudepr-1fc249b9)
-///
-/// Same as `malformed_config_integration_exit_code_2_and_structured_error`:
-/// The `--config` flag doesn't exist yet, so the CLI rejects it before we can
-/// test the actual config parsing.
-///
-/// # Expected Behavior (after fix)
-///
-/// Once `--config` is implemented, this test verifies that array syntax errors
-/// produce structured JSON errors with exit code 2.
+/// Verifies that array syntax errors produce structured JSON on stderr and exit
+/// with code 2.
 #[test]
 fn malformed_config_unclosed_array_bracket_structured_error() {
     use super::config_error_helpers::{
-        assert_exits_with_code, assert_json_error, ConfigFixture, run_with_config_and_format,
+        assert_exits_with_code, assert_json_error, run_with_config_and_format, ConfigFixture,
     };
 
     let fixture = ConfigFixture::new();
@@ -1582,7 +1539,9 @@ model = ["test""#;
         .as_str()
         .expect("error_message must be a string");
     assert!(
-        error_message.contains("config") || error_message.contains("unclosed") || error_message.contains("invalid"),
+        error_message.contains("config")
+            || error_message.contains("unclosed")
+            || error_message.contains("invalid"),
         "error_message must mention config syntax problem: {error_message}"
     );
 }

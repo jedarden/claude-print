@@ -372,7 +372,7 @@ fn test_stream_json_disconnect_exits_immediately() {
 #[test]
 fn test_json_long_text_serializes() {
     let long_text = "x".repeat(100_000);
-    let mut result = make_result(&long_text);
+    let result = make_result(&long_text);
     let (buf, mut writer) = capture();
     // Should not panic on unwrap at lines 68 and 105
     let result = emit_success(&mut writer, &result, &OutputFormat::Json, "1.0", 0);

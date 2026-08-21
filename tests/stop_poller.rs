@@ -67,7 +67,7 @@ fn test_stop_hook_fires() {
         "last_assistant_message mismatch"
     );
 
-    let info = resolve_stop_info(stop);
+    let info = resolve_stop_info(stop).expect("resolve_stop_info");
     assert_eq!(
         info.transcript_path,
         Some(std::path::PathBuf::from(
@@ -124,7 +124,7 @@ fn test_missing_transcript_path_derived() {
     );
     assert_eq!(stop.session_id.as_deref(), Some("abc123"));
 
-    let info = resolve_stop_info(stop);
+    let info = resolve_stop_info(stop).expect("resolve_stop_info");
 
     // Derived slug: /home/user/myproject → home-user-myproject
     // Follow the production contract: an unset HOME is an error, never /root.
