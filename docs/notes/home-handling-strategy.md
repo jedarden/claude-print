@@ -11,10 +11,16 @@ for documentation and call sites to drift apart.
 
 `get_home()` reads `HOME` with `std::env::var_os` and:
 
-- returns the path unchanged when the value is non-empty;
+- returns the path unchanged when the value names an existing, writable
+  directory;
 - returns `Error::Config` when the value is unset or empty;
 - preserves valid non-UTF-8 Unix paths; and
-- does not require the path to exist at resolution time.
+- returns a path-specific `Error::Config` when the directory is missing,
+  inaccessible, not a directory, or cannot create and write a temporary file.
+
+The temporary write probe detects permission denial and read-only mounts, then
+is removed before `get_home()` returns. Chroot and container launchers must
+therefore provision or mount HOME before starting `claude-print`.
 
 The actionable error is:
 
@@ -26,6 +32,13 @@ This is intentionally strict because Claude configuration and transcripts are
 user-owned data. Guessing `/root` can select another user's directory, fails for
 non-root processes, and may point outside a container or chroot. A clear setup
 error is safer and easier to diagnose than reading or writing an invented path.
+
+Filesystem failures follow these actionable forms:
+
+```text
+HOME path '/nonexistent' is not accessible: ...; set HOME to an existing, writable directory
+HOME path '/home/service' is not writable: ...; grant write permission or set HOME to an existing, writable directory
+```
 
 ## Call-site behavior
 
@@ -48,8 +61,8 @@ fixtures must not synthesize `/root` when it is absent.
 
 ## Verification
 
-The focused regression suite covers unset, empty, valid, nonexistent, and
-chroot-like HOME values, as well as CLI error rendering:
+The focused regression suite covers unset, empty, valid, nonexistent,
+read-only, and chroot-like HOME values, as well as CLI error rendering:
 
 ```bash
 cargo test --test home_unset

@@ -462,12 +462,14 @@ model = "claude-opus-4-8""#,
     #[test]
     fn default_path_fallback_to_home_config_when_xdg_not_set() {
         let _lock = env_lock();
-        let _home = EnvGuard::set("HOME", "/test/home");
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("HOME", home.path());
         let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
 
         let path = Config::default_path().unwrap();
         // Should be ~/.config/claude-print/config.toml
-        let expected = PathBuf::from("/test/home")
+        let expected = home
+            .path()
             .join(".config")
             .join("claude-print")
             .join("config.toml");

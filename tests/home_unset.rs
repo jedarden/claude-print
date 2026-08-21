@@ -1,9 +1,8 @@
 //! End-to-end and cross-module coverage for the process-wide `HOME` contract.
 //!
-//! `config` and `poller` both depend on the shared strict resolver: an unset or
-//! empty value is rejected, while any non-empty path is preserved without an
-//! eager filesystem check. The latter matters in containers and chroots where
-//! the home hierarchy may be mounted or created after path resolution.
+//! `config`, `poller`, and `session` depend on the shared strict resolver: HOME
+//! must name an existing, writable directory. Chroots and containers get a
+//! path-specific setup error instead of an implicit `/root` fallback.
 //!
 //! Tests which mutate this process's environment take one lock. Binary tests
 //! use child-only environment overrides, matching `env -u HOME claude-print`.
@@ -147,7 +146,7 @@ fn valid_home_roots_every_derived_path() {
 }
 
 #[test]
-fn nonexistent_home_is_accepted_consistently_without_eager_io() {
+fn nonexistent_home_is_rejected_consistently_with_path_context() {
     let _lock = env_lock();
     let root = tempfile::tempdir().expect("create isolated root");
     let missing_home = root.path().join("not-mounted/home/service");
@@ -155,26 +154,34 @@ fn nonexistent_home_is_accepted_consistently_without_eager_io() {
     let _home = EnvGuard::set("HOME", &missing_home);
     let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
 
-    let config_path = Config::default_path().unwrap();
-    let transcript_path = derive_transcript_path("session-id", "/srv/project").unwrap();
-    let projects_path = projects_dir_for_cwd().unwrap();
-
-    assert_eq!(
-        config_path,
-        missing_home.join(".config/claude-print/config.toml")
-    );
-    assert_eq!(
-        transcript_path,
-        missing_home.join(".claude/projects/srv-project/session-id.jsonl")
-    );
-    assert!(projects_path.starts_with(missing_home.join(".claude/projects")));
-    assert!(
-        Config::load_or_default(&config_path)
-            .unwrap()
-            .defaults
-            .is_none(),
-        "a not-yet-created HOME should behave like a missing optional config"
-    );
+    for error in [
+        Config::default_path().unwrap_err().to_string(),
+        derive_transcript_path("session-id", "/srv/project")
+            .unwrap_err()
+            .to_string(),
+        projects_dir_for_cwd().unwrap_err().to_string(),
+        Session::run(
+            Path::new("/unused/claude"),
+            &[],
+            b"unused prompt".to_vec(),
+            None,
+            None,
+            None,
+            None,
+            OutputFormat::Text,
+            &LaunchOptions::default(),
+        )
+        .unwrap_err()
+        .to_string(),
+    ] {
+        assert!(
+            error.contains(&missing_home.display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("not accessible"), "{error}");
+        assert!(error.contains("existing, writable directory"), "{error}");
+        assert!(!error.contains("/root"), "unexpected fallback: {error}");
+    }
 }
 
 #[test]
@@ -239,6 +246,83 @@ fn env_u_home_version_fails_with_actionable_error() {
     assert!(
         !stdout.contains("claude-print "),
         "--version printed a success version despite missing HOME: {stdout}"
+    );
+}
+
+#[test]
+fn nonexistent_home_version_fails_without_root_fallback() {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_claude-print"));
+    let missing_home = Path::new("/nonexistent");
+    assert!(
+        !missing_home.exists(),
+        "test requires /nonexistent to be absent"
+    );
+
+    let output = Command::new(&binary)
+        .arg("--version")
+        .env("HOME", missing_home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run HOME=/nonexistent claude-print --version");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("HOME path '/nonexistent' is not accessible"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("existing, writable directory"), "{stderr}");
+    assert!(!stderr.contains("/root"), "unexpected fallback: {stderr}");
+    assert!(stdout.is_empty(), "unexpected success output: {stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_home_version_reports_write_permission_problem() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_claude-print"));
+    let home = tempfile::tempdir().expect("create read-only HOME");
+    let original_mode = std::fs::metadata(home.path())
+        .expect("stat HOME")
+        .permissions()
+        .mode();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make HOME read-only");
+
+    let output = Command::new(&binary)
+        .arg("--version")
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run claude-print with read-only HOME");
+
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(original_mode))
+        .expect("restore HOME permissions");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(&home.path().display().to_string()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("not writable"), "{stderr}");
+    assert!(stderr.contains("write permission"), "{stderr}");
+    assert!(stdout.is_empty(), "unexpected success output: {stdout}");
+    assert_eq!(
+        std::fs::read_dir(home.path()).expect("read HOME").count(),
+        0,
+        "HOME validation must not leave a probe file"
     );
 }
 

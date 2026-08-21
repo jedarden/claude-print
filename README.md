@@ -232,18 +232,20 @@ env:
 For a chroot or one-off service invocation, the equivalent is
 `HOME=/home/service claude-print "..."`. Do not use `/root` unless the process
 actually runs as root and `/root` is intentionally where its Claude Code state
-is stored. The startup check accepts any non-empty path without probing the
-filesystem, but a real session still needs the directory and relevant state to
-be accessible and writable.
+is stored. Startup verifies that the configured path exists, is a directory,
+and permits a temporary file to be created and written. This detects missing
+home mounts, permission problems, and read-only filesystems before Claude Code
+starts. The probe file is removed immediately; failures name the configured
+path and never fall back to `/root`.
 
 **Migration note:** Older builds checked `HOME` only while resolving particular
-paths, accepted an empty value at some call sites, and could run early-exit
-commands such as `--version` without it. Current builds enforce one consistent,
-non-empty `HOME` contract before session startup, `--check`, and `--version`.
-When upgrading existing containers or service definitions, add an explicit
-`HOME`; update health checks that invoke `--version` in a stripped environment
-as well. Argument-parser help (`--help`) is still rendered before runtime HOME
-validation.
+paths, accepted an empty or unprovisioned value at some call sites, and could
+run early-exit commands such as `--version` without it. Current builds enforce
+one consistent, existing-and-writable `HOME` contract before session startup,
+`--check`, and `--version`. When upgrading existing containers or service
+definitions, add an explicit `HOME`, create or mount it with write permission,
+and update health checks that invoke `--version` in a stripped environment.
+Argument-parser help (`--help`) is still rendered before runtime HOME validation.
 
 ### Billing classification verification
 

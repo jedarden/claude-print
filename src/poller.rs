@@ -471,7 +471,8 @@ mod tests {
         // the original value is restored below.
         let original_home = std::env::var("HOME").ok();
 
-        std::env::set_var("HOME", "/test/home");
+        let home_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_dir.path());
 
         let payload = StopPayload {
             session_id: Some("mysession".to_string()),
@@ -480,7 +481,8 @@ mod tests {
             last_assistant_message: None,
         };
         let info = resolve_stop_info(payload).unwrap();
-        let expected = PathBuf::from("/test/home")
+        let expected = home_dir
+            .path()
             .join(".claude")
             .join("projects")
             .join("home-user-myproject")
@@ -581,13 +583,16 @@ mod tests {
     fn derive_transcript_path_builds_correct_path() {
         // Direct mutation supplies a deterministic HOME and is restored below.
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", "/test/home");
+        let home_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_dir.path());
         let result = derive_transcript_path("sess-id", "/project/dir");
         assert!(result.is_ok());
         let path = result.unwrap();
         assert_eq!(
             path,
-            PathBuf::from("/test/home/.claude/projects/project-dir/sess-id.jsonl")
+            home_dir
+                .path()
+                .join(".claude/projects/project-dir/sess-id.jsonl")
         );
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
@@ -600,7 +605,8 @@ mod tests {
     fn projects_dir_for_cwd_builds_correct_path() {
         // Direct mutation supplies a deterministic HOME and is restored below.
         let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", "/test/home");
+        let home_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home_dir.path());
         let result = projects_dir_for_cwd();
         assert!(result.is_ok());
         let path = result.unwrap();
@@ -609,7 +615,7 @@ mod tests {
         let cwd_slug = cwd_to_slug(&cwd.to_string_lossy()).expect("cwd_to_slug");
         assert_eq!(
             path,
-            PathBuf::from("/test/home/.claude/projects").join(cwd_slug)
+            home_dir.path().join(".claude/projects").join(cwd_slug)
         );
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);

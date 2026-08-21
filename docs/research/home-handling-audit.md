@@ -10,14 +10,16 @@ The implementation consistently uses the strict resolver in
 empty and never substitutes `/root` or another guessed directory.
 
 The helper uses `std::env::var_os`, so a non-empty non-UTF-8 Unix path is
-preserved. It intentionally performs no existence or canonicalization check;
-filesystem operations report their own errors later.
+preserved. It does not canonicalize the path, but it requires the path to name
+an accessible directory and verifies writability with a short-lived temporary
+file. This reports missing mounts, permission denial, and read-only filesystems
+before session startup.
 
 ## Call-site audit
 
-| Module | Function | Result when HOME is unset or empty |
+| Module | Function | Result when HOME is invalid |
 | --- | --- | --- |
-| `util.rs` | `get_home()` | `Error::Config` with an actionable message |
+| `util.rs` | `get_home()` | `Error::Config` with an actionable unset, access, type, or write message |
 | `config.rs` | `Config::default_path()` | Same error if `XDG_CONFIG_HOME` is unavailable; otherwise HOME is not read |
 | `poller.rs` | `resolve_stop_info()` | Same error only when it must derive a transcript path; explicit paths bypass HOME |
 | `poller.rs` | `derive_transcript_path()` | Same error |
