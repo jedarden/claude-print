@@ -299,3 +299,9 @@ Before cutting a release tag:
 - `scripts/billing-canary.sh` — daily credential-backed AS-4 canary
 - `scripts/claude-print-billing-canary.{service,timer}` — systemd user units for the canary
 - `scripts/` — integration test scripts
+
+---
+
+Part of [jedarden.com](https://jedarden.com)
+
+*This GitHub repo is a read-only mirror of git.ardenone.com/jedarden/claude-print — issues and PRs are welcome here either way.*
