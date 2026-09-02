@@ -22,3 +22,6 @@ target/
 # root becomes catastrophic. Anchored to root so only a repo-root '~' is ignored
 # (a '~' legitimately nested deeper in the tree is left alone).
 /~
+
+# NEEDLE execution traces are local diagnostics.
+**/.beads/traces/
