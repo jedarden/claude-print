@@ -11,7 +11,7 @@ fn install_fake_claude_print(root: &Path) -> PathBuf {
     let fake = root.join("fake-claude-print");
     fs::write(
         &fake,
-        r#"#!/bin/bash
+        r#"#!/usr/bin/env bash
 set -eu
 if [ "${FAKE_INVOCATION_FAIL:-0}" = 1 ]; then
     echo "synthetic invocation failure" >&2
