@@ -234,7 +234,7 @@ fn claude_print_base() -> Command {
     );
     assert!(
         mock.exists(),
-        "mock-claude binary missing at {}; build.rs should have built it",
+        "mock-claude binary missing at {}; run `cargo build`",
         mock.display()
     );
     let mut cmd = Command::new(&bin);

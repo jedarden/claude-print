@@ -13,6 +13,22 @@ license = "MIT"
 name = "claude-print"
 path = "src/main.rs"
 
+# The mock-claude fixture, built as a bin of THIS package so every `cargo test`
+# invocation (plain or filtered, local or CI) links it into
+# `target/<profile>/mock-claude` — exactly where the integration tests resolve
+# it. build.rs used to shell out to a nested `cargo build` for this, but cargo
+# only sets CARGO_PRIMARY_PACKAGE for explicit `-p` selections, so that nested
+# build was silently skipped on every plain `cargo test` (claudepr-2c965921),
+# and when it did run it blocked on the outer build's target-dir lock.
+# `test-fixtures/mock-claude` stays a workspace member because CI's build-musl
+# step builds it via `--manifest-path` for the release asset; both entries
+# produce the same output path, so the only way to hit a duplicate-bin error is
+# a `--workspace` build that includes both — nothing in CI or the documented
+# build commands does that.
+[[bin]]
+name = "mock-claude"
+path = "test-fixtures/mock-claude/src/main.rs"
+
 [dependencies]
 clap = { version = "4.5.38", features = ["derive", "env"] }
 anyhow = "1.0.98"

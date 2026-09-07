@@ -1,7 +1,8 @@
 //! Binary-level end-to-end tests (bead bf-46x).
 //!
 //! These tests invoke the *compiled* `claude-print` binary as a subprocess,
-//! using `mock-claude` (built alongside by `build.rs`) as the claude backend.
+//! using `mock-claude` (a bin of this package, linked by the same build) as
+//! the claude backend.
 //! Every invocation pins `--claude-binary` to the mock-claude path, so no real
 //! Anthropic credentials are required and the suite is fully hermetic.
 //!
@@ -40,8 +41,9 @@ struct Outcome {
 ///
 /// Test binaries live at `target/<profile>/deps/`; named workspace bins live at
 /// `target/<profile>/`. Same resolution strategy as `tests/stream_json_incremental.rs`,
-/// `tests/watchdog.rs`, and `tests/pty_integration.rs`. `build.rs` guarantees
-/// `mock-claude` is present for any `cargo test`/`clippy` run.
+/// `tests/watchdog.rs`, and `tests/pty_integration.rs`. `mock-claude` is a bin
+/// target of this package, so any `cargo test` run — plain or filtered — links
+/// it into `target/<profile>/` next to the test binaries (claudepr-2c965921).
 fn workspace_bin(name: &str) -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     let profile_dir = exe
@@ -62,7 +64,7 @@ fn claude_print() -> Command {
     );
     assert!(
         mock.exists(),
-        "mock-claude binary missing at {}; build.rs should have built it",
+        "mock-claude binary missing at {}; run `cargo build`",
         mock.display()
     );
     let mut cmd = Command::new(&bin);

@@ -38,7 +38,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-/// Locate the mock-claude binary built alongside this test binary by `build.rs`.
+/// Locate the mock-claude binary built alongside this test binary by the workspace build.
 ///
 /// Same resolution strategy as `tests/watchdog.rs` and `tests/binary_e2e.rs`:
 /// the test binary lives at `target/<profile>/deps/`, the named workspace bin at
@@ -219,7 +219,7 @@ fn as6_transcript_race_delayed_jsonl_write() {
 // verbose-trace guard in `tests/binary_e2e.rs` (bf-12f1) does NOT force a
 // retry; this test pins the retry-count trace specifically.
 
-/// Locate a workspace bin built alongside this test binary by `build.rs`.
+/// Locate a workspace bin built alongside this test binary by the workspace build.
 ///
 /// Test binaries live at `target/<profile>/deps/`; named workspace bins live at
 /// `target/<profile>/`. Same resolution strategy as `mock_claude_bin` above and

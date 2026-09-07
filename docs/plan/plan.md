@@ -158,9 +158,8 @@ claude-print (single Rust binary)
 
 ```
 claude-print/
-├── Cargo.toml                        # workspace root; declares `test-fixtures/mock-claude` as a workspace member so `cargo build` compiles `mock_claude`
+├── Cargo.toml                        # workspace root; `test-fixtures/mock-claude` stays a workspace member for CI's release build, and its main.rs is also a `[[bin]]` of the root package so every `cargo build`/`cargo test` links `mock-claude` into `target/<profile>/`
 ├── Cargo.lock
-├── build.rs                          # build script for version info
 ├── install.sh
 ├── claude-print.yaml                 # NEEDLE agent config
 ├── claude-print-ci-workflowtemplate.yml    # Argo WorkflowTemplate for CI/CD
