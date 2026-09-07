@@ -75,7 +75,23 @@ pub struct AssistantMessage {
 #[serde(default)]
 pub struct ResultEvent {
     pub is_error: Option<bool>,
+    #[serde(rename = "sessionId", alias = "session_id")]
     pub session_id: Option<String>,
+}
+
+/// Minimal probe for the `sessionId` carried on ordinary transcript records.
+///
+/// A PTY/TUI transcript contains no `type: "result"` event — that is a
+/// print/SDK-mode construct — so [`ResultEvent`] never fires for one and the
+/// session id has to be taken from a normal record instead. Every record
+/// carries `sessionId`, and all records in a single transcript carry the same
+/// value, so the first hit is sufficient (claudepr-26e7a0b6: `json` output
+/// reported `session_id: null` for every PTY run).
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct SessionIdProbe {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +147,16 @@ pub fn parse_transcript(path: &Path) -> Result<TranscriptResult> {
         let line = line.trim().to_owned();
         if line.is_empty() {
             continue;
+        }
+
+        // Cheap and skipped entirely once known; a Result event, when one
+        // exists, still overrides below.
+        if session_id.is_none() {
+            if let Ok(probe) = serde_json::from_str::<SessionIdProbe>(&line) {
+                if probe.session_id.is_some() {
+                    session_id = probe.session_id;
+                }
+            }
         }
 
         let event: Event = match serde_json::from_str(&line) {

@@ -1,8 +1,9 @@
 use nix::pty::{openpty, OpenptyResult};
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{execvp, fork, ForkResult, Pid};
+use nix::unistd::{execvpe, fork, ForkResult, Pid};
 use std::ffi::{CStr, CString};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,6 +48,92 @@ fn get_winsize(fd: i32) -> libc::winsize {
     ws
 }
 
+/// Claude Code session markers scrubbed from the child's environment so it
+/// starts a fresh, *persistable* top-level session rather than a nested one.
+///
+/// `CLAUDE_CODE_CHILD_SESSION` is the critical one: claude 2.1.263 gates
+/// transcript persistence on it. Inherited, the TUI renders "Transcript saving
+/// is off — inherited CLAUDE_CODE_CHILD_SESSION marker" and never writes
+/// `~/.claude/projects/<slug>/<session_id>.jsonl`, leaving claude-print's
+/// "wait for Stop, read the transcript" design with nothing to read
+/// (claudepr-26e7a0b6). Every agent- or NEEDLE-launched run inherits it from
+/// its parent session, which is why this only ever bit under fleet dispatch.
+const SCRUBBED_ENV: &[&str] = &[
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SKIP_PROMPT_HISTORY",
+];
+
+/// Variables forced on in the child regardless of what the parent had.
+///
+/// `CLAUDE_CODE_ENTRYPOINT=cli` is the subscription-billing invariant: the
+/// parent may have inherited `sdk-cli`, and propagating that would bill the
+/// metered SDK pool. `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` is claude's own
+/// documented remedy for the persistence gate, and keeps the design assumption
+/// alive even if a future claude derives child-session-ness some other way.
+const FORCED_ENV: &[(&str, &str)] = &[
+    ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+    ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1"),
+];
+
+/// Build the child's environment **in the parent, before `fork()`**.
+///
+/// This must not be done between `fork()` and `exec()`. POSIX permits only
+/// async-signal-safe calls there, and `setenv`/`unsetenv` are not: both may
+/// allocate. claude-print pool mode is multithreaded (`main.rs` shutdown
+/// monitor, `pool.rs` warmup threads and its connection-per-thread accept
+/// loop), so a fork racing another thread that holds the allocator lock would
+/// deadlock the child before it ever reached `exec` — a rare, load-dependent
+/// hang whose profile is precisely the fleet-dispatch workload this code
+/// exists to serve. Building the environment up-front and handing it to
+/// `execvpe` leaves the child executing only `login_tty` and `execvpe`.
+fn build_child_env() -> Vec<CString> {
+    scrub_env(std::env::vars_os())
+}
+
+/// Pure core of [`build_child_env`], taking the source environment explicitly.
+///
+/// Split out so it can be tested without mutating the process environment.
+/// `HOME`-style global env mutation in tests races across parallel test
+/// threads and produces exactly the pass-alone/fail-in-suite flake this crate
+/// already has elsewhere; a pure function has no such hazard.
+fn scrub_env<I, K, V>(vars: I) -> Vec<CString>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut env: Vec<CString> = Vec::new();
+    for (key, value) in vars {
+        let key = key.as_ref();
+        let value = value.as_ref();
+        let key_bytes = key.as_bytes();
+        if SCRUBBED_ENV.iter().any(|s| s.as_bytes() == key_bytes)
+            || FORCED_ENV.iter().any(|(s, _)| s.as_bytes() == key_bytes)
+        {
+            continue;
+        }
+        let value_bytes = value.as_bytes();
+        let mut entry = Vec::with_capacity(key_bytes.len() + 1 + value_bytes.len());
+        entry.extend_from_slice(key_bytes);
+        entry.push(b'=');
+        entry.extend_from_slice(value_bytes);
+        // A key or value containing an interior NUL cannot be represented in
+        // envp; such an entry is unreachable from the real environment, so
+        // dropping it is correct rather than fatal.
+        if let Ok(entry) = CString::new(entry) {
+            env.push(entry);
+        }
+    }
+    for (key, value) in FORCED_ENV {
+        if let Ok(entry) = CString::new(format!("{key}={value}")) {
+            env.push(entry);
+        }
+    }
+    env
+}
+
 impl PtySpawner {
     /// Open a PTY pair, fork, set the PTY window size, call `login_tty` in the
     /// child to make the slave the controlling terminal, then `execvp` `cmd`.
@@ -54,6 +141,9 @@ impl PtySpawner {
     /// `args` contains only the arguments to the program — not argv\[0\].
     /// argv\[0\] is set to `cmd` internally.
     pub fn spawn(cmd: &CStr, args: &[CString]) -> Result<Self> {
+        // Built before fork: the child may not allocate. See build_child_env.
+        let child_env = build_child_env();
+
         let OpenptyResult { master, slave } =
             openpty(None, None).map_err(|e| Error::OpenptyFailed(e.to_string()))?;
 
@@ -84,44 +174,15 @@ impl PtySpawner {
                 if unsafe { libc::login_tty(slave_fd) } != 0 {
                     unsafe { libc::_exit(127) };
                 }
-                // Unset Claude Code session environment variables so the child creates
-                // a fresh session. Without this, the child inherits the parent's session
-                // state and may write events into the parent's transcript, skip Stop hook
-                // dispatch, or behave as a subagent with an alternate transcript format.
-                //
-                // - CLAUDE_CODE_SESSION_ID: must be unset to prevent the child from
-                //   writing into the parent's transcript.
-                // - CLAUDECODE: must be unset when inherited from a parent Claude Code
-                //   session. If left set, the child treats the invocation as a nested/
-                //   subagent call and may write a subagent-style transcript instead of
-                //   a normal top-level session JSONL, causing session_id to be null and
-                //   num_turns to be 0 in the output.
-                // - CLAUDE_CODE_ENTRYPOINT: set to "cli" so the child runs in TUI
-                //   mode (required for subscription billing; cc_entrypoint=cli invariant).
-                //   Must be explicitly set — the parent may have inherited sdk-cli from a
-                //   prior Claude Code session, and simply "keeping" it would propagate
-                //   the wrong billing classification.
-                unsafe {
-                    libc::unsetenv(c"CLAUDE_CODE_SESSION_ID".as_ptr() as *const libc::c_char);
-                    libc::unsetenv(c"CLAUDECODE".as_ptr() as *const libc::c_char);
-                    // Debug: verify setenv succeeds
-                    let result = libc::setenv(
-                        c"CLAUDE_CODE_ENTRYPOINT".as_ptr() as *const libc::c_char,
-                        c"cli".as_ptr() as *const libc::c_char,
-                        1,
-                    );
-                    if result != 0 {
-                        // Write to stderr (fd 2) which should be available
-                        let msg = b"setenv CLAUDE_CODE_ENTRYPOINT=cli failed\n";
-                        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-                    }
-                }
+                // NOTE: no setenv/unsetenv here. The child's environment was
+                // built in the parent (build_child_env) and is passed to execvpe
+                // below, because neither call is async-signal-safe post-fork.
                 // Build full argv: [cmd, args...].
                 let mut argv: Vec<&CStr> = Vec::with_capacity(args.len() + 1);
                 argv.push(cmd);
                 argv.extend(args.iter().map(CString::as_c_str));
                 // execvp replaces the process image; it only returns on error.
-                let _ = execvp(cmd, &argv);
+                let _ = execvpe(cmd, &argv, &child_env);
                 unsafe { libc::_exit(127) };
             }
         }
@@ -348,5 +409,110 @@ mod tests {
         let spawner = PtySpawner::spawn(&cmd, &args).expect("spawn should succeed");
         let code = spawner.relay().expect("relay should succeed");
         assert_eq!(code, 42, "exit code should be 42");
+    }
+
+    // ── Child environment scrub (claudepr-26e7a0b6) ──────────────────────────
+    //
+    // These assert the transcript-persistence and billing invariants at the
+    // env-construction level. They are pure: `scrub_env` takes its source
+    // environment as an argument, so nothing here mutates the process
+    // environment or races other tests.
+
+    fn env_of(entries: &[(&str, &str)]) -> Vec<String> {
+        scrub_env(entries.iter().map(|(k, v)| (*k, *v)))
+            .into_iter()
+            .map(|c| c.into_string().expect("entries are valid UTF-8 here"))
+            .collect()
+    }
+
+    #[test]
+    fn scrub_env_drops_child_session_marker() {
+        // The bug: inherited, this marker makes claude 2.1.263 refuse to
+        // persist the transcript, so claude-print has nothing to read.
+        let env = env_of(&[("CLAUDE_CODE_CHILD_SESSION", "1"), ("PATH", "/usr/bin")]);
+        assert!(
+            !env.iter()
+                .any(|e| e.starts_with("CLAUDE_CODE_CHILD_SESSION=")),
+            "CLAUDE_CODE_CHILD_SESSION must not reach the child: {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == "PATH=/usr/bin"),
+            "unrelated variables must be preserved: {env:?}"
+        );
+    }
+
+    #[test]
+    fn scrub_env_drops_all_session_markers() {
+        let env = env_of(&[
+            ("CLAUDE_CODE_SESSION_ID", "abc"),
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1"),
+        ]);
+        for marker in SCRUBBED_ENV {
+            assert!(
+                !env.iter().any(|e| e.starts_with(&format!("{marker}="))),
+                "{marker} must be scrubbed: {env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_env_forces_persistence_and_cli_entrypoint() {
+        let env = env_of(&[("PATH", "/usr/bin")]);
+        assert!(
+            env.iter()
+                .any(|e| e == "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"),
+            "persistence must be forced on: {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == "CLAUDE_CODE_ENTRYPOINT=cli"),
+            "billing invariant: entrypoint must be cli: {env:?}"
+        );
+    }
+
+    #[test]
+    fn scrub_env_overrides_inherited_sdk_entrypoint() {
+        // Propagating an inherited sdk-cli would bill the metered SDK pool
+        // instead of the subscription — the exact failure claude-print exists
+        // to prevent. The forced value must win, and must not be duplicated.
+        let env = env_of(&[
+            ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
+            ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "0"),
+        ]);
+        assert!(
+            !env.iter().any(|e| e == "CLAUDE_CODE_ENTRYPOINT=sdk-cli"),
+            "inherited sdk-cli must not survive: {env:?}"
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|e| e.starts_with("CLAUDE_CODE_ENTRYPOINT="))
+                .count(),
+            1,
+            "exactly one entrypoint entry: {env:?}"
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|e| e.starts_with("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE="))
+                .count(),
+            1,
+            "exactly one persistence entry: {env:?}"
+        );
+        assert!(env.iter().any(|e| e == "CLAUDE_CODE_ENTRYPOINT=cli"));
+        assert!(env
+            .iter()
+            .any(|e| e == "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"));
+    }
+
+    #[test]
+    fn build_child_env_scrubs_the_real_environment() {
+        // Guards the wiring: the pure core is reached from the real env.
+        let env = build_child_env();
+        assert!(env
+            .iter()
+            .any(|e| e.to_bytes() == b"CLAUDE_CODE_ENTRYPOINT=cli"));
+        assert!(!env
+            .iter()
+            .any(|e| e.to_bytes().starts_with(b"CLAUDE_CODE_CHILD_SESSION=")));
     }
 }
