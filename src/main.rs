@@ -248,14 +248,15 @@ fn main() {
         claude_args.push(arg.into());
     }
 
-    // Timeout precedence: CLI --timeout flag > config.toml defaults.timeout_secs > 3600.
-    // Always forward an explicit --timeout so the compiled-in default is applied
-    // rather than letting the child silently fall back to its own internal default.
-    for arg in build_timeout_args(&config, Some(cli.timeout)) {
-        claude_args.push(arg.into());
-    }
-
-    // Resolve timeout for session tracking (same precedence as forwarded flag)
+    // `--timeout` is claude-print's OWN wall-clock watchdog and is deliberately
+    // NOT forwarded to the child: `claude` has never accepted a `--timeout`
+    // option. Forwarding it made every invocation die at the child's argv
+    // parsing with `error: unknown option '--timeout'` before the prompt was
+    // ever injected, which broke claude-print completely against claude
+    // 2.1.263. The resolved value is enforced locally by the watchdog below.
+    //
+    // Timeout precedence is unchanged: CLI --timeout > config.toml
+    // defaults.timeout_secs > compiled-in default (3600).
     let resolved_timeout = config.resolve_timeout_secs(Some(cli.timeout));
 
     if cli.dangerously_skip_permissions {
@@ -453,20 +454,6 @@ fn build_max_turns_args(config: &Config, cli_max_turns: Option<u32>) -> Vec<Stri
     ]
 }
 
-/// Build the `--timeout <resolved>` argv pair to forward to the child, applying
-/// the plan's documented precedence: CLI `--timeout` flag > `config.toml`
-/// `defaults.timeout_secs` > compiled-in default (3600).
-///
-/// Always returns a two-element pair (never empty) so the timeout forwarded to
-/// the child is always explicit — the compiled-in default is applied here
-/// rather than being left to the child's own internal default.
-fn build_timeout_args(config: &Config, cli_timeout: Option<u64>) -> Vec<String> {
-    vec![
-        "--timeout".to_string(),
-        config.resolve_timeout_secs(cli_timeout).to_string(),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,42 +567,44 @@ mod tests {
         assert_eq!(args, vec!["--max-turns".to_string(), "5".to_string()]);
     }
 
-    // (a) no --timeout flag + no config file → compiled-in default (3600) forwarded.
+    // Regression: `--timeout` is claude-print's own watchdog and must never be
+    // forwarded to the child. `claude` has no such option, so forwarding it
+    // killed every invocation at the child's argv parsing with
+    // `error: unknown option '--timeout'` before the prompt was injected.
+    // The child argv is built only from the builders exercised below plus the
+    // pass-through permission/tool flags; none of them may emit `--timeout`.
     #[test]
-    fn timeout_args_compiled_default_when_no_flag_and_no_config() {
+    fn timeout_is_never_forwarded_to_the_child() {
         let dir = tempfile::tempdir().unwrap();
+        let path = write_config_timeout(dir.path(), Some(1800));
+        let config = Config::load_or_default(&path).unwrap();
+
+        let mut forwarded: Vec<String> = Vec::new();
+        forwarded.extend(build_model_args(&config, None));
+        forwarded.extend(build_max_turns_args(&config, Some(30)));
+
+        assert!(
+            !forwarded.iter().any(|a| a == "--timeout"),
+            "--timeout must not reach the child; got {forwarded:?}"
+        );
+    }
+
+    // The timeout still has to be *resolved* with the documented precedence —
+    // it just feeds the local watchdog instead of the child argv.
+    #[test]
+    fn timeout_still_resolves_for_the_local_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) no flag + no config -> compiled-in default.
         let config = Config::load_or_default(&dir.path().join("does-not-exist.toml")).unwrap();
-        let args = build_timeout_args(&config, None);
-        assert_eq!(args, vec!["--timeout".to_string(), "3600".to_string()]);
-    }
+        assert_eq!(config.resolve_timeout_secs(None), 3600);
 
-    // (b) no --timeout flag + config sets timeout → config value forwarded.
-    #[test]
-    fn timeout_args_config_value_when_no_flag() {
-        let dir = tempfile::tempdir().unwrap();
+        // (b) no flag + config value -> config wins.
         let path = write_config_timeout(dir.path(), Some(1800));
         let config = Config::load_or_default(&path).unwrap();
-        let args = build_timeout_args(&config, None);
-        assert_eq!(args, vec!["--timeout".to_string(), "1800".to_string()]);
-    }
+        assert_eq!(config.resolve_timeout_secs(None), 1800);
 
-    // (c) --timeout 3600 flag + config sets timeout → explicit 3600 wins over config.
-    #[test]
-    fn timeout_args_explicit_3600_overrides_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config_timeout(dir.path(), Some(7200));
-        let config = Config::load_or_default(&path).unwrap();
-        let args = build_timeout_args(&config, Some(3600));
-        assert_eq!(args, vec!["--timeout".to_string(), "3600".to_string()]);
-    }
-
-    // (d) --timeout 7200 flag + config sets timeout → CLI flag wins.
-    #[test]
-    fn timeout_args_cli_flag_wins_over_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_config_timeout(dir.path(), Some(1800));
-        let config = Config::load_or_default(&path).unwrap();
-        let args = build_timeout_args(&config, Some(7200));
-        assert_eq!(args, vec!["--timeout".to_string(), "7200".to_string()]);
+        // (c) explicit flag -> flag wins over config.
+        assert_eq!(config.resolve_timeout_secs(Some(7200)), 7200);
     }
 }
