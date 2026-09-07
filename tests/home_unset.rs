@@ -137,10 +137,14 @@ fn valid_home_roots_every_derived_path() {
         Config::default_path().unwrap(),
         home.path().join(".config/claude-print/config.toml")
     );
+    // claude 2.1.263 folds every byte outside [a-zA-Z0-9] to '-', including
+    // the leading '/' of an absolute cwd, so "/srv/project" lands under
+    // "-srv-project" — see poller::cwd_to_slug, whose doc lists live-verified
+    // ~/.claude/projects/ vectors.
     assert_eq!(
         derive_transcript_path("session-id", "/srv/project").unwrap(),
         home.path()
-            .join(".claude/projects/srv-project/session-id.jsonl")
+            .join(".claude/projects/-srv-project/session-id.jsonl")
     );
     assert!(projects_dir_for_cwd()
         .unwrap()

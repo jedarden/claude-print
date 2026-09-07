@@ -933,7 +933,7 @@ fn version_resilience_extra_fields_in_stop_payload_through_pipeline() {
     let expected = home
         .join(".claude")
         .join("projects")
-        .join("home-user-project")
+        .join("-home-user-project")
         .join("vs-session.jsonl");
     assert_eq!(
         info.transcript_path,
@@ -996,8 +996,9 @@ fn stop_payload_path_derivation_and_transcript_emit() {
         ],
     );
 
-    // Verify the slug algorithm
-    assert_eq!(slug, "home-user-myproject");
+    // Verify the slug algorithm (claude 2.1.263: fold every non-alphanumeric,
+    // so the leading / of an absolute cwd becomes a leading dash)
+    assert_eq!(slug, "-home-user-myproject");
 
     let payload_json =
         format!(r#"{{"hook_event_name":"Stop","session_id":"{session_id}","cwd":"{cwd}"}}"#);
@@ -1029,25 +1030,37 @@ fn stop_payload_path_derivation_and_transcript_emit() {
 // ── CWD slug algorithm ────────────────────────────────────────────────────────
 
 /// Slug algorithm for representative cwd values (plan: "unit test for 3-4 cwd values").
+///
+/// claude 2.1.263 folds every byte outside `[a-zA-Z0-9]` to `-` — including the
+/// leading `/` of an absolute path — so `/home/coding/claude-print` lands in
+/// `~/.claude/projects/-home-coding-claude-print/`. The fold is lossy by
+/// design: distinct cwds can collide on one slug, exactly as they do in claude.
+/// tests/home_unset.rs pins the same fold from the HOME-derived-path side, and
+/// poller::cwd_to_slug's doc records how the vectors were verified.
 #[test]
 fn cwd_slug_algorithm_representative_cases() {
-    // Documented in plan §8 Transcript Reader
+    // Verified live against ~/.claude/projects/ contents on this machine.
     assert_eq!(
-        cwd_to_slug("/home/coding/myproject").unwrap(),
-        "home-coding-myproject"
+        cwd_to_slug("/home/coding/claude-print").unwrap(),
+        "-home-coding-claude-print"
     );
-    assert_eq!(cwd_to_slug("/root/foo/bar").unwrap(), "root-foo-bar");
-    assert_eq!(cwd_to_slug("/tmp/x").unwrap(), "tmp-x");
-    assert_eq!(cwd_to_slug("/tmp").unwrap(), "tmp");
-    // Ambiguous case: /home/user/a-b and /home/user-a/b both → home-user-a-b
+    assert_eq!(
+        cwd_to_slug("/tmp/probe-B_no_marker-1788799902").unwrap(),
+        "-tmp-probe-B-no-marker-1788799902",
+        "underscores fold like any other punctuation"
+    );
+    assert_eq!(cwd_to_slug("/root/foo/bar").unwrap(), "-root-foo-bar");
+    assert_eq!(cwd_to_slug("/tmp/x").unwrap(), "-tmp-x");
+    assert_eq!(cwd_to_slug("/tmp").unwrap(), "-tmp");
+    // Ambiguous case: /home/user/a-b and /home/user-a/b both → -home-user-a-b
     assert_eq!(
         cwd_to_slug("/home/user/a-b").unwrap(),
-        "home-user-a-b",
+        "-home-user-a-b",
         "hyphenated dir name"
     );
     assert_eq!(
         cwd_to_slug("/home/user-a/b").unwrap(),
-        "home-user-a-b",
+        "-home-user-a-b",
         "hyphen in parent dir"
     );
 }
@@ -1112,7 +1125,7 @@ fn stop_payload_minimal_fields_derives_path() {
     let expected = home
         .join(".claude")
         .join("projects")
-        .join("tmp-min")
+        .join("-tmp-min")
         .join("min-sid.jsonl");
     assert_eq!(info.transcript_path, Some(expected));
     assert!(info.last_assistant_message.is_none());

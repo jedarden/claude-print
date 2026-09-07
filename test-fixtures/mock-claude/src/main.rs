@@ -192,8 +192,19 @@ fn main() {
         .map(std::path::PathBuf::from)
         .expect("HOME must be set and non-empty");
 
-    // Compute the cwd slug the same way claude-print does: strip leading / and replace remaining / with -
-    let cwd_slug = cwd.trim_start_matches('/').replace('/', "-");
+    // Compute the cwd slug exactly as claude 2.1.263 does: fold every byte
+    // outside [a-zA-Z0-9] to '-', INCLUDING the leading '/' of an absolute
+    // path (so non-ASCII alphanumerics fold too, like any other punctuation).
+    // Verified live:
+    //   /home/coding/claude-print         → -home-coding-claude-print
+    //   /tmp/probe-B_no_marker-1788799902 → -tmp-probe-B-no-marker-1788799902
+    // mock-claude and claude-print's poller::cwd_to_slug must agree here — the
+    // stream-json discovery reader watches the directory claude-print derives,
+    // while the mock writes the directory it derives. (bead claudepr-26e7a0b6)
+    let cwd_slug: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
 
     let last_msg_part = if omit_last_message {
         String::new()
@@ -240,11 +251,37 @@ fn main() {
     // Skipped when transcript_path was omitted — there is no advertised path
     // to honor, and MOCK_OMIT_TRANSCRIPT_PATH's own scenario relies on the
     // last_assistant_message fallback.
+    //
+    // claudepr-26e7a0b6: the write is ALSO skipped when claude's transcript
+    // persistence gate says saving is off — mirroring real claude 2.1.263,
+    // which still reports `transcript_path` in the Stop payload but never
+    // creates the file when it considers itself a child session. The gate
+    // (verified in the claude bundle) is:
+    //   * CLAUDE_CODE_FORCE_SESSION_PERSISTENCE set → always save;
+    //   * else CLAUDE_CODE_CHILD_SESSION or CLAUDE_CODE_SKIP_PROMPT_HISTORY
+    //     set → "Transcript saving is off", no transcript file.
+    // claude-print's pty.rs scrubs both markers and sets the force flag before
+    // execvp, so a claude-print-driven mock always writes. A harness that
+    // forgets the scrub (or a future claude gating on something new) fails
+    // these tests loudly — stream-json emits nothing and json reports zero
+    // usage — instead of silently passing.
     if let Some(path) = transcript_path {
-        if mock_delay_jsonl_ms > 0 {
-            thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
+        let force_persistence = std::env::var_os("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE")
+            .is_some_and(|v| !v.is_empty());
+        let saving_disabled = !force_persistence
+            && (std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_some()
+                || std::env::var_os("CLAUDE_CODE_SKIP_PROMPT_HISTORY").is_some());
+        if saving_disabled {
+            eprintln!(
+                "mock-claude: Transcript saving is off — child-session marker inherited; \
+                 not writing {path}"
+            );
+        } else {
+            if mock_delay_jsonl_ms > 0 {
+                thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
+            }
+            write_transcript_jsonl(&path, &mock_response, session_id, mock_is_error);
         }
-        write_transcript_jsonl(&path, &mock_response, session_id, mock_is_error);
     }
 
     // Exit 0 if stdin is a controlling TTY (login_tty succeeded), 1 otherwise.

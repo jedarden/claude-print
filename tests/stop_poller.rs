@@ -126,13 +126,15 @@ fn test_missing_transcript_path_derived() {
 
     let info = resolve_stop_info(stop).expect("resolve_stop_info");
 
-    // Derived slug: /home/user/myproject → home-user-myproject
-    // Follow the production contract: an unset HOME is an error, never /root.
+    // Derived slug: /home/user/myproject → -home-user-myproject. claude 2.1.263
+    // folds every byte outside [a-zA-Z0-9] to '-', including the leading '/' —
+    // the scheme poller::cwd_to_slug implements. HOME is resolved through the
+    // production contract: an unset HOME is an error, never a /root fallback.
     let home = get_home().expect("test requires HOME");
     let expected = home
         .join(".claude")
         .join("projects")
-        .join("home-user-myproject")
+        .join("-home-user-myproject")
         .join("abc123.jsonl");
 
     assert_eq!(

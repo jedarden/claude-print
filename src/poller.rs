@@ -81,9 +81,10 @@ pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
 
 /// Build the full transcript path from `session_id` and `cwd`.
 ///
-/// Slug algorithm: strip the leading `/` from `cwd`, replace remaining `/` with `-`.
-/// Example: `/home/coding/myproject` → slug `home-coding-myproject`
-/// Full path: `$HOME/.claude/projects/<slug>/<session_id>.jsonl`
+/// Slug algorithm: claude 2.1.263 folds **every** non-alphanumeric byte of the
+/// cwd to `-` — including the leading `/` — so `/home/coding/myproject` → slug
+/// `-home-coding-myproject`. Full path:
+/// `$HOME/.claude/projects/<slug>/<session_id>.jsonl`
 ///
 /// # Errors
 ///
@@ -101,67 +102,55 @@ pub fn derive_transcript_path(session_id: &str, cwd: &str) -> Result<PathBuf> {
         .join(format!("{session_id}.jsonl")))
 }
 
-/// Convert a filesystem `cwd` path to a JSONL directory slug.
+/// Convert a filesystem `cwd` path to a JSONL directory slug, mirroring the
+/// scheme claude 2.1.263 actually uses for `~/.claude/projects/`.
 ///
-/// Strip the leading `/`, then replace all `/` with `-`.
+/// claude folds **every** character outside `[a-zA-Z0-9]` to `-` — the leading
+/// `/` of an absolute path becomes a leading dash, and `_`/`.` and other
+/// punctuation fold too:
+///
+/// ```text
+/// /home/coding/claude-print        → -home-coding-claude-print
+/// /tmp/probe-B_no_marker-1788799902 → -tmp-probe-B-no-marker-1788799902
+/// ```
+///
+/// (Both verified against live `~/.claude/projects/` contents; the earlier
+/// strip-leading-slash/split-on-slash scheme produced slugs claude never
+/// creates, which silently broke every derived transcript path and the
+/// stream-json discovery directory — bead claudepr-26e7a0b6.)
+///
+/// The result can only contain alphanumerics and dashes, so no component
+/// validation is needed: traversal sequences fold to dashes, never survive.
+/// Slugs longer than 200 characters are truncated to claude's cap — claude
+/// additionally appends a hash of the original path in that regime, which is
+/// not reproduced here (paths that deep are pathological, and Stop payloads
+/// carrying an explicit `transcript_path` never consult this derivation).
 ///
 /// # Errors
-/// Returns `Error::Config` if the path contains:
-/// - Path traversal components (`.` or `..`)
-/// - Components longer than 255 characters (filesystem limit)
-/// - Null bytes or control characters
-/// - Empty components (from `//` or trailing `/`)
-/// - Empty path or root path
+/// Returns `Error::Config` if the path contains a null byte or is empty.
 pub fn cwd_to_slug(cwd: &str) -> Result<String> {
-    // Check for null bytes
+    // Null bytes cannot appear in claude's slug (they fold) but they also make
+    // the input unusable as a path; reject rather than silently fold.
     if cwd.contains('\0') {
         return Err(Error::Config("path contains null byte".to_string()));
     }
 
-    // Check for control characters (except tab)
-    if cwd.chars().any(|c| c.is_control() && c != '\t') {
-        return Err(Error::Config(
-            "path contains control characters".to_string(),
-        ));
+    /// claude caps the folded slug at 200 characters before any hash suffix.
+    const MAX_SLUG_LEN: usize = 200;
+
+    // Every folded character is ASCII by construction, so truncation below
+    // cannot split one.
+    let mut slug: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+
+    if slug.is_empty() {
+        return Err(Error::Config("path is empty".to_string()));
     }
 
-    // Normalize: trim leading slash, split by '/'
-    let normalized = cwd.trim_start_matches('/');
-
-    // Empty path is invalid
-    if normalized.is_empty() {
-        return Err(Error::Config("path is empty or root".to_string()));
-    }
-
-    // Split into components and validate each
-    let components: Vec<&str> = normalized.split('/').collect();
-
-    for component in &components {
-        // Check for empty components (from // or trailing /)
-        if component.is_empty() {
-            return Err(Error::Config(
-                "path contains empty component (consecutive or trailing slashes)".to_string(),
-            ));
-        }
-
-        // Check for path traversal attempts
-        if *component == "." || *component == ".." {
-            return Err(Error::Config(
-                "path contains '.' or '..' components (path traversal not allowed)".to_string(),
-            ));
-        }
-
-        // Check component length (ext4, xfs, and most filesystems limit to 255 bytes)
-        if component.len() > 255 {
-            return Err(Error::Config(format!(
-                "path component exceeds filesystem limit of 255 characters (found {} characters)",
-                component.len()
-            )));
-        }
-    }
-
-    // Join validated components with '-'
-    Ok(components.join("-"))
+    slug.truncate(MAX_SLUG_LEN);
+    Ok(slug)
 }
 
 /// The projects directory claude writes session transcripts under, derived from
@@ -242,33 +231,39 @@ pub fn open_fifo_nonblock(path: &Path) -> Result<(OwnedFd, OwnedFd)> {
 mod tests {
     use super::*;
 
-    // ── cwd_to_slug ───────────────────────────────────────────────────────────
+    // ── cwd_to_slug (claude 2.1.263 scheme: fold every non-alphanumeric) ──────
 
     #[test]
-    fn cwd_to_slug_home_coding_myproject() {
+    fn cwd_to_slug_matches_claude_project_dir_for_this_repo() {
+        // Verified live: /home/coding/claude-print's real transcript dir is
+        // ~/.claude/projects/-home-coding-claude-print/ (leading dash).
         assert_eq!(
-            cwd_to_slug("/home/coding/myproject").unwrap(),
-            "home-coding-myproject"
+            cwd_to_slug("/home/coding/claude-print").unwrap(),
+            "-home-coding-claude-print"
         );
     }
 
     #[test]
-    fn cwd_to_slug_root_foo_bar() {
-        assert_eq!(cwd_to_slug("/root/foo/bar").unwrap(), "root-foo-bar");
+    fn cwd_to_slug_folds_underscores_like_claude() {
+        // Verified live: a session with cwd /tmp/probe-B_no_marker-1788799902
+        // wrote its transcript under -tmp-probe-B-no-marker-1788799902/.
+        assert_eq!(
+            cwd_to_slug("/tmp/probe-B_no_marker-1788799902").unwrap(),
+            "-tmp-probe-B-no-marker-1788799902"
+        );
     }
 
     #[test]
-    fn cwd_to_slug_tmp() {
-        assert_eq!(cwd_to_slug("/tmp").unwrap(), "tmp");
+    fn cwd_to_slug_tradegraph_vector() {
+        // Third live-verified vector: existing projects dir -home-coding-tradegraph-platform.
+        assert_eq!(
+            cwd_to_slug("/home/coding/tradegraph-platform").unwrap(),
+            "-home-coding-tradegraph-platform"
+        );
     }
 
     #[test]
-    fn cwd_to_slug_tmp_x() {
-        assert_eq!(cwd_to_slug("/tmp/x").unwrap(), "tmp-x");
-    }
-
-    #[test]
-    fn cwd_to_slug_no_leading_slash() {
+    fn cwd_to_slug_relative_path_has_no_leading_dash() {
         assert_eq!(cwd_to_slug("tmp/foo").unwrap(), "tmp-foo");
     }
 
@@ -281,67 +276,64 @@ mod tests {
     }
 
     #[test]
-    fn cwd_to_slug_rejects_control_characters() {
-        // Control characters (except tab) should be rejected
-        let result = cwd_to_slug("/home/coding\x01project");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("control characters"));
+    fn cwd_to_slug_folds_control_characters() {
+        // Control characters fold to '-' exactly like any other non-alphanumeric,
+        // mirroring claude's [^a-zA-Z0-9] fold. Nothing survives to be dangerous.
+        assert_eq!(cwd_to_slug("/home/cod\x01ing").unwrap(), "-home-cod-ing");
+        assert_eq!(
+            cwd_to_slug("/home/coding\n/project").unwrap(),
+            "-home-coding--project"
+        );
+        assert_eq!(
+            cwd_to_slug("/home/coding\r/project").unwrap(),
+            "-home-coding--project"
+        );
+        assert_eq!(
+            cwd_to_slug("/home/coding\tproject").unwrap(),
+            "-home-coding-project"
+        );
     }
 
     #[test]
-    fn cwd_to_slug_rejects_path_traversal_dot() {
-        let result = cwd_to_slug("/home/./coding/project");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("'.'"));
-        assert!(err.to_string().contains("path traversal"));
+    fn cwd_to_slug_folds_traversal_components_to_dashes() {
+        // '.' and '..' are not special after the fold — the result is a single
+        // flat directory NAME containing only alphanumerics and dashes, so
+        // traversal cannot survive.
+        assert_eq!(
+            cwd_to_slug("/home/./coding/project").unwrap(),
+            "-home---coding-project"
+        );
+        assert_eq!(
+            cwd_to_slug("/home/../etc/passwd").unwrap(),
+            "-home----etc-passwd"
+        );
     }
 
     #[test]
-    fn cwd_to_slug_rejects_path_traversal_dotdot() {
-        let result = cwd_to_slug("/home/../etc/passwd");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("'..'"));
-        assert!(err.to_string().contains("path traversal"));
+    fn cwd_to_slug_caps_at_claude_200_char_limit() {
+        // claude folds, then caps the slug at 200 chars (appending a hash of the
+        // original path that claude-print does not reproduce). The 200-char cap
+        // also keeps the single-component name within filesystem NAME_MAX (255).
+        let long = format!("/home/{}", "a".repeat(300));
+        let slug = cwd_to_slug(&long).unwrap();
+        assert_eq!(slug.len(), 200);
+        assert!(slug.starts_with("-home-"));
+        assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 
     #[test]
-    fn cwd_to_slug_rejects_component_exceeding_255_chars() {
-        let long_component = "a".repeat(256);
-        let result = cwd_to_slug(&format!("/home/{}", long_component));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("exceeds filesystem limit"));
-        assert!(err.to_string().contains("255 characters"));
-    }
-
-    #[test]
-    fn cwd_to_slug_accepts_component_exactly_255_chars() {
-        let long_component = "a".repeat(255);
-        let result = cwd_to_slug(&format!("/home/{}", long_component));
-        assert!(result.is_ok());
-        // The slug should be valid and the component preserved
-        assert!(result.unwrap().contains(&long_component[..50])); // Check prefix
-    }
-
-    #[test]
-    fn cwd_to_slug_rejects_consecutive_slashes() {
-        let result = cwd_to_slug("/home//coding/project");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("empty component"));
-        assert!(err.to_string().contains("consecutive"));
-    }
-
-    #[test]
-    fn cwd_to_slug_rejects_trailing_slash() {
-        let result = cwd_to_slug("/home/coding/project/");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("empty component"));
-        assert!(err.to_string().contains("trailing"));
+    fn cwd_to_slug_preserves_consecutive_and_trailing_slashes_as_dashes() {
+        // Dashes are NOT collapsed — /home//x folds with two dashes, mirroring
+        // the double dashes observed in real projects dir names.
+        assert_eq!(
+            cwd_to_slug("/home//coding/project").unwrap(),
+            "-home--coding-project"
+        );
+        assert_eq!(
+            cwd_to_slug("/home/coding/project/").unwrap(),
+            "-home-coding-project-"
+        );
+        assert_eq!(cwd_to_slug("///").unwrap(), "---");
     }
 
     #[test]
@@ -349,62 +341,31 @@ mod tests {
         let result = cwd_to_slug("");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("empty or root"));
+        assert!(err.to_string().contains("empty"));
     }
 
     #[test]
-    fn cwd_to_slug_rejects_root_path() {
-        let result = cwd_to_slug("/");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("empty or root"));
+    fn cwd_to_slug_root_folds_to_single_dash() {
+        // cwd "/" folds to "-" — a valid (if unusual) directory name, exactly
+        // what claude's own fold produces.
+        assert_eq!(cwd_to_slug("/").unwrap(), "-");
     }
 
     #[test]
-    fn cwd_to_slug_rejects_only_slashes() {
-        let result = cwd_to_slug("///");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("empty or root"));
-    }
-
-    #[test]
-    fn cwd_to_slug_allows_tab_character() {
-        // Tab is allowed (it's a control character but we explicitly allow it)
-        let result = cwd_to_slug("/home/coding\tproject");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "home-coding\tproject");
+    fn cwd_to_slug_folds_unicode_to_dashes() {
+        // claude's fold is ASCII-only: non-ASCII characters become dashes.
+        assert_eq!(
+            cwd_to_slug("/home/coding/projet-тест").unwrap(),
+            "-home-coding-projet-----"
+        );
     }
 
     #[test]
     fn cwd_to_slug_valid_multi_component_path() {
-        let result = cwd_to_slug("/usr/local/bin/project");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "usr-local-bin-project");
-    }
-
-    #[test]
-    fn cwd_to_slug_allows_unicode_characters() {
-        let result = cwd_to_slug("/home/coding/projet-тест");
-        assert!(result.is_ok());
-        // Unicode characters are allowed
-        assert!(result.unwrap().contains("тест"));
-    }
-
-    #[test]
-    fn cwd_to_slug_rejects_newline() {
-        let result = cwd_to_slug("/home/coding\n/project");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("control characters"));
-    }
-
-    #[test]
-    fn cwd_to_slug_rejects_carriage_return() {
-        let result = cwd_to_slug("/home/coding\r/project");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("control characters"));
+        assert_eq!(
+            cwd_to_slug("/usr/local/bin/project").unwrap(),
+            "-usr-local-bin-project"
+        );
     }
 
     // ── parse_stop_payload ────────────────────────────────────────────────────
@@ -495,7 +456,7 @@ mod tests {
             .path()
             .join(".claude")
             .join("projects")
-            .join("home-user-myproject")
+            .join("-home-user-myproject")
             .join("mysession.jsonl");
         assert_eq!(info.transcript_path, Some(expected));
 
@@ -602,7 +563,7 @@ mod tests {
             path,
             home_dir
                 .path()
-                .join(".claude/projects/project-dir/sess-id.jsonl")
+                .join(".claude/projects/-project-dir/sess-id.jsonl")
         );
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
