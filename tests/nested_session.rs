@@ -6,12 +6,20 @@
 // instead of a normal top-level session JSONL, causing session_id to be null and
 // num_turns to be 0 in the output.
 //
-// Fix: claude-print must unset CLAUDECODE before execvp so the child creates a fresh
-// top-level session regardless of parent environment.
+// Fix: claude-print must scrub CLAUDECODE (and the other session markers) from
+// the child's environment before exec so the child creates a fresh top-level
+// session regardless of parent environment.
+//
+// Since e75e810 (claudepr-26e7a0b6) the scrub is done by building the child's
+// environment in the PARENT — `build_child_env`/`scrub_env` in src/pty.rs, which
+// drops every var named in `SCRUBBED_ENV` and appends `FORCED_ENV` — and passing
+// it to `execvpe`. The earlier mechanism (libc::unsetenv/libc::setenv between
+// fork() and exec()) was removed because neither call is async-signal-safe and
+// pool mode is multithreaded; it must not come back.
 
 #[test]
 fn test_claudecode_env_var_propagation_without_fix() {
-    // Document the bug behavior: if CLAUDECODE were NOT unset,
+    // Document the bug behavior: if CLAUDECODE were NOT scrubbed,
     // we would see session_id=null and num_turns=0.
     //
     // This test documents the expected failure mode but cannot
@@ -26,7 +34,7 @@ fn test_claudecode_env_var_propagation_without_fix() {
     // This is a documentation-only test to help future maintainers
     // understand what was being fixed.
     let expected_symptoms = r#"
-    Bug symptoms when CLAUDECODE is NOT unset before execvp:
+    Bug symptoms when CLAUDECODE is NOT scrubbed from the child environment:
 
     1. Child Claude Code treats invocation as nested/subagent call
     2. Writes subagent-style transcript instead of top-level JSONL
@@ -35,17 +43,25 @@ fn test_claudecode_env_var_propagation_without_fix() {
     5. JSON output shows session_id=null and num_turns=0
     6. Despite is_error: false and correct response text
 
-    The fix: unset CLAUDECODE in pty.rs before execvp (line 106).
+    The fix (src/pty.rs, since e75e810): build the child environment in the
+    parent via build_child_env/scrub_env and pass it to execvpe.
 
     Proof of fix:
-    - src/pty.rs line 106: libc::unsetenv(c"CLAUDECODE".as_ptr() as *const libc::c_char);
-    - src/pty.rs line 105: libc::unsetenv(c"CLAUDE_CODE_SESSION_ID".as_ptr() as *const libc::c_char);
-    - src/pty.rs lines 108-117: set CLAUDE_CODE_ENTRYPOINT=cli explicitly
+    - src/pty.rs SCRUBBED_ENV: drops CLAUDE_CODE_SESSION_ID, CLAUDECODE,
+      CLAUDE_CODE_CHILD_SESSION, CLAUDE_CODE_SKIP_PROMPT_HISTORY
+      (CLAUDE_CODE_CHILD_SESSION is the transcript-persistence gate of
+      claude 2.1.263 — inherited, the TUI never writes the transcript,
+      claudepr-26e7a0b6)
+    - src/pty.rs FORCED_ENV: sets CLAUDE_CODE_ENTRYPOINT=cli explicitly
+      (billing invariant) and CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
+    - The built environment is handed to execvpe; no setenv/unsetenv runs
+      between fork() and exec() (async-signal-safety)
 
     This ensures the child Claude Code process:
     1. Does NOT inherit the parent's CLAUDE_CODE_SESSION_ID (prevents writing into parent's transcript)
     2. Does NOT inherit CLAUDECODE (prevents nested/subagent mode)
-    3. DOES have CLAUDE_CODE_ENTRYPOINT=cli (ensures TUI mode for billing)
+    3. Does NOT inherit CLAUDE_CODE_CHILD_SESSION (transcript persistence stays on)
+    4. DOES have CLAUDE_CODE_ENTRYPOINT=cli (ensures TUI mode for billing)
 
     Manual verification:
     echo "Reply with exactly one word: pong" | CLAUDECODE=1 claude-print --output-format json --timeout 45
@@ -56,50 +72,121 @@ fn test_claudecode_env_var_propagation_without_fix() {
 }
 
 #[test]
-fn test_claudecode_env_var_unset_logic_exists() {
-    // Verify that the fix code exists in pty.rs
-    // This is a compile-time check that the unsetenv call is present
+fn test_claudecode_env_scrub_logic_exists() {
+    // Verify that the scrub code exists in pty.rs
+    // This is a compile-time check that the env construction is present
 
     let pty_source = include_str!("../src/pty.rs");
 
-    // Check that CLAUDECODE unsetenv is present
+    // Check that every session marker is listed in SCRUBBED_ENV
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SKIP_PROMPT_HISTORY",
+    ] {
+        assert!(
+            pty_source.contains(&format!("\"{marker}\",")),
+            "Fix not found: pty.rs SCRUBBED_ENV must list {marker} so it cannot \
+             reach the child and trigger nested-session behavior"
+        );
+    }
+
+    // Check that the forced variables are present
     assert!(
-        pty_source.contains("libc::unsetenv(c\"CLAUDECODE\""),
-        "Fix not found: pty.rs must unset CLAUDECODE before execvp to prevent nested session bugs"
+        pty_source.contains("(\"CLAUDE_CODE_ENTRYPOINT\", \"cli\")"),
+        "Fix not found: pty.rs FORCED_ENV must set CLAUDE_CODE_ENTRYPOINT=cli for TUI billing mode"
+    );
+    assert!(
+        pty_source.contains("(\"CLAUDE_CODE_FORCE_SESSION_PERSISTENCE\", \"1\")"),
+        "Fix not found: pty.rs FORCED_ENV must force CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 \
+         (claudepr-26e7a0b6: claude 2.1.263 gates transcript persistence on the scrubbed markers)"
     );
 
-    // Check that CLAUDE_CODE_SESSION_ID unsetenv is present
+    // Check that the built environment is what the child actually execs with
     assert!(
-        pty_source.contains("libc::unsetenv(c\"CLAUDE_CODE_SESSION_ID\""),
-        "Fix not found: pty.rs must unset CLAUDE_CODE_SESSION_ID before execvp"
+        pty_source.contains("build_child_env()") && pty_source.contains("&child_env"),
+        "Fix not found: pty.rs must build the child environment via build_child_env \
+         and pass it to execvpe — a scrub that never reaches the exec call is a no-op"
     );
 
-    // Check that CLAUDE_CODE_ENTRYPOINT setenv is present
+    // e75e810 invariant: no setenv/unsetenv may run between fork() and exec().
+    // Neither is async-signal-safe and both may allocate; pool mode is
+    // multithreaded, so a fork racing a thread that holds the allocator lock
+    // would deadlock the child before it reached exec.
     assert!(
-        pty_source.contains("libc::setenv(") && pty_source.contains("CLAUDE_CODE_ENTRYPOINT"),
-        "Fix not found: pty.rs must set CLAUDE_CODE_ENTRYPOINT=cli for TUI billing mode"
-    );
-
-    // Verify the explanatory comments are present
-    assert!(
-        pty_source.contains("must be unset when inherited from a parent Claude Code"),
-        "Documentation missing: pty.rs should explain why CLAUDECODE must be unset"
-    );
-
-    // Check for the bug symptoms documentation (may span multiple lines)
-    let has_session_id_doc = pty_source.contains("session_id to be null");
-    let has_num_turns_doc = pty_source.contains("num_turns to be 0");
-    assert!(
-        has_session_id_doc && has_num_turns_doc,
-        "Documentation missing: pty.rs should document the bug symptoms (session_id=null, num_turns=0). \
-         Found session_id doc: {}, Found num_turns doc: {}",
-        has_session_id_doc,
-        has_num_turns_doc
+        !pty_source.contains("libc::unsetenv(") && !pty_source.contains("libc::setenv("),
+        "Regression: pty.rs must not call libc::setenv/libc::unsetenv — build the \
+         child environment in the parent and pass it to execvpe instead"
     );
 
     eprintln!("✓ All fix verifications passed:");
-    eprintln!("  - CLAUDECODE unsetenv call present");
-    eprintln!("  - CLAUDE_CODE_SESSION_ID unsetenv call present");
-    eprintln!("  - CLAUDE_CODE_ENTRYPOINT setenv call present");
-    eprintln!("  - Explanatory comments present");
+    eprintln!("  - SCRUBBED_ENV lists all four session markers");
+    eprintln!("  - FORCED_ENV sets ENTRYPOINT=cli and FORCE_SESSION_PERSISTENCE=1");
+    eprintln!("  - child_env is built in the parent and passed to execvpe");
+    eprintln!("  - no post-fork setenv/unsetenv (async-signal-safety)");
+}
+
+#[test]
+fn test_pty_spawner_scrubs_markers_and_forces_persistence_in_child_env() {
+    // Behavioral counterpart of the source check above: spawn a real child
+    // through the public PtySpawner API and inspect the environment it
+    // actually receives. `env` prints its own environment to the PTY.
+    //
+    // This mutates no process environment, so it cannot race the parallel
+    // test threads in this binary (see the scrub_env doc comment in pty.rs
+    // for why env mutation in tests is avoided).
+    use claude_print::pty::PtySpawner;
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    let cmd = CString::new("env").unwrap();
+    let spawner = PtySpawner::spawn(&cmd, &[]).expect("PtySpawner::spawn should succeed");
+
+    let master_fd = spawner.master.as_raw_fd();
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        // SAFETY: master_fd is a valid PTY master fd owned by `spawner`.
+        let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            break; // EOF, or EIO once the child exits and closes the slave side
+        }
+        output.extend_from_slice(&buf[..n as usize]);
+    }
+    let _ = nix::sys::wait::waitpid(spawner.child_pid, None);
+
+    let text = String::from_utf8_lossy(&output);
+
+    // The forced variables must reach the child.
+    assert!(
+        text.contains("CLAUDE_CODE_ENTRYPOINT=cli"),
+        "billing invariant: child env must force CLAUDE_CODE_ENTRYPOINT=cli, got: {text:?}"
+    );
+    assert!(
+        text.contains("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"),
+        "child env must force CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1, got: {text:?}"
+    );
+
+    // The scrubbed markers must not reach the child. Trivially true when the
+    // test runner itself has none set (e.g. plain `cargo test`); a real guard
+    // under agent/NEEDLE dispatch, where the runner inherits them and this
+    // bug actually bit.
+    for marker in [
+        "CLAUDECODE=",
+        "CLAUDE_CODE_SESSION_ID=",
+        "CLAUDE_CODE_CHILD_SESSION=",
+        "CLAUDE_CODE_SKIP_PROMPT_HISTORY=",
+    ] {
+        assert!(
+            !text.contains(marker),
+            "{marker} must be scrubbed from the child env, got: {text:?}"
+        );
+    }
+
+    // An inherited sdk-cli entrypoint must not survive the forced override.
+    assert!(
+        !text.contains("CLAUDE_CODE_ENTRYPOINT=sdk-cli"),
+        "inherited sdk-cli entrypoint must be overridden by cli, got: {text:?}"
+    );
 }
