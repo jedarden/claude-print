@@ -1,0 +1,68 @@
+{
+  "timestamp": "2026-09-09T23:34:09.921913973Z",
+  "total_open_beads": 8,
+  "exclusion_criteria": {
+    "has_assignee": 0,
+    "manually_blocked": 0,
+    "has_dependencies": 5,
+    "resource_conflicts": 0
+  },
+  "final_candidate_count": 3,
+  "excluded_beads": [
+    {
+      "bead_id": "claudepr-982a9e59",
+      "title": "Finish the exposed warm-pool daemon entrypoint and bounded shutdown path",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-309d826d",
+      "title": "Connect --pool-socket invocations to one prewarmed isolated session",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-6ef2541c",
+      "title": "Verify Claude Code hook merge, setting-source isolation, and multi-turn Stop contracts",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-a03e32d7",
+      "title": "Prove ADR-005 pool isolation, timeout, fallback, and latency invariants",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-4f4b7cef",
+      "title": "Cut a fresh evidenced claude-print release from current main",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 4,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    }
+  ]
+}
