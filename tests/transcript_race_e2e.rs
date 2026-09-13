@@ -35,8 +35,21 @@
 use claude_print::cli::OutputFormat;
 use claude_print::session::{LaunchOptions, Session};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+// Serializes the in-process test's env mutations (the `EnvGuard` set/remove
+// below) so a second env-touching test added to this binary later cannot race
+// one mid-flight. Same pattern as tests/home_unset.rs and tests/watchdog.rs.
+// The subprocess-based test needs no lock: it injects env into the child only.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Locate the mock-claude binary built alongside this test binary by the workspace build.
 ///
@@ -106,6 +119,8 @@ impl Drop for EnvGuard {
 #[test]
 #[ignore]
 fn as6_transcript_race_delayed_jsonl_write() {
+    let _lock = env_lock();
+
     let mock_bin = mock_claude_bin();
     if !mock_bin.exists() {
         eprintln!(

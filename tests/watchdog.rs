@@ -6,7 +6,43 @@
 use claude_print::cli::OutputFormat;
 use claude_print::error::Error;
 use claude_print::session::Session;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::sync::{Mutex, MutexGuard};
+
+// Env mutation must be serialized within this test binary and reverted even on
+// panic, or one test's cleanup can strip MOCK_SILENT out from under another
+// test's not-yet-forked child (the child reads it at exec time inside
+// Session::run). Same pattern as tests/home_unset.rs and the config.rs tests.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII guard that restores an env var to its prior value on drop.
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 /// Locate the mock-claude binary.
 ///
@@ -54,11 +90,15 @@ fn count_claude_print_temp_dirs() -> usize {
 /// 3. Clean up all temp dir artifacts (no orphaned claude-print-* directories)
 #[test]
 fn watchdog_silent_child_times_out_with_cleanup() {
+    // Hold the lock across the whole body: MOCK_SILENT must still be set when
+    // Session::run forks the child, and the guard restores it even on panic.
+    let _lock = env_lock();
+
     // Count orphaned temp dirs before the test (should be 0 in clean CI)
     let before_count = count_claude_print_temp_dirs();
 
     // Set MOCK_SILENT=1 to make mock-claude block forever without firing Stop
-    std::env::set_var("MOCK_SILENT", "1");
+    let _silent = EnvGuard::set("MOCK_SILENT", "1");
 
     let mock_bin = mock_claude_bin();
     if !mock_bin.exists() {
@@ -82,9 +122,6 @@ fn watchdog_silent_child_times_out_with_cleanup() {
         OutputFormat::Text,
         &Default::default(), // bf-uj0: headless-launch knobs (all off)
     );
-
-    // Clean up env var
-    std::env::remove_var("MOCK_SILENT");
 
     // Assert timeout error - should be PTY first-output timeout
     match result {
@@ -124,8 +161,9 @@ fn watchdog_silent_child_times_out_with_cleanup() {
 /// fires quickly even when the child produces no output whatsoever.
 #[test]
 fn watchdog_one_second_timeout_fires_cleanly() {
+    let _lock = env_lock();
+    let _silent = EnvGuard::set("MOCK_SILENT", "1");
     let before_count = count_claude_print_temp_dirs();
-    std::env::set_var("MOCK_SILENT", "1");
 
     let mock_bin = mock_claude_bin();
     if !mock_bin.exists() {
@@ -147,8 +185,6 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         OutputFormat::Text,
         &Default::default(), // bf-uj0: headless-launch knobs (all off)
     );
-
-    std::env::remove_var("MOCK_SILENT");
 
     match result {
         Err(Error::Timeout(msg)) => {
