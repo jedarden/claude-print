@@ -41,7 +41,9 @@ fn exit_with_cleanup(code: i32) -> ! {
 /// path — exits 2 with actionable stderr, before any worker is spawned. A
 /// signal-driven shutdown tears down every pooled worker and removes the
 /// socket file, then exits 0 (a supervisor stopping the service is not a
-/// failure).
+/// failure). An accept-loop failure after a successful bind exits 2, but the
+/// socket this daemon created is still removed on that path — the removal is
+/// identity-guarded, so a path that now names somebody else's file survives.
 fn run_serve(
     pool_size: usize,
     socket: Option<String>,
@@ -61,12 +63,16 @@ fn run_serve(
 
     if let Err(e) = server.run() {
         eprintln!("claude-print: {e:#}");
+        // The bind may have succeeded before the failure, so the error exit
+        // also removes the socket this daemon created — cleanup is
+        // identity-guarded, a no-op when the socket is gone or no longer ours.
+        server.cleanup();
         exit_with_cleanup(2);
     }
 
     // run() returns only after shutdown was requested: the accept loop saw the
-    // flag and stopped accepting, leaving worker teardown and socket removal
-    // to us.
+    // flag and stopped accepting (the listener fd is closed inside run),
+    // leaving worker teardown and socket removal to us — in that order.
     server.manager_mut().shutdown_all();
     server.cleanup();
     eprintln!("[claude-print pool] Shutdown complete");

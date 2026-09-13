@@ -71,6 +71,12 @@ pub const MAX_POOL_SIZE: usize = 256;
 /// doubles as the maintain() tick (top-up respawn cadence).
 const ACCEPT_POLL_TIMEOUT_MS: i32 = 250;
 
+/// How long a worker is given to exit on SIGTERM before SIGKILL. Bounds the
+/// whole daemon shutdown: `shutdown_all` destroys workers serially, so every
+/// worker pays at most this constant (a SIGTERM-compliant child pays none of
+/// it — teardown observes its exit on the first poll).
+const DESTROY_GRACE: Duration = Duration::from_secs(2);
+
 /// Cap on one client request frame. Legitimate acquire/release JSON is a few
 /// hundred bytes, so this leaves three orders of magnitude of headroom while
 /// keeping a hostile 4-byte length prefix from pinning gigabytes of daemon
@@ -317,7 +323,48 @@ impl PoolManager {
         }
     }
 
-    /// Destroy a worker and clean up its resources
+    /// Signal the worker's whole process group, falling back to the bare pid.
+    ///
+    /// `PtySpawner`'s `login_tty(3)` makes every worker a session *and* process
+    /// group leader (pgid == its own pid), so `killpg` reaches the worker plus
+    /// the descendants it has spawned, where a plain `kill(pid)` would strand
+    /// those descendants running after the daemon exits. Must only be called
+    /// while the direct child is still unreaped: a live or zombie child pins
+    /// its pid against recycling, so the fallback can never hit an unrelated
+    /// process.
+    fn signal_worker_group(pid: nix::unistd::Pid, sig: nix::sys::signal::Signal) {
+        use nix::sys::signal::{kill, killpg};
+        if killpg(pid, sig).is_err() {
+            // No such group: every member is gone, or the child moved itself
+            // to another group (nothing in this codebase does). Either way the
+            // direct child is still our unreaped child, so signalling its pid
+            // is safe.
+            let _ = kill(pid, sig);
+        }
+    }
+
+    /// SIGKILL whatever remains of the worker's process group. Unlike
+    /// [`Self::signal_worker_group`] this is safe to call *after* the direct
+    /// child has been reaped: a pgid cannot be recycled while its group has
+    /// any member, so the signal-0 probe and the kill bracketed around it can
+    /// only ever hit a member of this worker's own group. There is
+    /// deliberately no bare-pid fallback here — once the child is reaped its
+    /// pid may already belong to someone else.
+    fn kill_surviving_group(pid: nix::unistd::Pid) {
+        use nix::sys::signal::{killpg, Signal};
+        if killpg(pid, None).is_ok() {
+            let _ = killpg(pid, Signal::SIGKILL);
+        }
+    }
+
+    /// Destroy a worker and clean up its resources.
+    ///
+    /// Teardown is: close the pty master, SIGTERM the worker's process group,
+    /// hold a grace period while observing the direct child with waitpid,
+    /// SIGKILL the group if anything survived, and return only once the direct
+    /// child's exit has been observed and reaped — so shutdown never leaks a
+    /// worker, never leaves a zombie behind, and never signals a pid that has
+    /// already been reaped.
     fn destroy_worker(&self, worker: PoolWorker) {
         if self.verbose {
             eprintln!(
@@ -326,33 +373,71 @@ impl PoolManager {
             );
         }
 
-        // Close the PTY master fd
+        // Close the PTY master first. The kernel hangs the child's session up
+        // (its controlling terminal dies with the master), which is the
+        // PTY-level teardown every reader of the slave sees before any signal
+        // is even sent.
         let _ = nix::unistd::close(worker.master_fd);
 
-        // Send SIGTERM to the child, then SIGKILL after grace period
         let pid = worker.child_pid;
-        match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-            Ok(_) => {
-                // Wait up to 2 seconds for graceful exit
-                let start = Instant::now();
-                while start.elapsed() < Duration::from_secs(2) {
-                    match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-                        Ok(nix::sys::wait::WaitStatus::Exited(_, _)) => break,
-                        Ok(nix::sys::wait::WaitStatus::Signaled(_, _, _)) => break,
-                        Err(_) => break,
-                        _ => {
-                            std::thread::sleep(Duration::from_millis(100));
-                            continue;
-                        }
-                    }
+
+        // SIGTERM the worker's whole group — the worker itself plus any
+        // descendants it spawned.
+        Self::signal_worker_group(pid, nix::sys::signal::Signal::SIGTERM);
+
+        // Grace period: poll the direct child without blocking so a prompt
+        // exit ends teardown immediately, and *observe* the exit — waitpid
+        // reaps the zombie, which a teardown that only sent signals would
+        // leave behind.
+        let start = Instant::now();
+        let mut observed = false;
+        while start.elapsed() < DESTROY_GRACE {
+            match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(nix::sys::wait::WaitStatus::Exited(..))
+                | Ok(nix::sys::wait::WaitStatus::Signaled(..)) => {
+                    observed = true;
+                    break;
                 }
-                // If still running, force kill
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                let _ = nix::sys::wait::waitpid(pid, None);
+                // Reaped out from under us (nothing in the daemon does this
+                // today) or never our child: nothing left to wait for.
+                Err(nix::errno::Errno::ECHILD) => {
+                    observed = true;
+                    break;
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                // Unknown waitpid failure: stop waiting; the escalation below
+                // still ends in a blocking waitpid rather than a silent drop.
+                Err(_) => break,
+                // Still alive (or stopped/continued): keep polling.
+                _ => std::thread::sleep(Duration::from_millis(25)),
             }
-            Err(_) => {
-                // Process already gone
+        }
+
+        if !observed {
+            // The grace expired with the child still running: SIGKILL the
+            // group — untrappable, so no worker configuration can outstub
+            // teardown — then block on the direct child so its exit is
+            // observed before we return. The child is still unreaped here, so
+            // its pid (and therefore its pgid) is pinned.
+            Self::signal_worker_group(pid, nix::sys::signal::Signal::SIGKILL);
+            // A signal-interrupted wait is retried, not abandoned: serve mode
+            // keeps SIGINT/SIGTERM armed through teardown, and a second
+            // signal landing inside this wait must not skip the reap and
+            // strand the child as a zombie for the daemon's remaining life.
+            loop {
+                match nix::sys::wait::waitpid(pid, None) {
+                    Ok(_) => break,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    // Gone already, or never ours to wait on.
+                    Err(_) => break,
+                }
             }
+        } else {
+            // The direct child's exit was observed and reaped — but any
+            // descendants it spawned were orphaned by that exit and are no
+            // longer our children to wait on. A group that still exists has a
+            // member that survived SIGTERM: SIGKILL it.
+            Self::kill_surviving_group(pid);
         }
 
         // Drop the hook installer to clean up temp dir
@@ -799,6 +884,44 @@ impl PoolManager {
 
 /// Bind the pool's listening socket at `path` with user-only (0600) permissions.
 ///
+/// Identity of the socket file this daemon created: the (device, inode) of
+/// the filesystem node the bind placed at the socket path, captured
+/// immediately after binding.
+///
+/// A Unix socket node is just a directory entry naming an in-kernel socket.
+/// While the daemon runs, that entry can be replaced — another daemon taking
+/// the same path, an administrator, a test — without the bound socket
+/// noticing, and the daemon stays reachable only through the entry that was
+/// removed. Shutdown must therefore never blindly unlink the path: by the
+/// time it runs, the path may name a file this daemon never created.
+/// [`PoolServer::cleanup`] removes the path only when it still resolves to
+/// the exact inode recorded here.
+#[derive(Debug, Clone, Copy)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+/// Capture the socket node's identity by stat'ing the path immediately after
+/// the bind that created it.
+///
+/// This must stat the *path*, not fstat the listener: a Unix socket fd
+/// surfaces its sockfs pseudo-inode, which shares nothing with the filesystem
+/// node the path names. The bind-to-stat window is real but microscopic (the
+/// node was created microseconds earlier), and a replacement landing inside
+/// it merely degenerates this one shutdown to the unguarded behavior — it
+/// cannot strand a foreign file with a stale claim on it.
+fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(SocketIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+/// Bind the pool's listening socket at `path` with user-only (0600) permissions.
+///
 /// A Unix socket node is created with `0777 & ~umask`; under a permissive or
 /// cleared umask a plain bind would hand `/tmp` a world-connectable pool socket
 /// — anyone who can connect to it can acquire a warmed `claude` worker. The
@@ -807,7 +930,9 @@ impl PoolManager {
 /// the guarantee does not depend on umask semantics at all. Serve mode calls
 /// this before any worker thread exists, so no concurrent file creation sees
 /// the narrowed mask. A stale socket (or any other leftover file) at `path` is
-/// replaced, matching the daemon's restart story.
+/// replaced, matching the daemon's restart story — the *shutdown* side of this
+/// bargain is narrower: cleanup removes only the socket the daemon itself
+/// created (see [`PoolServer::cleanup`]).
 pub fn bind_socket(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -836,6 +961,10 @@ pub struct PoolServer {
     socket_path: std::path::PathBuf,
     /// Listener socket
     listener: Option<std::os::unix::net::UnixListener>,
+    /// (dev, ino) of the socket file this daemon created, captured at bind
+    /// time. `None` until `run` binds successfully; `cleanup` removes nothing
+    /// without it.
+    bound_identity: Option<SocketIdentity>,
     /// Pool manager
     manager: Arc<Mutex<PoolManager>>,
     /// Verbose logging
@@ -852,6 +981,7 @@ impl PoolServer {
         Self {
             socket_path: path,
             listener: None,
+            bound_identity: None,
             manager: Arc::new(Mutex::new(manager)),
             verbose,
         }
@@ -869,6 +999,10 @@ impl PoolServer {
             )
         })?;
 
+        // Record what we created before anything can replace the path — this
+        // is what makes shutdown's unlink ownership-checked.
+        self.bound_identity = socket_identity(&self.socket_path);
+
         self.listener = Some(listener);
 
         if self.verbose {
@@ -878,10 +1012,14 @@ impl PoolServer {
             );
         }
 
-        // Accept connections loop
-        self.accept_loop()?;
-
-        Ok(())
+        // Accept connections until shutdown. Whatever the outcome, this
+        // daemon stops accepting here: dropping the listener closes the fd
+        // and ends the socket's listening state before worker teardown and
+        // path removal run (teardown order — stop accepting, reap children,
+        // remove socket — is the run_serve contract).
+        let result = self.accept_loop();
+        drop(self.listener.take());
+        result
     }
 
     /// Accept and handle client connections
@@ -1177,9 +1315,46 @@ impl PoolServer {
         Ok(())
     }
 
-    /// Clean up socket on shutdown
+    /// Remove the socket file — but only the one this daemon created.
+    ///
+    /// The path can stop naming this daemon's socket while it runs (another
+    /// daemon rebinding the same path, an administrator, a test), and a daemon
+    /// that never bound has no socket at all. Unlinking whatever sits at the
+    /// path at shutdown would delete a file this daemon never created, so the
+    /// removal is guarded by the (dev, ino) identity captured at bind time:
+    /// a path that is already gone, or that now resolves to some other inode,
+    /// is left exactly as found.
+    ///
+    /// The guard also requires the occupant to be a *socket*: inode numbers
+    /// are recycled after unlink — deleting our node and dropping a regular
+    /// file at the same path can hand the replacement the very same inode
+    /// number — but a recycled number reused for a non-socket is excluded
+    /// here. The residual window (the number recycled for another *socket*
+    /// before shutdown) is theoretical; nothing richer is exposed to detect
+    /// it.
     pub fn cleanup(&self) {
-        if self.socket_path.exists() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let identity = match self.bound_identity {
+            Some(identity) => identity,
+            None => return,
+        };
+        let metadata = match std::fs::metadata(&self.socket_path) {
+            Ok(metadata) => metadata,
+            // Already gone (or unreadable): nothing of ours left to remove.
+            Err(_) => return,
+        };
+        let ours = metadata.file_type().is_socket()
+            && metadata.dev() == identity.dev
+            && metadata.ino() == identity.ino;
+        if ours {
+            if self.verbose {
+                eprintln!(
+                    "[claude-print pool] Removed pool socket {}",
+                    self.socket_path.display()
+                );
+            }
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
@@ -1643,5 +1818,283 @@ mod tests {
             err.to_string().contains(&MAX_REQUEST_BYTES.to_string()),
             "error must state the cap: {err}"
         );
+    }
+
+    // ── destroy_worker: reaping, escalation, descendant sweep ────────────────
+    //
+    // (claudepr-ffaf4def audit repair) The pre-repair teardown signalled the
+    // child after its exit had already been observed (a reaped pid can be
+    // recycled), never reached descendants a worker had spawned, and left the
+    // exit "observed" only implicitly. These pins exercise the real teardown
+    // against real PTY children — no mock at this level.
+
+    /// The process state letter from `/proc/<pid>/stat`, or `None` once the
+    /// pid no longer has a /proc entry. `Z` means dead-but-unreaped.
+    fn proc_state(pid: nix::unistd::Pid) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{}", pid.as_raw())).ok()?;
+        let rest = stat.rsplit_once(')')?.1.trim_start();
+        rest.split_whitespace().next().map(str::to_owned)
+    }
+
+    /// Poll until `pid` has no /proc entry at all — neither alive nor zombie.
+    /// destroy_worker observes (reaps) the direct child before returning, so
+    /// this is belt-and-suspenders on the instant case, but a zombie would
+    /// survive here indefinitely and fail the test.
+    fn assert_proc_gone(pid: nix::unistd::Pid, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        while let Some(state) = proc_state(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "pid {} still in /proc after destroy_worker (state {state}) — \
+                 leaked or left as a zombie",
+                pid.as_raw()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Every live process whose process group is `pgid`, scanned from /proc
+    /// (stat field 5: state, ppid, pgrp after the comm field).
+    fn group_members(pgid: nix::unistd::Pid) -> Vec<u32> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                let rest = match stat.rsplit_once(')') {
+                    Some((_, rest)) => rest.trim_start(),
+                    None => continue,
+                };
+                let pgrp = rest.split_whitespace().nth(2);
+                if pgrp == Some(pgid.as_raw().to_string().as_str()) {
+                    found.push(pid);
+                }
+            }
+        }
+        found
+    }
+
+    /// A PoolWorker wrapping a live PtySpawner child, ready for
+    /// destroy_worker (hook_installer is None — the temp dir is not part of
+    /// these contracts).
+    fn worker_from(spawner: crate::pty::PtySpawner) -> (PoolWorker, nix::unistd::Pid) {
+        let pid = spawner.child_pid;
+        let worker = PoolWorker {
+            id: "destroy-test".to_string(),
+            state: WorkerState::Ready,
+            master_fd: spawner.master.into_raw_fd(),
+            child_pid: pid,
+            state_since: Instant::now(),
+            hook_installer: None,
+        };
+        (worker, pid)
+    }
+
+    fn spawn_pty(path: &std::path::Path, args: &[&str]) -> crate::pty::PtySpawner {
+        let cmd = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let args: Vec<std::ffi::CString> = args
+            .iter()
+            .map(|a| std::ffi::CString::new(*a).unwrap())
+            .collect();
+        crate::pty::PtySpawner::spawn(&cmd, &args).expect("PtySpawner::spawn")
+    }
+
+    /// A SIGTERM-compliant child (dies on the default disposition) must be
+    /// reaped promptly: its exit is observed, it burns none of the grace
+    /// period, and nothing — leaked or zombie — is left in /proc.
+    #[test]
+    fn destroy_worker_reaps_a_sigterm_compliant_child() {
+        let manager = PoolManager::new(1, std::path::PathBuf::from("claude"), false);
+        let sleep = which::which("sleep").expect("'sleep' on PATH");
+        let spawner = spawn_pty(&sleep, &["30"]);
+        let (worker, pid) = worker_from(spawner);
+
+        let start = Instant::now();
+        manager.destroy_worker(worker);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < DESTROY_GRACE,
+            "a SIGTERM-compliant child must not burn the grace period, took {elapsed:?}"
+        );
+        assert_proc_gone(pid, Duration::from_secs(2));
+    }
+
+    /// A child that ignores SIGTERM (and the SIGHUP from the master close)
+    /// must be ended by the SIGKILL escalation — after the full grace period,
+    /// with its exit still observed — and any descendants it left in its
+    /// process group must go too: the group is swept, so the daemon leaves no
+    /// surviving descendants behind.
+    #[test]
+    fn destroy_worker_escalates_to_sigkill_and_sweeps_surviving_descendants() {
+        let manager = PoolManager::new(1, std::path::PathBuf::from("claude"), false);
+        let sh = which::which("sh").expect("'sh' on PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("traps-installed");
+
+        // trap first, so the sentinel proves the dispositions are live; the
+        // sleep respawn loop keeps a descendant in the group at all times.
+        let script = format!(
+            "trap \"\" TERM HUP; : > {}; while true; do sleep 5 & wait $!; done",
+            sentinel.display()
+        );
+        let spawner = spawn_pty(&sh, &["-c", &script]);
+        let (worker, pid) = worker_from(spawner);
+
+        // Deterministic start: only destroy once the traps are installed, so
+        // the test cannot race the child's pre-trap window.
+        let start = Instant::now();
+        while !sentinel.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "child never installed its traps"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let start = Instant::now();
+        manager.destroy_worker(worker);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= DESTROY_GRACE,
+            "a SIGTERM-immune child must be held for the full grace before \
+             SIGKILL, torn down in {elapsed:?}"
+        );
+        assert_proc_gone(pid, Duration::from_secs(2));
+
+        // No descendant may survive in the worker's group. The SIGKILLed
+        // sleep is orphaned to init and reaped there within moments, so a
+        // short poll absorbs only that reap.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let members = group_members(pid);
+            if members.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the worker's process group still has surviving members after \
+                 teardown: {members:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // ── listener teardown + socket-removal ownership (claudepr-ffaf4def) ─────
+
+    /// A server whose accept loop ends immediately (shutdown preset before
+    /// run): binds, returns at once, and never spawns a worker.
+    fn bind_then_stop(server: &mut PoolServer) {
+        server.manager_mut().shutdown();
+        server
+            .run()
+            .expect("bind with shutdown preset must bind and return at once");
+    }
+
+    fn quiet_server(path: &std::path::Path) -> PoolServer {
+        PoolServer::new(
+            Some(path.to_string_lossy().into_owned()),
+            PoolManager::new(1, std::path::PathBuf::from("claude"), false),
+            false,
+        )
+    }
+
+    // When run() returns, the daemon must have stopped accepting: the
+    // listener fd is closed even though the socket *file* is still there, so
+    // a connection is refused rather than queued into a daemon that is
+    // leaving. (Pre-repair, the listener stayed open until process exit.)
+    #[test]
+    fn run_closes_the_listener_when_the_accept_loop_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        let mut server = quiet_server(&path);
+
+        bind_then_stop(&mut server);
+        assert!(path.exists(), "bind creates the socket file");
+
+        let err = std::os::unix::net::UnixStream::connect(&path).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ECONNREFUSED),
+            "a returned server must not accept connections: {err}"
+        );
+    }
+
+    // The daemon removes the socket it created.
+    #[test]
+    fn cleanup_removes_the_socket_the_daemon_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        let mut server = quiet_server(&path);
+
+        bind_then_stop(&mut server);
+        assert!(path.exists());
+
+        server.cleanup();
+        assert!(!path.exists(), "cleanup must remove the daemon's socket");
+    }
+
+    // The heart of the ownership contract: if the path was replaced while the
+    // daemon ran (another daemon, an admin, a test), cleanup must leave the
+    // replacement exactly as found — the daemon holds its socket by inode,
+    // and the path's current occupant is somebody else's file.
+    #[test]
+    fn cleanup_leaves_a_replacement_file_at_the_path_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        let mut server = quiet_server(&path);
+
+        bind_then_stop(&mut server);
+
+        std::fs::remove_file(&path).expect("remove the daemon's socket");
+        std::fs::write(&path, b"not the daemon's file").expect("write replacement");
+
+        server.cleanup();
+
+        assert_eq!(
+            std::fs::read(&path).expect("replacement file must survive cleanup"),
+            b"not the daemon's file",
+            "cleanup deleted a file the daemon never created"
+        );
+    }
+
+    // A daemon that never bound has no socket identity — and must not
+    // "clean up" a pre-existing file at the configured path either.
+    #[test]
+    fn cleanup_without_a_bind_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        std::fs::write(&path, b"pre-existing").unwrap();
+
+        let server = quiet_server(&path);
+        server.cleanup();
+
+        assert_eq!(
+            std::fs::read(&path).expect("pre-existing file must survive"),
+            b"pre-existing",
+            "cleanup without a bind must be a no-op"
+        );
+    }
+
+    // A socket already removed before cleanup must not trip an error.
+    #[test]
+    fn cleanup_tolerates_an_already_gone_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        let mut server = quiet_server(&path);
+
+        bind_then_stop(&mut server);
+        std::fs::remove_file(&path).unwrap();
+
+        server.cleanup();
+        assert!(!path.exists());
     }
 }

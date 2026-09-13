@@ -418,13 +418,16 @@ impl Daemon {
             Duration::from_secs(20),
             socket,
             expected_workers,
+            true,
         )
     }
 
     /// Signal the daemon with each of `sigs` in order and pin the entire
     /// shutdown contract: the process exits 0 within `bound` of the signals,
-    /// the socket file is removed, and — the reaping check — every pooled
-    /// worker is gone from /proc afterwards.
+    /// the socket file is removed (unless `expect_socket_removed` is false —
+    /// the foreign-file ownership test replaces the path and inverts that
+    /// one assertion), and — the reaping check — every pooled worker is gone
+    /// from /proc afterwards.
     ///
     /// The worker set is snapshotted from /proc *before* signaling: pool
     /// workers are forked directly by the daemon, so while it lives they are
@@ -441,6 +444,7 @@ impl Daemon {
         bound: Duration,
         socket: &Path,
         expected_workers: usize,
+        expect_socket_removed: bool,
     ) -> Outcome {
         let workers = children_of(self.child.id());
         assert_eq!(
@@ -501,10 +505,12 @@ impl Daemon {
             Some(0),
             "a shutdown signal is a clean stop, not a failure; stderr: {stderr}"
         );
-        assert!(
-            !socket.exists(),
-            "clean shutdown must remove the socket file"
-        );
+        if expect_socket_removed {
+            assert!(
+                !socket.exists(),
+                "clean shutdown must remove the socket file"
+            );
+        }
         assert_workers_gone(&workers, Duration::from_secs(2));
 
         Outcome {
@@ -632,7 +638,7 @@ fn serve_sigint_stops_bounded_and_reaps_every_worker() {
     let mut daemon = Daemon::start(&mock, &socket, Some("2"));
     daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
 
-    let out = daemon.shutdown_daemon(&[Signal::SIGINT], SHUTDOWN_BOUND, &socket, 2);
+    let out = daemon.shutdown_daemon(&[Signal::SIGINT], SHUTDOWN_BOUND, &socket, 2, true);
 
     assert!(
         out.stderr.contains("cleaning up 2 workers"),
@@ -642,6 +648,31 @@ fn serve_sigint_stops_bounded_and_reaps_every_worker() {
     assert!(
         out.stderr.contains("Shutdown complete"),
         "shutdown must run to completion and report it: {}",
+        out.stderr
+    );
+
+    // Teardown order (claudepr-ffaf4def): stop accepting, reap the children,
+    // and only then remove the socket file. The stderr sequence pins the
+    // observable half — the last worker-destroy line precedes the socket
+    // removal, which precedes the completion line. destroy_worker is serial
+    // inside shutdown_all, so the last destroy line also means every destroy
+    // had started; the /proc check above pins that they finished.
+    let last_destroy = out
+        .stderr
+        .rfind("Destroying worker")
+        .expect("worker destroy lines present in verbose stderr");
+    let socket_removed = out
+        .stderr
+        .find("Removed pool socket")
+        .expect("socket removal line present in verbose stderr");
+    let complete = out
+        .stderr
+        .find("Shutdown complete")
+        .expect("completion line present");
+    assert!(
+        last_destroy < socket_removed && socket_removed < complete,
+        "teardown must reap children before removing the socket, and report \
+         completion last; stderr: {}",
         out.stderr
     );
 }
@@ -679,6 +710,7 @@ fn serve_sigint_then_sigterm_stops_cleanly_without_respawn() {
         SHUTDOWN_BOUND,
         &socket,
         2,
+        true,
     );
 
     assert!(
@@ -700,6 +732,76 @@ fn serve_sigint_then_sigterm_stops_cleanly_without_respawn() {
         spawns_total, spawns_at_rest,
         "no worker may be spawned after the shutdown flag is set; stderr: {}",
         out.stderr
+    );
+}
+
+// The socket path can stop naming this daemon's socket while it runs —
+// another daemon taking the path, an administrator, a test. The daemon holds
+// its bound socket by inode and never watches the path, so shutdown must
+// remove only what it created and leave the replacement exactly as found
+// (claudepr-ffaf4def). Pre-repair, cleanup unlinked whatever sat at the path.
+#[test]
+fn serve_shutdown_leaves_a_foreign_file_at_the_socket_path_untouched() {
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("1"));
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    // Replace the daemon's socket with a foreign regular file. Inode numbers
+    // are recycled after unlink, so this replacement may well reuse the
+    // daemon's socket inode number — the ownership guard must not be fooled
+    // (it also requires the occupant to be a socket).
+    std::fs::remove_file(&socket).expect("remove the daemon's socket");
+    std::fs::write(&socket, b"not the daemon's file").expect("write replacement file");
+
+    let out = daemon.shutdown_daemon(
+        &[Signal::SIGTERM],
+        SHUTDOWN_BOUND,
+        &socket,
+        1,
+        false, // the socket assertion is inverted: the replacement must survive
+    );
+
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("Shutdown complete"),
+        "shutdown must run to completion: {}",
+        out.stderr
+    );
+    assert_eq!(
+        std::fs::read(&socket).expect("replacement file must survive shutdown"),
+        b"not the daemon's file",
+        "shutdown deleted a file at the socket path that this daemon never created"
+    );
+}
+
+// A foreign file at the path *before* the daemon starts takes a different
+// path through the ownership story: startup replaces it (the restart story —
+// bind_socket unlinks whatever sits at the path), the identity is recorded
+// from the daemon's own node, and shutdown then removes that node normally.
+// This pins that the pre-start occupant leaves no stale claim behind — the
+// guard must not preserve a file that merely *shared the path* before the
+// bind, or a stopped daemon would strand its own socket file.
+#[test]
+fn serve_shutdown_removes_its_socket_even_when_a_foreign_file_preceded_it() {
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    std::fs::write(&socket, b"pre-existing, replaced at bind").expect("write pre-start file");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("1"));
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let out = daemon.shutdown_daemon(&[Signal::SIGTERM], SHUTDOWN_BOUND, &socket, 1, true);
+
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        !socket.exists(),
+        "the daemon's own socket must be removed even though the path held a \
+         foreign file before startup"
     );
 }
 
