@@ -1,0 +1,8 @@
+[?25l[?1002h[?1006h[2J[H
+[1m✻[0m [1mWelcome to Claude Code[0m[38;5;244m · /home/coding/claude-governor[0m
+
+Quick safety check: Is this a project you created or one you trust?
+[2K[1;36m❯[0m [36mNo, exit[0m
+[2K  Yes, I trust this folder
+[2KEnter to confirm [38;5;244m·[0m Esc to cancel
+[?1002l[?1006l

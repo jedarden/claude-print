@@ -3,10 +3,11 @@
 /// Verifies that `claude-print` survives Claude Code schema changes without
 /// rebuilding.  All tests are credential-free and run in CI on every push.
 use claude_print::poller::parse_stop_payload;
-use claude_print::startup::StartupSeq;
+use claude_print::startup::{StartupAction, StartupPhase, StartupSeq};
 use claude_print::transcript::parse_transcript;
 use std::io::Write as IoWrite;
 use std::path::Path;
+use std::time::Duration;
 use tempfile::TempDir;
 
 // ── Claude version format tracking ───────────────────────────────────────────
@@ -235,6 +236,118 @@ fn startup_10_non_dialog_lines_do_not_trigger() {
     }
 }
 
+// ── Startup regression: claude 2.1.263 caret-on-refuse layout ────────────────
+//
+// The 2.1.263 render highlights "No, exit" by default — screen-scraped in
+// tests/fixtures/startup_trust_dialog_v2.1.263.txt. Confirming whatever is
+// highlighted kills the session in every untrusted cwd (claudepr-fe3d3160),
+// so this exact layout must stay pinned: the dismissal moves the caret onto
+// the trusting entry before pressing Enter.
+
+/// The screen-scraped claude 2.1.263 caret-on-refuse startup render.
+fn fixture_v2_1_263_capture() -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/startup_trust_dialog_v2.1.263.txt");
+    std::fs::read(&path).expect("fixture startup_trust_dialog_v2.1.263.txt must exist")
+}
+
+/// The fixture reproduces the regressed layout: the dialog is detected and the
+/// dismissal plan is one Down arrow onto "Yes, I trust this folder", then Enter.
+#[test]
+fn startup_fixture_v2_1_263_caret_on_refuse_moves_down_then_enter() {
+    let capture = fixture_v2_1_263_capture();
+    assert!(
+        StartupSeq::dialog_present(&capture),
+        "the screen-scraped render must detect the trust dialog"
+    );
+    assert_eq!(
+        StartupSeq::plan_keys(&capture).as_deref(),
+        Some(b"\x1b[B\r".as_slice()),
+        "caret on 'No, exit' must move down to 'Yes, I trust this folder' before Enter"
+    );
+}
+
+/// Full startup sequence over the fixture: keys are held while the TUI paints,
+/// fire as Down+Enter once it has been quiet, then the prompt is injected as a
+/// bracketed paste.
+#[test]
+fn startup_fixture_v2_1_263_sequence_dismisses_then_injects_prompt() {
+    let capture = fixture_v2_1_263_capture();
+    let mut seq = StartupSeq::with_idle_gap(b"What is 2+2?".to_vec(), 100);
+
+    // Render burst: the dismissal is identified but held — keys written while
+    // the TUI is still painting are silently dropped.
+    assert!(
+        matches!(seq.feed(&capture), StartupAction::None),
+        "keys must be held at the parseable instant"
+    );
+    assert_eq!(*seq.phase(), StartupPhase::Waiting);
+
+    // Quiet window elapses (DISMISS_SETTLE_MS = 400 ms): move down, then Enter.
+    std::thread::sleep(Duration::from_millis(450));
+    match seq.poll_timers() {
+        StartupAction::Write(keys) => assert_eq!(
+            keys, b"\x1b[B\r",
+            "dismissal must select the trusting entry, not confirm the highlighted default"
+        ),
+        other => panic!("expected dismissal keys after the quiet window, got {other:?}"),
+    }
+    assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
+
+    // Post-dismiss idle gap (100 ms here): the prompt goes out as a bracketed
+    // paste, verbatim, terminated by CR.
+    std::thread::sleep(Duration::from_millis(150));
+    match seq.poll_timers() {
+        StartupAction::Write(payload) => {
+            let prompt = b"What is 2+2?";
+            assert!(
+                payload.starts_with(b"\x1b[200~")
+                    && payload.ends_with(b"\x1b[201~\r")
+                    && payload.windows(prompt.len()).any(|w| w == prompt),
+                "expected the bracketed-paste prompt payload, got {payload:?}"
+            );
+        }
+        other => panic!("expected prompt injection after the idle gap, got {other:?}"),
+    }
+    assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
+}
+
+/// An unidentifiable dialog (no Yes/No wording to classify) must produce
+/// Refuse once the screen settles — never a confirming keystroke, which would
+/// select 2.1.263's highlighted "No, exit" default.
+#[test]
+fn startup_unidentifiable_dialog_refuses_rather_than_guessing() {
+    let dialog = concat!(
+        "Quick safety check: trust this folder before you continue?\r\n",
+        "\u{276f} Depart\r\n",
+        "  Remain\r\n",
+        "Enter to confirm \u{b7} Esc to cancel\r\n",
+    );
+    let mut seq = StartupSeq::new(b"prompt".to_vec());
+    assert!(
+        matches!(seq.feed(dialog.as_bytes()), StartupAction::None),
+        "nothing may be sent before the screen settles"
+    );
+    assert_eq!(*seq.phase(), StartupPhase::Waiting);
+
+    // Screen settled (DIALOG_SETTLE_MS = 2 s) with no identifiable trusting entry.
+    std::thread::sleep(Duration::from_millis(2_100));
+    match seq.poll_timers() {
+        StartupAction::Refuse(reason) => {
+            assert!(
+                reason.contains("--pretrust-cwd"),
+                "refusal must be actionable: {reason}"
+            );
+        }
+        other => panic!("expected Refuse for an unidentifiable dialog, got {other:?}"),
+    }
+    assert_eq!(
+        *seq.phase(),
+        StartupPhase::Waiting,
+        "a refusal must not advance the phase or confirm any entry"
+    );
+}
+
 // ── Token count regression: fixture transcript_v2.1.168.jsonl ─────────────────
 
 #[test]
@@ -271,6 +384,52 @@ fn token_regression_fixture_v2_1_168() {
 fn fixture_unknown_usage_fields_ignored() {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.168.jsonl");
+    // The fixture contains `server_tool_use`, `service_tier`, `cache_creation`,
+    // `inference_geo`, `speed` in the usage object — all should be silently ignored.
+    let r = parse_transcript(&path).expect("parse fixture must succeed");
+    assert!(
+        r.num_turns > 0,
+        "must parse at least one turn despite unknown usage fields"
+    );
+}
+
+// ── Token count regression: fixture transcript_v2.1.233.jsonl ─────────────────
+
+#[test]
+fn token_regression_fixture_v2_1_233() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.233.jsonl");
+    let r = parse_transcript(&path).expect("parse fixture failed");
+    // Turn 1: msg-101 — in=5200, out=245, cache_create=650, cache_read=21000
+    // Turn 2: msg-102 × 2 streaming chunks — in=150, out=80 (first chunk), cache_create=0, cache_read=6000
+    // Turn 3: msg-103 — in=200, out=95, cache_create=0, cache_read=7500
+    assert_eq!(r.num_turns, 3, "fixture has 3 unique assistant turns");
+    assert_eq!(
+        r.usage.input_tokens, 5550,
+        "input_tokens mismatch (5200 + 150 + 200)"
+    );
+    assert_eq!(
+        r.usage.output_tokens, 420,
+        "output_tokens mismatch (245 + 80 + 95)"
+    );
+    assert_eq!(
+        r.usage.cache_creation_input_tokens, 650,
+        "cache_creation mismatch (650 + 0 + 0)"
+    );
+    assert_eq!(
+        r.usage.cache_read_input_tokens, 34500,
+        "cache_read mismatch (21000 + 6000 + 7500)"
+    );
+    // Last turn's text
+    assert_eq!(r.text, "Final answer", "last turn text mismatch");
+}
+
+// ── Fixture v2.1.233 also contains unknown usage fields → ignored ─────────────
+
+#[test]
+fn fixture_v233_unknown_usage_fields_ignored() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.233.jsonl");
     // The fixture contains `server_tool_use`, `service_tier`, `cache_creation`,
     // `inference_geo`, `speed` in the usage object — all should be silently ignored.
     let r = parse_transcript(&path).expect("parse fixture must succeed");
