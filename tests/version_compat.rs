@@ -312,6 +312,53 @@ fn startup_fixture_v2_1_263_sequence_dismisses_then_injects_prompt() {
     assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
 }
 
+/// Regression guard: a blind Enter — a confirming CR with no caret movement
+/// ahead of it — must fail this suite. On the pinned 2.1.263 layout the caret
+/// renders on "No, exit" (❯ on the first entry), so Enter without a preceding
+/// Down arrow confirms the refusing default and kills the session in every
+/// untrusted cwd (claudepr-fe3d3160). Both dismissal shapes are guarded: the
+/// pure planner must not plan a bare confirm, and the live state machine must
+/// never emit a bare CR as its first write — which is what the no-dialog idle
+/// fallback would produce if this fixture ever stopped detecting as a dialog
+/// (the capture is well past the 200-byte idle threshold).
+#[test]
+fn startup_fixture_v2_1_263_blind_enter_without_caret_move_fails() {
+    let capture = fixture_v2_1_263_capture();
+
+    // Planner shape: the dismissal must lead with an arrow key and confirm
+    // only after it; a bare CR is the blind Enter this fixture pins against.
+    let planned = StartupSeq::plan_keys(&capture)
+        .expect("the trusting entry must be positively identified for this layout");
+    assert_ne!(
+        planned, b"\r",
+        "blind Enter: no caret movement ahead of the confirming CR — against \
+         this layout that selects the highlighted 'No, exit'"
+    );
+    assert!(
+        planned.starts_with(b"\x1b[") && planned.ends_with(b"\r"),
+        "dismissal must move the caret (arrow keys first) and only then \
+         confirm: {planned:?}"
+    );
+
+    // State-machine shape: the first bytes actually written to the PTY must
+    // move the caret, never confirm the highlighted entry outright.
+    let mut seq = StartupSeq::with_idle_gap(b"What is 2+2?".to_vec(), 100);
+    assert!(
+        matches!(seq.feed(&capture), StartupAction::None),
+        "keys must be held while the TUI paints"
+    );
+    std::thread::sleep(Duration::from_millis(450));
+    match seq.poll_timers() {
+        StartupAction::Write(keys) => assert!(
+            keys.starts_with(b"\x1b["),
+            "blind Enter regression: the first write must move the caret off \
+             'No, exit' before confirming, got {keys:?}"
+        ),
+        other => panic!("expected dismissal keys after the quiet window, got {other:?}"),
+    }
+    assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
+}
+
 /// An unidentifiable dialog (no Yes/No wording to classify) must produce
 /// Refuse once the screen settles — never a confirming keystroke, which would
 /// select 2.1.263's highlighted "No, exit" default.
