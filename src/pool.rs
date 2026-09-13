@@ -71,6 +71,12 @@ pub const MAX_POOL_SIZE: usize = 256;
 /// doubles as the maintain() tick (top-up respawn cadence).
 const ACCEPT_POLL_TIMEOUT_MS: i32 = 250;
 
+/// Cap on one client request frame. Legitimate acquire/release JSON is a few
+/// hundred bytes, so this leaves three orders of magnitude of headroom while
+/// keeping a hostile 4-byte length prefix from pinning gigabytes of daemon
+/// memory (the wire length is an unbounded u32).
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
 /// Validate a `--pool-size` argument before the daemon starts. `0` would
 /// maintain an empty pool that serves nothing, and anything past
 /// [`MAX_POOL_SIZE`] forks that many full `claude` PTY processes — both are
@@ -967,6 +973,54 @@ impl PoolServer {
         Ok(())
     }
 
+    /// Read one length-prefixed request frame from `stream`.
+    ///
+    /// Returns `Ok(None)` when the peer closed without sending a complete
+    /// frame — including the partial cases (half a length prefix, or a body
+    /// shorter than its prefix claims). EOF must be checked on each read's
+    /// own return, never on the running total: a truncated frame makes every
+    /// later `read` return `Ok(0)` immediately, so a total-based check never
+    /// fires and the connection thread spins on EOF at 100% CPU forever, one
+    /// core per bad client. Length prefixes past [`MAX_REQUEST_BYTES`] are a
+    /// protocol violation: an arbitrary 32-bit length would otherwise pin up
+    /// to 4 GiB of daemon memory per connection.
+    fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Option<Vec<u8>>> {
+        // Read the 4-byte length prefix
+        let mut len_buf = [0u8; 4];
+        let mut n_read = 0;
+        while n_read < len_buf.len() {
+            let n = stream.read(&mut len_buf[n_read..])?;
+            if n == 0 {
+                return Ok(None); // EOF: clean close, even mid-prefix
+            }
+            n_read += n;
+        }
+
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        if msg_len > MAX_REQUEST_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "request length prefix {} exceeds the {}-byte maximum",
+                    msg_len, MAX_REQUEST_BYTES
+                ),
+            ));
+        }
+
+        // Read the request body
+        let mut buf = vec![0u8; msg_len];
+        let mut n_read = 0;
+        while n_read < buf.len() {
+            let n = stream.read(&mut buf[n_read..])?;
+            if n == 0 {
+                return Ok(None); // EOF: client went away mid-frame
+            }
+            n_read += n;
+        }
+
+        Ok(Some(buf))
+    }
+
     /// Handle a single client connection
     fn handle_connection(
         mut stream: std::os::unix::net::UnixStream,
@@ -976,24 +1030,13 @@ impl PoolServer {
         // Set read timeout to prevent hanging
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
 
-        // Read request length (4 bytes)
-        let mut len_buf = [0u8; 4];
-        let mut n_read = 0;
-        while n_read < 4 {
-            n_read += stream.read(&mut len_buf[n_read..])?;
-            if n_read == 0 {
-                return Ok(()); // Client closed
-            }
-        }
-
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Read request JSON
-        let mut buf = vec![0u8; msg_len];
-        let mut n_read = 0;
-        while n_read < msg_len {
-            n_read += stream.read(&mut buf[n_read..])?;
-        }
+        // One request frame; a client that closed (cleanly or mid-frame)
+        // just ends this connection, like any other close.
+        let buf = match Self::read_frame(&mut stream) {
+            Ok(Some(buf)) => buf,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
 
         // Parse JSON request
         let request: PoolRequest = serde_json::from_slice(&buf)?;
@@ -1482,5 +1525,78 @@ mod tests {
 
         let err = bind_socket(&path).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+    }
+
+    // ── read_frame: request framing (claudepr-b78932de audit repair) ─────────
+    //
+    // A client that closes mid-frame must end its connection, not wedge it:
+    // the pre-repair reader checked EOF against the running total instead of
+    // each read's own return, so a truncated frame spun its connection thread
+    // on sticky EOF at 100% CPU forever. Each of these failures hangs the test
+    // suite if the regression returns.
+
+    /// A connected socket pair (writer, reader) for framing tests.
+    fn stream_pair() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        std::os::unix::net::UnixStream::pair().unwrap()
+    }
+
+    #[test]
+    fn read_frame_reads_a_complete_length_prefixed_frame() {
+        let (mut w, mut r) = stream_pair();
+        w.write_all(&[0, 0, 0, 5]).unwrap();
+        w.write_all(b"hello").unwrap();
+
+        let frame = PoolServer::read_frame(&mut r).unwrap().unwrap();
+        assert_eq!(frame, b"hello");
+    }
+
+    #[test]
+    fn read_frame_returns_none_on_immediate_close() {
+        let (w, mut r) = stream_pair();
+        drop(w);
+
+        assert!(matches!(PoolServer::read_frame(&mut r), Ok(None)));
+    }
+
+    // Half a length prefix then close: the accumulator-based EOF check could
+    // never fire here (2 += 0 stays 2), which is exactly the hot-spin input.
+    #[test]
+    fn read_frame_returns_none_on_truncated_length_prefix() {
+        let (mut w, mut r) = stream_pair();
+        w.write_all(&[0, 0]).unwrap();
+        drop(w);
+
+        assert!(matches!(PoolServer::read_frame(&mut r), Ok(None)));
+    }
+
+    // A body shorter than its prefix claims (the body loop had no EOF check
+    // at all) must also end the connection cleanly.
+    #[test]
+    fn read_frame_returns_none_on_truncated_body() {
+        let (mut w, mut r) = stream_pair();
+        w.write_all(&[0, 0, 0, 100]).unwrap(); // claims 100 bytes…
+        w.write_all(b"only ten").unwrap(); // …sends 8, then closes
+        drop(w);
+
+        assert!(matches!(PoolServer::read_frame(&mut r), Ok(None)));
+    }
+
+    // An absurd length prefix is a protocol violation, not a frame: honouring
+    // it would let one 4-byte write pin up to 4 GiB of daemon memory.
+    #[test]
+    fn read_frame_rejects_length_prefix_over_the_cap() {
+        let (mut w, mut r) = stream_pair();
+        let huge = (MAX_REQUEST_BYTES as u32 + 1).to_be_bytes();
+        w.write_all(&huge).unwrap();
+
+        let err = PoolServer::read_frame(&mut r).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains(&MAX_REQUEST_BYTES.to_string()),
+            "error must state the cap: {err}"
+        );
     }
 }

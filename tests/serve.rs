@@ -24,6 +24,9 @@
 //!     supervisor stopping the service is not a failure).
 //!   * **child reaping** — after shutdown no worker process survives in
 //!     /proc: not alive (leaked), not unreaped (zombie).
+//!   * **malformed clients** — clients that close mid-frame or send an
+//!     absurd length prefix are dropped cleanly; the daemon keeps serving a
+//!     well-formed acquire afterwards (claudepr-b78932de audit repair).
 //!   * **default path unchanged** — an ordinary prompt invocation without the
 //!     subcommand still runs the plain session path, with no daemon behavior.
 
@@ -673,4 +676,87 @@ fn default_non_serve_invocation_is_unchanged() {
         !socket.exists(),
         "serve machinery must not bind a socket for a plain run"
     );
+}
+
+// ── Malformed clients (claudepr-b78932de audit repair) ──────────────────────
+
+/// Send one length-prefixed frame (the pool wire format: 4-byte big-endian
+/// length, then the payload).
+fn send_frame(stream: &mut std::os::unix::net::UnixStream, payload: &[u8]) {
+    use std::io::Write;
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .expect("write frame length");
+    stream.write_all(payload).expect("write frame body");
+}
+
+/// Read one length-prefixed response frame; `None` = server closed.
+fn read_response(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    let mut len_buf = [0u8; 4];
+    if stream.read_exact(&mut len_buf).is_err() {
+        return Ok(None);
+    }
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; msg_len];
+    stream.read_exact(&mut buf)?;
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+// Abusive connections must not degrade the daemon: a client that closes
+// mid-frame ends its connection cleanly (the pre-repair reader spun its
+// connection thread on sticky EOF forever — see read_frame's unit tests in
+// src/pool.rs for the mechanism-level pins), and an absurd length prefix is
+// refused instead of allocated. After the abuse the daemon must still be
+// serving: a well-formed acquire gets a worker_assigned response, and the
+// full shutdown contract holds on the (replenished) worker set.
+#[test]
+fn serve_survives_malformed_clients_and_keeps_serving() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("2"));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+
+    // (a) connects and closes without sending anything.
+    drop(UnixStream::connect(&socket).expect("connect (a)"));
+
+    // (b) sends half a length prefix, then closes.
+    let mut truncator = UnixStream::connect(&socket).expect("connect (b)");
+    truncator.write_all(&[0, 0]).expect("write partial prefix");
+    drop(truncator);
+
+    // (c) claims a frame larger than the daemon's cap.
+    let mut glutton = UnixStream::connect(&socket).expect("connect (c)");
+    glutton
+        .write_all(&u32::MAX.to_be_bytes())
+        .expect("write huge prefix");
+    drop(glutton);
+
+    // The daemon must still serve a well-formed acquire after all that.
+    let mut client = UnixStream::connect(&socket).expect("connect (acquire)");
+    send_frame(&mut client, br#"{"type": "acquire", "timeout_secs": 5}"#);
+    let response = read_response(&mut client)
+        .expect("read acquire response")
+        .expect("server closed instead of answering a valid acquire");
+    assert!(
+        response.contains("worker_assigned"),
+        "acquire after abusive clients must still be served: {response}"
+    );
+
+    // Acquiring one worker drops the pool below target, so the maintain tick
+    // spawns a replenishment replacement (target counts Warming+Ready, not
+    // the handed-out worker). Waiting for that third spawn both proves the
+    // accept loop is still ticking and makes the /proc snapshot in terminate
+    // deterministic.
+    daemon.wait_for("Spawning worker", 3, Duration::from_secs(30));
+
+    // A shutdown signal must still take the daemon through the full
+    // clean-stop contract with the whole (replenished) worker set.
+    let out = daemon.terminate(&socket, 3);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
