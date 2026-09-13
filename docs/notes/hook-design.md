@@ -43,7 +43,7 @@ The per-run settings file contains only the Stop relay hook:
 }
 ```
 
-Claude Code merges this with any user hooks from `~/.claude/settings.json`, so both user hooks and the relay hook fire.
+Claude Code merges this with any user hooks from `~/.claude/settings.json`, so both user hooks and the relay hook fire. **Measured on claude 2.1.270 (2026-09-13, `docs/notes/claude-contract-probes.md`):** merge confirmed for user- and project-source hooks alongside the relay hook — every loaded source fires on each hook event. Cross-source firing *order* is not contractual: standard-source hooks typically start first (1–3 ms ahead), but concurrent firing — and a run where the relay started before the project hook — was also observed. Nothing in claude-print may depend on the relay firing last; the payload may arrive while user Stop hooks are still running, which is safe because the two consumers are independent.
 
 ## FIFO Protocol
 
@@ -80,6 +80,12 @@ Where `<slug>` is the `cwd` with leading `/` stripped and remaining `/` replaced
 /home/user/myproject → home-user-myproject
 /tmp → tmp
 ```
+
+### Stop Firing Frequency
+
+**Measured on claude 2.1.270** (full evidence: `docs/notes/claude-contract-probes.md`): Claude Code fires Stop **once per completed turn** — a multi-round tool-using turn produces exactly one Stop at its end, and each new user prompt in a TUI session produces its own Stop. A run cut off by `--max-turns` fires no Stop at all (it exits with an error; the `--stop-hook-timeout` watchdog owns that case). Since claude-print sends exactly one prompt per session, the first Stop payload it reads from the FIFO is the terminal signal.
+
+Known hazard on degraded runs: when the model's tool calls are permission-**denied** (no allowlist, headless), one measured run produced an extra Stop firing. This is not reachable in the NEEDLE fleet (`claude-print.yaml` passes `--dangerously-skip-permissions`), and the single-fire poller degrades gracefully there — it acts on the first payload, the transcript retry/fallback path absorbs the rest, and the watchdog still bounds the session. The measured counts are pinned in `tests/fixtures/claude_contracts_v2.1.270.json`; the merge and suppression contracts are re-measured live by `cargo test --test claude_contracts -- --ignored`, and the Stop-count probes are re-runnable via `scripts/probe-stop-toolallowed.sh` after any Claude Code update.
 
 ## Keeper FD Pattern
 
@@ -127,7 +133,7 @@ By default, `claude-print` does not redirect `CLAUDE_CONFIG_DIR`. The inner `cla
 
 When `--no-inherit-hooks` is passed:
 
-- `--setting-sources=` (empty) is forwarded to claude — suppresses loading of standard settings sources
+- `--setting-sources=` (empty) is forwarded to claude — suppresses loading of standard settings sources (**measured** on claude 2.1.270: the empty spelling is accepted, suppresses every standard source, and does not suppress the `--settings` file; the alternative spelling `=none` is rejected outright — exit 1 before session start)
 - Only `--settings <temp>/settings.json` is active — contains solely the relay hook
 - User hooks (SessionStart, Stop, PreToolUse, ccdash, trail-boss, etc.) do not fire
 

@@ -18,7 +18,7 @@ The billing classification is determined by `isatty(stdout)` inside the `claude`
 |------|-----------|
 | PTY | Pseudoterminal: a master/slave fd pair where `isatty()` returns true on the slave. Allows a parent process to control a child process's terminal I/O through the kernel line discipline. |
 | cc_entrypoint | Anthropic billing header field. `cli` = subscription pool; `sdk-cli` = Agent SDK credit pool. Determined at Claude Code startup by `isatty(stdout)`. |
-| Stop hook | A Claude Code hook event fired when the AI completes a turn. Payload includes `session_id`, `transcript_path`, and `last_assistant_message`. Used as the IPC signal between the inner `claude` process and `claude-print`. (Note: in `claude -p`-style single-turn sessions, Stop fires once at session end. With `--max-turns > 1` and tool use, Stop behavior is unverified — add to OQ-1 resolution checklist. The Stop Poller assumes single-fire per session; if multi-fire is observed, the poller must be updated to match on the JSONL `Result` event before acting.) |
+| Stop hook | A Claude Code hook event fired when the AI completes a turn. Payload includes `session_id`, `transcript_path`, and `last_assistant_message`. Used as the IPC signal between the inner `claude` process and `claude-print`. (Measured on claude 2.1.270, 2026-09-13 — see `docs/notes/claude-contract-probes.md`: a completed turn fires **once per loaded source**, including multi-round tool-using turns, and a run cut off by `--max-turns` fires **no** Stop at all (it exits with an error instead). One Stop payload per prompt is therefore the terminal signal and the Stop Poller's single-fire design is correct; permission-denied tool paths can produce extra firings, which the poller tolerates by acting on the first payload and letting the watchdog cover non-termination.) |
 | FIFO | POSIX named pipe (`mkfifo`). The Stop hook writes to it; the parent poll loop reads from it. Per-run, per-pid — prevents cross-invocation contamination. |
 | Bracketed paste | Terminal feature that wraps pasted text in `ESC[200~` … `ESC[201~` markers. Prevents embedded newlines from triggering premature Enter in Ink's REPL. |
 | Ink | The React/Yoga-based TUI framework used by Claude Code. Sends DEC terminal probes (DA1, DA2, DSR, XTVERSION, window-size) at startup and hangs indefinitely if unanswered. |
@@ -222,7 +222,10 @@ claude-print/
 │   ├── test_sessionstart_hook.sh
 │   ├── test_startup_wedge.sh
 │   ├── verify_fix.sh
-│   └── verify-startup-wedge-fix.sh
+│   ├── verify-startup-wedge-fix.sh
+│   ├── probe-claude-contracts.sh          # live PO-1/PO-2/OQ-1/OQ-2 probes (claude 2.1.270; docs/notes/claude-contract-probes.md)
+│   ├── probe-stop-toolallowed.sh          # live Stop-count probes with tool use permitted (print + TUI)
+│   └── probe-tui-second-turn.sh           # live TUI once-per-turn Stop probe (with probe-tui-stop.py driver)
 ├── test-fixtures/
 │   └── mock-claude/
 │       ├── Cargo.toml
@@ -388,14 +391,14 @@ By default `claude-print` does **not** redirect `CLAUDE_CONFIG_DIR`. The inner `
 - Appends to `~/.claude/history.jsonl`
 - Fires all hooks in `~/.claude/settings.json` (SessionStart, Stop, PreToolUse, trail-boss, ccdash, etc.)
 
-`claude-print` adds its own Stop hook by passing `--settings <temp>/settings.json` with the per-run relay hook. Claude Code merges `--settings` with the user's settings file — all existing hooks continue to fire alongside the relay hook (merge behavior per OQ-1, unverified; see Hook Installer §2 schema note and PO-1 for fallback if merge fails).
+`claude-print` adds its own Stop hook by passing `--settings <temp>/settings.json` with the per-run relay hook. Claude Code merges `--settings` with the user's settings file — all existing hooks continue to fire alongside the relay hook (**measured**: merge confirmed on claude 2.1.270 — project- and user-source hooks and relay hooks all fired in one run; see `docs/notes/claude-contract-probes.md` and OQ-1's resolution below; PO-1's in-process-merge fallback is not needed).
 
 This matches exactly what `claude -p` does. Transcripts, token counts, and usage stats land in `~/.claude/` with no special handling.
 
 ### `--no-inherit-hooks` (Isolation Mode)
 
 When `--no-inherit-hooks` is passed:
-- `--setting-sources=` is forwarded to claude (empty value = load no standard settings sources)
+- `--setting-sources=` is forwarded to claude (empty value = load no standard settings sources; **measured**: the empty spelling suppresses every standard source while the `--settings` file still loads, claude 2.1.270)
 - Only `--settings <temp>/settings.json` is loaded, which contains solely the Stop relay hook
 - User's `~/.claude/settings.json` hooks do not fire (ccdash, trail-boss, etc.)
 - `CLAUDE_CONFIG_DIR` is **not** set even in isolation mode — transcripts still land in `~/.claude/projects/`
@@ -414,7 +417,7 @@ max_turns = 30
 timeout_secs = 3600
 ```
 
-CLI flags override config file values. `inherit_hooks = true` — Setting to `false` is equivalent to passing `--no-inherit-hooks` on the command line: `--setting-sources=` (per OQ-2, unverified) is forwarded to the inner `claude` process, suppressing user hook inheritance. CLI `--no-inherit-hooks` takes precedence over the config file value.
+CLI flags override config file values. `inherit_hooks = true` — Setting to `false` is equivalent to passing `--no-inherit-hooks` on the command line: `--setting-sources=` (measured per OQ-2: suppresses standard sources, leaves the `--settings` file active) is forwarded to the inner `claude` process, suppressing user hook inheritance. CLI `--no-inherit-hooks` takes precedence over the config file value.
 
 ### Where Logs and Token Counts Land
 
@@ -465,7 +468,7 @@ Drop-in for `claude -p`:
 | `--stream-json-timeout SECS` | Stream-json first-output timeout in seconds (default: 90). If child produces no stream-json events within this deadline, watchdog terminates with timeout error. |
 | `--stop-hook-timeout SECS` | Stop hook watchdog timeout in seconds (default: 120). If Stop hook doesn't fire within this deadline after prompt injection, watchdog assumes child is hung and terminates. |
 | `--claude-binary PATH` | Override claude binary path (default: resolves `claude` from PATH) |
-| `--no-inherit-hooks` | Disable user hook inheritance; passes `--setting-sources=` to claude (unverified per OQ-2) |
+| `--no-inherit-hooks` | Disable user hook inheritance; passes `--setting-sources=` to claude (verified per OQ-2 resolution) |
 | `--version` | Print `claude-print <version> (wrapping claude <version>)` and exit. The claude version is obtained by running the binary at `--claude-binary` (or the PATH-resolved `claude` if not specified). If claude is not found, print `claude-print <version> (wrapping claude: not found)` and exit 0. |
 | `--verbose` | Write timing traces to stderr |
 | `--check` | Run installation self-test: verify openpty, mkfifo, optional PTY round-trip with mock_claude. Exits 0 on all checks passed, 2 on any failure. |
@@ -508,9 +511,9 @@ Creates `$TMPDIR/claude-print-<pid>-<rand>/` via `tempfile::Builder`, created wi
 
 Passed to claude via `--settings <temp>/settings.json`. Claude Code merges this with all other loaded settings sources. The user's `~/.claude/settings.json` Stop hooks (if any) also fire, plus this relay hook.
 
-*Schema note: This double-nested `hooks.Stop[{hooks:[...]}]` structure matches the Claude Code settings format observed in v2.x. Add schema verification to OQ-1's resolution checklist: confirm the settings JSON schema by inspecting a real `~/.claude/settings.json` from the target Claude Code version. If the schema changes, this template must be updated.*
+*Schema note: This double-nested `hooks.Stop[{hooks:[...]}]` structure matches the Claude Code settings format observed in v2.x. **Live-verified on claude 2.1.270** (2026-09-13): a settings file in exactly this shape was accepted and its hooks fired (see `docs/notes/claude-contract-probes.md`; also pinned by `relay_settings_schema_matches_live_verified_structure` in `tests/claude_contracts.rs`). If the schema changes, this template must be updated.*
 
-**Hook merge ordering:** Claude Code runs merged hooks sequentially in the order they appear in the merged settings. The relay hook's `"timeout": 10` applies only to the relay hook itself — it does not affect the user's hooks. The user's Stop hooks likely run first (settings.json is merged before --settings), but **this ordering is unverified (per OQ-1)**.
+**Hook merge ordering:** The relay hook's `"timeout": 10` applies only to the relay hook itself — it does not affect the user's hooks. **Measured (OQ-1 resolved, claude 2.1.270):** cross-source firing order is **not contractual**. In the four measured Stop/SessionStart pairs the standard-source hook started 2–3 ms ahead of the relay hook, but a dedicated start/end-timestamp probe (project hook sleeping 300 ms, relay 0 ms) observed the relay **starting before** the project hook in 1 of 4 runs, with the two hooks running concurrently. The guaranteed property is only that every loaded source fires (merge). Consequence: claude-print **can** observe the Stop payload while user Stop hooks (e.g. a JSONL post-processor) are still running. That window is accepted, not ordered away — the two consumers are independent (claude-print reads payload + transcript and tears down; user hooks post-process separately), no later turn depends on user-hook output in the one-prompt session shape, and the existing teardown bounds (`/exit` window, then SIGTERM/SIGKILL; `--stop-hook-timeout` watchdog) are unchanged. Nothing in claude-print may depend on the relay firing last. See `docs/notes/claude-contract-probes.md`.
 
 **`hook.sh`** (executed by Claude Code on Stop):
 ```sh
@@ -522,7 +525,7 @@ Receives the Stop JSON payload on stdin and writes it to the FIFO. Claude Code d
 
 **`stop.fifo`** — POSIX named pipe created with `nix::unistd::mkfifo()`.
 
-**In `--no-inherit-hooks` mode**, also forward `--setting-sources=` to claude (empty = no standard sources loaded) *(per OQ-2, unverified; see PO-2 for fallback)*. Only `--settings <temp>/settings.json` is active. This prevents the user's SessionStart/Stop/PreToolUse hooks from firing.
+**In `--no-inherit-hooks` mode**, also forward `--setting-sources=` to claude (empty = no standard sources loaded) *(measured per OQ-2 resolution: the empty spelling is accepted, suppresses every standard source, and does not suppress the `--settings` file; the PO-2 fallback spelling `=none` is rejected outright by claude 2.1.270 — exit 1 before session start — so it must never be emitted)*. Only `--settings <temp>/settings.json` is active. This prevents the user's SessionStart/Stop/PreToolUse hooks from firing.
 
 `tempfile::TempDir` handles cleanup on any drop path.
 
@@ -627,7 +630,7 @@ The reduced quiet windows leave the race guards intact: EC-7 still rejects a Sto
 
 ### 7. Stop Poller
 
-**Assumption:** Stop fires once per session, not once per turn. This matches observed `claude -p` behavior for single-turn sessions. Verify for multi-turn `--max-turns > 1` sessions during OQ-1 verification.
+**Assumption — VERIFIED (claude 2.1.270, 2026-09-13):** Stop fires once per completed turn per loaded source, not once per session and not once per API round. Measured: single-turn runs fire exactly one Stop per source; a multi-round tool-using turn (two sequential Bash calls, tools actually permitted) fires exactly **one** Stop at the turn's true end; a second prompt in the same TUI session fires its own Stop (once per turn, not once per session); a run cut off by `--max-turns` fires **no** Stop at all (exits with an error instead — the watchdog's `--stop-hook-timeout`, not the poller, owns that case). The single-fire design below is correct for the one-prompt-per-session shape claude-print drives. Known deviation: permission-denied tool paths (no allowlist, headless denial) can produce an extra Stop firing on a degraded run — observed once; the poller's act-on-first behavior degrades gracefully there (the transcript read retries then falls back), and the watchdog still bounds the session. See `docs/notes/claude-contract-probes.md` and `scripts/probe-stop-toolallowed.sh`.
 
 Reads from `stop.fifo` (non-blocking open; polled via the main `poll()` loop). On data available:
 
@@ -982,8 +985,8 @@ Assumptions that must hold for the design to work. Each has a named recovery if 
 
 | # | Assumption | If False | Recovery |
 |---|-----------|---------|---------|
-| PO-1 | `--settings <file>` merges hooks rather than replacing | User hooks silently stop firing | Read `~/.claude/settings.json`, merge hook arrays in-process, write combined file to temp dir, pass combined via `--settings` |
-| PO-2 | `--setting-sources=` (empty) suppresses all standard sources | `--no-inherit-hooks` still loads user hooks | Try `--setting-sources=none`; if unsupported, enumerate only relay hook source explicitly |
+| PO-1 | `--settings <file>` merges hooks rather than replacing | User hooks silently stop firing | **VERIFIED 2026-09-13 (claude 2.1.270):** merge confirmed — project-, user- and relay-source hooks all fired in single runs. Cross-source firing order is NOT contractual (typically standard-source-first by 2–3 ms; concurrent and start-order-flipped firing also measured) — nothing may rely on the relay firing last. In-process merge fallback NOT implemented and not needed. Evidence: `docs/notes/claude-contract-probes.md`; regression pin: `tests/claude_contracts.rs` |
+| PO-2 | `--setting-sources=` (empty) suppresses all standard sources | `--no-inherit-hooks` still loads user hooks | **VERIFIED 2026-09-13 (claude 2.1.270):** empty spelling suppresses every standard source while the `--settings` file still loads. The `=none` fallback spelling is REJECTED by the CLI (exit 1, "Valid options are: user, project, local") — never emit it. Evidence: `docs/notes/claude-contract-probes.md`; regression pin: `tests/claude_contracts.rs` |
 | PO-3 | `login_tty` compiles under `x86_64-unknown-linux-musl` | Phase 2 fails to build | Inline as `setsid()` + `ioctl(slave, TIOCSCTTY, 0)` + `dup2(slave, 0/1/2)` + `close(slave)` — all four syscalls musl always provides |
 | PO-4 | Ink probes are DA1/DA2/DSR/XTVERSION/window-size only | Session hangs on unrecognized probe | Unknown probes ignored; session falls through to idle timeout for trust dismiss. Add new probes to table as discovered. |
 | PO-5 | Stop hook fires after final JSONL flush | Transcript empty on first attempt | 40×50 ms retry loop (2 s budget). If Stop fires >2 s ahead of JSONL flush, increase retry budget or fall back to `last_assistant_message`. |
@@ -1012,10 +1015,10 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* `cargo build --target x86_64-unknown-linux-musl` succeeds; `claude-print --version` prints expected format; `cargo test --lib` passes; `claude-print-ci.yaml` stub exists in declarative-config and ArgoCD syncs it to `argo-workflows-ns-iad-ci`.
 
 **Phase 2: Hook Installer + PTY Spawner (~200 LOC)**
-*Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting). **PO-1 verified** (confirm `--settings` merges hooks rather than replacing; if false, see PO-1 recovery before writing the hook installer). PO-1 can be verified with a simple test: run `claude --settings /tmp/test_settings.json echo test` where test_settings.json contains a dummy hook, alongside a user hook in ~/.claude/settings.json, and confirm both fire. **OQ-5 (login_tty availability in musl) verified or PO-3 inline fallback ready; OQ-6 (CLAUDE_CODE_SESSION_ID inheritance) resolved.**
+*Entry:* Phase 1 complete. **PO-3 verified** (attempt `login_tty` under musl; if absent, inline implementation ready before starting). **PO-1 verified** (confirm `--settings` merges hooks rather than replacing; if false, see PO-1 recovery before writing the hook installer). PO-1 can be verified with a simple test: run `claude --settings /tmp/test_settings.json echo test` where test_settings.json contains a dummy hook, alongside a user hook in ~/.claude/settings.json, and confirm both fire. **OQ-5 (login_tty availability in musl) verified or PO-3 inline fallback ready; OQ-6 (CLAUDE_CODE_SESSION_ID inheritance) resolved.** *(Update 2026-09-13: PO-1/OQ-1 measured against claude 2.1.270 — merge confirmed, firing order not contractual; see `docs/notes/claude-contract-probes.md`.)*
 - [x] `hook.rs`: temp dir (`tempfile::TempDir`), write `settings.json` and `hook.sh`, `mkfifo`
 - [x] `pty.rs`: `openpty`, `fork`, window-size probe, `login_tty`, `execvp`, SIGTERM/SIGKILL/`waitpid`
-- [x] `--no-inherit-hooks` forwards `--setting-sources=` to child (unverified per OQ-2)
+- [x] `--no-inherit-hooks` forwards `--setting-sources=` to child (verified per OQ-2 resolution, claude 2.1.270)
 - [x] Build `mock_claude` fixture binary (`test-fixtures/mock-claude/`) as part of the workspace — required for PTY integration tests starting this phase
 
 *Complete when:* Integration test `test_pty_spawns_tty` passes (child observes `isatty(stdout)=true`); temp dir absent after test; `--setting-sources=` in child argv when `--no-inherit-hooks` set.
@@ -1039,7 +1042,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 *Complete when:* All startup unit tests pass; integration test `test_trust_dialog_standard_wording` and `test_trust_dialog_alternate_wording` pass.
 
 **Phase 6: Stop Poller (~80 LOC)**
-*Entry:* Phase 5 complete. **OQ-2 must be resolved** (verify `--setting-sources=` suppresses standard sources; see PO-2 for fallback). **OQ-4 (FIFO open race) validated by test.**
+*Entry:* Phase 5 complete. **OQ-2 resolved** (measured 2026-09-13 on claude 2.1.270: `--setting-sources=` suppresses standard sources and leaves the `--settings` file active; `=none` is rejected — see PO-2 and `docs/notes/claude-contract-probes.md`). **OQ-4 (FIFO open race) validated by test.**
 - [x] Open FIFO read-end O_NONBLOCK, integrate into `poll()` loop, parse Stop payload, derive transcript path, signal event loop exit
 
 *Complete when:* Integration test `test_stop_hook_fires` passes; `test_missing_transcript_path_derived` passes.
@@ -1193,7 +1196,7 @@ Integration test scenarios:
 | **Unknown event type in JSONL** | `MOCK_UNKNOWN_EVENT_TYPE=1` | parse succeeds, text extracted |
 | **Unknown usage fields** | `MOCK_UNKNOWN_USAGE_FIELDS=1` | ignored, token counts correct |
 | Custom response text | `MOCK_RESPONSE=hello` | response field in json output equals 'hello' |
-| `--no-inherit-hooks` | `--no-inherit-hooks` flag set | appropriate `--setting-sources` arg in child argv (either `=` or `=none` per OQ-2 resolution), exit 0 |
+| `--no-inherit-hooks` | `--no-inherit-hooks` flag set | `--setting-sources=` (empty value — the only verified form; `=none` is rejected by claude 2.1.270) in child argv, exit 0 |
 | Output format json | defaults | output parses as valid JSON |
 | Output format stream-json | defaults | each output line parses as valid JSON |
 | Stop fires before PROMPT_INJECTED | `MOCK_STOP_BEFORE_INJECT=1` | exit 2, `is_error: true` in output (EC-7 path) |
@@ -1209,7 +1212,7 @@ These tests verify that `--settings` relay hook merges correctly and that `--no-
 - `--settings` flag is present in the child process argv (visible via `/proc/<pid>/cmdline`)
 
 **`--no-inherit-hooks` flag:**
-- The appropriate `--setting-sources` argument is present in child argv when flag is set — either `--setting-sources=` (empty value, per OQ-2 primary) or `--setting-sources=none` (per PO-2 fallback). The test MUST be parameterized over both valid forms and accept whichever is generated by the current implementation. The specific form used MUST match what was verified in OQ-2 resolution.
+- The `--setting-sources` argument is present in child argv when flag is set and is exactly `--setting-sources=` (empty value). OQ-2 is resolved: the empty form is the verified one (claude 2.1.270), and the `=none` fallback was measured as rejected (exit 1 before session start) — the test pins the single verified form instead of parameterizing over both. `tests/claude_contracts.rs::child_argv_matches_verified_spelling_no_inherit_hooks` asserts this against the measured-contract fixture.
 - `--setting-sources` is absent from child argv when flag is not set
 - Mock that tracks whether a "user hook" fires: with `--no-inherit-hooks`, user hook does not fire; without, it does
 
@@ -1410,7 +1413,7 @@ The manual `scripts/check-billing.sh` release gate remains required as a belt-an
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|------|-----------|--------|-----------|
 | R-1 | Claude Code update changes `isatty()` detection logic; `cc_entrypoint` silently becomes `sdk-cli` | Low | Critical (billing regression, all sessions misclassified) | Daily credential-backed AS-4 canary with PASS/FAIL state and journal output; manual AS-4 check before every release; `--verbose` shows PTY slave assigned; `--check` verifies PTY opens |
-| R-2 | `--settings` merge behavior changes in a Claude Code update; user hooks stop firing | Medium | Medium (user hooks silently broken) | PO-1 verified before Phase 2; version-compat tests track `claude --version`; CI alert on version change |
+| R-2 | `--settings` merge behavior changes in a Claude Code update; user hooks stop firing | Medium | Medium (user hooks silently broken) | PO-1 verified before Phase 2 and re-measured live on 2026-09-13 (claude 2.1.270 — merge confirmed, order not contractual; `docs/notes/claude-contract-probes.md`); version-compat tests track `claude --version`; CI alert on version change; `cargo test --test claude_contracts -- --ignored` re-measures merge/suppression against the installed claude |
 | R-3 | Ink adds a new mandatory terminal probe; session hangs indefinitely | Low | High (complete outage for new Claude Code versions) | Unknown probes are ignored; session falls through to idle timeout; `MOCK_UNKNOWN_PROBE` integration test verifies resilience |
 | R-4 | `login_tty` absent in musl-libc | Low | High (binary fails to build) | Inline implementation (PO-3 recovery) is 4 syscalls; verified before Phase 2 |
 | R-5 | FIFO race: Stop hook fires before read-end open | Low | Medium (payload lost; exit 2) | FIFO opened before prompt injection (EC-3, INV-3); integration test `test_fast_stop_hook` validates timing |
@@ -1493,8 +1496,8 @@ Unresolved questions are mapped to the phase they block. Each MUST be resolved b
 
 | # | Question | Blocks | Resolution / Fallback |
 |---|---------|--------|----------------------|
-| OQ-1 | Does `--settings <file>` merge hooks with `~/.claude/settings.json` or replace them? | Phase 2 | Verify by running `claude` with `--settings` containing a test hook alongside a real user hook and checking both fire. If merge fails: PO-1 fallback (merge in-process). Also verify hook firing order: confirm user hooks run before or after the relay hook. If relay fires first, confirm this does not cause a read race with user Stop hooks that post-process the JSONL (e.g., ccdash). |
-| OQ-2 | Does `--setting-sources=` (empty string) suppress all standard sources? | Phase 6 | Verify by running `claude --setting-sources= --settings <relay-only-file>` and checking user hooks do not fire. If not accepted: try `--setting-sources=none`; if neither works, enumerate relay source explicitly. |
+| OQ-1 | Does `--settings <file>` merge hooks with `~/.claude/settings.json` or replace them? | Phase 2 | **Resolved 2026-09-13 (claude 2.1.270).** Merges — project-, user- and `--settings`-source hooks all fired alongside each other in isolated probe runs. Firing order is **not contractual**: the typical pattern is standard-source-first (2–3 ms ahead), but a start/end-timestamp probe measured the relay starting before the project hook in 1 of 4 runs with concurrent execution. The read-race clause resolves as "cannot be ordered away": claude-print may observe the Stop while user Stop hooks are still running — acceptable because the consumers are independent and the one-prompt session shape means no later turn depends on user-hook output (teardown bounds unchanged). Nothing may depend on the relay firing last. PO-1 in-process fallback not needed. Evidence: `docs/notes/claude-contract-probes.md`; live re-verification: `cargo test --test claude_contracts -- --ignored` |
+| OQ-2 | Does `--setting-sources=` (empty string) suppress all standard sources? | Phase 6 | **Resolved 2026-09-13 (claude 2.1.270).** Yes — the empty spelling is accepted and suppresses every standard source, while the `--settings` file remains loaded (relay hooks still fire). `--setting-sources=none` is rejected outright (exit 1, "Valid options are: user, project, local"), so the PO-2 fallback spelling is void and must never be emitted. Evidence: `docs/notes/claude-contract-probes.md`; live re-verification: `cargo test --test claude_contracts -- --ignored` |
 | OQ-3a | Is `/read` a built-in slash command (always available) vs. a tool invocation (requires allowedTools)? | — | **Resolved.** Confirmed built-in slash command; does not require `Read` in `--allowedTools`. |
 | OQ-3b | Does `/read` accept absolute paths for prompts >32 KB? | Phase 5 | End-to-end test with a 33 KB prompt file at an absolute path. If not: PO-6 fallback (truncate at 32 KB). |
 | OQ-4 | FIFO open race: will O_NONBLOCK open-before-inject reliably prevent timing issues? | Phase 6 | Validated by `test_fast_stop_hook` integration test (MOCK_DELAY_STOP=0). If race occurs in practice, add a pre-prompt-inject `poll()` to confirm FIFO open. |
