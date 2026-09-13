@@ -102,6 +102,23 @@ fn main() {
     let mock_is_error = env_flag("MOCK_IS_ERROR");
     let mock_stop_before_inject = env_flag("MOCK_STOP_BEFORE_INJECT");
 
+    // MOCK_IGNORE_TERM_HUP: survive the daemon's teardown instead of ending at
+    // the first signal or terminal hangup. Installs SIG_IGN for SIGTERM (what
+    // pool teardown sends the worker's whole process group) and SIGHUP (what
+    // the kernel delivers to the session leader when teardown closes the PTY
+    // master). A pool worker at rest sits in wait_for_prompt, and the master
+    // close is what ends that wait — so the block below is what keeps the
+    // process alive for destroy_worker's full SIGTERM grace and SIGKILL
+    // escalation. Only tests that must land signals inside the teardown
+    // window set this; unset leaves every other test's behavior untouched.
+    let mock_ignore_term_hup = env_flag("MOCK_IGNORE_TERM_HUP");
+    if mock_ignore_term_hup {
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+    }
+
     // Handle --version before MOCK_SILENT so version resolution works in tests
     // This is needed because Session::run() resolves the version before spawning
     // the PTY child, and we need the timeout path to work correctly.
@@ -199,6 +216,17 @@ fn main() {
     // and in legacy direct-spawn mode (no claude-print sequencer injects a prompt).
     if driven_by_claude_print && !mock_stop_before_inject {
         wait_for_prompt();
+    }
+
+    // MOCK_IGNORE_TERM_HUP (see its installation above): the prompt wait just
+    // ended — for a pool worker only the teardown's master close ends it — so
+    // hold the process open rather than firing Stop and exiting, which would
+    // spare destroy_worker its grace period and SIGKILL escalation and close
+    // the teardown window the knob exists to open.
+    if mock_ignore_term_hup {
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
     }
 
     let Some(fifo_path) = fifo_path else {

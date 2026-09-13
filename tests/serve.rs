@@ -26,7 +26,8 @@
 //!     within a bounded time, remove the socket file, and exit 0 (a
 //!     supervisor stopping the service is not a failure); SIGINT *then*
 //!     SIGTERM back-to-back still tears down completely — the second signal
-//!     is inert once the shutdown flag is set.
+//!     is inert once the shutdown flag is set — and so is a repeated signal
+//!     landing inside active teardown (claudepr-41b6a99b).
 //!   * **child reaping** — after shutdown no worker process survives in
 //!     /proc: not alive (leaked), not unreaped (zombie).
 //!   * **malformed clients** — clients that close mid-frame or send an
@@ -432,6 +433,19 @@ impl Daemon {
     /// `--pool-size <size>` when `size` is `Some` (omit it to exercise the
     /// compiled-in default).
     fn start(mock: &Path, socket: &Path, size: Option<&str>) -> Daemon {
+        Self::start_with_env(mock, socket, size, &[])
+    }
+
+    /// [`Self::start`] plus extra environment for the daemon — which
+    /// `build_child_env` forwards to the mock-claude workers (only the
+    /// CLAUDE_CODE session markers are scrubbed), so `MOCK_*` knobs set here
+    /// reach every worker the pool spawns.
+    fn start_with_env(
+        mock: &Path,
+        socket: &Path,
+        size: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Daemon {
         let bin = workspace_bin("claude-print");
         let mut cmd = Command::new(&bin);
         cmd.arg("--claude-binary").arg(mock).arg("serve");
@@ -439,6 +453,9 @@ impl Daemon {
             cmd.args(["--pool-size", size]);
         }
         cmd.arg("--socket").arg(socket).arg("--verbose");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         let mut child = cmd
             // The daemon reads no prompt: a null stdin proves the serve path
             // never consults prompt resolution (a fall-through would exit 4
@@ -529,8 +546,54 @@ impl Daemon {
     /// and the grace absorbs only the instant init needs to finish reaping an
     /// orphaned zombie.
     fn shutdown_daemon(
+        self,
+        sigs: &[Signal],
+        bound: Duration,
+        socket: &Path,
+        expected_workers: Option<usize>,
+        expect_socket_removed: bool,
+    ) -> Outcome {
+        self.shutdown_daemon_inner(
+            sigs,
+            None,
+            bound,
+            socket,
+            expected_workers,
+            expect_socket_removed,
+        )
+    }
+
+    /// [`Self::shutdown_daemon`], with the difference that matters when the
+    /// signal arrives: the first signal is delivered immediately, and every
+    /// signal in `trailing` is held back until stderr shows
+    /// `mid_teardown_needle` — so they land *inside* the work that line
+    /// proves is under way, instead of racing the first signal into the
+    /// accept loop's 250 ms poll tick.
+    #[allow(clippy::too_many_arguments)] // same shape as shutdown_daemon plus the hold
+    fn shutdown_daemon_during_teardown(
+        self,
+        first: Signal,
+        mid_teardown_needle: &str,
+        trailing: &[Signal],
+        bound: Duration,
+        socket: &Path,
+        expected_workers: Option<usize>,
+        expect_socket_removed: bool,
+    ) -> Outcome {
+        self.shutdown_daemon_inner(
+            &[first],
+            Some((mid_teardown_needle, trailing)),
+            bound,
+            socket,
+            expected_workers,
+            expect_socket_removed,
+        )
+    }
+
+    fn shutdown_daemon_inner(
         mut self,
         sigs: &[Signal],
+        hold: Option<(&str, &[Signal])>,
         bound: Duration,
         socket: &Path,
         expected_workers: Option<usize>,
@@ -547,18 +610,38 @@ impl Daemon {
         }
 
         let start = Instant::now();
-        for (leg, sig) in sigs.iter().enumerate() {
-            let pid = Pid::from_raw(self.child.id() as i32);
-            if leg == 0 {
-                // The first signal must always find a live daemon — nothing
-                // else kills it, so delivery is load-bearing for the contract.
-                kill(pid, *sig).expect("failed to signal daemon");
-            } else {
-                // A trailing signal races the teardown the earlier ones
-                // started: if the daemon already exited, the pid is gone and
-                // delivery is moot — the contract below still holds.
-                let _ = kill(pid, *sig);
+        let pid = Pid::from_raw(self.child.id() as i32);
+        // The first signal must always find a live daemon — nothing else
+        // kills it, so delivery is load-bearing for the contract.
+        kill(pid, sigs[0]).expect("failed to signal daemon");
+
+        // Remaining legs: fired immediately (`hold` is None — a trailing
+        // signal races the teardown the earlier ones started, and if the
+        // daemon already exited the pid is gone and delivery is moot), or
+        // held back until stderr proves the named work is under way.
+        let holding_for_teardown = hold.is_some();
+        let trailing: &[Signal] = match hold {
+            None => &sigs[1..],
+            Some((needle, held)) => {
+                self.wait_for(needle, 1, Duration::from_secs(10));
+                held
             }
+        };
+        for sig in trailing {
+            if holding_for_teardown {
+                // A held-back signal exists to land inside teardown; if the
+                // daemon is already gone the window this test pins has
+                // collapsed (e.g. workers died without burning their grace)
+                // and the contract below would pass vacuously — fail loudly
+                // instead. Teardown holds the window open for seconds, so
+                // this cannot flake on a healthy daemon.
+                assert!(
+                    matches!(self.child.try_wait(), Ok(None)),
+                    "daemon exited before the held-back {sig:?} could be \
+                     delivered — the mid-teardown window collapsed"
+                );
+            }
+            let _ = kill(pid, *sig);
         }
 
         let code = loop {
@@ -875,6 +958,84 @@ fn serve_sigint_then_sigterm_stops_cleanly_without_respawn() {
         "no worker may be spawned after the shutdown flag is set; stderr: {}",
         out.stderr
     );
+}
+
+// The back-to-back test above delivers its second signal microseconds after
+// the first — before the accept loop's next poll tick, let alone teardown —
+// so a teardown that *disarmed* the handlers on entry (reset default
+// dispositions, a plausible "fix" for a spurious-double-shutdown bug) would
+// pass every existing test and still die on a real repeated Ctrl-C:
+// workers stranded mid-reap, socket left behind, exit killed-by-signal.
+// This pin holds the door shut on that shape: the repeated SIGINT and the
+// second SIGTERM land only after "cleaning up N workers" proves teardown is
+// actively running, and must be inert — the full clean-stop contract holds
+// anyway.
+//
+// The window is deterministic, not raced: the worker runs with
+// MOCK_IGNORE_TERM_HUP, so it ignores destroy_worker's group SIGTERM and
+// the SIGHUP of the master close and must be ended by the SIGKILL
+// escalation after the full 2 s grace — teardown stays open for seconds
+// while the held-back signals are delivered within tens of milliseconds of
+// the needle appearing. shutdown_daemon_during_teardown asserts the daemon
+// was still alive at each delivery, so a regression that collapses the
+// window fails loudly instead of passing vacuously.
+#[test]
+fn serve_repeated_and_second_signals_during_teardown_do_not_wedge_or_respawn() {
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon =
+        Daemon::start_with_env(&mock, &socket, Some("1"), &[("MOCK_IGNORE_TERM_HUP", "1")]);
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let spawns_at_rest = daemon
+        .stderr()
+        .iter()
+        .filter(|l| l.contains("Spawning worker"))
+        .count();
+    assert_eq!(
+        spawns_at_rest,
+        1,
+        "expected a stable pool of 1 before signaling; stderr: {:?}",
+        daemon.stderr()
+    );
+
+    // SIGINT starts the shutdown; the repeat and the second, different
+    // signal land inside the teardown it started.
+    let out = daemon.shutdown_daemon_during_teardown(
+        Signal::SIGINT,
+        "cleaning up 1 workers",
+        &[Signal::SIGINT, Signal::SIGTERM],
+        SHUTDOWN_BOUND,
+        &socket,
+        Some(1),
+        true,
+    );
+
+    assert!(
+        out.stderr.contains("cleaning up 1 workers"),
+        "teardown must have begun before the trailing signals landed: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("Shutdown complete"),
+        "signals landing mid-teardown must not abort it before completion: {}",
+        out.stderr
+    );
+    let spawns_total = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("Spawning worker"))
+        .count();
+    assert_eq!(
+        spawns_total, spawns_at_rest,
+        "no worker may be spawned by or after the mid-teardown signals; \
+         stderr: {}",
+        out.stderr
+    );
+    // exit 0 within SHUTDOWN_BOUND, socket removed, the worker gone from
+    // /proc — pinned by shutdown_daemon_during_teardown above.
 }
 
 // The socket path can stop naming this daemon's socket while it runs —
