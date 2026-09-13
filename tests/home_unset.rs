@@ -81,6 +81,10 @@ impl Drop for CwdGuard {
 }
 
 fn assert_shared_home_error() {
+    // Every path funnels through `get_home()` and surfaces `Error::Config`,
+    // whose Display prefixes "invalid config: ". Pin the complete text, not a
+    // substring: a reworded detail or a lost prefix must fail loudly here.
+    let expected = format!("invalid config: {HOME_ERROR_DETAIL}");
     let config_error = Config::default_path().unwrap_err().to_string();
     let transcript_error = derive_transcript_path("session-id", "/workspace")
         .unwrap_err()
@@ -102,10 +106,10 @@ fn assert_shared_home_error() {
 
     // Regression guard for the original inconsistency: config used to reject a
     // missing HOME while other paths could continue or derive paths under /root.
-    assert!(config_error.contains(HOME_ERROR_DETAIL));
-    assert_eq!(transcript_error, config_error);
-    assert_eq!(projects_error, config_error);
-    assert_eq!(session_error, config_error);
+    assert_eq!(config_error, expected, "config path");
+    assert_eq!(transcript_error, expected, "poller transcript path");
+    assert_eq!(projects_error, expected, "poller projects path");
+    assert_eq!(session_error, expected, "session path");
 }
 
 #[test]
@@ -160,32 +164,54 @@ fn nonexistent_home_is_rejected_consistently_with_path_context() {
     let _home = EnvGuard::set("HOME", &missing_home);
     let _xdg = EnvGuard::remove("XDG_CONFIG_HOME");
 
-    for error in [
-        Config::default_path().unwrap_err().to_string(),
-        derive_transcript_path("session-id", "/srv/project")
+    let errors = [
+        ("config", Config::default_path().unwrap_err().to_string()),
+        (
+            "poller transcript",
+            derive_transcript_path("session-id", "/srv/project")
+                .unwrap_err()
+                .to_string(),
+        ),
+        (
+            "poller projects",
+            projects_dir_for_cwd().unwrap_err().to_string(),
+        ),
+        (
+            "session",
+            Session::run(
+                Path::new("/unused/claude"),
+                &[],
+                b"unused prompt".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                OutputFormat::Text,
+                &LaunchOptions::default(),
+            )
             .unwrap_err()
             .to_string(),
-        projects_dir_for_cwd().unwrap_err().to_string(),
-        Session::run(
-            Path::new("/unused/claude"),
-            &[],
-            b"unused prompt".to_vec(),
-            None,
-            None,
-            None,
-            None,
-            OutputFormat::Text,
-            &LaunchOptions::default(),
-        )
-        .unwrap_err()
-        .to_string(),
-    ] {
-        assert!(
-            error.contains(&missing_home.display().to_string()),
-            "{error}"
+        ),
+    ];
+    // The inaccessible-path branch of `get_home`'s contract is
+    // `invalid config: HOME path '<path>' is not accessible: <OS error>;
+    // set HOME to an existing, writable directory`. The OS error text is the
+    // one segment owned by the platform, so it is matched by position rather
+    // than pinned byte-for-byte.
+    let template_prefix = format!(
+        "invalid config: HOME path '{}' is not accessible: ",
+        missing_home.display()
+    );
+    let template_suffix = "; set HOME to an existing, writable directory";
+    for (path_name, error) in &errors {
+        assert_eq!(
+            error, &errors[0].1,
+            "{path_name} disagrees with the config path on the nonexistent-HOME error"
         );
-        assert!(error.contains("not accessible"), "{error}");
-        assert!(error.contains("existing, writable directory"), "{error}");
+        assert!(
+            error.starts_with(&template_prefix) && error.ends_with(template_suffix),
+            "{path_name} does not match the inaccessible-HOME template: {error}"
+        );
         assert!(!error.contains("/root"), "unexpected fallback: {error}");
     }
 }
