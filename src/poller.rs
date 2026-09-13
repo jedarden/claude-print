@@ -55,6 +55,23 @@ pub fn parse_stop_payload(bytes: &[u8]) -> Result<StopPayload> {
 /// See [`get_home`](crate::util::get_home) for the canonical strict-policy
 /// rationale and exact error forms.
 pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
+    resolve_stop_info_with(payload, get_home)
+}
+
+/// Pure core of [`resolve_stop_info`], taking the `HOME` resolution as a
+/// closure.
+///
+/// The closure is consulted **lazily** — only when the payload carries no
+/// explicit transcript path and holds both a session id and a cwd — mirroring
+/// the documented contract that an explicit path never reads `HOME`. Split out
+/// so tests can drive the derivation branch from a temp root without mutating
+/// the process environment; process-global env mutation in tests races across
+/// parallel test threads and produces exactly the pass-alone/fail-in-suite
+/// flake this crate already had here (see the `scrub_env` note in `pty.rs`).
+fn resolve_stop_info_with<F>(payload: StopPayload, get_home: F) -> Result<StopInfo>
+where
+    F: FnOnce() -> Result<PathBuf>,
+{
     let explicit_path = payload
         .transcript_path
         .as_deref()
@@ -66,7 +83,8 @@ pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
     } else {
         match (&payload.session_id, &payload.cwd) {
             (Some(sid), Some(cwd)) if !sid.is_empty() && !cwd.is_empty() => {
-                Some(derive_transcript_path(sid, cwd)?)
+                let home = get_home()?;
+                Some(derive_transcript_path_at(&home, sid, cwd)?)
             }
             _ => None,
         }
@@ -93,12 +111,24 @@ pub fn resolve_stop_info(payload: StopPayload) -> Result<StopInfo> {
 /// [`get_home`](crate::util::get_home) for the canonical strict-policy rationale
 /// and exact error forms. Invalid `cwd` values also return `Error::Config`.
 pub fn derive_transcript_path(session_id: &str, cwd: &str) -> Result<PathBuf> {
-    let slug = cwd_to_slug(cwd)?;
     let home = get_home()?;
+    derive_transcript_path_at(&home, session_id, cwd)
+}
+
+/// Pure core of [`derive_transcript_path`], taking the `HOME` root explicitly.
+///
+/// Split out so tests exercise derivation against a temp root without mutating
+/// the process environment; process-global env mutation in tests races across
+/// parallel test threads and produces exactly the pass-alone/fail-in-suite
+/// flake this crate already had here (see the `scrub_env` note in `pty.rs`).
+/// `HOME` resolution and its strict validation stay in [`get_home`], whose
+/// error contract applies unchanged to the public wrapper.
+fn derive_transcript_path_at(home: &Path, session_id: &str, cwd: &str) -> Result<PathBuf> {
+    let slug = cwd_to_slug(cwd)?;
     Ok(home
         .join(".claude")
         .join("projects")
-        .join(&slug)
+        .join(slug)
         .join(format!("{session_id}.jsonl")))
 }
 
@@ -169,8 +199,20 @@ pub fn cwd_to_slug(cwd: &str) -> Result<String> {
 /// `Error::Config`; failure to read the current directory returns `Error::Io`.
 pub fn projects_dir_for_cwd() -> Result<PathBuf> {
     let cwd = std::env::current_dir().map_err(Error::Io)?;
-    let slug = cwd_to_slug(&cwd.to_string_lossy())?;
     let home = get_home()?;
+    projects_dir_at(&home, &cwd)
+}
+
+/// Pure core of [`projects_dir_for_cwd`], taking the `HOME` root and working
+/// directory explicitly.
+///
+/// Split out for the same reason as [`derive_transcript_path_at`]: tests pin
+/// the derived layout against a temp root without mutating the process
+/// environment or racing other test threads on a global env var. `HOME`
+/// resolution and its strict validation stay in [`get_home`], whose error
+/// contract applies unchanged to the public wrapper.
+fn projects_dir_at(home: &Path, cwd: &Path) -> Result<PathBuf> {
+    let slug = cwd_to_slug(&cwd.to_string_lossy())?;
     Ok(home.join(".claude").join("projects").join(slug))
 }
 
@@ -436,22 +478,31 @@ mod tests {
         );
     }
 
+    // The strict HOME-unset behavior of the public wrappers
+    // (`resolve_stop_info`, `derive_transcript_path`, `projects_dir_for_cwd`)
+    // is deliberately NOT re-tested here by mutating the process environment:
+    // those mutations raced parallel test threads and produced exactly the
+    // pass-alone/fail-in-suite flake this module used to ship (bead
+    // claudepr-1e6dbeaa; same rationale as `scrub_env` in pty.rs). The contract
+    // lives in race-free places instead: all three wrappers resolve HOME via
+    // the single strict `get_home` resolver — pinned pure in `util::tests` and
+    // end-to-end in tests/home_unset.rs under env_lock(), whose completion to
+    // cover this module's resolve path is bead claudepr-f6e6aca6 — while
+    // `resolve_propagates_home_resolution_failure` below pins that
+    // `resolve_stop_info` propagates the resolver's error unchanged.
+
     #[test]
     fn resolve_derives_path_when_transcript_path_absent() {
-        // Direct mutation selects the derivation branch's strict HOME behavior;
-        // the original value is restored below.
-        let original_home = std::env::var("HOME").ok();
-
+        // Pure: the HOME resolution is injected, so derivation runs against a
+        // temp root without touching the process environment.
         let home_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home_dir.path());
-
         let payload = StopPayload {
             session_id: Some("mysession".to_string()),
             transcript_path: None,
             cwd: Some("/home/user/myproject".to_string()),
             last_assistant_message: None,
         };
-        let info = resolve_stop_info(payload).unwrap();
+        let info = resolve_stop_info_with(payload, || Ok(home_dir.path().to_path_buf())).unwrap();
         let expected = home_dir
             .path()
             .join(".claude")
@@ -459,13 +510,6 @@ mod tests {
             .join("-home-user-myproject")
             .join("mysession.jsonl");
         assert_eq!(info.transcript_path, Some(expected));
-
-        // Restore environment
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
@@ -481,82 +525,54 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fails_when_home_not_set() {
-        // Save original HOME
-        let original_home = std::env::var("HOME").ok();
-
-        // Unset HOME
-        std::env::remove_var("HOME");
-
+    fn resolve_propagates_home_resolution_failure() {
+        // Pure: an injected failing resolution stands in for the strict
+        // `get_home()` error and must propagate unchanged from the derivation
+        // branch. The real unset-HOME text through the public API is pinned by
+        // tests/home_unset.rs under env_lock().
         let payload = StopPayload {
             session_id: Some("sid".to_string()),
             transcript_path: None,
             cwd: Some("/home/user/myproject".to_string()),
             last_assistant_message: None,
         };
-
-        let result = resolve_stop_info(payload);
+        let result = resolve_stop_info_with(payload, || {
+            Err(Error::Config("home resolution failed".to_string()))
+        });
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("HOME environment variable not set"));
-
-        // Restore HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        }
+            .contains("home resolution failed"));
     }
 
     #[test]
-    fn derive_transcript_path_fails_when_home_not_set() {
-        // Save original HOME
-        let original_home = std::env::var("HOME").ok();
-
-        // Unset HOME
-        std::env::remove_var("HOME");
-
-        let result = derive_transcript_path("sid123", "/home/user/project");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("HOME environment variable not set"));
-
-        // Restore HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        }
+    fn resolve_explicit_transcript_path_never_consults_home() {
+        // Pins the documented contract: an explicit transcript path is
+        // authoritative, so the HOME resolution is not merely tolerated but
+        // never invoked on that branch — even when it would fail.
+        let payload = StopPayload {
+            session_id: Some("sid".to_string()),
+            transcript_path: Some("/explicit/path.jsonl".to_string()),
+            cwd: Some("/some/cwd".to_string()),
+            last_assistant_message: None,
+        };
+        let info = resolve_stop_info_with(payload, || {
+            panic!("HOME must not be consulted when transcript_path is explicit")
+        })
+        .unwrap();
+        assert_eq!(
+            info.transcript_path,
+            Some(PathBuf::from("/explicit/path.jsonl"))
+        );
     }
 
     #[test]
-    fn projects_dir_for_cwd_fails_when_home_not_set() {
-        // Save original HOME
-        let original_home = std::env::var("HOME").ok();
-
-        // Unset HOME
-        std::env::remove_var("HOME");
-
-        let result = projects_dir_for_cwd();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("HOME environment variable not set"));
-
-        // Restore HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        }
-    }
-
-    #[test]
-    fn derive_transcript_path_builds_correct_path() {
-        // Direct mutation supplies a deterministic HOME and is restored below.
-        let original_home = std::env::var("HOME").ok();
+    fn derive_transcript_path_at_builds_correct_path() {
+        // Pure: the HOME root is an argument, so no process-env mutation and
+        // no race with parallel tests.
         let home_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home_dir.path());
-        let result = derive_transcript_path("sess-id", "/project/dir");
+        let result = derive_transcript_path_at(home_dir.path(), "sess-id", "/project/dir");
         assert!(result.is_ok());
         let path = result.unwrap();
         assert_eq!(
@@ -565,34 +581,18 @@ mod tests {
                 .path()
                 .join(".claude/projects/-project-dir/sess-id.jsonl")
         );
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 
     #[test]
-    fn projects_dir_for_cwd_builds_correct_path() {
-        // Direct mutation supplies a deterministic HOME and is restored below.
-        let original_home = std::env::var("HOME").ok();
+    fn projects_dir_at_builds_correct_path() {
+        // Pure: the HOME root and cwd are arguments. That the public wrapper
+        // feeds it the real current directory (not the PWD env var) is pinned
+        // by tests/home_unset.rs under env_lock().
         let home_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home_dir.path());
-        let result = projects_dir_for_cwd();
+        let result = projects_dir_at(home_dir.path(), Path::new("/project/dir"));
         assert!(result.is_ok());
         let path = result.unwrap();
-        // The actual current directory should be used, not PWD env var
-        let cwd = std::env::current_dir().expect("current_dir");
-        let cwd_slug = cwd_to_slug(&cwd.to_string_lossy()).expect("cwd_to_slug");
-        assert_eq!(
-            path,
-            home_dir.path().join(".claude/projects").join(cwd_slug)
-        );
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        assert_eq!(path, home_dir.path().join(".claude/projects/-project-dir"));
     }
 
     // ── open_fifo_nonblock (OQ-4: FIFO open race) ─────────────────────────────
