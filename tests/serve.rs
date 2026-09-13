@@ -19,8 +19,13 @@
 //!     workers (mock-claude completes the full warmup: trust dialog →
 //!     dismissal → idle-settle, then blocks awaiting a prompt that warmup
 //!     never sends).
-//!   * **clean shutdown** — SIGTERM destroys every worker, removes the socket
-//!     file, and exits 0.
+//!   * **clean bounded shutdown** — SIGINT *and* SIGTERM stop the daemon
+//!     within a bounded time, remove the socket file, and exit 0 (a
+//!     supervisor stopping the service is not a failure).
+//!   * **child reaping** — after shutdown no worker process survives in
+//!     /proc: not alive (leaked), not unreaped (zombie).
+//!   * **default path unchanged** — an ordinary prompt invocation without the
+//!     subcommand still runs the plain session path, with no daemon behavior.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -32,10 +37,11 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
 /// A captured subprocess outcome: exit code (or `None` if killed on timeout),
-/// and decoded stderr.
+/// and decoded stdout/stderr.
 #[derive(Debug)]
 struct Outcome {
     code: Option<i32>,
+    stdout: String,
     stderr: String,
 }
 
@@ -99,6 +105,7 @@ fn run(cmd: &mut Command, budget: Duration) -> Outcome {
     let output = child.wait_with_output().expect("wait_with_output");
     Outcome {
         code: code.or(output.status.code()),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }
@@ -106,6 +113,94 @@ fn run(cmd: &mut Command, budget: Duration) -> Outcome {
 /// Budget for the negative (fast-exit) cases. Generous ceiling that still
 /// fails fast on a wedge.
 const BUDGET: Duration = Duration::from_secs(30);
+
+/// How long a shutdown signal may take to produce an exited daemon. The
+/// accept loop notices the signal within ACCEPT_POLL_TIMEOUT_MS (250 ms),
+/// `shutdown_all` gives each worker a 2 s SIGTERM grace before SIGKILL, so
+/// even a pathological multi-worker teardown lands far inside this bound.
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(15);
+
+// ── Child-process accounting (/proc scan) ────────────────────────────────────
+
+/// Parse the parent PID out of the contents of `/proc/<pid>/stat`.
+///
+/// The comm field may contain spaces and parentheses of its own, so scanning
+/// starts after its closing `)`; the fields then resume with state (field 3)
+/// followed by ppid (field 4).
+fn stat_ppid(stat: &str) -> Option<u32> {
+    let rest = stat.rsplit_once(')')?.1.trim_start();
+    let mut fields = rest.split_whitespace();
+    fields.next()?; // state
+    fields.next()?.parse().ok()
+}
+
+/// Every live process whose parent is `ppid`, read from /proc.
+///
+/// Pool workers are forked directly by the daemon (`PtySpawner::spawn` — no
+/// intermediate shell) and nothing else in serve mode forks, so while the
+/// daemon is alive this is exactly its set of mock-claude workers.
+fn children_of(ppid: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if stat_ppid(&stat) == Some(ppid) {
+                found.push(pid);
+            }
+        }
+    }
+    found
+}
+
+/// The process state letter from `/proc/<pid>/stat` (`Z` = zombie), or `None`
+/// once the pid no longer has a /proc entry.
+fn proc_state(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1.trim_start();
+    rest.split_whitespace().next().map(str::to_owned)
+}
+
+/// The reaping half of the shutdown contract: once the daemon has exited,
+/// every pooled worker pid is gone from /proc — neither alive (leaked) nor
+/// dead-but-unreaped (zombie).
+///
+/// The daemon removes the socket and exits only *after* `shutdown_all` has
+/// reaped every worker (each worker teardown ends in a blocking `waitpid`),
+/// so a worker pid visible here is teardown that never ran. `grace` absorbs
+/// only the reaping instant the daemon no longer controls — the moment
+/// between the test observing the exit and init finishing the reap of an
+/// orphaned zombie — and is poll-width short: an orphaned mock-claude whose
+/// PTY master died with the daemon self-exits on its next stdin read, so pid
+/// evidence disappears quickly in every scenario. This is a tripwire for
+/// teardown that never ran, not a leniency window for a stuck worker.
+fn assert_workers_gone(workers: &[u32], grace: Duration) {
+    let deadline = Instant::now() + grace;
+    loop {
+        let survivors: Vec<(u32, String)> = workers
+            .iter()
+            .copied()
+            .filter_map(|pid| proc_state(pid).map(|state| (pid, state)))
+            .collect();
+        if survivors.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker processes were still present in /proc after daemon exit \
+             (leaked or unreaped; the letter is the state from \
+             /proc/<pid>/stat): {survivors:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
 
 // ── Invalid pool size ────────────────────────────────────────────────────────
 
@@ -309,40 +404,96 @@ impl Daemon {
         }
     }
 
-    /// SIGTERM the daemon and wait (budget-bounded, SIGKILL fallback) for a
-    /// clean exit. Returns the captured outcome.
-    fn terminate(mut self, socket: &Path) -> Outcome {
-        kill(Pid::from_raw(self.child.id() as i32), Signal::SIGTERM)
-            .expect("failed to signal daemon");
+    /// SIGTERM the daemon and hold it to the full shutdown contract. The
+    /// 20 s bound doubles as the SIGKILL-fallback window the older contract
+    /// tests were written against.
+    fn terminate(self, socket: &Path, expected_workers: usize) -> Outcome {
+        self.shutdown_daemon(
+            Signal::SIGTERM,
+            Duration::from_secs(20),
+            socket,
+            expected_workers,
+        )
+    }
+
+    /// Signal the daemon with `sig` and pin the entire shutdown contract:
+    /// the process exits 0 within `bound` of the signal, the socket file is
+    /// removed, and — the reaping check — every pooled worker is gone from
+    /// /proc afterwards.
+    ///
+    /// The worker set is snapshotted from /proc *before* signaling: pool
+    /// workers are forked directly by the daemon, so while it lives they are
+    /// exactly its children, and `expected_workers` proves the snapshot
+    /// captured the whole pool (a respawn-churning daemon would fail here
+    /// before the reaping assertion could go vacuous). After the daemon exits
+    /// it can no longer hold zombies — orphans are re-parented immediately —
+    /// so the post-exit check polls a short grace window for every pid to
+    /// vanish: a leaked worker survives indefinitely, and the grace absorbs
+    /// only the instant init needs to finish reaping an orphaned zombie.
+    fn shutdown_daemon(
+        mut self,
+        sig: Signal,
+        bound: Duration,
+        socket: &Path,
+        expected_workers: usize,
+    ) -> Outcome {
+        let workers = children_of(self.child.id());
+        assert_eq!(
+            workers.len(),
+            expected_workers,
+            "daemon must hold exactly {expected_workers} worker processes at \
+             shutdown time; found {workers:?}"
+        );
 
         let start = Instant::now();
+        kill(Pid::from_raw(self.child.id() as i32), sig).expect("failed to signal daemon");
+
         let code = loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => break status.code(),
                 Ok(None) => {
-                    if start.elapsed() > Duration::from_secs(20) {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        panic!("daemon did not exit within 20s of SIGTERM");
-                    }
+                    assert!(
+                        start.elapsed() < bound,
+                        "daemon did not exit within {bound:?} of {sig:?} — shutdown must be \
+                         bounded; workers: {workers:?}"
+                    );
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(_) => panic!("failed to reap daemon after SIGTERM"),
+                Err(_) => panic!("failed to reap daemon after {sig:?}"),
             }
         };
+
+        // The daemon writes nothing to stdout; the pipe is at EOF by exit.
+        // `Child::wait_with_output` would move `self.child` out from under
+        // the Drop impl, so drain the taken handle instead — the process is
+        // already reaped by the try_wait loop above.
+        let mut stdout_bytes = Vec::new();
+        if let Some(mut pipe) = self.child.stdout.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut stdout_bytes);
+        }
+        let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
 
         if let Some(reader) = self.reader.take() {
             reader.join().expect("stderr reader thread");
         }
 
+        let stderr = self.stderr().join("\n");
+        assert_eq!(
+            code,
+            Some(0),
+            "a shutdown signal is a clean stop, not a failure; stderr: {stderr}"
+        );
         assert!(
             !socket.exists(),
             "clean shutdown must remove the socket file"
         );
+        assert_workers_gone(&workers, Duration::from_secs(2));
 
         Outcome {
             code,
-            stderr: self.stderr().join("\n"),
+            stdout,
+            stderr,
         }
     }
 }
@@ -350,8 +501,13 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         // Assertion-failure escape hatch: never leak the daemon or its
-        // mock-claude workers into the rest of the suite.
-        let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+        // mock-claude workers into the rest of the suite. Skip the kill when
+        // the child has already been reaped (a completed shutdown_daemon) —
+        // its pid is recyclable, and a blind SIGKILL there could hit an
+        // unrelated process.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = kill(Pid::from_raw(self.child.id() as i32), Signal::SIGKILL);
+        }
         let _ = self.child.wait();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
@@ -403,7 +559,7 @@ fn serve_warms_exactly_requested_workers_then_shuts_down_cleanly() {
         daemon.stderr()
     );
 
-    let out = daemon.terminate(&socket);
+    let out = daemon.terminate(&socket, 2);
 
     assert_eq!(
         out.code,
@@ -440,6 +596,81 @@ fn serve_default_pool_size_warms_one_worker() {
         daemon.stderr()
     );
 
-    let out = daemon.terminate(&socket);
+    let out = daemon.terminate(&socket, 1);
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+// SIGINT (Ctrl-C on a foreground daemon) must take the same clean path as
+// SIGTERM — the serve signal handler treats both alike — and the shutdown
+// must be *bounded*: the signal may not merely eventually work, it must land
+// inside SHUTDOWN_BOUND. Pool size 2 makes the reaping check cover a
+// multi-worker teardown, and the teardown log pins that shutdown_all saw the
+// whole pool rather than a subset.
+#[test]
+fn serve_sigint_stops_bounded_and_reaps_every_worker() {
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("2"));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+
+    let out = daemon.shutdown_daemon(Signal::SIGINT, SHUTDOWN_BOUND, &socket, 2);
+
+    assert!(
+        out.stderr.contains("cleaning up 2 workers"),
+        "teardown must see the entire pool, not a subset: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("Shutdown complete"),
+        "shutdown must run to completion and report it: {}",
+        out.stderr
+    );
+}
+
+// The serve dispatch and its signal handling now sit above the ordinary path
+// in main(); this pins that they did not perturb it. A plain prompt run — no
+// subcommand — still exits 0 with the text contract, shows no daemon behavior
+// at all, and terminates promptly (run()'s kill-on-overrun is the bound: a
+// regression into the accept loop would hang until the budget fires).
+#[test]
+fn default_non_serve_invocation_is_unchanged() {
+    let config = tempfile::tempdir().unwrap();
+    let socket = config.path().join("never-created.sock");
+
+    let mut base = claude_print();
+    let cmd = base.arg("plain prompt");
+    cmd.env("XDG_CONFIG_HOME", config.path());
+    let out = run(cmd, BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "plain prompt run must still succeed; stdout: {}\nstderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "text-mode stdout must stay non-empty; stderr: {}",
+        out.stderr
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(out.stdout.trim()).is_err(),
+        "text-mode stdout must not have turned into JSON: {}",
+        out.stdout
+    );
+    for marker in ["[claude-print pool]", "Listening on", "Shutdown complete"] {
+        assert!(
+            !out.stdout.contains(marker) && !out.stderr.contains(marker),
+            "plain run must show no pool-daemon behavior ({marker}); stdout: {}\nstderr: {}",
+            out.stdout,
+            out.stderr
+        );
+    }
+    assert!(
+        !socket.exists(),
+        "serve machinery must not bind a socket for a plain run"
+    );
 }

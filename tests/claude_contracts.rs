@@ -408,7 +408,7 @@ fn live_settings_flag_merges_across_sources() {
         &sandbox.proj,
     );
     let relay_settings = sandbox._dir.path().join("relay-settings.json");
-    sandbox.install_session_start_hook(&relay_settings, "relay", &sandbox._dir.path());
+    sandbox.install_session_start_hook(&relay_settings, "relay", sandbox._dir.path());
 
     let exit = run_probe_turn(
         &claude_bin,
@@ -450,7 +450,7 @@ fn live_empty_setting_sources_suppresses_but_settings_file_loads() {
         &sandbox.proj,
     );
     let relay_settings = sandbox._dir.path().join("relay-settings.json");
-    sandbox.install_session_start_hook(&relay_settings, "relay", &sandbox._dir.path());
+    sandbox.install_session_start_hook(&relay_settings, "relay", sandbox._dir.path());
 
     let exit = run_probe_turn(
         &claude_bin,
