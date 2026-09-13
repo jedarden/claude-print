@@ -21,7 +21,9 @@
 //!     never sends).
 //!   * **clean bounded shutdown** — SIGINT *and* SIGTERM stop the daemon
 //!     within a bounded time, remove the socket file, and exit 0 (a
-//!     supervisor stopping the service is not a failure).
+//!     supervisor stopping the service is not a failure); SIGINT *then*
+//!     SIGTERM back-to-back still tears down completely — the second signal
+//!     is inert once the shutdown flag is set.
 //!   * **child reaping** — after shutdown no worker process survives in
 //!     /proc: not alive (leaked), not unreaped (zombie).
 //!   * **malformed clients** — clients that close mid-frame or send an
@@ -412,17 +414,17 @@ impl Daemon {
     /// tests were written against.
     fn terminate(self, socket: &Path, expected_workers: usize) -> Outcome {
         self.shutdown_daemon(
-            Signal::SIGTERM,
+            &[Signal::SIGTERM],
             Duration::from_secs(20),
             socket,
             expected_workers,
         )
     }
 
-    /// Signal the daemon with `sig` and pin the entire shutdown contract:
-    /// the process exits 0 within `bound` of the signal, the socket file is
-    /// removed, and — the reaping check — every pooled worker is gone from
-    /// /proc afterwards.
+    /// Signal the daemon with each of `sigs` in order and pin the entire
+    /// shutdown contract: the process exits 0 within `bound` of the signals,
+    /// the socket file is removed, and — the reaping check — every pooled
+    /// worker is gone from /proc afterwards.
     ///
     /// The worker set is snapshotted from /proc *before* signaling: pool
     /// workers are forked directly by the daemon, so while it lives they are
@@ -435,7 +437,7 @@ impl Daemon {
     /// only the instant init needs to finish reaping an orphaned zombie.
     fn shutdown_daemon(
         mut self,
-        sig: Signal,
+        sigs: &[Signal],
         bound: Duration,
         socket: &Path,
         expected_workers: usize,
@@ -449,7 +451,19 @@ impl Daemon {
         );
 
         let start = Instant::now();
-        kill(Pid::from_raw(self.child.id() as i32), sig).expect("failed to signal daemon");
+        for (leg, sig) in sigs.iter().enumerate() {
+            let pid = Pid::from_raw(self.child.id() as i32);
+            if leg == 0 {
+                // The first signal must always find a live daemon — nothing
+                // else kills it, so delivery is load-bearing for the contract.
+                kill(pid, *sig).expect("failed to signal daemon");
+            } else {
+                // A trailing signal races the teardown the earlier ones
+                // started: if the daemon already exited, the pid is gone and
+                // delivery is moot — the contract below still holds.
+                let _ = kill(pid, *sig);
+            }
+        }
 
         let code = loop {
             match self.child.try_wait() {
@@ -457,12 +471,12 @@ impl Daemon {
                 Ok(None) => {
                     assert!(
                         start.elapsed() < bound,
-                        "daemon did not exit within {bound:?} of {sig:?} — shutdown must be \
+                        "daemon did not exit within {bound:?} of {sigs:?} — shutdown must be \
                          bounded; workers: {workers:?}"
                     );
                     std::thread::sleep(Duration::from_millis(25));
                 }
-                Err(_) => panic!("failed to reap daemon after {sig:?}"),
+                Err(_) => panic!("failed to reap daemon after {sigs:?}"),
             }
         };
 
@@ -618,7 +632,7 @@ fn serve_sigint_stops_bounded_and_reaps_every_worker() {
     let mut daemon = Daemon::start(&mock, &socket, Some("2"));
     daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
 
-    let out = daemon.shutdown_daemon(Signal::SIGINT, SHUTDOWN_BOUND, &socket, 2);
+    let out = daemon.shutdown_daemon(&[Signal::SIGINT], SHUTDOWN_BOUND, &socket, 2);
 
     assert!(
         out.stderr.contains("cleaning up 2 workers"),
@@ -628,6 +642,63 @@ fn serve_sigint_stops_bounded_and_reaps_every_worker() {
     assert!(
         out.stderr.contains("Shutdown complete"),
         "shutdown must run to completion and report it: {}",
+        out.stderr
+    );
+}
+
+// Acceptance shape for the shutdown-signaling bead: SIGINT *then* SIGTERM,
+// back to back. The handlers stay installed through teardown, so the second
+// signal re-sets the already-latched flag instead of killing the daemon by
+// default disposition mid-cleanup — which would strand the workers teardown
+// had not reaped yet. And once the flag is set the pool must never respawn:
+// pinned by the "Spawning worker" count staying at its pre-signal level in
+// the final stderr.
+#[test]
+fn serve_sigint_then_sigterm_stops_cleanly_without_respawn() {
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("2"));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+
+    let spawns_at_rest = daemon
+        .stderr()
+        .iter()
+        .filter(|l| l.contains("Spawning worker"))
+        .count();
+    assert_eq!(
+        spawns_at_rest,
+        2,
+        "expected a stable pool of 2 before signaling; stderr: {:?}",
+        daemon.stderr()
+    );
+
+    let out = daemon.shutdown_daemon(
+        &[Signal::SIGINT, Signal::SIGTERM],
+        SHUTDOWN_BOUND,
+        &socket,
+        2,
+    );
+
+    assert!(
+        out.stderr.contains("cleaning up 2 workers"),
+        "teardown must see the entire pool, not a subset: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("Shutdown complete"),
+        "the second signal must not abort teardown before it completes: {}",
+        out.stderr
+    );
+    let spawns_total = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("Spawning worker"))
+        .count();
+    assert_eq!(
+        spawns_total, spawns_at_rest,
+        "no worker may be spawned after the shutdown flag is set; stderr: {}",
         out.stderr
     );
 }

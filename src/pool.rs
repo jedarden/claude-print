@@ -1439,6 +1439,51 @@ mod tests {
         assert!(flag.load(Ordering::SeqCst));
     }
 
+    // ── Signal→flag transition (claudepr-6fc0cad7 audit repair) ──────────────
+    //
+    // Historical trap: an in-flight wiring attempt installed handlers that
+    // never set the flag, leaving serve with default dispositions in disguise
+    // — the first SIGINT killed the daemon outright and leaked every worker.
+    // This pin exercises the real delivery path (install → kernel delivery →
+    // handler → store): `raise` targets the calling thread, so the delivery
+    // cannot EINTR a blocking syscall on another test's thread, and a missing
+    // installation would kill this process by default disposition instead of
+    // reaching the polls below. Only this test touches SERVE_SIGNALED in this
+    // binary, so it starts clear.
+    #[test]
+    fn serve_signal_delivery_flips_the_observable_flag() {
+        assert!(
+            !SERVE_SIGNALED.load(Ordering::SeqCst),
+            "SERVE_SIGNALED must start clear; another test leaked a delivery"
+        );
+
+        install_serve_signal_handlers();
+
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0, "raise(SIGINT)");
+        wait_for_serve_flag();
+
+        // SIGTERM shares the handler; reset the latched flag between legs so
+        // this one proves SIGTERM's own delivery, not the SIGINT store.
+        SERVE_SIGNALED.store(false, Ordering::SeqCst);
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0, "raise(SIGTERM)");
+        wait_for_serve_flag();
+    }
+
+    /// Spin until the async signal handler's store becomes visible. Returning
+    /// at all proves the handler ran; timing out means the handler exists but
+    /// never flips the flag — the exact historical trap this pin guards.
+    fn wait_for_serve_flag() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !SERVE_SIGNALED.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "signal delivered but SERVE_SIGNALED never transitioned — \
+                 handler is not wired to the flag"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn validate_pool_size_accepts_the_whole_legal_range() {
         assert_eq!(validate_pool_size(1), Ok(()));
