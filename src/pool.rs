@@ -71,6 +71,47 @@ pub const MAX_POOL_SIZE: usize = 256;
 /// doubles as the maintain() tick (top-up respawn cadence).
 const ACCEPT_POLL_TIMEOUT_MS: i32 = 250;
 
+/// Validate a `--pool-size` argument before the daemon starts. `0` would
+/// maintain an empty pool that serves nothing, and anything past
+/// [`MAX_POOL_SIZE`] forks that many full `claude` PTY processes — both are
+/// argv-validation failures the caller must reject with exit 2 rather than
+/// enter the server loop.
+pub fn validate_pool_size(size: usize) -> Result<(), String> {
+    if size == 0 {
+        return Err(
+            "--pool-size must be at least 1 (a pool of 0 workers would serve nothing)".to_string(),
+        );
+    }
+    if size > MAX_POOL_SIZE {
+        return Err(format!(
+            "--pool-size {size} exceeds the maximum of {MAX_POOL_SIZE} (each worker is a full claude PTY process)"
+        ));
+    }
+    Ok(())
+}
+
+/// Serve-mode shutdown signal, flipped by the SIGINT/SIGTERM handler. A signal
+/// handler may only touch statics (it cannot lock the manager's Mutex), so the
+/// accept loop relays this into `manager.shutdown()` on its next tick — within
+/// [`ACCEPT_POLL_TIMEOUT_MS`] of the signal arriving.
+static SERVE_SIGNALED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn serve_signal_handler(_sig: libc::c_int) {
+    SERVE_SIGNALED.store(true, Ordering::SeqCst);
+}
+
+/// Install SIGINT/SIGTERM handlers for serve mode so a stopped daemon tears
+/// down cleanly: the accept loop notices the relayed flag, `shutdown_all`
+/// destroys every worker, and the socket file is removed. Only serve mode
+/// installs these; the ordinary session path keeps default signal dispositions.
+pub fn install_serve_signal_handlers() {
+    use nix::sys::signal::{signal, SigHandler, Signal};
+    unsafe {
+        let _ = signal(Signal::SIGINT, SigHandler::Handler(serve_signal_handler));
+        let _ = signal(Signal::SIGTERM, SigHandler::Handler(serve_signal_handler));
+    }
+}
+
 /// Quiet window a worker must see after trust-dismiss before it counts as
 /// Ready (ADR-005 "idle-settle"). Feeds the warmup sequencer's idle gap so
 /// the pool path shares the ordinary session path's settle constant and both
@@ -750,6 +791,36 @@ impl PoolManager {
     }
 }
 
+/// Bind the pool's listening socket at `path` with user-only (0600) permissions.
+///
+/// A Unix socket node is created with `0777 & ~umask`; under a permissive or
+/// cleared umask a plain bind would hand `/tmp` a world-connectable pool socket
+/// — anyone who can connect to it can acquire a warmed `claude` worker. The
+/// process umask is therefore narrowed to 0077 across the bind so the node is
+/// owner-only from the first instant, and the mode is then set explicitly so
+/// the guarantee does not depend on umask semantics at all. Serve mode calls
+/// this before any worker thread exists, so no concurrent file creation sees
+/// the narrowed mask. A stale socket (or any other leftover file) at `path` is
+/// replaced, matching the daemon's restart story.
+pub fn bind_socket(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+
+    let previous_mask = unsafe { libc::umask(0o077) };
+    let bind_result = std::os::unix::net::UnixListener::bind(path);
+    unsafe {
+        libc::umask(previous_mask);
+    }
+    let listener = bind_result?;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+
+    Ok(listener)
+}
+
 /// Unix socket server for pool daemon
 ///
 /// Listens on a Unix domain socket and handles client requests for workers.
@@ -782,13 +853,15 @@ impl PoolServer {
 
     /// Start the server - bind to socket and accept connections
     pub fn run(&mut self) -> Result<(), anyhow::Error> {
-        // Remove existing socket if present
-        if self.socket_path.exists() {
-            std::fs::remove_file(&self.socket_path)?;
-        }
-
-        // Create Unix domain socket listener
-        let listener = std::os::unix::net::UnixListener::bind(&self.socket_path)?;
+        let listener = bind_socket(&self.socket_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to set up pool socket {}: {} — check that the parent \
+                 directory exists and is writable, and that no other daemon is \
+                 already using this socket path",
+                self.socket_path.display(),
+                e
+            )
+        })?;
 
         self.listener = Some(listener);
 
@@ -823,6 +896,12 @@ impl PoolServer {
         loop {
             {
                 let mut manager = self.manager.lock().unwrap();
+                // Relay an async signal into the manager's own flag: the
+                // handler could only touch the SERVE_SIGNALED static, and
+                // this tick is what turns it into a real shutdown.
+                if SERVE_SIGNALED.load(Ordering::SeqCst) {
+                    manager.shutdown();
+                }
                 if manager.shutdown.load(Ordering::SeqCst) {
                     break;
                 }
@@ -1315,5 +1394,93 @@ mod tests {
 
         manager.shutdown();
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn validate_pool_size_accepts_the_whole_legal_range() {
+        assert_eq!(validate_pool_size(1), Ok(()));
+        assert_eq!(validate_pool_size(MAX_POOL_SIZE), Ok(()));
+    }
+
+    #[test]
+    fn validate_pool_size_rejects_zero_with_actionable_message() {
+        let err = validate_pool_size(0).unwrap_err();
+        assert!(
+            err.contains("--pool-size"),
+            "message must name the flag: {err}"
+        );
+        assert!(
+            err.contains("at least 1"),
+            "message must state the minimum: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_pool_size_rejects_above_max_with_actionable_message() {
+        let err = validate_pool_size(MAX_POOL_SIZE + 1).unwrap_err();
+        assert!(
+            err.contains("--pool-size"),
+            "message must name the flag: {err}"
+        );
+        assert!(
+            err.contains(&MAX_POOL_SIZE.to_string()),
+            "message must state the cap: {err}"
+        );
+        assert!(
+            err.contains(&(MAX_POOL_SIZE + 1).to_string()),
+            "message must echo the rejected value: {err}"
+        );
+    }
+
+    // serve must hand clients a socket nobody else can connect to, whatever the
+    // invoking shell's umask was — bind_socket sets 0600 explicitly after the
+    // bind, and the narrowed-umask window keeps the node owner-only in between.
+    #[test]
+    fn bind_socket_creates_owner_only_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+
+        let _listener = bind_socket(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "socket must be user-only, got {mode:o}"
+        );
+    }
+
+    // Restart story: a leftover socket file from a previous daemon must not
+    // force the new one into a bind failure.
+    #[test]
+    fn bind_socket_replaces_stale_socket() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+
+        // First bind creates a live socket file...
+        drop(bind_socket(&path).unwrap());
+        assert!(path.exists());
+        // ...and a second bind over the leftover path succeeds.
+        let _second = bind_socket(&path).unwrap();
+        assert!(path.exists());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // An unusable path (parent is a regular file) surfaces the OS error instead
+    // of panicking — main.rs turns this into exit 2 with actionable stderr.
+    #[test]
+    fn bind_socket_surfaces_unusable_path_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("blocker");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let path = file.join("pool.sock"); // parent is a file → ENOTDIR
+
+        let err = bind_socket(&path).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
     }
 }

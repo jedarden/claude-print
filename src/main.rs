@@ -34,6 +34,45 @@ fn exit_with_cleanup(code: i32) -> ! {
     process::exit(code);
 }
 
+/// Serve mode (ADR-005 warm PTY pool): validate the requested pool size, then
+/// run the pool daemon until SIGINT/SIGTERM.
+///
+/// Any setup failure — an out-of-range `--pool-size` or an unusable socket
+/// path — exits 2 with actionable stderr, before any worker is spawned. A
+/// signal-driven shutdown tears down every pooled worker and removes the
+/// socket file, then exits 0 (a supervisor stopping the service is not a
+/// failure).
+fn run_serve(
+    pool_size: usize,
+    socket: Option<String>,
+    verbose: bool,
+    claude_bin: &std::path::Path,
+) -> ! {
+    if let Err(message) = claude_print::pool::validate_pool_size(pool_size) {
+        eprintln!("claude-print: {}", message);
+        exit_with_cleanup(2);
+    }
+
+    claude_print::pool::install_serve_signal_handlers();
+
+    let manager =
+        claude_print::pool::PoolManager::new(pool_size, claude_bin.to_path_buf(), verbose);
+    let mut server = claude_print::pool::PoolServer::new(socket, manager, verbose);
+
+    if let Err(e) = server.run() {
+        eprintln!("claude-print: {e:#}");
+        exit_with_cleanup(2);
+    }
+
+    // run() returns only after shutdown was requested: the accept loop saw the
+    // flag and stopped accepting, leaving worker teardown and socket removal
+    // to us.
+    server.manager_mut().shutdown_all();
+    server.cleanup();
+    eprintln!("[claude-print pool] Shutdown complete");
+    exit_with_cleanup(0);
+}
+
 fn main() {
     // Register the cleanup handler early to ensure it runs on all exit paths,
     // including external signals that trigger Rust's default handler.
@@ -106,6 +145,21 @@ fn main() {
             );
         }
         exit_with_cleanup(2);
+    }
+
+    // ADR-005: `serve` is daemon mode — it owns the rest of the process
+    // lifetime and must never fall through to ordinary prompt validation.
+    // Prompt/stdin/config handling is client-path state the pool does not use,
+    // so dispatch before any of it is consulted. The missing-binary check
+    // above is shared: the pool spawns `claude` workers with this binary, so
+    // entering serve without it would just churn failing warmups.
+    if let Some(claude_print::cli::Command::Serve {
+        pool_size,
+        socket,
+        verbose,
+    }) = cli.command
+    {
+        run_serve(pool_size, socket, verbose, &claude_bin);
     }
 
     // Prompt resolution (in order of precedence)
