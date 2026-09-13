@@ -1,13 +1,13 @@
 {
-  "timestamp": "2026-09-13T03:08:33.787154075Z",
-  "total_open_beads": 10,
+  "timestamp": "2026-09-13T04:07:00.312845262Z",
+  "total_open_beads": 12,
   "exclusion_criteria": {
     "has_assignee": 0,
     "manually_blocked": 0,
-    "has_dependencies": 9,
+    "has_dependencies": 11,
     "resource_conflicts": 0
   },
-  "final_candidate_count": 1,
+  "final_candidate_count": 2,
   "excluded_beads": [
     {
       "bead_id": "claudepr-fe3d3160",
@@ -82,14 +82,14 @@
       "assignee": null,
       "manual_blocked": false,
       "has_blockers": true,
-      "blocker_count": 3,
+      "blocker_count": 2,
       "has_resource_conflicts": false,
       "conflict_count": 0
     },
     {
-      "bead_id": "claudepr-3032a5f7",
-      "title": "Fail loudly with a distinct trust-dialog error instead of a late Stop-hook internal_error",
-      "priority": 1,
+      "bead_id": "claudepr-4664fb1e",
+      "title": "Verify src/session.rs tests are free of process-global HOME mutation",
+      "priority": 2,
       "assignee": null,
       "manual_blocked": false,
       "has_blockers": true,
@@ -98,9 +98,20 @@
       "conflict_count": 0
     },
     {
-      "bead_id": "claudepr-208eccc2",
-      "title": "Add a caret-on-refuse startup fixture and regression tests for trust dismissal",
-      "priority": 1,
+      "bead_id": "claudepr-f6e6aca6",
+      "title": "Pin the strict HOME contract end-to-end in tests/home_unset.rs",
+      "priority": 2,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-889cfdb3",
+      "title": "Prove the full claude-print suite is flake-free under default parallelism",
+      "priority": 2,
       "assignee": null,
       "manual_blocked": false,
       "has_blockers": true,
