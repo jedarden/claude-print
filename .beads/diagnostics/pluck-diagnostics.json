@@ -1,13 +1,13 @@
 {
-  "timestamp": "2026-09-13T14:07:19.774095217Z",
-  "total_open_beads": 8,
+  "timestamp": "2026-09-13T15:07:24.132162337Z",
+  "total_open_beads": 6,
   "exclusion_criteria": {
     "has_assignee": 0,
     "manually_blocked": 0,
-    "has_dependencies": 7,
+    "has_dependencies": 6,
     "resource_conflicts": 0
   },
-  "final_candidate_count": 1,
+  "final_candidate_count": 0,
   "excluded_beads": [
     {
       "bead_id": "claudepr-982a9e59",
@@ -45,17 +45,6 @@
     {
       "bead_id": "claudepr-4f4b7cef",
       "title": "Cut a fresh evidenced claude-print release from current main",
-      "priority": 1,
-      "assignee": null,
-      "manual_blocked": false,
-      "has_blockers": true,
-      "blocker_count": 1,
-      "has_resource_conflicts": false,
-      "conflict_count": 0
-    },
-    {
-      "bead_id": "claudepr-7f088327",
-      "title": "Dispatch the serve subcommand in main.rs with validated pool size and socket setup",
       "priority": 1,
       "assignee": null,
       "manual_blocked": false,
