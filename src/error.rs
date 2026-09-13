@@ -324,6 +324,30 @@ mod tests {
     }
 
     #[test]
+    fn error_to_claude_print_error_trust_dialog_unresolved() {
+        // claudepr-3032a5f7: an unresolvable trust dialog must surface as a
+        // Setup error (exit 2) whose message names the trust dialog — the
+        // loud, immediate failure that replaced the late "claude exited
+        // before Stop hook fired" internal_error that masked the defect.
+        let internal = Error::TrustDialogUnresolved(
+            "no trusting entry (an option starting with \"Yes\") is visible in the startup output"
+                .to_string(),
+        );
+        let user_facing: ClaudePrintError = internal.into();
+        match &user_facing {
+            ClaudePrintError::Setup(msg) => {
+                assert!(
+                    msg.contains("trust dialog"),
+                    "message must name the trust dialog: {msg}"
+                );
+            }
+            _ => panic!("expected Setup variant, got {user_facing:?}"),
+        }
+        assert_eq!(user_facing.exit_code(), 2);
+        assert_eq!(user_facing.subtype(), "internal_error");
+    }
+
+    #[test]
     fn config_error_converts_to_typed_startup_error() {
         let internal = Error::Config("invalid config at /tmp/config.toml: bad TOML".to_string());
         let user_facing: ClaudePrintError = internal.into();

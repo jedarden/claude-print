@@ -140,18 +140,35 @@ fn main() {
     // exit 3, so any driver that regresses to a bare-CR dismissal fails the
     // whole binary e2e suite instead of passing.
     if driven_by_claude_print && mock_trust_dialog && !mock_stop_before_inject {
-        if mock_trust_wording == "alternate" {
-            // Uses "continue" + "folder" as trust keywords
-            print!("Do you want to continue and grant permission to this folder?\r\n");
+        if mock_trust_wording == "unresolvable" {
+            // claudepr-3032a5f7: entries that classify as neither trusting
+            // nor refusing — the future-phrasing shape pinned at the state-
+            // machine level by tests/startup.rs
+            // (test_unrecognised_entries_are_never_confirmed). claude-print
+            // must refuse this dialog loudly (exit 2, message naming the
+            // trust dialog) rather than confirm a guessed entry, so the mock
+            // blocks in dismiss_trust_dialog and dies when the refusing
+            // driver kills the session.
+            print!("Quick safety check: trust this folder before you continue?\r\n");
+            print!("\u{276f} Depart\r\n");
+            print!("  Remain\r\n");
+            print!("Enter to confirm \u{b7} Esc to cancel\r\n");
+            std::io::stdout().flush().ok();
+            dismiss_trust_dialog();
         } else {
-            // Standard wording uses "trust" + "Allow"
-            print!("Do you trust and Allow access to this folder?\r\n");
+            if mock_trust_wording == "alternate" {
+                // Uses "continue" + "folder" as trust keywords
+                print!("Do you want to continue and grant permission to this folder?\r\n");
+            } else {
+                // Standard wording uses "trust" + "Allow"
+                print!("Do you trust and Allow access to this folder?\r\n");
+            }
+            print!("\u{276f} No, exit\r\n");
+            print!("  Yes, I trust this folder\r\n");
+            print!("Enter to confirm \u{b7} Esc to cancel\r\n");
+            std::io::stdout().flush().ok();
+            dismiss_trust_dialog();
         }
-        print!("\u{276f} No, exit\r\n");
-        print!("  Yes, I trust this folder\r\n");
-        print!("Enter to confirm \u{b7} Esc to cancel\r\n");
-        std::io::stdout().flush().ok();
-        dismiss_trust_dialog();
     }
 
     // MOCK_EXIT_BEFORE_STOP: exit without writing to the FIFO (tests child-exit-before-Stop)

@@ -222,6 +222,48 @@ fn trust_dialog_caret_on_refuse_dismissed_via_trusting_entry() {
     );
 }
 
+/// claudepr-3032a5f7: a trust dialog whose trusting entry cannot be positively
+/// identified must fail the run immediately and recognizably — exit 2, stderr
+/// naming the trust dialog and the --pretrust-cwd escape hatch — never the
+/// late "claude exited before Stop hook fired" internal_error that masked the
+/// original defect. The mock renders entries that classify as neither
+/// trusting nor refusing; a driver that guesses (bare CR) or wedges would
+/// fail these assertions instead of silently succeeding.
+#[test]
+fn trust_dialog_unresolved_refusal_exits_2_naming_the_dialog() {
+    let _temp_config = setup_temp_config();
+    let out = run_with(
+        claude_print().arg("test prompt"),
+        BUDGET,
+        Stdio::null(),
+        Some(("MOCK_TRUST_WORDING", "unresolvable")),
+    );
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "unresolved trust dialog must exit 2 (Setup), got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("trust dialog"),
+        "stderr must name the trust dialog:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("--pretrust-cwd"),
+        "the refusal must name the escape hatch:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("claude exited before Stop hook fired"),
+        "the trust-dialog refusal must not surface as the old Stop-hook error:\n{}",
+        out.stderr
+    );
+}
+
 // ── AS-2: --output-format json ──────────────────────────────────────────────
 
 /// `claude-print --claude-binary <mock> --output-format json 'test prompt'` →
