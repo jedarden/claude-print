@@ -7,12 +7,15 @@
 //!   * **enter the server path** — `serve` binds the selected Unix socket and
 //!     starts maintaining the pool; it never falls through to ordinary prompt
 //!     validation (a fall-through would exit 4 with "no prompt provided",
-//!     since no positional prompt accompanies the subcommand).
+//!     since no positional prompt accompanies the subcommand). The shared
+//!     missing-binary check runs before the dispatch: serve with a bogus
+//!     `--claude-binary` exits 2 before binding anything.
 //!   * **invalid pool size** — `--pool-size 0`, `--pool-size` past
 //!     `MAX_POOL_SIZE`, and non-numeric values all exit 2 with actionable
 //!     stderr before any worker is spawned.
-//!   * **socket setup failures** — an unbindable socket path exits 2 with
-//!     actionable stderr naming the socket.
+//!   * **socket setup failures** — an unbindable socket path (parent a file,
+//!     or parent missing entirely) exits 2 with actionable stderr naming the
+//!     exact path and what to check.
 //!   * **safe local permissions** — the socket node is user-only (0600),
 //!     whatever umask the invoking shell carried.
 //!   * **population** — the daemon warms exactly the requested number of
@@ -307,11 +310,52 @@ fn serve_fails_fast_on_unbindable_socket() {
     // Parent of the socket path is a regular file → bind cannot succeed.
     let blocker = dir.path().join("blocker");
     std::fs::write(&blocker, b"not a directory").unwrap();
+    let socket = blocker.join("pool.sock");
 
     let out = run(
         claude_print()
             .args(["serve", "--pool-size", "1", "--socket"])
-            .arg(blocker.join("pool.sock")),
+            .arg(&socket),
+        BUDGET,
+    );
+
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("failed to set up pool socket"),
+        "stderr must name the socket failure: {}",
+        out.stderr
+    );
+    // Actionable means the operator can act on it: the failing path named in
+    // full, plus what to check about it.
+    assert!(
+        out.stderr
+            .contains(socket.to_str().expect("utf-8 tempdir path")),
+        "stderr must name the exact socket path that failed: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("check that the parent directory"),
+        "stderr must say what to check: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("Spawning worker"),
+        "a socket failure must abort before any worker spawn: {}",
+        out.stderr
+    );
+}
+
+// The other unbindable shape: the socket path's parent directory does not
+// exist. Same contract — exit 2, the failing path named, nothing spawned.
+#[test]
+fn serve_fails_fast_on_socket_path_with_missing_parent_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("no-such-dir").join("pool.sock");
+
+    let out = run(
+        claude_print()
+            .args(["serve", "--pool-size", "1", "--socket"])
+            .arg(&socket),
         BUDGET,
     );
 
@@ -322,9 +366,52 @@ fn serve_fails_fast_on_unbindable_socket() {
         out.stderr
     );
     assert!(
+        out.stderr
+            .contains(socket.to_str().expect("utf-8 tempdir path")),
+        "stderr must name the exact socket path that failed: {}",
+        out.stderr
+    );
+    assert!(
         !out.stderr.contains("Spawning worker"),
         "a socket failure must abort before any worker spawn: {}",
         out.stderr
+    );
+}
+
+// The shared missing-binary check runs BEFORE the serve dispatch (main.rs:
+// the pool spawns workers with this binary, so entering serve without it
+// would just churn failing warmups). This pins that ordering: serve with a
+// bogus `--claude-binary` must exit 2 with actionable stderr before binding
+// any socket. If dispatch ever moved above the check, this test stops exiting
+// fast and dies at the budget with a bound daemon instead.
+#[test]
+fn serve_rejects_missing_claude_binary_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut cmd = Command::new(workspace_bin("claude-print"));
+    let out = run(
+        cmd.arg("--claude-binary")
+            .arg(dir.path().join("no-such-claude"))
+            .args(["serve", "--pool-size", "1", "--socket"])
+            .arg(&socket),
+        BUDGET,
+    );
+
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("not found"),
+        "stderr must say the binary was not found: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("Listening on"),
+        "the binary check must precede the bind: {}",
+        out.stderr
+    );
+    assert!(
+        !socket.exists(),
+        "the binary check must precede socket setup"
     );
 }
 
@@ -417,7 +504,7 @@ impl Daemon {
             &[Signal::SIGTERM],
             Duration::from_secs(20),
             socket,
-            expected_workers,
+            Some(expected_workers),
             true,
         )
     }
@@ -431,28 +518,33 @@ impl Daemon {
     ///
     /// The worker set is snapshotted from /proc *before* signaling: pool
     /// workers are forked directly by the daemon, so while it lives they are
-    /// exactly its children, and `expected_workers` proves the snapshot
-    /// captured the whole pool (a respawn-churning daemon would fail here
-    /// before the reaping assertion could go vacuous). After the daemon exits
-    /// it can no longer hold zombies — orphans are re-parented immediately —
-    /// so the post-exit check polls a short grace window for every pid to
-    /// vanish: a leaked worker survives indefinitely, and the grace absorbs
-    /// only the instant init needs to finish reaping an orphaned zombie.
+    /// exactly its children. `expected_workers` — `Some(n)` — additionally
+    /// proves the snapshot captured the whole pool (a respawn-churning daemon
+    /// would fail here before the reaping assertion could go vacuous); `None`
+    /// skips that count (used by the dispatch-entry test, which signals while
+    /// the first spawn may still be mid-fork and pins no exact population).
+    /// After the daemon exits it can no longer hold zombies — orphans are
+    /// re-parented immediately — so the post-exit check polls a short grace
+    /// window for every pid to vanish: a leaked worker survives indefinitely,
+    /// and the grace absorbs only the instant init needs to finish reaping an
+    /// orphaned zombie.
     fn shutdown_daemon(
         mut self,
         sigs: &[Signal],
         bound: Duration,
         socket: &Path,
-        expected_workers: usize,
+        expected_workers: Option<usize>,
         expect_socket_removed: bool,
     ) -> Outcome {
         let workers = children_of(self.child.id());
-        assert_eq!(
-            workers.len(),
-            expected_workers,
-            "daemon must hold exactly {expected_workers} worker processes at \
-             shutdown time; found {workers:?}"
-        );
+        if let Some(expected) = expected_workers {
+            assert_eq!(
+                workers.len(),
+                expected,
+                "daemon must hold exactly {expected} worker processes at \
+                 shutdown time; found {workers:?}"
+            );
+        }
 
         let start = Instant::now();
         for (leg, sig) in sigs.iter().enumerate() {
@@ -536,6 +628,56 @@ impl Drop for Daemon {
             let _ = reader.join();
         }
     }
+}
+
+// The dispatch pin in its purest form, decoupled from the warmup
+// choreography: `serve` must enter the server path — bind the selected
+// socket, run the accept/maintain loop — and never consult prompt validation
+// or stdin. A fall-through regression exits 4 with "no prompt provided"
+// (no positional prompt accompanies the subcommand, and stdin is null here);
+// the full-lifecycle tests below would only surface that as a settle-wait
+// timeout, so this one names the contract and fails in seconds. No exact
+// worker count is pinned (the first spawn may still be mid-fork when the
+// signal lands — population is owned by the tests below); whatever children
+// existed at signal time must still be gone, which shutdown_daemon's `None`
+// mode asserts.
+#[test]
+fn serve_dispatch_enters_the_server_path_and_never_validates_a_prompt() {
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("1"));
+    daemon.wait_for("Listening on", 1, Duration::from_secs(30));
+    assert!(
+        socket.exists(),
+        "entering the server path must bind the selected socket"
+    );
+    // The maintain loop is running: the pool below the target is being topped
+    // up, not waiting on a prompt.
+    daemon.wait_for("Spawning worker", 1, Duration::from_secs(30));
+    assert!(
+        !daemon
+            .stderr()
+            .iter()
+            .any(|l| l.contains("no prompt provided")),
+        "serve must not fall through to prompt validation: {:?}",
+        daemon.stderr()
+    );
+
+    let out = daemon.shutdown_daemon(
+        &[Signal::SIGTERM],
+        SHUTDOWN_BOUND,
+        &socket,
+        None, // no exact population: the spawn raced above is not pinned here
+        true,
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("Shutdown complete"),
+        "the entered server path must still stop cleanly: {}",
+        out.stderr
+    );
 }
 
 /// Full serve lifecycle with mock-claude, which performs the real warmup
@@ -638,7 +780,7 @@ fn serve_sigint_stops_bounded_and_reaps_every_worker() {
     let mut daemon = Daemon::start(&mock, &socket, Some("2"));
     daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
 
-    let out = daemon.shutdown_daemon(&[Signal::SIGINT], SHUTDOWN_BOUND, &socket, 2, true);
+    let out = daemon.shutdown_daemon(&[Signal::SIGINT], SHUTDOWN_BOUND, &socket, Some(2), true);
 
     assert!(
         out.stderr.contains("cleaning up 2 workers"),
@@ -709,7 +851,7 @@ fn serve_sigint_then_sigterm_stops_cleanly_without_respawn() {
         &[Signal::SIGINT, Signal::SIGTERM],
         SHUTDOWN_BOUND,
         &socket,
-        2,
+        Some(2),
         true,
     );
 
@@ -760,7 +902,7 @@ fn serve_shutdown_leaves_a_foreign_file_at_the_socket_path_untouched() {
         &[Signal::SIGTERM],
         SHUTDOWN_BOUND,
         &socket,
-        1,
+        Some(1),
         false, // the socket assertion is inverted: the replacement must survive
     );
 
@@ -795,7 +937,7 @@ fn serve_shutdown_removes_its_socket_even_when_a_foreign_file_preceded_it() {
     let mut daemon = Daemon::start(&mock, &socket, Some("1"));
     daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
 
-    let out = daemon.shutdown_daemon(&[Signal::SIGTERM], SHUTDOWN_BOUND, &socket, 1, true);
+    let out = daemon.shutdown_daemon(&[Signal::SIGTERM], SHUTDOWN_BOUND, &socket, Some(1), true);
 
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
     assert!(

@@ -1747,6 +1747,18 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
     }
 
+    // The other unbindable shape: the parent directory does not exist at all.
+    // Bind must surface ENOENT the same way — exit-2 material — rather than
+    // attempting to create directories or panicking.
+    #[test]
+    fn bind_socket_surfaces_missing_parent_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-dir").join("pool.sock");
+
+        let err = bind_socket(&path).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
+
     // ── read_frame: request framing (claudepr-b78932de audit repair) ─────────
     //
     // A client that closes mid-frame must end its connection, not wedge it:
@@ -1818,6 +1830,23 @@ mod tests {
             err.to_string().contains(&MAX_REQUEST_BYTES.to_string()),
             "error must state the cap: {err}"
         );
+    }
+
+    // The cap boundary is inclusive: a frame of exactly MAX_REQUEST_BYTES is
+    // legitimate wire data and must be read, not refused. An off-by-one in the
+    // refusal (`>=`) would reject the largest legal frame.
+    #[test]
+    fn read_frame_accepts_a_frame_exactly_at_the_cap() {
+        let (mut w, mut r) = stream_pair();
+        let payload = vec![b'x'; MAX_REQUEST_BYTES];
+        w.write_all(&(MAX_REQUEST_BYTES as u32).to_be_bytes())
+            .unwrap();
+        w.write_all(&payload).unwrap();
+
+        let frame = PoolServer::read_frame(&mut r).unwrap().unwrap();
+        assert_eq!(frame.len(), MAX_REQUEST_BYTES);
+        assert_eq!(frame[0], b'x');
+        assert_eq!(frame[MAX_REQUEST_BYTES - 1], b'x');
     }
 
     // ── destroy_worker: reaping, escalation, descendant sweep ────────────────
@@ -1986,6 +2015,145 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    // ── manager state machine vs. the shutdown flag (claudepr-1feb2d1b) ──────
+    //
+    // The flag-side contracts of the shutdown chain, pinned at the level where
+    // they are cheapest to fail loudly: once shutdown is requested the pool
+    // must hand out nothing and respawn nothing — every respawn would race
+    // `shutdown_all`'s reaper. The e2e suite pins the observable half (the
+    // "Spawning worker" count never rises after the signal); these pins hold
+    // the manager's own entry points to it directly.
+
+    /// A PoolWorker record with no real process behind it — enough for the
+    /// manager's bookkeeping contracts (acquire/release state transitions),
+    /// which never touch the fd or the pid. The *reaping* contracts use
+    /// [`worker_from`], which wraps a live PTY child instead.
+    fn record_worker(id: &str, state: WorkerState) -> PoolWorker {
+        PoolWorker {
+            id: id.to_string(),
+            state,
+            master_fd: -1,
+            child_pid: nix::unistd::Pid::from_raw(0),
+            state_since: Instant::now(),
+            hook_installer: None,
+        }
+    }
+
+    /// Acquire hands out exactly one Ready worker and marks it InUse; the next
+    /// acquire finds nothing Ready and answers pool_full rather than re-issuing
+    /// the same worker to a second client.
+    #[test]
+    fn acquire_worker_marks_the_worker_in_use_and_reports_pool_full_when_empty() {
+        let mut manager = PoolManager::new(1, std::path::PathBuf::from("claude"), false);
+        manager
+            .workers
+            .insert("w1".to_string(), record_worker("w1", WorkerState::Ready));
+
+        let id = manager
+            .acquire_worker()
+            .expect("a Ready worker must be acquirable");
+        assert_eq!(id, "w1");
+        assert_eq!(
+            manager.workers["w1"].state,
+            WorkerState::InUse,
+            "an acquired worker must be marked InUse"
+        );
+
+        let err = manager.acquire_worker().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PoolResponse::Error {
+                    code: ErrorCode::PoolFull,
+                    ..
+                }
+            ),
+            "no second assignment may come from one Ready worker: {err:?}"
+        );
+    }
+
+    /// Once the shutdown flag is set, acquire_worker refuses new assignments —
+    /// a client racing the teardown must not pull a worker out of the pool
+    /// that `shutdown_all` is about to reap — and the worker it refused stays
+    /// untouched.
+    #[test]
+    fn acquire_worker_refuses_assignments_after_shutdown_is_requested() {
+        let mut manager = PoolManager::new(1, std::path::PathBuf::from("claude"), false);
+        manager
+            .workers
+            .insert("w1".to_string(), record_worker("w1", WorkerState::Ready));
+
+        manager.shutdown();
+
+        let err = manager.acquire_worker().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PoolResponse::Error {
+                    code: ErrorCode::ShuttingDown,
+                    ..
+                }
+            ),
+            "acquire after shutdown must answer shutting_down: {err:?}"
+        );
+        assert_eq!(
+            manager.workers["w1"].state,
+            WorkerState::Ready,
+            "the refused assignment must not disturb the worker"
+        );
+    }
+
+    /// maintain() is a no-op once shutdown is requested: an empty, below-target
+    /// pool stays empty. Pre-repair, a respawn here would fork fresh workers
+    /// directly into the path of the reaper.
+    #[test]
+    fn maintain_spawns_nothing_once_shutdown_is_requested() {
+        let mut manager = PoolManager::new(2, std::path::PathBuf::from("claude"), false);
+        manager.shutdown();
+
+        manager
+            .maintain()
+            .expect("maintain under shutdown must be a clean no-op, not an error");
+
+        assert!(
+            manager.workers.is_empty(),
+            "no worker may be spawned after shutdown is requested"
+        );
+    }
+
+    /// release_worker destroys the worker — a real PTY child is reaped, not
+    /// merely dropped — removes it from the pool, and answers invalid_worker_id
+    /// for an id the pool does not hold.
+    #[test]
+    fn release_worker_reaps_the_worker_and_rejects_unknown_ids() {
+        let mut manager = PoolManager::new(1, std::path::PathBuf::from("claude"), false);
+        let sleep = which::which("sleep").expect("'sleep' on PATH");
+        let spawner = spawn_pty(&sleep, &["30"]);
+        let (worker, pid) = worker_from(spawner);
+        manager.workers.insert(worker.id.clone(), worker);
+
+        let err = manager.release_worker("no-such-worker").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PoolResponse::Error {
+                    code: ErrorCode::InvalidWorkerId,
+                    ..
+                }
+            ),
+            "an unknown id must be rejected, not ignored: {err:?}"
+        );
+
+        manager
+            .release_worker("destroy-test")
+            .expect("a held worker id must release");
+        assert_proc_gone(pid, Duration::from_secs(2));
+        assert!(
+            !manager.workers.contains_key("destroy-test"),
+            "a released worker must leave the pool"
+        );
     }
 
     // ── listener teardown + socket-removal ownership (claudepr-ffaf4def) ─────

@@ -667,4 +667,92 @@ mod tests {
         // (c) explicit flag -> flag wins over config.
         assert_eq!(config.resolve_timeout_secs(Some(7200)), 7200);
     }
+
+    // ── serve dispatch (claudepr-1feb2d1b) ───────────────────────────────────
+    //
+    // main() dispatches on exactly the shape these pins capture: a parsed
+    // Command::Serve arm, matched before any prompt/stdin/config state is
+    // consulted. A parse-layer regression (renamed flag, changed default, the
+    // subcommand degrading into the positional prompt) fails here without
+    // needing a daemon; the binary-level counterparts live in tests/serve.rs.
+
+    /// `serve` parses as the Serve subcommand carrying the compiled-in
+    /// defaults — pool size 1 (same value `validate_pool_size` floors at), no
+    /// explicit socket (PoolServer then falls back to DEFAULT_SOCKET_PATH),
+    /// verbose off — and consumes no positional prompt.
+    #[test]
+    fn serve_subcommand_parses_with_compiled_in_defaults() {
+        let cli = Cli::try_parse_from(["claude-print", "serve"]).expect("bare serve must parse");
+        match cli.command {
+            Some(claude_print::cli::Command::Serve {
+                pool_size,
+                socket,
+                verbose,
+            }) => {
+                assert_eq!(pool_size, 1, "--pool-size default must stay 1");
+                assert_eq!(socket, None, "--socket default must be unset");
+                assert!(!verbose, "--verbose default must be off");
+            }
+            other => panic!("serve must parse into Command::Serve, got {other:?}"),
+        }
+        assert_eq!(
+            cli.prompt, None,
+            "serve consumes no positional prompt for the session path"
+        );
+    }
+
+    /// Explicit serve flags reach the arm the dispatch matches on, with the
+    /// values given — a flag that parses but stops short of the Serve variant
+    /// would strand the daemon defaults in charge of an explicit request.
+    #[test]
+    fn serve_flags_carry_through_to_the_serve_command() {
+        let cli = Cli::try_parse_from([
+            "claude-print",
+            "serve",
+            "--pool-size",
+            "3",
+            "--socket",
+            "/tmp/pool-test.sock",
+            "--verbose",
+        ])
+        .expect("flagged serve must parse");
+        match cli.command {
+            Some(claude_print::cli::Command::Serve {
+                pool_size,
+                socket,
+                verbose,
+            }) => {
+                assert_eq!(pool_size, 3);
+                assert_eq!(socket.as_deref(), Some("/tmp/pool-test.sock"));
+                assert!(verbose);
+            }
+            other => panic!("serve must parse into Command::Serve, got {other:?}"),
+        }
+    }
+
+    /// The ordinary invocation keeps `command` empty — the serve arm must not
+    /// capture plain prompts, or the default stateless path would vanish into
+    /// the daemon. (Dispatch precedence runs the other way: serve is matched
+    /// first, everything else falls through to the session path.)
+    #[test]
+    fn plain_prompt_invocation_does_not_dispatch_serve() {
+        let cli = Cli::try_parse_from(["claude-print", "fix the bug"]).expect("prompt must parse");
+        assert!(
+            cli.command.is_none(),
+            "a plain prompt must not dispatch into serve"
+        );
+        assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
+    }
+
+    /// `serve` is a true subcommand boundary: a positional after it belongs to
+    /// the subcommand (which takes none), so clap rejects it rather than
+    /// letting "extra" silently become the top-level prompt of a serve run.
+    #[test]
+    fn positional_after_serve_is_a_subcommand_parse_error() {
+        let parsed = Cli::try_parse_from(["claude-print", "serve", "extra"]);
+        assert!(
+            parsed.is_err(),
+            "a positional after `serve` must not become the top-level prompt"
+        );
+    }
 }
