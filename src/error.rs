@@ -83,6 +83,16 @@ pub enum Error {
     /// Maps to exit code 1, distinct from Setup (2) which is a claude-print failure.
     #[error("assistant error: {0}")]
     AssistantError(String),
+
+    /// Trust dialog was detected but its trusting entry could not be positively
+    /// identified (claudepr-fe3d3160), so claude-print refused to confirm a
+    /// possibly-refusing default — claude 2.1.263 highlights "No, exit" first,
+    /// and confirming it kills the session in every untrusted cwd. Deliberately
+    /// loud and distinct: the old behavior surfaced much later as a misleading
+    /// Stop-hook error. Has no dedicated mapping in `main`; the catch-all `Err`
+    /// arm wraps it as a `Setup` user error and exits 2, which is the intent.
+    #[error("trust dialog could not be resolved: {0}")]
+    TrustDialogUnresolved(String),
 }
 
 /// Result type alias for operations that can fail with [`Error`].

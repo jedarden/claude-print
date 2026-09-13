@@ -125,13 +125,20 @@ fn main() {
     }
 
     // Emit the trust dialog so claude-print's startup scanner can detect the
-    // keywords, dismiss the dialog, and reach PROMPT_INJECTED — mirroring real
-    // Claude Code's first-run trust prompt. Only in claude-print-driven mode; the
+    // dialog, dismiss it, and reach PROMPT_INJECTED — mirroring real Claude
+    // Code's first-run trust prompt. Only in claude-print-driven mode; the
     // legacy direct-spawn mode (no --settings=) just round-trips the FIFO.
     // Suppressed under MOCK_STOP_BEFORE_INJECT so the Stop hook (fired below) wins
     // the race against the scanner — emitting trust keywords here would let the
     // scanner reach PROMPT_INJECTED and turn the run into a normal success instead
     // of the EC-7 leak this fixture is meant to produce.
+    //
+    // claudepr-fe3d3160: the dialog body mirrors claude 2.1.263, which renders
+    // the REFUSING entry ("No, exit") highlighted by default. The mock then
+    // applies real selection semantics (see dismiss_trust_dialog): confirming
+    // whatever is highlighted picks "No, exit" and the child dies — loudly, with
+    // exit 3, so any driver that regresses to a bare-CR dismissal fails the
+    // whole binary e2e suite instead of passing.
     if driven_by_claude_print && mock_trust_dialog && !mock_stop_before_inject {
         if mock_trust_wording == "alternate" {
             // Uses "continue" + "folder" as trust keywords
@@ -140,7 +147,11 @@ fn main() {
             // Standard wording uses "trust" + "Allow"
             print!("Do you trust and Allow access to this folder?\r\n");
         }
+        print!("\u{276f} No, exit\r\n");
+        print!("  Yes, I trust this folder\r\n");
+        print!("Enter to confirm \u{b7} Esc to cancel\r\n");
         std::io::stdout().flush().ok();
+        dismiss_trust_dialog();
     }
 
     // MOCK_EXIT_BEFORE_STOP: exit without writing to the FIFO (tests child-exit-before-Stop)
@@ -305,6 +316,64 @@ fn env_bool_default(key: &str, default: bool) -> bool {
         Some("") => default,
         Some(_) => true,
         None => default,
+    }
+}
+
+/// Consume the keys that dismiss the trust dialog, applying claude's own
+/// selection semantics (claudepr-fe3d3160).
+///
+/// The caret starts on "No, exit" — the refusing entry, which is what claude
+/// 2.1.263 highlights by default. Arrow keys move it and Enter confirms
+/// whatever is highlighted. Confirming the refusing entry is precisely the
+/// failure that killed every claude-print session in an untrusted cwd, so
+/// instead of quietly succeeding the mock exits 3 with a diagnostic on stderr:
+/// any driven run that regresses to a bare-CR dismissal fails fast and names
+/// the bug. EOF or a read error returns without comment — there is no driver
+/// left to talk to, and `wait_for_prompt` reports that state in its own way.
+fn dismiss_trust_dialog() {
+    use std::io::Read;
+
+    /// Entry index the caret starts on: the refusing default in claude 2.1.263.
+    const REFUSING: usize = 0;
+    /// Entry index of "Yes, I trust this folder".
+    const TRUSTING: usize = 1;
+
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut caret = REFUSING;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        match handle.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => pending.extend_from_slice(&buf[..n]),
+        }
+        while !pending.is_empty() {
+            if pending.starts_with(b"\x1b[B") {
+                // Down.
+                pending.drain(..3);
+                caret = (caret + 1).min(TRUSTING);
+            } else if pending.starts_with(b"\x1b[A") {
+                // Up.
+                pending.drain(..3);
+                caret = caret.saturating_sub(1);
+            } else if pending[0] == b'\r' || pending[0] == b'\n' {
+                // Enter confirms whatever the caret is on.
+                pending.clear();
+                if caret == TRUSTING {
+                    return;
+                }
+                eprintln!(
+                    "mock-claude: trust dialog confirmed the highlighted REFUSING entry 'No, exit' \
+                     (a bare Enter while the caret sits on the refusing default) — the driver must \
+                     move the caret to 'Yes, I trust this folder' first (claudepr-fe3d3160)"
+                );
+                std::process::exit(3);
+            } else {
+                // Probe responses and any other non-selection bytes.
+                pending.remove(0);
+            }
+        }
     }
 }
 

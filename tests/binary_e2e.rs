@@ -181,6 +181,47 @@ fn as1_text_mode_exit0_nonempty_not_json() {
     );
 }
 
+// ── Trust dialog: caret on the refusing entry (claudepr-fe3d3160) ───────────
+
+/// Every driven mock-claude run renders the claude 2.1.263 trust dialog with the
+/// REFUSING entry highlighted, and the mock confirms whatever is highlighted —
+/// exiting 3 the instant a driver confirms "No, exit". A happy-path run
+/// therefore proves the dismissal moved the caret onto "Yes, I trust this
+/// folder" before pressing Enter: if this test fails with exit 3 (or with the
+/// old `internal_error` / "exited before Stop hook" shape), the bare-CR
+/// dismissal regression has returned.
+#[test]
+fn trust_dialog_caret_on_refuse_dismissed_via_trusting_entry() {
+    let _temp_config = setup_temp_config();
+    let out = run(claude_print().arg("test prompt"), BUDGET);
+
+    assert_ne!(
+        out.code,
+        Some(3),
+        "mock confirmed the highlighted 'No, exit' entry — a bare-CR dismissal sent the session \
+         to its death (claudepr-fe3d3160)\nstderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(
+        out.code,
+        Some(0),
+        "expected exit 0 through the caret-on-refuse trust dialog, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.code,
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("No, exit"),
+        "stderr must not carry the refusing-entry diagnostic:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("internal_error"),
+        "the trust-dialog failure used to surface as internal_error:\n{}",
+        out.stdout
+    );
+}
+
 // ── AS-2: --output-format json ──────────────────────────────────────────────
 
 /// `claude-print --claude-binary <mock> --output-format json 'test prompt'` →

@@ -569,6 +569,13 @@ impl Session {
         // surface it on a slow/stall exit. A no-op (empty buffer) until dumped.
         let mut child_capture = ChildCapture::new(launch.show_child_stderr);
 
+        // claudepr-fe3d3160: set when the startup sequencer refuses to dismiss
+        // the trust dialog because the trusting entry could not be positively
+        // identified. The diagnostic is surfaced after the event loop exits so
+        // it replaces the misleading "claude exited before Stop hook fired"
+        // error this failure used to produce.
+        let mut startup_refusal: Option<String> = None;
+
         let exit_reason = event_loop.run(|chunk| {
             // Empty chunk = timer tick from the event loop (poll timeout with no data).
             // Only feed real data to the terminal emulator and startup sequence.
@@ -611,6 +618,24 @@ impl Session {
                 },
                 StartupAction::HardTimeout => {
                     // Handled after event loop exits.
+                }
+                StartupAction::Refuse(reason) => {
+                    // claudepr-fe3d3160: the dialog cannot be dismissed safely.
+                    // Say so immediately, kill the child (its own PTY closes and
+                    // the event loop exits), and remember why for the return
+                    // value below.
+                    if startup_refusal.is_none() {
+                        startup_refusal = Some(reason.clone());
+                    }
+                    eprintln!("claude-print: {}", reason);
+                    // Trace the reason too (first line — the full text goes to
+                    // stderr above), so a --verbose trace says WHY the dialog
+                    // was unresolved, not just that it was.
+                    tracer_clone.trace(format!(
+                        "startup refused: {}",
+                        reason.lines().next().unwrap_or("trust dialog unresolved")
+                    ));
+                    kill_child(spawner.child_pid);
                 }
                 StartupAction::None => {}
             }
@@ -678,9 +703,34 @@ impl Session {
                 StartupAction::HardTimeout => {
                     // Handled after event loop exits.
                 }
+                StartupAction::Refuse(reason) => {
+                    // Same refusal via the timer-driven path (see above).
+                    if startup_refusal.is_none() {
+                        startup_refusal = Some(reason.clone());
+                    }
+                    eprintln!("claude-print: {}", reason);
+                    tracer_clone.trace(format!(
+                        "startup refused: {}",
+                        reason.lines().next().unwrap_or("trust dialog unresolved")
+                    ));
+                    kill_child(spawner.child_pid);
+                }
                 StartupAction::None => {}
             }
         })?;
+
+        // claudepr-fe3d3160: the startup sequencer refused to dismiss the trust
+        // dialog (the trusting entry could not be positively identified). The
+        // child was killed when the refusal fired, so the loop exited with
+        // ChildExited — report the refusal, not the misleading "child exited
+        // without Stop payload" error that used to mask it.
+        if let Some(reason) = startup_refusal {
+            // INV-8: the reader was never spawned (the prompt was never
+            // injected), so this drop is a no-op; kept for symmetry with the
+            // other error arms — Drop joins without draining.
+            drop(stream_json_handle);
+            return Err(Error::TrustDialogUnresolved(reason));
+        }
 
         // 13. Check if watchdog timeout fired.
         if watchdog_state.has_timeout_fired() {
@@ -1753,76 +1803,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pretrust_cwd_fails_when_home_not_set() {
-        // Save original HOME
-        let original_home = std::env::var("HOME").ok();
-
-        // Unset HOME
-        std::env::remove_var("HOME");
-
-        let result = pretrust_cwd();
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("HOME environment variable not set"));
-
-        // Restore HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        }
-    }
-
-    #[test]
-    fn home_unset_consistent_error_handling_across_all_modules() {
-        // This test verifies that all modules consistently return Error::Config
-        // when HOME is not set, rather than panicking or using silent fallbacks.
-        // This is critical for predictable behavior in headless/chroot environments.
-
-        use crate::config::Config;
-        use crate::poller::{derive_transcript_path, projects_dir_for_cwd};
-
-        // Save original HOME
-        let original_home = std::env::var("HOME").ok();
-
-        // Unset HOME
-        std::env::remove_var("HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
-
-        // Test 1: Config::default_path() fails with clear error
-        let config_result = Config::default_path();
-        assert!(config_result.is_err());
-        assert!(config_result
-            .unwrap_err()
-            .to_string()
-            .contains("HOME environment variable not set"));
-
-        // Test 2: derive_transcript_path fails with clear error
-        let derive_result = derive_transcript_path("session-123", "/project/dir");
-        assert!(derive_result.is_err());
-        assert!(derive_result
-            .unwrap_err()
-            .to_string()
-            .contains("HOME environment variable not set"));
-
-        // Test 3: projects_dir_for_cwd fails with clear error
-        let projects_result = projects_dir_for_cwd();
-        assert!(projects_result.is_err());
-        assert!(projects_result
-            .unwrap_err()
-            .to_string()
-            .contains("HOME environment variable not set"));
-
-        // Test 4: pretrust_cwd fails with clear error
-        let pretrust_result = pretrust_cwd();
-        assert!(pretrust_result.is_err());
-        assert!(pretrust_result
-            .unwrap_err()
-            .to_string()
-            .contains("HOME environment variable not set"));
-
-        // Restore HOME
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        }
-    }
+    // The former `pretrust_cwd_fails_when_home_not_set` and
+    // `home_unset_consistent_error_handling_across_all_modules` tests mutated
+    // the process `HOME` with no shared serialization, so they raced parallel
+    // test threads and failed only when the whole suite ran together (bead
+    // claudepr-1e6dbeaa). Their coverage lives in race-free places instead:
+    // `pretrust_cwd_at` above pins the file-mutation logic purely against a
+    // temp path, `util::tests` pins the strict unset/empty-HOME resolver, and
+    // tests/home_unset.rs pins the consistent Error::Config contract across
+    // config, poller, and `Session::run` — which validates `HOME` before any
+    // pretrust work — under its env_lock().
 }
