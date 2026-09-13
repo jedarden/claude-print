@@ -1,14 +1,25 @@
 {
-  "timestamp": "2026-09-13T12:07:10.108429121Z",
-  "total_open_beads": 5,
+  "timestamp": "2026-09-13T13:07:14.292341681Z",
+  "total_open_beads": 8,
   "exclusion_criteria": {
     "has_assignee": 0,
     "manually_blocked": 0,
-    "has_dependencies": 5,
-    "resource_conflicts": 3
+    "has_dependencies": 8,
+    "resource_conflicts": 0
   },
-  "final_candidate_count": 2,
+  "final_candidate_count": 1,
   "excluded_beads": [
+    {
+      "bead_id": "claudepr-982a9e59",
+      "title": "Finish the exposed warm-pool daemon entrypoint and bounded shutdown path",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
     {
       "bead_id": "claudepr-309d826d",
       "title": "Connect --pool-socket invocations to one prewarmed isolated session",
@@ -17,8 +28,8 @@
       "manual_blocked": false,
       "has_blockers": true,
       "blocker_count": 1,
-      "has_resource_conflicts": true,
-      "conflict_count": 1
+      "has_resource_conflicts": false,
+      "conflict_count": 0
     },
     {
       "bead_id": "claudepr-a03e32d7",
@@ -28,8 +39,8 @@
       "manual_blocked": false,
       "has_blockers": true,
       "blocker_count": 1,
-      "has_resource_conflicts": true,
-      "conflict_count": 1
+      "has_resource_conflicts": false,
+      "conflict_count": 0
     },
     {
       "bead_id": "claudepr-4f4b7cef",
@@ -38,9 +49,42 @@
       "assignee": null,
       "manual_blocked": false,
       "has_blockers": true,
-      "blocker_count": 2,
-      "has_resource_conflicts": true,
-      "conflict_count": 1
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-7f088327",
+      "title": "Dispatch the serve subcommand in main.rs with validated pool size and socket setup",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-18a34cd7",
+      "title": "Make SIGINT and SIGTERM set shutdown state and bound the server stop path",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
+    },
+    {
+      "bead_id": "claudepr-8a3bfe0e",
+      "title": "Add binary-level tests for serve dispatch, bounded shutdown, and child reaping",
+      "priority": 1,
+      "assignee": null,
+      "manual_blocked": false,
+      "has_blockers": true,
+      "blocker_count": 1,
+      "has_resource_conflicts": false,
+      "conflict_count": 0
     }
   ]
 }
