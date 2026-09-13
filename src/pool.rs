@@ -46,7 +46,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +60,33 @@ const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 60;
 
 /// Maximum time to wait for a worker to complete its warmup phase
 const WARMUP_TIMEOUT_SECS: u64 = 120;
+
+/// Hard cap on `--pool-size`. Each worker is a full `claude` PTY process, so a
+/// typo like `--pool-size 100000` must fail argv validation with exit 2 rather
+/// than fork-bombing the host.
+pub const MAX_POOL_SIZE: usize = 256;
+
+/// poll(2) timeout for the serve accept loop, in milliseconds. Bounds how long
+/// a shutdown request can go unnoticed even without the signal self-pipe, and
+/// doubles as the maintain() tick (top-up respawn cadence).
+const ACCEPT_POLL_TIMEOUT_MS: i32 = 250;
+
+/// Quiet window a worker must see after trust-dismiss before it counts as
+/// Ready (ADR-005 "idle-settle"). Feeds the warmup sequencer's idle gap so
+/// the pool path shares the ordinary session path's settle constant and both
+/// paths agree on what "settled" means.
+const WARMUP_SETTLE_MS: u64 = crate::startup::DEFAULT_POST_DISMISS_IDLE_MS;
+
+/// Message a warmup thread sends back to the pool manager when a warmup
+/// attempt reaches a terminal outcome. Every warmup attempt sends exactly
+/// one notification, so `maintain()` can mark the worker Ready or
+/// destroy-and-respawn it — a warmup that terminates silently would otherwise
+/// pin its slot as `Warming` forever and permanently shrink the pool.
+#[derive(Debug)]
+enum WarmupNotification {
+    Ready(String),
+    Failed(String),
+}
 
 /// Client request types sent to the pool daemon
 #[derive(Debug, Deserialize, Serialize)]
@@ -167,10 +194,10 @@ pub struct PoolManager {
     verbose: bool,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
-    /// Channel for warmup completion notifications
-    warmup_tx: mpsc::Sender<String>,
-    /// Channel for warmup completion notifications (receiver)
-    warmup_rx: mpsc::Receiver<String>,
+    /// Channel for warmup outcome notifications
+    warmup_tx: mpsc::Sender<WarmupNotification>,
+    /// Channel for warmup outcome notifications (receiver)
+    warmup_rx: mpsc::Receiver<WarmupNotification>,
 }
 
 impl PoolManager {
@@ -287,6 +314,12 @@ impl PoolManager {
 
     /// Maintain the pool at target size
     pub fn maintain(&mut self) -> Result<(), anyhow::Error> {
+        // Once shutdown is requested the pool must not respawn anything —
+        // every spawn here would race the reaper in `shutdown_all`.
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
         // Process any warmup completions
         self.process_warmup_completions();
 
@@ -315,15 +348,30 @@ impl PoolManager {
         Ok(())
     }
 
-    /// Process warmup completion notifications
+    /// Process warmup terminal-outcome notifications
     fn process_warmup_completions(&mut self) {
-        // Drain the channel of all completed warmups
-        while let Ok(worker_id) = self.warmup_rx.try_recv() {
-            if let Some(worker) = self.workers.get_mut(&worker_id) {
-                worker.state = WorkerState::Ready;
-                worker.state_since = Instant::now();
-                if self.verbose {
-                    eprintln!("[claude-print pool] Worker {} marked as Ready", worker_id);
+        // Drain the channel of all terminal warmup outcomes
+        while let Ok(notification) = self.warmup_rx.try_recv() {
+            match notification {
+                WarmupNotification::Ready(worker_id) => {
+                    if let Some(worker) = self.workers.get_mut(&worker_id) {
+                        worker.state = WorkerState::Ready;
+                        worker.state_since = Instant::now();
+                        if self.verbose {
+                            eprintln!("[claude-print pool] Worker {} marked as Ready", worker_id);
+                        }
+                    }
+                }
+                WarmupNotification::Failed(worker_id) => {
+                    // A failed warmup must not pin its slot as Warming forever:
+                    // destroy the worker so the maintain() count below sees the
+                    // missing slot and respawns a replacement.
+                    if let Some(worker) = self.workers.remove(&worker_id) {
+                        if self.verbose {
+                            eprintln!("[claude-print pool] Retiring failed worker {}", worker_id);
+                        }
+                        self.destroy_worker(worker);
+                    }
                 }
             }
         }
@@ -386,10 +434,17 @@ impl PoolManager {
         // Spawn the PTY
         let spawner = crate::pty::PtySpawner::spawn(&cmd, &args)?;
 
+        // Transfer ownership of the master fd out of the OwnedFd: `spawner`
+        // is dropped at the end of this function, and dropping its OwnedFd
+        // would close the master behind the pool's back — every later
+        // read/poll on the worker would see EBADF/POLLNVAL. The raw fd is
+        // now owned by the PoolWorker and closed by destroy_worker.
+        let master_fd = spawner.master.into_raw_fd();
+
         Ok(PoolWorker {
             id: worker_id.to_string(),
             state: WorkerState::Warming,
-            master_fd: spawner.master.as_raw_fd(),
+            master_fd,
             child_pid: spawner.child_pid,
             state_since: Instant::now(),
             hook_installer: Some(hook_installer),
@@ -399,16 +454,58 @@ impl PoolManager {
     /// Background task to warm a worker through trust-dismiss and idle-settle
     ///
     /// This is the core warmup logic per ADR-005: workers are pre-warmed through
-    /// trust-dismiss and idle-settle, but never past prompt injection.
+    /// trust-dismiss and idle-settle, but never past prompt injection. Every
+    /// attempt reaches a terminal outcome and sends exactly one
+    /// [`WarmupNotification`] — a warmup that terminated silently would pin its
+    /// slot as `Warming` forever and permanently shrink the pool.
     fn warm_worker_background(
         worker_id: String,
         master_fd: RawFd,
         shutdown_flag: Arc<AtomicBool>,
-        warmup_tx: mpsc::Sender<String>,
+        warmup_tx: mpsc::Sender<WarmupNotification>,
         verbose: bool,
     ) {
+        let outcome = Self::warm_worker_to_outcome(worker_id, master_fd, &shutdown_flag, verbose);
+        // Exactly one terminal-outcome notification per warmup attempt, sent
+        // on every path. A send failure means the manager is gone (daemon
+        // exiting), which the reaper side already handles.
+        let _ = warmup_tx.send(outcome);
+    }
+
+    /// Log a warmup failure and build its terminal [`WarmupNotification`].
+    fn fail(worker_id: String, reason: &str) -> WarmupNotification {
+        eprintln!(
+            "[claude-print pool] Worker {} warmup failed: {}",
+            worker_id, reason
+        );
+        WarmupNotification::Failed(worker_id)
+    }
+
+    /// Write one byte to the self-pipe so the blocked poll(2) inside
+    /// [`crate::event_loop::EventLoop::run`] returns immediately.
+    fn wake_event_loop(pipe_w_raw: RawFd) {
+        let byte = [0u8];
+        let _ =
+            unsafe { libc::write(pipe_w_raw, byte.as_ptr() as *const libc::c_void, byte.len()) };
+    }
+
+    /// Drive one warmup attempt to its terminal outcome.
+    ///
+    /// The phase machine runs inside the event-loop callback: the startup
+    /// timers (dismiss keys, idle-settle) only fire there, because `run`
+    /// itself blocks until the child exits — a machine placed outside the
+    /// callback would never advance while the child is healthy. Terminal
+    /// outcomes write the self-pipe so `run` returns promptly instead of
+    /// blocking until the child dies. The pipe fds are closed exactly once by
+    /// their OwnedFd drops when this function returns.
+    fn warm_worker_to_outcome(
+        worker_id: String,
+        master_fd: RawFd,
+        shutdown_flag: &AtomicBool,
+        verbose: bool,
+    ) -> WarmupNotification {
         if shutdown_flag.load(Ordering::SeqCst) {
-            return;
+            return Self::fail(worker_id, "pool shutdown before warmup started");
         }
 
         if verbose {
@@ -418,108 +515,60 @@ impl PoolManager {
             );
         }
 
-        // Create a self-pipe for signal handling (minimal setup)
+        // Self-pipe: EventLoop requires one; warmup's terminal outcomes write
+        // it to break out of `run` (nobody else writes it — this thread
+        // installs no signal handler).
         let (pipe_r, pipe_w) = match nix::unistd::pipe() {
             Ok(p) => p,
-            Err(e) => {
-                eprintln!("[claude-print pool] Failed to create self-pipe: {}", e);
-                return;
-            }
+            Err(e) => return Self::fail(worker_id, &format!("failed to create self-pipe: {e}")),
         };
-
-        // Get raw fds for the pipe ends
         let pipe_r_raw = pipe_r.as_raw_fd();
         let pipe_w_raw = pipe_w.as_raw_fd();
 
         // Create event loop with the PTY master fd
         let mut event_loop = crate::event_loop::EventLoop::new(master_fd, pipe_r_raw);
 
-        // Create startup sequencer (empty prompt - we won't inject during warmup)
-        let mut startup_seq = crate::startup::StartupSeq::new(Vec::new());
+        // Empty prompt: warmup drives trust-dismiss and idle-settle only. The
+        // idle gap IS the settle window (ADR-005), so it shares the session
+        // path's quiet-window constant.
+        let mut startup_seq =
+            crate::startup::StartupSeq::with_idle_gap(Vec::new(), WARMUP_SETTLE_MS);
 
         // Create terminal emulator for probe responses (default window size: 220x50)
         let mut terminal_emu = crate::terminal::TerminalEmu::new(220, 50);
 
-        // Warmup timeout tracking
+        // Warmup timeout tracking — enforced on the 50 ms timer tick inside
+        // the callback, so it fires even while a chatty child keeps the PTY
+        // busy (the callback runs on every tick, not just on PTY data).
         let warmup_start = Instant::now();
         let warmup_timeout = Duration::from_secs(WARMUP_TIMEOUT_SECS);
 
-        // Warmup phases: Starting → Settling → Ready
-        // We never inject a prompt during warmup (that happens when client acquires)
+        // Warmup phases: Starting → Settling → Ready; any failure → Failed.
+        // We never inject a prompt during warmup (that happens when the client
+        // acquires the worker).
         let mut warmup_phase = WarmupPhase::Starting;
+        let mut failed_reason: Option<String> = None;
 
-        loop {
-            // Check shutdown flag
-            if shutdown_flag.load(Ordering::SeqCst) {
-                if verbose {
-                    eprintln!(
-                        "[claude-print pool] Worker {} warmup cancelled (shutdown)",
-                        worker_id
-                    );
-                }
-                let _ = nix::unistd::close(pipe_r_raw);
-                let _ = nix::unistd::close(pipe_w_raw);
-                std::mem::forget(pipe_r); // Avoid double-close
-                std::mem::forget(pipe_w);
-                return;
-            }
-
-            // Check warmup timeout
-            if warmup_start.elapsed() > warmup_timeout {
-                eprintln!(
-                    "[claude-print pool] Worker {} warmup timeout after {:.1}s",
-                    worker_id,
-                    warmup_start.elapsed().as_secs_f64()
-                );
-                let _ = nix::unistd::close(pipe_r_raw);
-                let _ = nix::unistd::close(pipe_w_raw);
-                std::mem::forget(pipe_r);
-                std::mem::forget(pipe_w);
-                return;
-            }
-
-            // Run event loop for one iteration
-            match event_loop.run(|chunk| {
-                if !chunk.is_empty() {
-                    // Feed chunk to terminal emulator for probe responses
-                    let responses = terminal_emu.feed(chunk);
-                    if !responses.is_empty() {
-                        let _ = unsafe {
-                            libc::write(
-                                master_fd,
-                                responses.as_ptr() as *const libc::c_void,
-                                responses.len(),
-                            )
-                        };
-                    }
-
-                    // Feed chunk to startup sequencer
-                    let action = startup_seq.feed(chunk);
-                    match action {
-                        crate::startup::StartupAction::Write(bytes) => {
-                            let _ = unsafe {
-                                libc::write(
-                                    master_fd,
-                                    bytes.as_ptr() as *const libc::c_void,
-                                    bytes.len(),
-                                )
-                            };
-                        }
-                        crate::startup::StartupAction::None => {}
-                        crate::startup::StartupAction::HardTimeout => {
-                            eprintln!(
-                                "[claude-print pool] Worker {} hard timeout during warmup",
-                                worker_id
-                            );
-                            warmup_phase = WarmupPhase::Failed;
-                        }
-                    }
-                }
-
-                // Check startup timers
-                let action = startup_seq.poll_timers();
-                match action {
-                    crate::startup::StartupAction::Write(bytes) => {
+        // Handle one StartupAction. Trust-dismissal keys are written to the
+        // master; the idle-gap injection payload never is — when the sequencer
+        // advances to PromptInjected the payload is the prompt injection,
+        // which warmup must not deliver (ADR-005), and its firing IS the
+        // settle-complete event. Returns true on any terminal outcome.
+        let handle_action = |startup_seq: &mut crate::startup::StartupSeq,
+                             warmup_phase: &mut WarmupPhase,
+                             failed_reason: &mut Option<String>,
+                             action: crate::startup::StartupAction|
+         -> bool {
+            use crate::startup::{StartupAction, StartupPhase};
+            let terminal = match action {
+                StartupAction::Write(bytes) => {
+                    if *startup_seq.phase() == StartupPhase::PromptInjected {
+                        // Idle-settle window completed: the worker is Ready.
+                        *warmup_phase = WarmupPhase::Ready;
+                        true
+                    } else {
+                        // Trust-dismissal keys (from feed, or held until the
+                        // render burst went quiet) — deliver them.
                         let _ = unsafe {
                             libc::write(
                                 master_fd,
@@ -527,116 +576,146 @@ impl PoolManager {
                                 bytes.len(),
                             )
                         };
-                    }
-                    crate::startup::StartupAction::None => {}
-                    crate::startup::StartupAction::HardTimeout => {
-                        eprintln!(
-                            "[claude-print pool] Worker {} hard timeout during warmup",
-                            worker_id
-                        );
-                        warmup_phase = WarmupPhase::Failed;
+                        false
                     }
                 }
-            }) {
-                Ok(crate::event_loop::ExitReason::ChildExited) => {
-                    // Child exited during warmup - this is a failure
-                    eprintln!(
-                        "[claude-print pool] Worker {} child exited during warmup",
-                        worker_id
-                    );
-                    let _ = nix::unistd::close(pipe_r_raw);
-                    let _ = nix::unistd::close(pipe_w_raw);
-                    return;
+                StartupAction::None => false,
+                StartupAction::HardTimeout => {
+                    *failed_reason = Some("hard timeout during warmup".to_string());
+                    *warmup_phase = WarmupPhase::Failed;
+                    true
                 }
-                Ok(crate::event_loop::ExitReason::Interrupted) => {
-                    // SIGINT/SIGTERM - exit gracefully
-                    if verbose {
-                        eprintln!(
-                            "[claude-print pool] Worker {} warmup interrupted",
-                            worker_id
-                        );
-                    }
-                    let _ = nix::unistd::close(pipe_r_raw);
-                    let _ = nix::unistd::close(pipe_w_raw);
-                    return;
+                StartupAction::Refuse(reason) => {
+                    *failed_reason = Some(format!("trust dismissal refused: {reason}"));
+                    *warmup_phase = WarmupPhase::Failed;
+                    true
                 }
-                Ok(crate::event_loop::ExitReason::FifoPayload(_)) => {
-                    // Should not happen during warmup (FIFO not opened yet)
-                    eprintln!(
-                        "[claude-print pool] Worker {} unexpected FIFO payload during warmup",
-                        worker_id
-                    );
+            };
+            if terminal {
+                // Wake the poll loop: run() returns only on its own exit
+                // conditions, so without this a terminal outcome reached
+                // inside the callback would block until the child exits.
+                Self::wake_event_loop(pipe_w_raw);
+            }
+            terminal
+        };
+
+        let reason = event_loop.run(|chunk| {
+            if !chunk.is_empty() {
+                // Feed chunk to terminal emulator for probe responses
+                let responses = terminal_emu.feed(chunk);
+                if !responses.is_empty() {
+                    let _ = unsafe {
+                        libc::write(
+                            master_fd,
+                            responses.as_ptr() as *const libc::c_void,
+                            responses.len(),
+                        )
+                    };
                 }
-                Err(e) => {
-                    eprintln!(
-                        "[claude-print pool] Worker {} warmup event loop error: {}",
-                        worker_id, e
-                    );
-                    let _ = nix::unistd::close(pipe_r_raw);
-                    let _ = nix::unistd::close(pipe_w_raw);
+
+                // Feed chunk to startup sequencer
+                let action = startup_seq.feed(chunk);
+                if handle_action(
+                    &mut startup_seq,
+                    &mut warmup_phase,
+                    &mut failed_reason,
+                    action,
+                ) {
                     return;
                 }
             }
 
-            // Check if we've reached the Ready state
-            // We're ready when trust has been dismissed and we've settled
-            if warmup_phase == WarmupPhase::Starting {
-                if startup_seq.phase() == &crate::startup::StartupPhase::TrustDismissed {
-                    warmup_phase = WarmupPhase::Settling;
-                    if verbose {
-                        eprintln!(
-                            "[claude-print pool] Worker {} trust dismissed, settling...",
-                            worker_id
-                        );
-                    }
-                }
-            } else if warmup_phase == WarmupPhase::Settling {
-                // Check if we've been idle long enough after trust dismiss
-                let action = startup_seq.poll_timers();
-                match action {
-                    crate::startup::StartupAction::None => {
-                        // We've settled - worker is ready
-                        warmup_phase = WarmupPhase::Ready;
-                        if verbose {
-                            eprintln!("[claude-print pool] Worker {} settled and ready", worker_id);
-                        }
-                        break;
-                    }
-                    _ => {
-                        // Still settling or some other action needed
-                        continue;
-                    }
-                }
-            } else if warmup_phase == WarmupPhase::Failed {
-                eprintln!("[claude-print pool] Worker {} warmup failed", worker_id);
-                let _ = nix::unistd::close(pipe_r_raw);
-                let _ = nix::unistd::close(pipe_w_raw);
-                std::mem::forget(pipe_r);
-                std::mem::forget(pipe_w);
+            // Check startup timers (runs on every poll wakeup, including the
+            // 50 ms tick)
+            let action = startup_seq.poll_timers();
+            if handle_action(
+                &mut startup_seq,
+                &mut warmup_phase,
+                &mut failed_reason,
+                action,
+            ) {
                 return;
             }
 
-            // Small sleep to prevent tight loop
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // Clean up pipe fds
-        let _ = nix::unistd::close(pipe_r_raw);
-        let _ = nix::unistd::close(pipe_w_raw);
-        // Prevent the OwnedFds from closing again when they drop
-        std::mem::forget(pipe_r);
-        std::mem::forget(pipe_w);
-
-        // Notify main thread that warmup is complete
-        if !shutdown_flag.load(Ordering::SeqCst) && warmup_phase == WarmupPhase::Ready {
-            let _ = warmup_tx.send(worker_id.clone());
-            if verbose {
-                eprintln!(
-                    "[claude-print pool] Worker {} warmup complete in {:.1}s",
-                    worker_id,
+            // Overall warmup deadline — see warmup_timeout above.
+            if warmup_start.elapsed() > warmup_timeout {
+                failed_reason = Some(format!(
+                    "warmup timeout after {:.1}s",
                     warmup_start.elapsed().as_secs_f64()
-                );
+                ));
+                warmup_phase = WarmupPhase::Failed;
+                Self::wake_event_loop(pipe_w_raw);
+                return;
             }
+
+            // Stop warming as soon as shutdown is requested.
+            if shutdown_flag.load(Ordering::SeqCst) {
+                if verbose {
+                    eprintln!(
+                        "[claude-print pool] Worker {} warmup cancelled (shutdown)",
+                        worker_id
+                    );
+                }
+                failed_reason = Some("pool shutdown during warmup".to_string());
+                warmup_phase = WarmupPhase::Failed;
+                Self::wake_event_loop(pipe_w_raw);
+                return;
+            }
+
+            // Phase machine: trust dismissed → settling.
+            if warmup_phase == WarmupPhase::Starting
+                && *startup_seq.phase() == crate::startup::StartupPhase::TrustDismissed
+            {
+                warmup_phase = WarmupPhase::Settling;
+                if verbose {
+                    eprintln!(
+                        "[claude-print pool] Worker {} trust dismissed, settling...",
+                        worker_id
+                    );
+                }
+            }
+        });
+
+        match reason {
+            Ok(crate::event_loop::ExitReason::ChildExited) => {
+                // The child exited — or the master fd was closed under us
+                // (POLLNVAL, e.g. the pool shutdown path destroyed this
+                // worker from another thread). Either way warming is over.
+                let reason = failed_reason
+                    .take()
+                    .unwrap_or_else(|| "child exited during warmup".to_string());
+                Self::fail(worker_id, &reason)
+            }
+            Ok(crate::event_loop::ExitReason::Interrupted) => {
+                // Self-pipe wake: the callback reached a terminal phase.
+                match warmup_phase {
+                    WarmupPhase::Ready => {
+                        if verbose {
+                            eprintln!(
+                                "[claude-print pool] Worker {} settled and ready in {:.1}s",
+                                worker_id,
+                                warmup_start.elapsed().as_secs_f64()
+                            );
+                        }
+                        WarmupNotification::Ready(worker_id)
+                    }
+                    WarmupPhase::Failed => Self::fail(
+                        worker_id,
+                        failed_reason.as_deref().unwrap_or("warmup failed"),
+                    ),
+                    // Nothing else writes this pipe, so a wake before a
+                    // terminal phase cannot happen; fail loudly rather than
+                    // re-enter a loop that would spin.
+                    _ => Self::fail(worker_id, "warmup interrupted mid-phase"),
+                }
+            }
+            Ok(crate::event_loop::ExitReason::FifoPayload(_)) => {
+                // The stop FIFO is never registered during warmup, so this is
+                // unexpected; fail rather than re-poll.
+                Self::fail(worker_id, "unexpected FIFO payload during warmup")
+            }
+            Err(e) => Self::fail(worker_id, &format!("warmup event loop error: {e}")),
         }
     }
 
@@ -730,10 +809,56 @@ impl PoolServer {
     fn accept_loop(&self) -> Result<(), anyhow::Error> {
         let listener = self.listener.as_ref().unwrap();
 
-        // Set non-blocking mode for accept to check shutdown flag
-        listener.set_nonblocking(true)?;
+        // poll(2) with a bounded timeout rather than non-blocking accept plus
+        // sleep: a pending connection is accepted the instant poll reports the
+        // listener readable, a shutdown request is noticed within
+        // ACCEPT_POLL_TIMEOUT_MS even without the signal self-pipe, and the
+        // same tick drives maintain() (top-up respawn cadence).
+        let mut poll_fds = [libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
 
-        while !self.manager.lock().unwrap().shutdown.load(Ordering::SeqCst) {
+        loop {
+            {
+                let mut manager = self.manager.lock().unwrap();
+                if manager.shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Pool maintenance tick: mark finished warmups Ready, retire
+                // failed ones, top the pool back up to target size. No-ops
+                // once shutdown is requested (maintain checks the flag too).
+                if let Err(e) = manager.maintain() {
+                    eprintln!("[claude-print pool] Maintain failed: {}", e);
+                }
+            }
+
+            poll_fds[0].revents = 0;
+            let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, ACCEPT_POLL_TIMEOUT_MS) };
+            if ret < 0 {
+                let errno = nix::errno::Errno::last();
+                if errno == nix::errno::Errno::EINTR {
+                    continue;
+                }
+                return Err(anyhow::anyhow!("pool listener poll failed: {errno}"));
+            }
+            if ret == 0 {
+                continue; // timeout → re-check shutdown + run the maintain tick
+            }
+
+            // The listener fd itself went bad — nothing more to accept.
+            if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(anyhow::anyhow!(
+                    "pool listener fd error (revents = {})",
+                    poll_fds[0].revents
+                ));
+            }
+
+            if poll_fds[0].revents & libc::POLLIN == 0 {
+                continue; // spurious wakeup of some other kind
+            }
+
             match listener.accept() {
                 Ok((stream, _addr)) => {
                     let manager = Arc::clone(&self.manager);
@@ -747,8 +872,8 @@ impl PoolServer {
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No connection pending, sleep briefly and check shutdown flag
-                    std::thread::sleep(Duration::from_millis(100));
+                    // The connection vanished from the backlog between poll
+                    // and accept; the next poll cycle retries.
                     continue;
                 }
                 Err(e) => {

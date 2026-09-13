@@ -171,7 +171,12 @@ impl EventLoop {
             }
 
             // POLLHUP/POLLERR with no POLLIN → child exited, no data pending.
-            if master_revents & (libc::POLLHUP | libc::POLLERR) != 0
+            // POLLNVAL → the master fd itself is invalid, i.e. closed under us
+            // (the pool shutdown path closes a warming worker's master fd from
+            // another thread). Fall through to the same child-gone exit rather
+            // than spinning: no check below consumes POLLNVAL, so an unhandled
+            // POLLNVAL would re-poll the dead fd in a tight loop forever.
+            if master_revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
                 && master_revents & libc::POLLIN == 0
             {
                 return Ok(ExitReason::ChildExited);
@@ -242,6 +247,40 @@ mod tests {
             "expected ChildExited, got {reason:?}"
         );
 
+        let _ = waitpid(spawner.child_pid, None);
+    }
+
+    /// POLLNVAL must end the loop: the pool shutdown path closes a warming
+    /// worker's master fd from another thread (claudepr-badd9c44), and an
+    /// unhandled POLLNVAL would re-poll the dead fd in a tight loop forever —
+    /// this test hangs if that regression returns.
+    #[test]
+    fn test_event_loop_pollnval_returns_child_exited() {
+        let (pipe_r, _pipe_w) = make_self_pipe();
+
+        // A child that stays alive so the exit comes from the invalid master
+        // fd, not from the child dying.
+        let sleep_path = which::which("sleep").expect("'sleep' should be resolvable on PATH");
+        let cmd = CString::new(sleep_path.as_os_str().as_encoded_bytes()).unwrap();
+        let args = vec![CString::new("30").unwrap()];
+        let spawner = PtySpawner::spawn(&cmd, &args).expect("PtySpawner::spawn");
+        let master_fd = spawner.master.as_raw_fd();
+
+        // Simulate the pool destroying the worker: the master fd is closed
+        // out from under the loop. The fd is handed to close() deliberately —
+        // the child is reaped below, so nothing else needs the OwnedFd.
+        let _ = nix::unistd::close(master_fd);
+        std::mem::forget(spawner.master);
+
+        let mut el = EventLoop::new(master_fd, pipe_r.as_raw_fd());
+        let reason = el.run(|_| {}).unwrap();
+
+        assert!(
+            matches!(reason, ExitReason::ChildExited),
+            "expected ChildExited on POLLNVAL, got {reason:?}"
+        );
+
+        let _ = nix::sys::signal::kill(spawner.child_pid, nix::sys::signal::Signal::SIGKILL);
         let _ = waitpid(spawner.child_pid, None);
     }
 
