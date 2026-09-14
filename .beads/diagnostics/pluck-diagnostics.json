@@ -1,13 +1,13 @@
 {
-  "timestamp": "2026-09-14T18:39:56.825241988Z",
-  "total_open_beads": 3,
+  "timestamp": "2026-09-14T19:39:23.164442301Z",
+  "total_open_beads": 4,
   "exclusion_criteria": {
     "has_assignee": 0,
     "manually_blocked": 0,
     "has_dependencies": 3,
     "resource_conflicts": 1
   },
-  "final_candidate_count": 0,
+  "final_candidate_count": 1,
   "excluded_beads": [
     {
       "bead_id": "claudepr-309d826d",
