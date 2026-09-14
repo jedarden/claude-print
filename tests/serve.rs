@@ -11,8 +11,8 @@
 //!     missing-binary check runs before the dispatch: serve with a bogus
 //!     `--claude-binary` exits 2 before binding anything.
 //!   * **invalid pool size** — `--pool-size 0`, `--pool-size` past
-//!     `MAX_POOL_SIZE`, and non-numeric values all exit 2 with actionable
-//!     stderr before any worker is spawned.
+//!     `MAX_POOL_SIZE`, and non-numeric or negative values all exit 2 with
+//!     actionable stderr before any worker is spawned.
 //!   * **socket setup failures** — an unbindable socket path (parent a file,
 //!     or parent missing entirely) exits 2 with actionable stderr naming the
 //!     exact path and what to check.
@@ -296,6 +296,40 @@ fn serve_rejects_non_numeric_pool_size() {
     assert!(
         out.stderr.contains("pool-size"),
         "stderr must name the offending flag: {}",
+        out.stderr
+    );
+    assert!(
+        !socket.exists(),
+        "no socket may be created for a rejected size"
+    );
+}
+
+// A negative size is a distinct invalid shape from a non-numeric one: with
+// `=` syntax the value reaches clap's value parser, which must reject it
+// naming the flag and the value (the space form is refused even earlier, as
+// an unexpected `-`-leading argument). Same contract — exit 2, no socket,
+// no server loop, no prompt validation.
+#[test]
+fn serve_rejects_negative_pool_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let out = run(
+        claude_print()
+            .args(["serve", "--pool-size=-1", "--socket"])
+            .arg(&socket),
+        BUDGET,
+    );
+
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("--pool-size") && out.stderr.contains("-1"),
+        "stderr must name the flag and the rejected value: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("no prompt provided"),
+        "serve must not reach prompt validation: {}",
         out.stderr
     );
     assert!(
