@@ -17,7 +17,8 @@
 //!     or parent missing entirely) exits 2 with actionable stderr naming the
 //!     exact path and what to check.
 //!   * **safe local permissions** — the socket node is user-only (0600),
-//!     whatever umask the invoking shell carried.
+//!     whatever umask the invoking shell carried (dedicated pin under a
+//!     deliberately cleared umask: `serve_socket_is_owner_only_regardless_of_umask`).
 //!   * **population** — the daemon warms exactly the requested number of
 //!     workers (mock-claude completes the full warmup: trust dialog →
 //!     dismissal → idle-settle, then blocks awaiting a prompt that warmup
@@ -845,6 +846,59 @@ fn serve_default_pool_size_warms_one_worker() {
     );
 
     let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+// Named pin for the safe-permissions bullet (claudepr-2075eea1 coverage
+// audit): the population test above asserts the same mode on its happy path,
+// but only under whatever umask the machine running the suite happened to
+// start with — a chmod regression there is caught only because CI's ambient
+// umask is narrow. This makes the bullet its own named failure and removes
+// the ambient-umask dependency: the daemon is spawned under a deliberately
+// cleared umask 000, so if bind_socket ever drops its explicit
+// set_permissions (src/pool.rs) or its narrowed-umask bind window, the node
+// comes out 0777 — group/world-connectable, i.e. anyone who can reach the
+// path can acquire a warmed worker — and the exact-equality assert fails
+// loudly instead of leaning on the environment.
+//
+// The flip is process-wide but held only across the spawn: the child
+// inherits the mask at fork, and bind_socket then narrows and chmods itself,
+// so nothing the daemon does afterwards observes the test process's mask.
+// Concurrent tests in this binary create no umask-sensitive state in that
+// window (tempfile pins its dirs/files to 0700/0600; every socket goes
+// through bind_socket), so the few milliseconds cannot perturb them.
+#[test]
+fn serve_socket_is_owner_only_regardless_of_umask() {
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let previous_mask = unsafe { libc::umask(0o000) };
+    let mut daemon = Daemon::start(&mock, &socket, Some("1"));
+    unsafe {
+        libc::umask(previous_mask);
+    }
+
+    // bind_socket runs before "Listening on" is logged, so the mode is final
+    // the moment the daemon announces the bind.
+    daemon.wait_for("Listening on", 1, Duration::from_secs(30));
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&socket)
+        .expect("socket metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "socket must be owner-only even under umask 000, got {mode:o}"
+    );
+
+    // The daemon under that hostile umask still satisfies the full clean-stop
+    // contract. No exact worker count is pinned (the first spawn may still be
+    // mid-fork — population is owned by the tests above); whatever children
+    // existed at signal time must be gone, which the `None` mode asserts.
+    let out = daemon.shutdown_daemon(&[Signal::SIGTERM], SHUTDOWN_BOUND, &socket, None, true);
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
 
