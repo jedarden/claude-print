@@ -35,7 +35,10 @@
 //!     absurd length prefix are dropped cleanly; the daemon keeps serving a
 //!     well-formed acquire afterwards (claudepr-b78932de audit repair).
 //!   * **default path unchanged** — an ordinary prompt invocation without the
-//!     subcommand still runs the plain session path, with no daemon behavior.
+//!     subcommand still runs the plain session path, with no daemon behavior —
+//!     including under SIGINT/SIGTERM: the session interrupt contract (exit
+//!     130) holds and the serve shutdown never fires, pinning
+//!     install_serve_signal_handlers as serve-only (claudepr-e7bc9482).
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -1240,6 +1243,153 @@ fn default_non_serve_invocation_is_unchanged() {
         !socket.exists(),
         "serve machinery must not bind a socket for a plain run"
     );
+}
+
+// The other side of the serve-only boundary (claudepr-e7bc9482): the ordinary
+// session path must keep its own signal contract. Session::run installs
+// scoped self-pipe SIGINT/SIGTERM handlers and restores the defaults on drop
+// (SignalGuard, src/session.rs); run_serve is the only caller of
+// install_serve_signal_handlers. The regression worth a binary-level pin is
+// the plausible refactor that "shares" the serve handler by installing it
+// unconditionally in main(): SIGINT during an ordinary session would flip
+// SERVE_SIGNALED — which nothing outside the accept loop ever reads — and
+// Ctrl-C would be silently swallowed, hanging the session instead of
+// interrupting it. This pin holds both doors on each leg: exit 130 (neither a
+// default-disposition kill, which would be killed-by-signal, nor a swallow,
+// which would hang) inside a bound, the structured interrupted error on
+// stderr, zero pool-daemon behavior in either stream, and the session's child
+// reaped from /proc.
+//
+// Determinism: MOCK_SILENT makes the mock block forever, so the session is
+// alive until signaled, and the `child forked` verbose trace is emitted after
+// the scoped handlers are installed (program order in Session::run), so the
+// signal always lands inside the handler window — never in the pre-install
+// startup span where the default disposition would kill the process.
+#[test]
+fn plain_session_signals_keep_the_session_contract_not_serve_teardown() {
+    signal_plain_session_and_pin_interrupt_contract(Signal::SIGINT);
+    signal_plain_session_and_pin_interrupt_contract(Signal::SIGTERM);
+}
+
+/// Run an ordinary (no-subcommand) session against a `MOCK_SILENT` mock — the
+/// session stays alive until signaled — deliver `sig` once the `--verbose`
+/// trace proves the PTY child is forked, and pin the session-path interrupt
+/// contract (see the test above for the full rationale).
+fn signal_plain_session_and_pin_interrupt_contract(sig: Signal) -> Outcome {
+    let config = tempfile::tempdir().unwrap();
+
+    let mut cmd = claude_print();
+    cmd.arg("--verbose").arg("plain prompt");
+    cmd.env("MOCK_SILENT", "1");
+    cmd.env("XDG_CONFIG_HOME", config.path());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn claude-print: {e}"));
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    let reader = std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => sink.lock().unwrap().push(line),
+                Err(_) => break,
+            }
+        }
+    });
+    let stderr_lines = || lines.lock().unwrap().clone();
+
+    // Readiness: the fork trace exists only after Session::run installed its
+    // scoped handlers, and the silent mock keeps the session alive past it.
+    let start = Instant::now();
+    loop {
+        if stderr_lines()
+            .iter()
+            .any(|l| l.contains("child forked pid="))
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "session never reached the PTY fork; stderr: {:?}",
+            stderr_lines()
+        );
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "session exited before signaling ({status:?}); stderr: {:?}",
+                stderr_lines()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // The silent mock is the session's only child at this point (PtySpawner
+    // forks it directly; nothing else in the session path forks).
+    let workers = children_of(child.id());
+    assert_eq!(
+        workers.len(),
+        1,
+        "expected exactly the mock PTY child at signal time; found {workers:?}"
+    );
+
+    let pid = Pid::from_raw(child.id() as i32);
+    kill(pid, sig).expect("failed to signal session");
+
+    // Interrupted teardown is bounded: the self-pipe wakes the event loop,
+    // kill_child gives the child 2 s before SIGKILL. A swallowed signal (the
+    // serve-handler leak this pin guards) never exits at all.
+    let start = Instant::now();
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {
+                assert!(
+                    start.elapsed() < SHUTDOWN_BOUND,
+                    "session ignored {sig:?} — a signal disposition leaked onto \
+                     the ordinary path (serve handler swallows, default kills); \
+                     workers: {workers:?}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("failed to reap session after {sig:?}: {e}"),
+        }
+    };
+
+    let mut stdout_bytes = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_end(&mut stdout_bytes);
+    }
+    reader.join().expect("stderr reader thread");
+
+    let stderr = stderr_lines().join("\n");
+    assert_eq!(
+        code,
+        Some(130),
+        "{sig:?} must take the session interrupt contract (exit 130, matching \
+         the in-session Interrupted path); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("interrupted by signal"),
+        "the interrupted error must surface on stderr: {stderr}"
+    );
+    for marker in ["[claude-print pool]", "Listening on", "Shutdown complete"] {
+        assert!(
+            !stderr.contains(marker),
+            "a plain session must show no pool-daemon behavior ({marker}); stderr: {stderr}"
+        );
+    }
+    assert_workers_gone(&workers, Duration::from_secs(2));
+
+    Outcome {
+        code,
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr,
+    }
 }
 
 // ── Malformed clients (claudepr-b78932de audit repair) ──────────────────────
