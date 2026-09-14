@@ -75,7 +75,19 @@ If the same probe is received again, no response is emitted.
 
 Unknown escape sequences are **silently ignored** — they are never treated as an error. This ensures version-resilience: if Ink adds new probe types in future versions, `claude-print` will not hang; it simply won't respond to the unrecognized probes.
 
-The startup sequencer has a fallback timeout (0.8 s idle after ≥ 200 bytes received) to cover cases where the terminal doesn't respond to all probes or emits unexpected output.
+The startup sequencer has a fallback timeout (0.4 s idle after ≥ 200 bytes received — `IDLE_THRESHOLD_BYTES` / `IDLE_TIMEOUT_MS` in `src/startup.rs`; reduced from the original 0.8 s on 2026-08-15 by the adaptive-backoff change) to cover cases where the terminal doesn't respond to all probes or emits unexpected output.
+
+## Version-Pinned Capture
+
+What the real TUI actually sends is pinned per Claude Code version, the same way `docs/notes/claude-contract-probes.md` pins the hook contracts:
+
+- **Fixture:** `tests/fixtures/terminal_probes_v<version>.json` — a startup capture of the real `claude` TUI (chunks preserved at read boundaries, plus every CSI sequence found in it, recognized or not).
+- **Capture harness:** `scripts/probe-tui-terminal-probes.py <claude_bin> <out.json> --answer`. `--answer` makes the driver reply via a port of the `src/terminal.rs` responder, which is the production shape (unanswered, Ink stalls after its first queries and the rest never hit the wire — useful for observing the hang, not for pinning the contract).
+- **`tests/terminal.rs`** feeds the recorded chunks (and the same bytes one byte at a time) through the real `TerminalEmu` and asserts the answers are exactly the deduplicated documented responses.
+
+Measured against `claude` 2.1.270 (2026-09-14, sandboxed HOME, trust pre-seeded, `TERM=xterm-256color`, winsize 220×50): the startup render burst sends **XTVERSION** (`ESC[>0q`) once and **DA1** (`ESC[c`) **twice** — the retry is real-traffic proof the dedup bitmask must suppress — and no DA2/DSR/window-size probe at all. The burst also carries sequences the table does not list (`ESC[?u`, `ESC[?2026$p`, SGR colors, mode sets) which must stay silent. The other three probe kinds remain part of the responder contract (other versions / terminal shapes) and are pinned by the table-driven tests.
+
+Re-run the capture script after any Claude Code update; if a probe the table does not list appears in the new capture, treat it like a moved contract in `claude-contract-probes.md` §Maintenance: re-measure, update table + fixture + tests in one change, and file a follow-up bead if any downstream design depends on it.
 
 ## Version Resilience
 
