@@ -5,7 +5,10 @@ claude-print dev host. Probe harness: `scripts/probe-claude-contracts.sh` (merge
 suppression / single-turn Stop), `scripts/probe-stop-toolallowed.sh` (multi-round
 Stop contract, print mode), and `scripts/probe-tui-second-turn.sh` (TUI
 once-per-turn contract). Re-run them after any Claude Code update; results are
-version-pinned. Resolves plan PO-1, PO-2, OQ-1, OQ-2 and the Stop-poller
+version-pinned — the maintenance workflow (drift detection, re-run procedure,
+re-pin checklist, follow-up rule) is defined in §Maintenance at the bottom of
+this file, with `scripts/check-claude-version-bump.sh` as its detection step.
+Resolves plan PO-1, PO-2, OQ-1, OQ-2 and the Stop-poller
 assumption (plan §7 Stop Poller and the glossary Stop-hook note).
 
 **Isolation:** every probe ran with `HOME` redirected into a throwaway
@@ -143,3 +146,61 @@ swallow a following positional prompt; and a hook log of the form
 field-count check (a filter written for the 4-field `ts|tag|event|payload`
 layout silently counts zero on the 2-field layout, which invalidated one TUI
 driver run before this was caught).
+
+## Maintenance: re-running after a Claude Code update
+
+The evidence above is pinned to one claude version and carries to a new one
+only by re-measurement. The maintenance step has four parts: detect, re-run,
+re-pin, and (only if a contract moved) file follow-ups. This section is the
+definition of that step — the doc-level instruction "re-run them after any
+Claude Code update" is otherwise unowned and unscheduled.
+
+**Detect.** `bash scripts/check-claude-version-bump.sh` compares the live
+`claude --version` against the **Measured against:** stamp at the top of this
+file: exit 0 = current, exit 1 = drift (re-run due), exit 2 = cannot
+determine. It runs `claude --version` only — no sandbox, no model turns — so
+it is safe to run on a schedule or from CI, where exit 1 is the R-2 "CI alert
+on version change" signal. Versions move in two ways; either should trigger
+the check:
+
+- the dev host auto-updates the native install
+  (`~/.local/share/claude/versions/`, repointing `~/.local/bin/claude`) —
+  a manual upgrade lands the same way;
+- CI records the version it saw into `target/last-claude-version.txt` via
+  `test_claude_version_recorded` (`tests/version_compat.rs`), and the release
+  WorkflowTemplate uploads it as a release asset — diffing consecutive
+  artifacts is the fleet-visible drift signal (claudepr-777d3056).
+
+**Re-run.** No drift → nothing to do. The cheap live tests re-verify the
+merge and suppression contracts against the installed binary in ~35 s
+(`cargo test --test claude_contracts -- --ignored`) and are the fastest way
+to confirm "no drift within a version" (last verified 2026-09-14 against
+2.1.270: 2/2 passed). On drift, run all three scripts from §Reproducing —
+each is self-contained (sandboxed mktemp `HOME`, scrubbed `CLAUDECODE*` env,
+trust pre-seeded for the probe cwd only, auth by inherited environment) and
+stamps the version it measured. Budget 1–6 min each. Note that
+`probe-tui-second-turn.sh` can legitimately fail to produce a second
+completed reply (an incomplete turn firing no Stop *is* the contract) — an
+incomplete second turn is a re-run, not a contract finding; only
+"reply rendered + no Stop" would be.
+
+**Re-pin** (all contracts unchanged): re-stamp **Measured against:** at the
+top of this file; copy `tests/fixtures/claude_contracts_v<old>.json` to
+`claude_contracts_v<new>.json`, updating `claude_version`/`measured_at`; and
+repoint `FIXTURE` in `tests/claude_contracts.rs` together with its header
+comment and any version-citing assertion messages. Commit doc + fixture +
+test in one change so the always-on suite and this document keep claiming the
+same version.
+
+**File follow-ups** (a contract moved): one bead per moved contract,
+naming the downstream design that depends on it, and update this document and
+the fixture to the new measured truth in the same change, citing sanitized
+evidence only (timestamps, counts, tags — never payloads):
+
+| Moved contract | Design that depends on it |
+|---|---|
+| `--settings` merge (PO-1/OQ-1) | relay wiring in `hook-design.md`; plan hook sections |
+| cross-source firing order becoming contractual (OQ-1) | `hook-design.md` read-race note (currently: not contractual, do not order away) |
+| `--setting-sources=` suppression (PO-2/OQ-2) | `--no-inherit-hooks` mode (plan) |
+| once-per-turn Stop | Stop Poller single-fire design (plan §Stop Poller) |
+| `--max-turns` cutoff fires no Stop | watchdog ownership of cutoff cases (plan) |
