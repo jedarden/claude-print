@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-09-13T23:07:57.333629903Z",
-  "total_open_beads": 6,
+  "timestamp": "2026-09-14T00:08:03.01204336Z",
+  "total_open_beads": 4,
   "exclusion_criteria": {
     "has_assignee": 0,
     "manually_blocked": 0,
-    "has_dependencies": 6,
+    "has_dependencies": 4,
     "resource_conflicts": 0
   },
   "final_candidate_count": 0,
@@ -46,28 +46,6 @@
       "bead_id": "claudepr-4f4b7cef",
       "title": "Cut a fresh evidenced claude-print release from current main",
       "priority": 1,
-      "assignee": null,
-      "manual_blocked": false,
-      "has_blockers": true,
-      "blocker_count": 1,
-      "has_resource_conflicts": false,
-      "conflict_count": 0
-    },
-    {
-      "bead_id": "claudepr-5595466c",
-      "title": "Verify bounded shutdown reaps every child and removes only the daemon-owned socket",
-      "priority": 2,
-      "assignee": null,
-      "manual_blocked": false,
-      "has_blockers": true,
-      "blocker_count": 1,
-      "has_resource_conflicts": false,
-      "conflict_count": 0
-    },
-    {
-      "bead_id": "claudepr-2075eea1",
-      "title": "Audit the binary-level serve test surface against the parent acceptance criteria",
-      "priority": 2,
       "assignee": null,
       "manual_blocked": false,
       "has_blockers": true,
