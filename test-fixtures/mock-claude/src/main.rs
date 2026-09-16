@@ -102,6 +102,15 @@ fn main() {
     let mock_is_error = env_flag("MOCK_IS_ERROR");
     let mock_stop_before_inject = env_flag("MOCK_STOP_BEFORE_INJECT");
 
+    // claudepr-8dcf53ce: MOCK_EXTRA_STOPS=<n> re-fires the Stop hook n extra
+    // times after the normal payload + transcript sequence — the degraded-run
+    // shape measured on claude 2.1.270, where permission-denied headless tool
+    // runs produced an extra Stop firing (docs/notes/hook-design.md "Stop
+    // Firing Frequency"). Firing 1 duplicates the real payload byte-for-byte
+    // (the same turn re-fired); later firings are spurious phantom turns. See
+    // the firing loop near the end of main for the exact payload shapes.
+    let mock_extra_stops: u64 = env_u64("MOCK_EXTRA_STOPS", 0);
+
     // MOCK_IGNORE_TERM_HUP: survive the daemon's teardown instead of ending at
     // the first signal or terminal hangup. Installs SIG_IGN for SIGTERM (what
     // pool teardown sends the worker's whole process group) and SIGHUP (what
@@ -337,6 +346,42 @@ fn main() {
                 thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
             }
             write_transcript_jsonl(&path, &mock_response, session_id, mock_is_error);
+        }
+    }
+
+    // claudepr-8dcf53ce: degraded-run Stop duplication (MOCK_EXTRA_STOPS, see
+    // its parsing above). Each extra firing is its own write-end open + write
+    // + close — byte-for-byte how an extra `cat > fifo` hook invocation lands.
+    // Extra firing 1 re-sends the real payload unchanged (the measured
+    // permission-denied shape: the same turn's Stop fired twice); every firing
+    // after that is a spurious phantom turn with a different session_id, a
+    // transcript_path this mock NEVER writes, and a distinct
+    // last_assistant_message — so a driver that acts on any later payload
+    // produces visibly wrong output (wrong session id, fallback text) instead
+    // of silently passing. The writes cannot block: claude-print holds the
+    // FIFO read-end open for the whole session and each payload is far below
+    // the pipe buffer. Whether the driver's single FIFO read sweeps these into
+    // the same buffer as the first payload or they land after it has returned
+    // and are discarded at cleanup, exactly one clean result must come out.
+    for i in 0..mock_extra_stops {
+        let extra_payload = if i == 0 {
+            payload.clone()
+        } else {
+            let spurious_session = format!("{session_id}-spurious-{i}");
+            let spurious_transcript = home
+                .join(".claude")
+                .join("projects")
+                .join(&cwd_slug)
+                .join(format!("{spurious_session}.jsonl"))
+                .to_string_lossy()
+                .into_owned();
+            format!(
+                "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{spurious_session}\",\"transcript_path\":\"{}\",\"cwd\":\"{cwd}\",\"last_assistant_message\":\"spurious extra Stop firing {i}\"}}\n",
+                json_escape(&spurious_transcript),
+            )
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&fifo_path) {
+            let _ = file.write_all(extra_payload.as_bytes());
         }
     }
 

@@ -55,6 +55,7 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/stream_json_incremental.rs` | Incremental stream-json forwarding through the real binary (events emitted mid-session, not post-burst) |
 | `tests/stream_json_cleanup.rs` | Stream-json reader thread cleanup on all exit paths (verifies plan invariant INV-8) |
 | `tests/transcript_race_e2e.rs` | AS-6 end-to-end test: Stop-before-JSONL-flush race (bead bf-3isy) |
+| `tests/stop_duplicate_firings_e2e.rs` | Degraded-run regression: duplicate/spurious extra Stop firings (`MOCK_EXTRA_STOPS`) still yield exactly one clean result (bead claudepr-8dcf53ce) |
 | `tests/transcript_flush_window.rs` | Flush-window regression: final assistant line absent/truncated on first read, present on retry; decoy `last_assistant_message` suppressed; bounded retries; text/json/stream-json all carry the complete final message |
 | `tests/fixtures/` | Shared fixture helpers |
 
