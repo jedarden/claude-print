@@ -74,12 +74,59 @@ If `transcript_path` is absent from the payload, it is derived from `session_id`
 <HOME>/.claude/projects/<slug>/<session_id>.jsonl
 ```
 
-Where `<slug>` is the `cwd` with leading `/` stripped and remaining `/` replaced with `-`:
+Where `<slug>` folds **every** non-alphanumeric byte of the `cwd` to `-` —
+including the leading `/` — the scheme claude 2.1.263 actually uses for
+`~/.claude/projects/` (verified live; the earlier strip-leading-slash scheme
+produced slugs claude never creates — bead claudepr-26e7a0b6):
 
 ```
-/home/user/myproject → home-user-myproject
-/tmp → tmp
+/home/user/myproject → -home-user-myproject
+/tmp → -tmp
 ```
+
+### Sparse Stop Payloads
+
+Because every field is optional, a payload may arrive missing `transcript_path`,
+`session_id`, `cwd`, or all of them at once. The contract (pinned by
+`tests/stop_sparse_payloads_e2e.rs` across text/json/stream-json, with the
+empty-string variants pinned at the unit level in `src/poller.rs` and the shared
+degraded-result shape in `src/transcript.rs::TranscriptResult::from_fallback`):
+
+1. **Derive when possible.** `transcript_path` absent (or empty — an empty
+   string names nothing and selects this branch, it is never treated as a
+   relative explicit path) but `session_id` + `cwd` both present and non-empty →
+   derive the path per the algorithm above. HOME is consulted only on this
+   branch.
+2. **Derivation impossible → `last_assistant_message` fallback.** When
+   `session_id` or `cwd` is absent/empty, resolution yields no path; if the
+   payload still carries a non-empty `last_assistant_message`, the run is a
+   **degraded success**: that text is the response (ANSI-stripped per EC-9,
+   `used_fallback=true`, `num_turns` 0, zero usage, `session_id` from the
+   payload — `null` when the payload had none). Same shape as the file-level
+   fallback in `read_transcript` — a turn that produced an answer is not
+   discarded because its metadata was sparse.
+3. **Nothing to fall back to → bounded setup error.** No derivable path and no
+   `last_assistant_message` → exit 2, `error:` message on stderr in text mode,
+   one `internal_error` result object on stdout in json and stream-json (after
+   inject). Bounded means: no panic, no hang, FIFO/temp cleanup still runs.
+4. **Unknown extra fields are ignored** — payloads carrying fields
+   claude-print has never heard of are processed normally
+   (`#[serde(default)]`, no `deny_unknown_fields`).
+
+Boundaries of the fallback:
+
+- **HOME failures stay hard.** If derivation is *attempted* and `HOME` is
+  unset/invalid, the strict `get_home` error propagates (exit 2) even when
+  `last_assistant_message` is present — the strict HOME contract
+  (`src/util.rs`, `tests/home_unset.rs`) is not relaxed by the sparse-payload
+  fallback. The fallback covers payloads that *cannot name* a transcript, not
+  environments that cannot resolve HOME.
+- **Malformed derivation inputs stay hard.** A `cwd` containing a null byte
+  fails derivation with the `cwd_to_slug` Config error (exit 2) — a broken
+  payload is a bounded setup error, not a silent degradation.
+- The transcript-read retry loop and its `last_assistant_message` fallback
+  (below) are unchanged: they govern a *resolved* path whose file is missing or
+  empty, not a payload that cannot name a path.
 
 ### Stop Firing Frequency
 

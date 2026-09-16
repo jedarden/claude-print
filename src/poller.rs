@@ -524,6 +524,87 @@ mod tests {
         assert!(info.transcript_path.is_none());
     }
 
+    // ── sparse payloads (claudepr-f3ed858a): absent/empty optional fields ─────
+    //
+    // docs/notes/hook-design.md "Sparse Stop Payloads": every field is optional
+    // for forward compatibility. Resolution must never crash, never mis-derive,
+    // and treat EMPTY-string fields exactly like absent ones — an empty
+    // session_id, cwd, or transcript_path names nothing.
+
+    #[test]
+    fn resolve_treats_empty_session_id_as_absent() {
+        let payload = StopPayload {
+            session_id: Some(String::new()),
+            transcript_path: None,
+            cwd: Some("/home/user/myproject".to_string()),
+            last_assistant_message: Some("answer".to_string()),
+        };
+        // Derivation impossible; the session layer falls back to
+        // last_assistant_message. Resolution must yield None without erroring
+        // — and without consulting HOME (pinned by the no-derivation-no-home
+        // test below).
+        let info = resolve_stop_info_with(payload, || {
+            panic!("HOME must not be consulted when derivation is impossible")
+        })
+        .unwrap();
+        assert!(info.transcript_path.is_none());
+        assert_eq!(info.session_id, Some(String::new()));
+        assert_eq!(info.last_assistant_message.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn resolve_treats_empty_cwd_as_absent() {
+        let payload = StopPayload {
+            session_id: Some("sid".to_string()),
+            transcript_path: None,
+            cwd: Some(String::new()),
+            last_assistant_message: None,
+        };
+        let info = resolve_stop_info_with(payload, || {
+            panic!("HOME must not be consulted when derivation is impossible")
+        })
+        .unwrap();
+        assert!(info.transcript_path.is_none());
+    }
+
+    #[test]
+    fn resolve_treats_empty_transcript_path_as_absent_and_derives() {
+        // `transcript_path: ""` names nothing — it must select the DERIVATION
+        // branch (so "" never becomes a relative path resolved against the
+        // process cwd), not the explicit-path branch.
+        let home_dir = tempfile::tempdir().unwrap();
+        let payload = StopPayload {
+            session_id: Some("sid".to_string()),
+            transcript_path: Some(String::new()),
+            cwd: Some("/home/user/myproject".to_string()),
+            last_assistant_message: None,
+        };
+        let info = resolve_stop_info_with(payload, || Ok(home_dir.path().to_path_buf())).unwrap();
+        let expected = home_dir
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-home-user-myproject")
+            .join("sid.jsonl");
+        assert_eq!(info.transcript_path, Some(expected));
+    }
+
+    #[test]
+    fn resolve_default_payload_yields_all_none_without_consulting_home() {
+        // The degenerate shape — `{"hook_event_name":"Stop"}` or even an empty
+        // FIFO write — parses to the default payload. Resolution must return
+        // all-None lazily: HOME is never read (pinned with a panicking
+        // resolver), nothing errors, and the caller keeps the payload's
+        // (absent) last_assistant_message to decide the degraded outcome.
+        let info = resolve_stop_info_with(StopPayload::default(), || {
+            panic!("HOME must not be consulted for an all-fields-absent payload")
+        })
+        .unwrap();
+        assert!(info.session_id.is_none());
+        assert!(info.transcript_path.is_none());
+        assert!(info.last_assistant_message.is_none());
+    }
+
     #[test]
     fn resolve_propagates_home_resolution_failure() {
         // Pure: an injected failing resolution stands in for the strict

@@ -1,4 +1,6 @@
-use claude_print::transcript::{parse_transcript, read_transcript, strip_ansi, AggregatedUsage};
+use claude_print::transcript::{
+    parse_transcript, read_transcript, strip_ansi, AggregatedUsage, TranscriptResult,
+};
 use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
@@ -397,6 +399,39 @@ fn test_fallback_to_last_assistant_message() {
     let r = read_transcript(&path2, Some("fallback text")).unwrap();
     assert_eq!(r.text, "fallback text");
     assert!(r.used_fallback);
+}
+
+// ── TranscriptResult::from_fallback (claudepr-f3ed858a) ─────────────────────
+//
+// Shared degraded-result constructor for both sparse-input sites: the
+// read_transcript retry-exhausted fallback above, and session.rs's
+// derivation-impossible arm (payload had no transcript_path and none derivable
+// from session_id + cwd). These pins hold regardless of which site calls it.
+
+#[test]
+fn from_fallback_strips_ansi_and_marks_used_fallback() {
+    let r = TranscriptResult::from_fallback(
+        "\x1b[31mraw \x1b]0;title\x07payload\x1b[0m text",
+        Some("sid".to_string()),
+        false,
+    );
+    assert_eq!(r.text, "raw payload text");
+    assert!(r.used_fallback);
+    assert!(!r.is_error);
+    assert_eq!(r.session_id.as_deref(), Some("sid"));
+    // Degraded result carries no transcript-derived metadata.
+    assert_eq!(r.num_turns, 0);
+    assert_eq!(r.usage, AggregatedUsage::default());
+}
+
+#[test]
+fn from_fallback_preserves_is_error_flag_and_absent_session_id() {
+    // The file-level site passes an is_error seen in partial reads (bf-416c);
+    // the sparse-payload site passes false and often no session id at all.
+    let r = TranscriptResult::from_fallback("rate limited", None, true);
+    assert!(r.is_error);
+    assert!(r.used_fallback);
+    assert!(r.session_id.is_none());
 }
 
 // ── read_transcript: error when both empty ────────────────────────────────────

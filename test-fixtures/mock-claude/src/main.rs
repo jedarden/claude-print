@@ -73,6 +73,26 @@ fn main() {
         std::env::var("MOCK_RESPONSE").unwrap_or_else(|_| "Hello from mock_claude".to_string());
     let omit_transcript_path = env_flag("MOCK_OMIT_TRANSCRIPT_PATH");
     let omit_last_message = env_flag("MOCK_OMIT_LAST_MESSAGE");
+    // claudepr-f3ed858a: sparse-payload knobs. All Stop payload fields are
+    // optional for forward compatibility (docs/notes/hook-design.md "Sparse Stop
+    // Payloads"), and claude-print must degrade on every sparse shape:
+    //   * MOCK_OMIT_SESSION_ID / MOCK_OMIT_CWD: drop the field the derivation
+    //     fallback needs, making transcript-path derivation impossible. With
+    //     last_assistant_message still present the run must degrade to a
+    //     payload-text success; without it, to the bounded setup error.
+    //   * MOCK_WRITE_DERIVED_JSONL: write the transcript at the path DERIVED
+    //     from session_id + cwd (the path claude-print must reconstruct when
+    //     transcript_path is absent). Lets a test prove derivation found the
+    //     real file — transcript-sourced text with non-zero usage — rather than
+    //     silently passing via the last_assistant_message fallback. Requires
+    //     session_id + cwd (it names the file); ignored without them.
+    //   * MOCK_UNKNOWN_FIELDS: append fields claude-print has never heard of
+    //     (scalar + nested object), pinning that forward-compatible payloads are
+    //     processed, not rejected.
+    let omit_session_id = env_flag("MOCK_OMIT_SESSION_ID");
+    let omit_cwd = env_flag("MOCK_OMIT_CWD");
+    let write_derived_jsonl = env_flag("MOCK_WRITE_DERIVED_JSONL");
+    let unknown_fields = env_flag("MOCK_UNKNOWN_FIELDS");
     // bf-3isy: make mock_claude honor the transcript_path it reports. Real
     // claude writes a transcript JSONL file at this path; until now mock_claude
     // only sent `last_assistant_message` inline over the Stop FIFO, so the retry
@@ -301,8 +321,29 @@ fn main() {
         None => String::new(),
     };
 
+    // claudepr-f3ed858a: each optional field is emitted only when present, so
+    // any sparse combination is expressible. With every omit knob set the
+    // payload degenerates to {"hook_event_name":"Stop"} — the minimal shape a
+    // forward-compatible claude could legally send.
+    let session_id_part = if omit_session_id {
+        String::new()
+    } else {
+        format!(",\"session_id\":\"{session_id}\"")
+    };
+    let cwd_part = if omit_cwd {
+        String::new()
+    } else {
+        format!(",\"cwd\":\"{cwd}\"")
+    };
+    let unknown_fields_part = if unknown_fields {
+        // A scalar and a nested object claude-print has never heard of.
+        ",\"future_field\":42,\"nested\":{\"a\":[1,2],\"b\":\"x\"}"
+    } else {
+        ""
+    };
+
     let payload = format!(
-        "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{session_id}\"{transcript_path_part},\"cwd\":\"{cwd}\"{last_msg_part}}}\n"
+        "{{\"hook_event_name\":\"Stop\"{session_id_part}{transcript_path_part}{cwd_part}{last_msg_part}{unknown_fields_part}}}\n"
     );
 
     // O_WRONLY on a FIFO blocks until a reader opens the other end.
@@ -330,7 +371,26 @@ fn main() {
     // forgets the scrub (or a future claude gating on something new) fails
     // these tests loudly — stream-json emits nothing and json reports zero
     // usage — instead of silently passing.
-    if let Some(path) = transcript_path {
+    // claudepr-f3ed858a: under MOCK_WRITE_DERIVED_JSONL a transcript_path-less
+    // payload still gets a transcript file — at the path claude-print must
+    // DERIVE from session_id + cwd (the whole point of the derivation fallback:
+    // real claude writes the JSONL there even when it omits transcript_path).
+    // Requires session_id + cwd advertised; without them there is no filename.
+    let derived_transcript_path: Option<String> =
+        if transcript_path.is_none() && write_derived_jsonl && !omit_session_id && !omit_cwd {
+            Some(
+                home.join(".claude")
+                    .join("projects")
+                    .join(&cwd_slug)
+                    .join(format!("{session_id}.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
+
+    if let Some(path) = transcript_path.or(derived_transcript_path) {
         let force_persistence = std::env::var_os("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE")
             .is_some_and(|v| !v.is_empty());
         let saving_disabled = !force_persistence

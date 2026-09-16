@@ -814,8 +814,7 @@ impl Session {
 
                 // Read transcript. On error, `?` returns and Drop joins the
                 // reader without draining (INV-8, exit-immediately on error).
-                let transcript_path = stop_info.transcript_path.as_ref();
-                let transcript = if let Some(path) = transcript_path {
+                let transcript = if let Some(path) = stop_info.transcript_path.as_ref() {
                     let t = read_transcript_traced(
                         path,
                         stop_info.last_assistant_message.as_deref(),
@@ -834,10 +833,36 @@ impl Session {
                         return Err(Error::AssistantError(t.text));
                     }
                     t
+                } else if let Some(msg) = stop_info
+                    .last_assistant_message
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                {
+                    // Sparse payload (forward-compat contract,
+                    // docs/notes/hook-design.md "Sparse Stop Payloads"): no
+                    // `transcript_path` in the payload AND derivation impossible
+                    // (`session_id`/`cwd` absent or empty) — but the payload
+                    // still carries the response text. Mirror the file-level
+                    // fallback in `read_transcript_traced`: a turn that produced
+                    // an answer must not be discarded because its metadata was
+                    // sparse. Same degraded shape: the payload's own message,
+                    // ANSI-stripped by `from_fallback` (EC-9), zero turns/usage,
+                    // session_id from the payload (possibly None), `is_error`
+                    // false (no transcript reported one). Falls through to the
+                    // normal Stop tail below: kill_child, drain, Ok.
+                    tracer.trace(
+                        "no transcript path in payload and none derivable; using \
+                         last_assistant_message fallback",
+                    );
+                    TranscriptResult::from_fallback(msg, stop_info.session_id.clone(), false)
                 } else {
-                    // No transcript path: error path — Drop joins without draining.
+                    // Derivation impossible and no `last_assistant_message`
+                    // fallback either: the bounded setup error (exit 2,
+                    // `internal_error` in json/stream-json). No crash, no hang —
+                    // Drop joins the reader without draining (INV-8).
                     return Err(Error::Internal(anyhow::anyhow!(
-                        "Stop payload contained no transcript path and could not derive one"
+                        "Stop payload had no transcript path, none derivable \
+                         (session_id/cwd absent), and no last_assistant_message fallback"
                     )));
                 };
 

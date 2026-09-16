@@ -118,6 +118,34 @@ pub struct TranscriptResult {
     pub used_fallback: bool,
 }
 
+impl TranscriptResult {
+    /// Degraded result built from the Stop payload's `last_assistant_message`
+    /// when no transcript content could be read.
+    ///
+    /// Two call sites share this shape:
+    /// - [`read_transcript_traced`]: the transcript path resolved but the file
+    ///   was missing/empty after the full retry budget (Stop-before-JSONL race).
+    /// - the sparse-payload arm in `session.rs`: the payload carried no
+    ///   `transcript_path` and none could be derived (`session_id`/`cwd`
+    ///   absent), so there was never a file to read.
+    ///
+    /// `is_error` lets the file-level site preserve an `is_error:true` seen in
+    /// partial reads (bf-416c); the sparse-payload site has no transcript to
+    /// consult and passes `false`. The message is ANSI-stripped HERE (EC-9) —
+    /// the single point where fallback text enters the system — so every
+    /// downstream consumer receives clean text.
+    pub fn from_fallback(message: &str, session_id: Option<String>, is_error: bool) -> Self {
+        Self {
+            text: strip_ansi(message),
+            num_turns: 0,
+            usage: AggregatedUsage::default(),
+            session_id,
+            is_error,
+            used_fallback: true,
+        }
+    }
+}
+
 /// Parse a transcript JSONL file once (no retry).
 ///
 /// Missing files return an empty result. Malformed lines are silently skipped.
@@ -264,25 +292,15 @@ pub fn read_transcript_traced(
             "transcript retry exhausted after {} attempts; using last_assistant_message fallback",
             MAX_RETRIES + 1
         ));
-        return Ok(TranscriptResult {
-            // EC-9: the Stop payload's `last_assistant_message` originates from
-            // Claude Code's TUI-facing internals and may carry raw ANSI escapes
-            // (SGR color codes, OSC title strings, cursor moves). Sanitize it
-            // HERE — the single point where fallback text enters the system —
-            // so every downstream consumer receives clean text. This is required
-            // for the `stream-json` synthesized error result path: that flows
-            // through `Error::AssistantError(t.text)` → `emit_error`, whose
-            // signature carries only the message string and has no `used_fallback`
-            // context to gate a strip on, so the strip must happen upstream.
-            // The text/json emitter path also gets an idempotent defense-in-depth
-            // strip in `emit_success`.
-            text: strip_ansi(msg),
-            num_turns: 0,
-            usage: AggregatedUsage::default(),
-            session_id: last_session_id,
-            is_error: last_is_error,
-            used_fallback: true,
-        });
+        // EC-9: the Stop payload's `last_assistant_message` may carry raw ANSI
+        // escapes — `from_fallback` strips them at this single entry point.
+        // `last_is_error` preserves an `is_error:true` seen in partial reads
+        // (bf-416c) so an errored turn is never reported as success.
+        return Ok(TranscriptResult::from_fallback(
+            msg,
+            last_session_id,
+            last_is_error,
+        ));
     }
 
     Err(Error::Internal(anyhow::anyhow!(
