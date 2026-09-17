@@ -49,14 +49,17 @@ struct RejectedCwd {
     cwd: String,
 }
 
-/// The stale scheme's recipe, in every spelling it has appeared in so far.
-/// Historical *mentions* of the superseded scheme (e.g. the "the earlier
+/// The stale scheme's recipe, in spellings a literal match can catch. The
+/// strip-the-leading-slash wording itself is banned structurally (any
+/// inflection of "strip" followed by "the leading" on one line — see
+/// `STRIP_VERB_FORMS`), because the recipe drifts by inflection: the plan
+/// glossary said "stripping", the Transcript Reader section said "strip", and
+/// "claude strips the leading slash" is the same recipe again. Historical
+/// *mentions* of the superseded scheme (e.g. the "the earlier
 /// strip-leading-slash scheme produced slugs claude never creates" note in
-/// `hook-design.md`) deliberately avoid these exact spellings; if you need to
-/// mention it, do the same.
+/// `hook-design.md`) deliberately avoid these shapes; if you need to mention
+/// it, do the same.
 const BANNED_PHRASES: &[&str] = &[
-    "stripping the leading `/`",
-    "strip the leading `/`",
     "replace('/', '-')",
     "replace(\"/\", \"-\")",
     // The stale scheme's outputs for the documented example cwds — always
@@ -64,6 +67,45 @@ const BANNED_PHRASES: &[&str] = &[
     "`home-coding-myproject`",
     "`home-user-myproject`",
 ];
+
+/// Verb inflections the strip-the-leading-slash recipe appears in. Matched
+/// case-insensitively at word boundaries; flagged when the recipe's object
+/// ("the leading") follows anywhere later on the same line.
+const STRIP_VERB_FORMS: &[&str] = &["stripped", "stripping", "strips", "strip"];
+
+/// The object that turns "strip" (which also names the deliberate ANSI / env
+/// stripping elsewhere in these docs) into the slug recipe.
+const STRIP_RECIPE_OBJECT: &str = "the leading";
+
+/// One line of the strip-the-leading-slash recipe: a standalone inflection of
+/// "strip" with the recipe's object later on the same line. Line-granular on
+/// purpose — the fold scheme's own "the leading `/` included" phrasing shares
+/// lines with "folds"/"folding", never with a strip verb, and the historical
+/// mention ("the earlier strip-leading-slash scheme") has no "the leading" on
+/// its line — so legitimate prose passes and only the recipe pairs.
+fn line_uses_strip_recipe(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    for verb in STRIP_VERB_FORMS {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(verb) {
+            let start = from + rel;
+            let end = start + verb.len();
+            let word_starts = lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let word_ends = lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
+            if word_starts && word_ends && lower[end..].contains(STRIP_RECIPE_OBJECT) {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
 
 /// Markdown docs the guard covers: everything under `docs/` plus the README.
 fn doc_files() -> Vec<(String, String)> {
@@ -308,6 +350,13 @@ fn docs_contain_no_stale_slug_scheme() {
                 failures.push(format!("{rel}: stale slug phrasing {phrase:?}"));
             }
         }
+        for line in content.lines() {
+            if line_uses_strip_recipe(line) {
+                failures.push(format!(
+                    "{rel}: stale strip-the-leading-slash recipe: {line:?}"
+                ));
+            }
+        }
         // A `projects/<segment>/` path equal to the stale scheme's output for
         // a cwd documented in the same file is the hook-design.md-style drift
         // (payload example showing `home-user-myproject` next to a derivation
@@ -331,6 +380,43 @@ fn docs_contain_no_stale_slug_scheme() {
         "stale slug scheme found in docs:\n  {}",
         failures.join("\n  ")
     );
+}
+
+#[test]
+fn strip_recipe_detector_catches_historical_spellings() {
+    // Guard the structural layer: the literal banned phrases were folded into
+    // `line_uses_strip_recipe`, so if that detector ever stops matching, the
+    // stale recipe becomes publishable again with every test green. Pin the
+    // spellings the recipe actually appeared in (plan glossary, Transcript
+    // Reader section, third-person drift) plus a couple of plausible
+    // re-inflections.
+    for line in [
+        "stripping the leading `/`, then replace the remaining `/` with `-`",
+        "strip the leading `/`, then replace the remaining `/` with `-`",
+        "claude strips the leading slash from the cwd before folding",
+        "the cwd is stripped of the leading `/` before the fold",
+    ] {
+        assert!(
+            line_uses_strip_recipe(line),
+            "detector missed a historical spelling of the stale recipe: {line:?}"
+        );
+    }
+    // …and the legitimate shapes that share words with the recipe — the fold
+    // scheme's own phrasing, the deliberate historical mention, ANSI and
+    // environment stripping — must stay clean, or every doc edit trips here.
+    for line in [
+        "`<slug>` folds **every** non-alphanumeric byte of the `cwd` to `-` —",
+        "including the leading `/` — the scheme claude 2.1.263 actually uses for",
+        "`~/.claude/projects/` (verified live; the earlier strip-leading-slash scheme",
+        "| EC-9 | `last_assistant_message` contains ANSI escape sequences | Strip ANSI",
+        "update health checks that invoke `--version` in a stripped environment.",
+        ".rstrip()",
+    ] {
+        assert!(
+            !line_uses_strip_recipe(line),
+            "detector flagged legitimate prose: {line:?}"
+        );
+    }
 }
 
 #[test]
