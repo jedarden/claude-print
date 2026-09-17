@@ -114,36 +114,110 @@ claude-print --timeout 30 "quick question"
 
 ## Configuration
 
-By default, `claude-print` reads `$XDG_CONFIG_HOME/claude-print/config.toml`
-when `XDG_CONFIG_HOME` is set, or `~/.config/claude-print/config.toml`
-otherwise. Use `--config <FILE>` to select another file. The file is optional;
-when it is missing, the built-in defaults are used.
+### File location
 
-Configuration uses TOML. Every key is optional, so partial configurations are
-valid:
+`claude-print` reads at most one optional TOML file. The path is resolved in
+this order — the first rule that matches wins:
+
+1. `--config <FILE>` — an explicit path, used as given
+2. `$XDG_CONFIG_HOME/claude-print/config.toml` — when `XDG_CONFIG_HOME` is set
+3. `$HOME/.config/claude-print/config.toml` — otherwise
+
+An explicit `--config` replaces the default path entirely; it does not merge
+with it. A valid `HOME` is required in every case, even when `XDG_CONFIG_HOME`
+or `--config` supplies the path (see
+[Troubleshooting](#home-in-containers-and-chroots) for why). The config file is
+read only by normal prompt runs — `--version`, `--check`, and `serve` never
+load it.
+
+`claude-print` never creates or writes the file; you own it.
+
+### Keys
 
 ```toml
 [defaults]
-model = "claude-sonnet-4-6"
+model = "claude-opus-4-8"
 inherit_hooks = true
 max_turns = 30
 timeout_secs = 3600
 ```
 
-`model` must start with `claude-` and may contain letters, numbers, hyphens,
-underscores, and dots. `max_turns` must be from 1 through 1000, and
-`timeout_secs` must be from 1 through 86400. Unknown keys, invalid value types,
-out-of-range values, and malformed TOML are rejected.
+Every key is optional and a bare `[defaults]` table is valid, so partial
+configurations are fine. The four keys are:
 
-Only a missing file falls back to defaults. If an existing config cannot be
-read, parsed, or validated, `claude-print` exits with status 2 instead of
-continuing with a warning. In `json` and `stream-json` modes, a configuration
-failure leaves stdout empty and writes a structured result to stderr, for
-example:
+| Key | Type | Built-in default | CLI counterpart | Meaning |
+|-----|------|------------------|-----------------|---------|
+| `model` | string | `claude-sonnet-4-6` | `--model`, `-m` | Model forwarded to the child `claude` process |
+| `inherit_hooks` | bool | `true` | `--no-inherit-hooks` | `false` isolates the run from your `~/.claude/settings.json` hooks by forwarding `--setting-sources=` to the child |
+| `max_turns` | integer | `30` | `--max-turns` | Maximum agentic turns, forwarded to the child |
+| `timeout_secs` | integer | `3600` | `--timeout` | claude-print's own wall-clock watchdog (never forwarded to the child) |
 
-```json
-{"claude_version":"2.1.238 (Claude Code)","error_message":"invalid config: /tmp/config.toml: TOML parse error ...","is_error":true,"subtype":"internal_error","type":"result"}
-```
+Unknown keys are rejected at parse time; the error lists the four valid names.
+
+### Precedence
+
+An explicit CLI flag wins over the config file, which wins over the built-in
+default:
+
+| Setting | Resolution order |
+|---------|------------------|
+| `model` | `--model` → `defaults.model` → `claude-sonnet-4-6` |
+| `inherit_hooks` | `--no-inherit-hooks` → `defaults.inherit_hooks` → `true` |
+| `max_turns` | `--max-turns` (built-in default `30`); `defaults.max_turns` is not consulted |
+| `timeout` | `--timeout` (built-in default `3600`); `defaults.timeout_secs` is not consulted |
+
+**Known limitation:** `--max-turns` and `--timeout` carry their built-in
+defaults in the argument parser, and an absent flag is indistinguishable from
+an explicitly passed one — so `defaults.max_turns` and `defaults.timeout_secs`
+are parsed and validated but currently have no effect. Control these two with
+the CLI flags (or, for NEEDLE, the `invoke_template` in `claude-print.yaml`).
+The config keys are accepted so a future fix can honor them without a format
+change. `model` and `inherit_hooks` have no flag default, so their config
+values apply whenever the flag is absent.
+
+### Missing file
+
+A missing config file is not an error: `claude-print` runs on built-in
+defaults. This holds for the default path *and* for an explicit `--config
+<FILE>` that does not exist. Only a file that exists but cannot be read,
+parsed, or validated is fatal.
+
+### Validation
+
+| Key | Constraint |
+|-----|------------|
+| `model` | Non-empty, at most 100 characters; only letters, digits, `-`, `_`, `.`; must start with lowercase `claude-` |
+| `max_turns` | 1–1000 |
+| `timeout_secs` | 1–86400 (24 hours) |
+| `inherit_hooks` | Must be a TOML boolean |
+
+Types are strict: `max_turns = "50"` (quoted), `max_turns = 50.5`, or
+`model = 123` are all rejected — values are not coerced.
+
+### Errors
+
+If an existing config file cannot be read, parsed, or validated,
+`claude-print` exits with status 2 and never starts a session — it does not
+fall back to defaults with a warning.
+
+- **`text` mode:** one line on stderr:
+
+  ```text
+  error: invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'
+  ```
+
+- **`json` / `stream-json` mode:** stdout stays empty and a structured `result`
+  object is written to **stderr** — config errors fire before a session exists,
+  so stdout, which carries the response payload, is left clean:
+
+  ```json
+  {"claude_version":"2.1.238 (Claude Code)","error_message":"invalid config: /tmp/config.toml: TOML parse error ...","is_error":true,"subtype":"internal_error","type":"result"}
+  ```
+
+A parse failure reports the TOML line and column (`invalid config: <path>:
+TOML parse error at line 1, column 10 ...`); a value that parses but fails a
+constraint reports `invalid config: config validation failed at <path>:
+<reason>` instead.
 
 For a quick check without touching the default config:
 
