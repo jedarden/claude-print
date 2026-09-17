@@ -134,15 +134,19 @@ load it.
 
 ### Keys
 
+The schema is the `Defaults` struct in `src/config.rs`: one optional
+`[defaults]` table holding four optional keys. Every key is shown here at its
+shipped default:
+
 ```toml
 [defaults]
-model = "claude-opus-4-8"
-inherit_hooks = true
-max_turns = 30
-timeout_secs = 3600
+model = "claude-sonnet-4-6" # string
+inherit_hooks = true        # bool
+max_turns = 30              # integer
+timeout_secs = 3600         # integer
 ```
 
-Every key is optional and a bare `[defaults]` table is valid, so partial
+The table is optional too — a bare `[defaults]` line is valid, so partial
 configurations are fine. The four keys are:
 
 | Key | Type | Built-in default | CLI counterpart | Meaning |
