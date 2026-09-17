@@ -142,8 +142,8 @@ shipped default:
 [defaults]
 model = "claude-sonnet-4-6" # string
 inherit_hooks = true        # bool
-max_turns = 30              # integer
-timeout_secs = 3600         # integer
+max_turns = 30              # integer (u32)
+timeout_secs = 3600         # integer (u64)
 ```
 
 The table is optional too — a bare `[defaults]` line is valid, so partial
@@ -151,10 +151,10 @@ configurations are fine. The four keys are:
 
 | Key | Type | Built-in default | CLI counterpart | Meaning |
 |-----|------|------------------|-----------------|---------|
-| `model` | string | `claude-sonnet-4-6` | `--model`, `-m` | Model forwarded to the child `claude` process |
+| `model` | string | `claude-sonnet-4-6` (`DEFAULT_MODEL` in `src/config.rs`) | `--model`, `-m` | Model forwarded to the child `claude` process |
 | `inherit_hooks` | bool | `true` | `--no-inherit-hooks` | `false` isolates the run from your `~/.claude/settings.json` hooks by forwarding `--setting-sources=` to the child |
-| `max_turns` | integer | `30` | `--max-turns` | Maximum agentic turns, forwarded to the child |
-| `timeout_secs` | integer | `3600` | `--timeout` | claude-print's own wall-clock watchdog (never forwarded to the child) |
+| `max_turns` | integer (`u32`) | `30` | `--max-turns` | Maximum agentic turns, forwarded to the child |
+| `timeout_secs` | integer (`u64`) | `3600` | `--timeout` | claude-print's own wall-clock watchdog (never forwarded to the child) |
 
 Unknown keys are rejected at parse time; the error lists the four valid names.
 
