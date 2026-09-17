@@ -23,7 +23,7 @@ The billing classification is determined by `isatty(stdout)` inside the `claude`
 | Bracketed paste | Terminal feature that wraps pasted text in `ESC[200~` … `ESC[201~` markers. Prevents embedded newlines from triggering premature Enter in Ink's REPL. |
 | Ink | The React/Yoga-based TUI framework used by Claude Code. Sends DEC terminal probes (DA1, DA2, DSR, XTVERSION, window-size) at startup and hangs indefinitely if unanswered. |
 | login_tty | glibc function: `setsid()` + `ioctl(TIOCSCTTY)` + `dup2(slave, 0/1/2)` + `close(slave)`. Makes the PTY slave the controlling terminal for the child process. |
-| JSONL transcript | Newline-delimited JSON at `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Claude Code appends one event per line as the session progresses. The `<cwd-slug>` is derived by stripping the leading `/` and replacing remaining `/` with `-`. (Note: paths containing hyphens in directory names produce ambiguous slugs; `session_id` resolves the file within the directory.) |
+| JSONL transcript | Newline-delimited JSON at `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Claude Code appends one event per line as the session progresses. The `<cwd-slug>` is derived by folding **every** non-alphanumeric byte of `cwd` to `-` — the leading `/` included — so `/home/coding/myproject` → `-home-coding-myproject`. Authoritative implementation: `src/poller.rs::cwd_to_slug` (claude 2.1.263 scheme, verified live — bead claudepr-26e7a0b6); docs are kept in sync with it by `tests/docs_slug_consistency.rs`. (Note: folding is not injective — `/home/user/a-b` and `/home/user-a/b` both fold to `-home-user-a-b`; `session_id` resolves the file within the directory.) |
 | usage-fingerprint | Tuple of `(input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens)` used to deduplicate streaming JSONL events from the same API call when `message.id` is absent. |
 | stream-json | Output format where each transcript event line is forwarded to stdout as Claude Code writes it, providing real-time streaming compatible with `claude -p --output-format stream-json`. |
 | mock_claude | Compiled Rust binary (`test-fixtures/mock-claude/`) simulating Claude Code's PTY and JSONL behavior. Controlled via env vars — not a shell script. |
@@ -647,17 +647,22 @@ On Stop receipt:
 
 ```
 1. Open transcript_path (derived if not in payload)
-   Path derivation algorithm (observed from Claude Code v2.x): strip the leading `/` from
-   `cwd`, replace all remaining `/` characters with `-`.
-   Example: `/home/coding/myproject` → `home-coding-myproject`.
-   This algorithm can produce ambiguous slugs for paths where directory names contain hyphens
-   (e.g., `/home/user/a-b` and `/home/user-a/b` both produce `home-user-a-b`). In practice,
+   Path derivation algorithm (claude 2.1.263 scheme, verified live — bead claudepr-26e7a0b6):
+   fold **every** non-alphanumeric byte of `cwd` to `-` — the leading `/` included.
+   Example: `/home/coding/myproject` → `-home-coding-myproject`.
+   Authoritative implementation: `src/poller.rs::cwd_to_slug`, which additionally rejects null
+   bytes and empty paths and truncates to claude's 200-character slug cap.
+   Folding is not injective: paths where directory names contain hyphens collide
+   (e.g., `/home/user/a-b` and `/home/user-a/b` both fold to `-home-user-a-b`). In practice,
    `session_id` uniquely identifies the JSONL file within the directory, so slug ambiguity only
    causes a problem if the slug-derived *directory* is wrong. If path derivation fails (directory
    not found), fall back to `last_assistant_message`.
-   Add a unit test in `tests/transcript.rs` asserting this mapping for 3–4 representative
-   cwd values (e.g. `/home/coding/myproject`, `/root/foo/bar`, `/home/user/a-b` [note: same
-   slug as `/home/user-a/b` — ambiguity documented above], `/tmp/x`).
+   The mapping is pinned by the `cwd_to_slug_*` unit tests in `src/poller.rs` (live-verified
+   vectors: `/home/coding/claude-print`, `/tmp/probe-B_no_marker-1788799902`,
+   `/home/coding/tradegraph-platform`), cross-checked against mock-claude's independent slug
+   computation by `tests/stop_sparse_payloads_e2e.rs`, and mirrored in
+   `tests/fixtures/slug_vectors_v2.1.263.json`. `tests/docs_slug_consistency.rs` keeps this
+   document and the other markdown docs in sync with the implementation.
 2. Scan for unique API turns (usage-fingerprint dedup)
 3. Collect final turn's text blocks
 4. Sum token counts across all unique turns

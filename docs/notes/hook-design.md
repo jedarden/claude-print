@@ -60,7 +60,7 @@ All fields are optional for forward compatibility:
 {
   "hook_event_name": "Stop",
   "session_id": "abc123",
-  "transcript_path": "/home/user/.claude/projects/home-user-myproject/abc123.jsonl",
+  "transcript_path": "/home/user/.claude/projects/-home-user-myproject/abc123.jsonl",
   "last_assistant_message": "Response text...",
   "cwd": "/home/user/myproject"
 }

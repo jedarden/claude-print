@@ -37,7 +37,7 @@ Each session writes its full conversation to:
 ~/.claude/projects/<cwd-slug>/<session-id>.jsonl
 ```
 
-The `<cwd-slug>` is the working directory path with `/` replaced by `-` (e.g., `/home/coding/claude-print` → `-home-coding-claude-print`).
+The `<cwd-slug>` folds **every** non-alphanumeric byte of the working directory path to `-` — the leading `/` included, and `_`/`.`/other punctuation too (claude 2.1.263 scheme, verified live — bead claudepr-26e7a0b6; e.g., `/home/coding/claude-print` → `-home-coding-claude-print`, `/tmp/probe-B_no_marker-1788799902` → `-tmp-probe-B-no-marker-1788799902`). Folding is not injective: `/home/user/a-b` and `/home/user-a/b` both fold to `-home-user-a-b`, but `session_id` resolves the file within the directory.
 
 The JSONL file is **append-only** — every event is a single JSON line. The file is flushed incrementally during a session; at Stop-hook fire time there is a race window (2–5 ms) where the final assistant event may not yet be written.
 
@@ -46,9 +46,11 @@ To derive `transcript_path` from a session record:
 import os, re
 
 def transcript_path(session_id, cwd):
-    slug = cwd.replace('/', '-')
+    slug = re.sub(r'[^A-Za-z0-9]', '-', cwd)
     return os.path.expanduser(f'~/.claude/projects/{slug}/{session_id}.jsonl')
 ```
+
+claude-print's authoritative implementation of this derivation is `src/poller.rs::cwd_to_slug` (adds null-byte/empty rejection and claude's 200-character slug cap); `tests/docs_slug_consistency.rs` keeps the docs quoting the scheme aligned with it.
 
 ### Session Flags
 

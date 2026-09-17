@@ -1,0 +1,88 @@
+{
+  "claude_version": "2.1.263",
+  "verified_at": "2026-09-07",
+  "resolves": ["claudepr-26e7a0b6"],
+  "algorithm": "Fold every non-alphanumeric byte of cwd to '-' (leading '/' included); reject null bytes and empty paths; truncate to 200 characters. Authoritative implementation: src/poller.rs::cwd_to_slug.",
+  "evidence": [
+    "docs/notes/hook-design.md (Transcript Path Derivation)",
+    "docs/research/claude-code-internals.md (Transcript Storage)",
+    "docs/plan/plan.md (Glossary: JSONL transcript; section 8: Transcript Reader)"
+  ],
+  "vectors": [
+    {
+      "cwd": "/home/coding/claude-print",
+      "slug": "-home-coding-claude-print",
+      "source": "live: real transcript dir of this repo"
+    },
+    {
+      "cwd": "/tmp/probe-B_no_marker-1788799902",
+      "slug": "-tmp-probe-B-no-marker-1788799902",
+      "source": "live: underscore folds like any other punctuation"
+    },
+    {
+      "cwd": "/home/coding/tradegraph-platform",
+      "slug": "-home-coding-tradegraph-platform",
+      "source": "live: existing projects dir"
+    },
+    {
+      "cwd": "/home/coding/myproject",
+      "slug": "-home-coding-myproject",
+      "source": "doc example: leading '/' folds to a leading dash"
+    },
+    {
+      "cwd": "/home/user/myproject",
+      "slug": "-home-user-myproject",
+      "source": "doc example: hook-design.md payload example pairs this cwd with this slug"
+    },
+    {
+      "cwd": "/tmp",
+      "slug": "-tmp",
+      "source": "doc example: single-component absolute path"
+    },
+    {
+      "cwd": "/home/user/a-b",
+      "slug": "-home-user-a-b",
+      "source": "ambiguity example: folds to the same slug as /home/user-a/b"
+    },
+    {
+      "cwd": "/home/user-a/b",
+      "slug": "-home-user-a-b",
+      "source": "ambiguity example: folds to the same slug as /home/user/a-b"
+    },
+    {
+      "cwd": "tmp/foo",
+      "slug": "tmp-foo",
+      "source": "relative path: no leading dash"
+    },
+    {
+      "cwd": "/",
+      "slug": "-",
+      "source": "root folds to a single dash"
+    },
+    {
+      "cwd": "/home//coding/project/",
+      "slug": "-home--coding-project-",
+      "source": "dashes are not collapsed: empty components and a trailing slash survive as dashes"
+    },
+    {
+      "cwd": "/home/../etc/passwd",
+      "slug": "-home----etc-passwd",
+      "source": "traversal components fold; result is one flat directory name"
+    },
+    {
+      "cwd": "/home/coding/projet-тест",
+      "slug": "-home-coding-projet-----",
+      "source": "non-ASCII bytes fold to dashes"
+    }
+  ],
+  "rejected": [
+    {
+      "cwd": "/home/coding/\u0000project",
+      "reason": "null byte: unusable as a path even though claude would fold it"
+    },
+    {
+      "cwd": "",
+      "reason": "empty path names nothing"
+    }
+  ]
+}
