@@ -49,6 +49,7 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/hooks.rs` | Stop hook FIFO install / read |
 | `tests/stop_poller.rs` | Stop payload polling logic |
 | `tests/pty_integration.rs` | PTY spawn + round-trip (requires PTY capability) |
+| `tests/sigint_forwarding_e2e.rs` | Single-session SIGINT forwarding through `PtySpawner::relay` (HR-8): mock child receives the forwarded signal AS SIGINT (trap marker + default-disposition kill), relay returns 130, child reaped, SIGINT/SIGWINCH dispositions restored (bead claudepr-1472789b) |
 | `tests/version_compat.rs` | `--version` output parsing |
 | `tests/watchdog.rs` | Watchdog timeout for silent children (no output + no Stop hook) |
 | `tests/binary_e2e.rs` | Binary-level end-to-end via the *compiled* binary + mock-claude (exit codes, stdout/stderr contract) |

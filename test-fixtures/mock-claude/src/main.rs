@@ -1,4 +1,6 @@
 use std::io::Write;
+use std::os::unix::io::IntoRawFd;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -155,6 +157,47 @@ fn main() {
     if args.len() > 1 && args[1] == "--version" {
         println!("mock-claude-version-1.0.0");
         std::process::exit(0);
+    }
+
+    // MOCK_TRAP_SIGINT_REPORT=<path> (claudepr-1472789b): the mock-child fixture
+    // for HR-8 SIGINT-forwarding coverage. Installs a SIGINT trap, reports
+    // `ready` to <path>, and blocks forever. When SIGINT arrives, the handler
+    // appends `sigint` to the same file and _exit(130)s — positive, in-child
+    // evidence that the driver forwarded the signal AS SIGINT (a SIGTERM or
+    // SIGKILL mis-forward would kill the mock with no marker and a different
+    // wait status). Placed after `--version` (version probes must keep working
+    // with the knob set) and before MOCK_SILENT; the scenarios that use this
+    // knob never set another, so the ordering between them is unobservable.
+    if let Ok(path) = std::env::var("MOCK_TRAP_SIGINT_REPORT") {
+        // Pre-open the report file so the signal handler only ever needs
+        // write(2): open(2) is not async-signal-safe, so the fd must exist —
+        // and `ready` must be written — before the trap is armed.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("mock-claude: cannot create {path}: {e}"));
+        let fd = file.into_raw_fd();
+        SIGINT_REPORT_FD.store(fd, Ordering::Relaxed);
+        // SAFETY: signal(2) installs the trap above; nothing else runs first.
+        // Raw libc rather than nix: mock_claude is also a standalone workspace
+        // member whose only dependency is libc (its Cargo.toml), and CI builds
+        // it via `cargo build -p mock-claude`.
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                sigint_trap_handler as *const () as libc::sighandler_t,
+            );
+        }
+        let ready = b"ready\n";
+        // SAFETY: plain write(2) to the fd just opened.
+        unsafe {
+            libc::write(fd, ready.as_ptr() as *const libc::c_void, ready.len());
+        }
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
     }
 
     // MOCK_SILENT: block forever without firing Stop (tests timeout path)
@@ -448,6 +491,29 @@ fn main() {
     // Exit 0 if stdin is a controlling TTY (login_tty succeeded), 1 otherwise.
     let has_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     std::process::exit(if has_tty { 0 } else { 1 });
+}
+
+/// Raw fd of the MOCK_TRAP_SIGINT_REPORT file, pre-opened on the normal path
+/// so the signal handler below only touches async-signal-safe calls (write(2),
+/// _exit(2)). -1 = the knob is unset and the handler can never run.
+static SIGINT_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// SIGINT trap for MOCK_TRAP_SIGINT_REPORT (see the knob's block in main).
+///
+/// Appends `sigint` to the report file via write(2) on the pre-opened fd, then
+/// _exit(130)s — the documented interrupted-exit code — mirroring how a
+/// trapping Claude Code surfaces Ctrl-C to its driver.
+extern "C" fn sigint_trap_handler(_: libc::c_int) {
+    let fd = SIGINT_REPORT_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let marker = b"sigint\n";
+        // SAFETY: write(2) is async-signal-safe; fd was opened before install.
+        unsafe {
+            libc::write(fd, marker.as_ptr() as *const libc::c_void, marker.len());
+        }
+    }
+    // SAFETY: _exit(2) is async-signal-safe.
+    unsafe { libc::_exit(130) };
 }
 
 fn env_flag(key: &str) -> bool {
