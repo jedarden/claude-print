@@ -231,7 +231,7 @@ claude-print/
 │       ├── Cargo.toml
 │       └── src/
 │           └── main.rs
-└── notes/                            # per-bead NEEDLE worker scratch notes (notes/bf-*.md); tracked for history, not product docs
+└── notes/                            # per-bead NEEDLE worker scratch notes, named <bead-id>.md (claudepr-*.md today; bf-*.md are pre-2026-08-14 bead-forge history); tracked for history, not product docs
 ```
 
 ## State Machine

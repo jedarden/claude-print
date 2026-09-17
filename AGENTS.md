@@ -152,26 +152,78 @@ These must hold across all changes:
 
 ## Bead workflow
 
-Beads use the `bf` prefix. Config is at `.beads/config.yaml`.
+Beads use the **bead-rs `bead` CLI** — canonical across this environment since
+2026-08-14. The backend is declared in `.needle.yaml` (`bead_cli: backend:
+bead-rs`); the live store is SQLite at `.beads/beads.db` with a git-tracked
+durable checkpoint under `.beads/checkpoint/`; bead IDs use the `claudepr`
+prefix (workspace identity in `.beads/config.json`).
+
+> **Never run `bf` (bead-forge) against this workspace — `bf` is retired and
+> not installed on this box.** Running the wrong CLI does not fail cleanly:
+> `bf` reports a generic SQLite "no such column" error rather than "wrong
+> tool," and applying the *other* tool's recovery recipe to that error
+> silently reinitializes the store with the wrong schema and destroys the
+> live data. The on-disk tell is unambiguous here: `.beads/config.json` +
+> `.beads/checkpoint/` = bead-rs; a `.beads/config.yaml` + flat
+> `.beads/issues.jsonl` would mean bf (this repo has neither). If a bead
+> command fails with an unfamiliar schema/column error, stop and re-check the
+> backend declaration before attempting any repair.
 
 ```bash
-# List open beads
-bf list
+# List beads (all / ready frontier only)
+bead list
+bead list --ready
 
-# Claim a bead
-bf claim <id>
+# Show one bead
+bead show <id>            # claudepr-… IDs only — historical bf-* IDs no longer resolve
 
-# Close a bead (requires a commit first)
-bf close <id>
+# Record progress / verification evidence on a bead
+bead update <id> --notes "..."
+
+# Atomically claim from the ready frontier (or claim for a named worker)
+bead claim
+bead claim --assignee <worker>
+
+# Close — non-empty --reason is required (status can't be closed via update).
+# Commit the work first; NEEDLE re-verifies close evidence against committed state.
+bead close <id> --reason "..."
 ```
 
-See `CLAUDE.md` (root workspace) for full `bf` CLI docs and FrankenSQLite recovery
-procedures.
+Checkpoint sync and recovery:
+
+```bash
+# Database -> checkpoint (idempotent; bead 0.2.x also auto-publishes the
+# checkpoint after every successful mutation)
+bead sync flush-only
+
+# If beads.db is missing/corrupt/wrong-schema (fresh clone, or someone ran the
+# wrong CLI): diagnose read-only first, then rebuild losslessly from the
+# git-tracked checkpoint — never by deleting beads.db and re-importing with a
+# bf-shaped command (see the warning above).
+bead doctor                    # read-only; --repair adds non-destructive fixes only
+bead init                      # rebuild schema, keeps committed workspace identity
+bead sync import-only --input .beads/checkpoint/forensic.jsonl \
+  --restore-into-empty --actor <you>
+```
+
+Historical note: code comments, parts of `docs/plan/plan.md`, and everything
+under `notes/` still reference `bf-*` bead IDs from the bead-forge era. Those
+IDs are provenance, not pointers — they predate the 2026-08-14 bead-rs
+migration and do not resolve in this store (`bead show bf-3isy` → "Issue not
+found"). Do not rewrite them, and don't try to look them up.
+
+See the **"Beads (bead-rs CLI)"** section of the root workspace `CLAUDE.md`
+for the full `bead` CLI reference and gotchas (`bead reopen` clears the
+assignee; `bead release` refuses assigned-but-open beads; `--if-revision N`
+for optimistic concurrency on worker-contested beads).
 
 ## Notes
 
-`notes/` holds per-bead NEEDLE worker scratch notes — one file per bead
-(`notes/bf-*.md`) recording what the worker did and verified for that bead.
+`notes/` holds per-bead NEEDLE worker scratch notes — one file per bead,
+named after the bead's ID (`notes/claudepr-*.md`; the existing `bf-*.md`
+files are historical artifacts of the bead-forge era, kept for traceability).
 These are worker journals, **not** product documentation; they are deliberately
-tracked (kept simple — history is appended, never rewritten) for traceability.
-Product design lives in `docs/plan/plan.md`.
+tracked (kept simple — history is appended, never rewritten). Routine status
+and verification evidence belongs on the bead itself (`bead update --notes`,
+`bead close --reason`) — never create a notes file just to have a commit
+artifact. Product design lives in `docs/plan/plan.md`.
