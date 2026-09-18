@@ -11,6 +11,7 @@
 //! timeout prevents indefinite polling of stop.fifo by killing the child
 //! and exiting non-zero regardless of why the child wedged.
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -248,6 +249,16 @@ pub struct Watchdog {
     /// Temp directory path where transcript will be written.
     temp_dir_path: Option<PathBuf>,
     /// Self-pipe write end raw fd for signaling the event loop on timeout.
+    ///
+    /// The spawned timeout thread writes through its OWN owned duplicate of
+    /// this fd (taken in [`Self::spawn_timeout_thread`]), never through the
+    /// raw number: the thread is detached and can outlive the drive by the
+    /// whole remaining deadline, by which point the drive's pipe fds are
+    /// closed and their numbers may have been reused by the next drive's
+    /// self-pipe. A late deadline firing through a reused number would wake
+    /// the WRONG session's event loop and surface as a bogus
+    /// `Error::Interrupted`; through its own duplicate it hits a dead pipe
+    /// (EPIPE, ignored) and cannot cross into anyone else's drive.
     self_pipe_write_fd: Option<i32>,
     /// Whether deadline enforcement may SIGTERM the child directly.
     ///
@@ -315,8 +326,18 @@ impl Watchdog {
         let prompt_injected_at = Arc::clone(&self.state.prompt_injected_at);
         let session_start = Arc::clone(&self.state.session_start);
         let temp_dir_path = self.temp_dir_path.clone();
-        // Copy the raw fd for signaling the event loop
-        let self_pipe_write_fd = self.self_pipe_write_fd;
+        // Duplicate the self-pipe write end for the thread to signal through
+        // (see the field doc: this thread is detached and may fire long after
+        // the drive ended, so it must never write through a raw fd number
+        // another drive's self-pipe may have reused). On dup failure the wake
+        // degrades to the event loop's own poll tick, which observes
+        // `timeout_fired` regardless.
+        let self_pipe_write_fd =
+            self.self_pipe_write_fd
+                .and_then(|raw| match nix::unistd::dup(raw) {
+                    Ok(dup_fd) => Some(unsafe { OwnedFd::from_raw_fd(dup_fd) }),
+                    Err(_) => None,
+                });
         // Enforcement helper. On the pool path (`without_child_signals`) the
         // kill is suppressed — the deadline bookkeeping below (timeout_fired,
         // timeout_type, self-pipe wake) is identical either way, so the session
@@ -380,10 +401,14 @@ impl Watchdog {
                     timeout_fired.store(true, Ordering::SeqCst);
                     timeout_type.store(1, Ordering::SeqCst); // PtyFirstOutput
                                                              // Signal the event loop via self-pipe
-                    if let Some(fd) = self_pipe_write_fd {
+                    if let Some(pipe) = self_pipe_write_fd.as_ref() {
                         let byte: [u8; 1] = [1];
                         unsafe {
-                            let _ = libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+                            let _ = libc::write(
+                                pipe.as_raw_fd(),
+                                byte.as_ptr() as *const libc::c_void,
+                                1,
+                            );
                         }
                     }
                     return;
@@ -403,10 +428,14 @@ impl Watchdog {
                     timeout_fired.store(true, Ordering::SeqCst);
                     timeout_type.store(2, Ordering::SeqCst); // StreamJsonFirstOutput
                                                              // Signal the event loop via self-pipe
-                    if let Some(fd) = self_pipe_write_fd {
+                    if let Some(pipe) = self_pipe_write_fd.as_ref() {
                         let byte: [u8; 1] = [1];
                         unsafe {
-                            let _ = libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+                            let _ = libc::write(
+                                pipe.as_raw_fd(),
+                                byte.as_ptr() as *const libc::c_void,
+                                1,
+                            );
                         }
                     }
                     return;
@@ -420,10 +449,14 @@ impl Watchdog {
                     timeout_fired.store(true, Ordering::SeqCst);
                     timeout_type.store(3, Ordering::SeqCst); // OverallTimeout
                                                              // Signal the event loop via self-pipe
-                    if let Some(fd) = self_pipe_write_fd {
+                    if let Some(pipe) = self_pipe_write_fd.as_ref() {
                         let byte: [u8; 1] = [1];
                         unsafe {
-                            let _ = libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+                            let _ = libc::write(
+                                pipe.as_raw_fd(),
+                                byte.as_ptr() as *const libc::c_void,
+                                1,
+                            );
                         }
                     }
                     return;
@@ -440,11 +473,14 @@ impl Watchdog {
                             timeout_fired.store(true, Ordering::SeqCst);
                             timeout_type.store(4, Ordering::SeqCst); // StopHookTimeout
                                                                      // Signal the event loop via self-pipe
-                            if let Some(fd) = self_pipe_write_fd {
+                            if let Some(pipe) = self_pipe_write_fd.as_ref() {
                                 let byte: [u8; 1] = [1];
                                 unsafe {
-                                    let _ =
-                                        libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+                                    let _ = libc::write(
+                                        pipe.as_raw_fd(),
+                                        byte.as_ptr() as *const libc::c_void,
+                                        1,
+                                    );
                                 }
                             }
                             return;
@@ -754,6 +790,72 @@ mod tests {
         // Cleanup.
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The timeout thread signals through its OWN duplicate of the self-pipe
+    /// write end, never through the raw fd number: the thread is detached and
+    /// can fire long after its drive ended, by which point the drive's pipe
+    /// fds are closed and their numbers may belong to someone else entirely.
+    /// The flake this pins (claudepr-8b0e6e78): a 30s stop-hook watchdog from
+    /// a SIGINT-interrupted drive fired after the next drive had opened its
+    /// own self-pipe at the same fd number; the stray byte was read as a
+    /// signal and surfaced as a bogus `Error::Interrupted`.
+    ///
+    /// The discriminator: with the drive's write end closed but its READ end
+    /// still held, a late overall-deadline fire must land in the ORIGINAL
+    /// pipe (the thread's duplicate points at the same kernel pipe). Writing
+    /// through the stale raw number instead would hit a closed-or-reused fd
+    /// and nothing would ever arrive here.
+    #[test]
+    fn late_watchdog_fire_writes_through_its_own_pipe_duplicate() {
+        use std::io::Read;
+
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        let config = WatchdogConfig::new(Some(0), Some(0), Some(1), Some(0), false);
+        // A fiction pid is safe: signal suppression means nothing is ever
+        // signalled — this is exactly the pooled drive's configuration.
+        let watchdog = Watchdog::new(
+            config,
+            nix::unistd::Pid::from_raw(4000),
+            None,
+            Some(write_end.as_raw_fd()),
+        )
+        .without_child_signals();
+        let handle = watchdog.spawn_timeout_thread();
+
+        // End the "drive": the write end goes away while the thread is
+        // still armed. The read end is deliberately kept alive — it is the
+        // observation point.
+        let mut read_end = std::fs::File::from(read_end);
+
+        // The 1s overall deadline fires through the thread's duplicate.
+        // Non-blocking poll so a regression fails by assertion, not a hang.
+        let _ = nix::fcntl::fcntl(
+            read_end.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut byte = [0u8; 1];
+        loop {
+            match read_end.read(&mut byte) {
+                Ok(1) => break,
+                Ok(n) => panic!("unexpected read of {n} bytes"),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the late deadline never fired through the thread's own duplicate"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+        handle
+            .join()
+            .expect("the watchdog thread exits after firing");
     }
 
     // ── Mutex poisoning tests ────────────────────────────────────────────────────
