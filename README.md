@@ -188,7 +188,7 @@ absent flag indistinguishable from an explicitly passed one, so `main.rs`
 always passes `Some(cli.max_turns)` / `Some(cli.timeout)` into
 `Config::resolve_max_turns` and `Config::resolve_timeout_secs`
 (`src/config.rs`) — the config tier of those resolvers never fires. Control
-these two with the CLI flags (or, for NEEDLE, the `invoke_template` in
+these two with the CLI flags (or, for NEEDLE, the `invoke` template in
 `claude-print.yaml`). The config keys are accepted so a future fix can honor
 them without a format change. `--model` and `--no-inherit-hooks` have no
 parser default, so their absence is detectable and their config values apply
