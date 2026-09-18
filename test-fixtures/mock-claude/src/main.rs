@@ -306,7 +306,17 @@ fn main() {
         std::process::exit(0);
     };
 
-    let session_id = "mock-session-abc123";
+    // MOCK_UNIQUE_SESSION_ID=1: mint the session id from this process's pid
+    // instead of the shared default. Real claude derives a fresh uuid per
+    // session; the shared default makes every driven session reuse one
+    // transcript PATH, which blurs the sequential-pool-invocation isolation
+    // tests (a second caller tailing only its own transcript, never the first
+    // caller's file) into indistinguishability.
+    let session_id = if env_flag("MOCK_UNIQUE_SESSION_ID") {
+        format!("mock-session-pid-{}", std::process::id())
+    } else {
+        "mock-session-abc123".to_string()
+    };
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/tmp".to_string());
@@ -448,7 +458,7 @@ fn main() {
             if mock_delay_jsonl_ms > 0 {
                 thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
             }
-            write_transcript_jsonl(&path, &mock_response, session_id, mock_is_error);
+            write_transcript_jsonl(&path, &mock_response, &session_id, mock_is_error);
         }
     }
 

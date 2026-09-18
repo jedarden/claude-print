@@ -2315,6 +2315,182 @@ fn pool_socket_two_sequential_invocations_get_isolated_workers() {
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
 
+/// The `session_id` field of the transcript's result event in a stream-json
+/// run's stdout. The live reader forwards transcript JSONL lines verbatim and
+/// the CLI adds nothing in stream-json mode, so the forwarded result event is
+/// the only carrier of the session the run actually answered.
+fn result_session_id(stream: &str) -> Option<String> {
+    stream.lines().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        if value.get("type").and_then(|t| t.as_str()) == Some("result") {
+            value
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        } else {
+            None
+        }
+    })
+}
+
+/// How many transcript result events a stream-json run forwarded.
+fn result_event_count(stream: &str) -> usize {
+    stream
+        .lines()
+        .filter(|line| {
+            matches!(
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("type")),
+                Some(serde_json::Value::String(t)) if t == "result"
+            )
+        })
+        .count()
+}
+
+/// Transcript-offset isolation between sequential pool invocations — the last
+/// of the four cross-caller leakage categories (session id, hook path,
+/// transcript offset, environment) without a two-invocation pin: session id,
+/// hook path and environment are pinned in-process by
+/// `two_sequential_pooled_invocations_observe_zero_cross_caller_leakage`
+/// (src/pool.rs), which drives text format only and so never spawns the
+/// stream-json reader whose injection-time offset snapshot IS the transcript
+/// offset.
+///
+/// Every worker of one daemon inherits the daemon's cwd and HOME, so both
+/// callers' readers discover transcripts in the SAME projects dir — and by
+/// the time invocation 2's reader snapshots offsets at its prompt injection,
+/// invocation 1's transcript is complete, pre-existing content on disk. The
+/// reader must exclude it: invocation 2's tail must start from ITS OWN
+/// worker's state (its new session file, discovered at offset 0), never
+/// re-emitting invocation 1's events. MOCK_UNIQUE_SESSION_ID gives each
+/// worker its own session id and transcript file (real claude mints a fresh
+/// uuid per session; the fixed mock default would make invocation 2 rewrite
+/// invocation 1's file, leaving nothing to tell the callers apart).
+#[test]
+fn pool_socket_two_sequential_stream_json_invocations_tail_only_their_own_transcript() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+    let home = tempfile::tempdir().unwrap();
+
+    let mut daemon = Daemon::start_with_env(
+        &mock,
+        &socket,
+        Some("1"),
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("MOCK_UNIQUE_SESSION_ID", "1"),
+        ],
+    );
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let pooled_stream_json_run = |socket: &Path| -> Outcome {
+        let mut cmd = claude_print();
+        cmd.env("XDG_CONFIG_HOME", dir.path())
+            .env("HOME", home.path())
+            .arg("--pool-socket")
+            .arg(socket)
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("Reply with exactly one word: pong");
+        run(&mut cmd, Duration::from_secs(120))
+    };
+
+    // ── invocation 1 ────────────────────────────────────────────────────────
+    let out1 = pooled_stream_json_run(&socket);
+    assert_eq!(
+        out1.code,
+        Some(0),
+        "invocation 1 must succeed\nstdout:\n{}\nstderr:\n{}",
+        out1.stdout,
+        out1.stderr
+    );
+    let sess1 = result_session_id(&out1.stdout)
+        .unwrap_or_else(|| panic!("invocation 1 must forward a result event\nstdout: {out1:?}"));
+    assert!(
+        out1.stdout.contains("assistant"),
+        "invocation 1 must forward the assistant turn\nstdout: {out1:?}"
+    );
+
+    // Fully released before invocation 2 starts, so its transcript is
+    // complete, stable, pre-existing content long before invocation 2's
+    // reader snapshots the projects dir.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(10));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+
+    // ── invocation 2 ────────────────────────────────────────────────────────
+    let out2 = pooled_stream_json_run(&socket);
+    assert_eq!(
+        out2.code,
+        Some(0),
+        "invocation 2 must succeed\nstdout:\n{}\nstderr:\n{}",
+        out2.stdout,
+        out2.stderr
+    );
+    let sess2 = result_session_id(&out2.stdout)
+        .unwrap_or_else(|| panic!("invocation 2 must forward a result event\nstdout: {out2:?}"));
+
+    // Invocation 2's tail starts from its own worker's state: never
+    // invocation 1's. A reader that ignored the injection snapshot would
+    // re-emit invocation 1's transcript (its result event names {sess1}) into
+    // invocation 2's stream before (or instead of) discovering the new file;
+    // one that "continued" invocation 1's offset would sit at EOF on the old
+    // file and never forward invocation 2's own events at all. Both shapes
+    // fail here.
+    assert!(
+        !out2.stdout.contains(&sess1),
+        "invocation 2's stream must not carry invocation 1's transcript \
+         events (session {sess1})\nstdout:\n{}",
+        out2.stdout
+    );
+
+    // Each worker minted its own session: the two callers genuinely wrote two
+    // transcript files, so the isolation assertions above are meaningful.
+    assert_ne!(sess1, sess2, "the two invocations shared one session id");
+
+    assert_eq!(
+        result_event_count(&out2.stdout),
+        1,
+        "invocation 2's stream must carry exactly its own result event\nstdout:\n{}",
+        out2.stdout
+    );
+    assert!(
+        out2.stdout.contains("assistant"),
+        "invocation 2 must forward its own assistant turn\nstdout: {out2:?}"
+    );
+
+    // Symmetrically, invocation 1's stream never saw invocation 2's session.
+    assert!(
+        !out1.stdout.contains(&sess2),
+        "invocation 1's stream must not carry invocation 2's transcript \
+         events (session {sess2})\nstdout:\n{}",
+        out1.stdout
+    );
+
+    // Same pool discipline as the text-format sequential test: exactly two
+    // workers handed out and released, one per caller.
+    let stderr = daemon.stderr();
+    assert_eq!(
+        stderr.iter().filter(|l| l.contains("Assigned worker")).count(),
+        2,
+        "exactly two workers may be handed out; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        stderr.iter().filter(|l| l.contains("Released worker")).count(),
+        2,
+        "each caller must release exactly once; stderr: {stderr:?}"
+    );
+
+    let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
 /// An acquire that finds NO ready worker — the pool is up but fully handed
 /// out — must wait bounded by the caller's budget, then follow the ADR-005
 /// fallback classification to a successful stateless session, never a hang
