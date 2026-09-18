@@ -108,10 +108,23 @@ fn line_uses_strip_recipe(line: &str) -> bool {
 }
 
 /// Markdown docs the guard covers: everything under `docs/` plus the README.
+///
+/// The root is resolved from the *runtime* `CARGO_MANIFEST_DIR` (cargo sets it
+/// in the test process's environment) with the compile-time value as fallback.
+/// The compile-time value alone bakes the building checkout's path into the
+/// test binary; when the shared target cache reuses that binary from a
+/// different checkout — the extraction a CI gate runs in, or this workspace
+/// after that extraction is deleted — `read_dir` hits a directory that no
+/// longer exists and the guard fails with a NotFound that has nothing to do
+/// with drift. Runtime resolution always reads the docs of the tree under
+/// test, whatever binary cargo hands us.
 fn doc_files() -> Vec<(String, String)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string()),
+    );
     let mut files = Vec::new();
-    collect_md(&root.join("docs"), root, &mut files);
+    collect_md(&root.join("docs"), &root, &mut files);
     let readme = root.join("README.md");
     if readme.exists() {
         files.push((
