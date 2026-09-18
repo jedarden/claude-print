@@ -407,7 +407,7 @@ Use this when running as a NEEDLE worker to prevent hook noise, or when the user
 
 ### Configuration File
 
-`$XDG_CONFIG_HOME/claude-print/config.toml` if `$XDG_CONFIG_HOME` is set, otherwise `~/.config/claude-print/config.toml`. Created with defaults on first run.
+`$XDG_CONFIG_HOME/claude-print/config.toml` if `$XDG_CONFIG_HOME` is set, otherwise `~/.config/claude-print/config.toml`. The file is optional and never auto-created — `claude-print` only reads it, and a missing file simply runs on the built-in defaults shown below.
 
 ```toml
 [defaults]
