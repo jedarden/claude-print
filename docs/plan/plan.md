@@ -419,7 +419,7 @@ max_turns = 30
 timeout_secs = 3600
 ```
 
-The schema is the `Defaults` struct in `src/config.rs`, marked `#[serde(deny_unknown_fields)]`. All four keys are optional and so is the `[defaults]` table itself — a bare `[defaults]` line parses cleanly, so partial configurations are fine. Unknown keys are rejected at parse time: the serde error names the offending key and lists the four valid names (`inherit_hooks`, `model`, `max_turns`, `timeout_secs`), surfaced as `invalid config at <path>: …` with exit code 2.
+The schema is the `Defaults` struct in `src/config.rs`, marked `#[serde(deny_unknown_fields)]`. All four keys are optional and so is the `[defaults]` table itself — a bare `[defaults]` line parses cleanly, so partial configurations are fine. Unknown keys are rejected at parse time: the serde error names the offending key and lists the four valid names (`inherit_hooks`, `model`, `max_turns`, `timeout_secs`), surfaced as `invalid config: <path>: …` with exit code 2.
 
 CLI flags override config file values. `inherit_hooks = true` — Setting to `false` is equivalent to passing `--no-inherit-hooks` on the command line: `--setting-sources=` (measured per OQ-2: suppresses standard sources, leaves the `--settings` file active) is forwarded to the inner `claude` process, suppressing user hook inheritance. CLI `--no-inherit-hooks` takes precedence over the config file value.
 
