@@ -355,6 +355,77 @@ fn main() {
         verbose: cli.verbose,
     };
 
+    // ADR-005 warm-PTY pool (claudepr-12e0cd23): `--pool-socket` opts this
+    // invocation into acquiring one prewarmed worker instead of paying the
+    // full fork/trust/startup cost from zero. Acquisition runs inside the
+    // invocation's own timeout budget and every outcome is classified in
+    // pool::acquire_for_invocation: flag absent → no pool code runs at all;
+    // fallback-classified failure → one verbose diagnostic and the ordinary
+    // stateless session below; protocol failure → the hard-error arm here.
+    let pool_tracer = claude_print::verbose::Tracer::new(cli.verbose, t0);
+    let pooled_worker = match claude_print::pool::acquire_for_invocation(
+        cli.pool_socket.as_deref(),
+        resolved_timeout,
+    ) {
+        Ok(claude_print::pool::InvocationAcquisition::NotRequested) => None,
+        Ok(claude_print::pool::InvocationAcquisition::Fallback(failure)) => {
+            // ADR-005: the pool is additive latency work, never a new
+            // failure surface for the ordinary path — say why once (verbose
+            // only, stderr only), then run exactly the stateless path.
+            pool_tracer.trace(format!(
+                "pool: {failure}; falling back to the ordinary stateless session"
+            ));
+            None
+        }
+        Ok(claude_print::pool::InvocationAcquisition::Acquired(worker)) => Some(worker),
+        Err(failure) => {
+            // Reachable-but-broken daemon: malformed protocol, failed fd
+            // transfer, or silence past the acquire deadline (the deadline
+            // bounds every protocol stage, so this arm is reached promptly,
+            // never by hanging) — the complement of
+            // pool::is_stateless_fallback, which is exactly why this arm is
+            // Err and not Fallback. Falling back would silently mask the
+            // breakage behind full-price stateless sessions, so fail safely
+            // with exit 2, structured in JSON modes like every other setup
+            // error.
+            let mut stdout = io::stdout().lock();
+            let mut stderr = io::stderr().lock();
+            let _ = emit_error(
+                &mut stdout,
+                &mut stderr,
+                &ClaudePrintError::Setup(failure.to_string()),
+                &cli.output_format,
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                true,
+            );
+            exit_with_cleanup(2);
+        }
+    };
+
+    // INTERIM (claudepr-12e0cd23, child 1 of the claudepr-309d826d split):
+    // acquisition is wired into the invocation path, but driving a prompt
+    // through the acquired PTY is child 2's work (claudepr-f1e93af1 — the
+    // Session event loop over the worker's master fd, Stop FIFO, and
+    // transcript cwd). Until that lands, a successfully acquired worker is
+    // released here EXACTLY ONCE via the drop path: Drop calls
+    // AcquiredWorker::release, the daemon tears the worker down and spawns a
+    // replacement, so a worker is never handed a second prompt and no
+    // prewarmed slot stays pinned to a client that cannot drive it. This is
+    // deliberate interim behavior, not a bug or a leak — child 2 replaces
+    // this block with the pooled session run and keeps the worker alive
+    // for it.
+    if let Some(worker) = pooled_worker {
+        pool_tracer.trace(format!(
+            "pool: acquired worker {} (pid {}) — interim: pooled session driving \
+             lands in claudepr-f1e93af1; releasing via drop, running the ordinary \
+             stateless session",
+            worker.worker_id(),
+            worker.pid()
+        ));
+        drop(worker);
+    }
+
     // Call session::Session::run()
     let result = session::Session::run(
         &claude_bin,

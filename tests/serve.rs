@@ -39,6 +39,14 @@
 //!     including under SIGINT/SIGTERM: the session interrupt contract (exit
 //!     130) holds and the serve shutdown never fires, pinning
 //!     install_serve_signal_handlers as serve-only (claudepr-e7bc9482).
+//!   * **client acquisition fallback (claudepr-12e0cd23)** — `--pool-socket`
+//!     on the ordinary invocation path honors the ADR-005 client contract
+//!     end to end: a missing daemon falls back to a successful stateless
+//!     session (quiet by default, exactly one verbose diagnostic line with
+//!     `--verbose`), a reachable-but-broken daemon answering protocol garbage
+//!     exits 2 without falling back, and the interim acquire-then-release
+//!     hands the worker back exactly once for the daemon to tear down and
+//!     replace.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -1472,5 +1480,235 @@ fn serve_survives_malformed_clients_and_keeps_serving() {
     // A shutdown signal must still take the daemon through the full
     // clean-stop contract with the whole (replenished) worker set.
     let out = daemon.terminate(&socket, 3);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+// ── client acquisition fallback (claudepr-12e0cd23) ─────────────────────────
+//
+// The ADR-005 client contract, end to end through the compiled binary. The
+// mechanism-level pins live in src/pool.rs's unit tests (classification,
+// deadline bounding, wire format); these pin what only a real invocation can:
+// that a fallback actually runs the ordinary stateless session to a successful
+// exit, that the diagnostic is exactly one verbose stderr line, that a
+// protocol failure exits 2 instead of falling back, and that the interim
+// acquire-then-release leaves the daemon's pool whole.
+
+/// A `--pool-socket` invocation with no daemon at the path must succeed
+/// statelessly, and quietly: the ADR-005 fallback is additive, so without
+/// `--verbose` nothing about the pool may surface on stderr.
+#[test]
+fn pool_socket_unreachable_daemon_falls_back_to_a_successful_stateless_session() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("absent.sock");
+    assert!(!socket.exists(), "precondition: no daemon at the path");
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "a missing pool must fall back to a successful stateless session\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("Hello from mock_claude"),
+        "the stateless session must have run to its answer\nstdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        !out.stderr.contains("pool:"),
+        "quiet mode must stay quiet about the fallback\nstderr:\n{}",
+        out.stderr
+    );
+}
+
+/// Same fallback, `--verbose`: exactly one diagnostic line names why the pool
+/// was not used, and the stateless session still owns the run.
+#[test]
+fn pool_socket_fallback_diagnostic_is_one_verbose_line_then_success() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("absent.sock");
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--verbose")
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "fallback must succeed\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    let pool_lines: Vec<&str> = out.stderr.lines().filter(|l| l.contains("pool:")).collect();
+    assert_eq!(
+        pool_lines.len(),
+        1,
+        "exactly one verbose diagnostic line expected\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        pool_lines[0].contains("no pool reachable at") && pool_lines[0].contains("falling back"),
+        "the diagnostic must name the failure and the fallback: {}",
+        pool_lines[0]
+    );
+    assert!(
+        out.stdout.contains("Hello from mock_claude"),
+        "the stateless session must have run to its answer\nstdout:\n{}",
+        out.stdout
+    );
+}
+
+/// A reachable daemon that answers with protocol garbage is the one class the
+/// contract refuses to mask: the invocation must exit 2 promptly, never fall
+/// back, and never hang.
+#[test]
+fn pool_socket_protocol_failure_fails_safely_instead_of_falling_back() {
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("broken.sock");
+
+    let listener = UnixListener::bind(&socket).expect("bind the broken daemon");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            // Answer the acquire with a well-formed frame carrying garbage —
+            // reachable-but-broken, not absent.
+            let payload: &[u8] = b"\x00\xff not json at all";
+            let _ = stream.write_all(&(payload.len() as u32).to_be_bytes());
+            let _ = stream.write_all(payload);
+            // Hold the connection briefly so the failure is the parse, not a
+            // lost race with the peer's close.
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .args(["--timeout", "30"])
+        .arg("Reply with exactly one word: pong");
+    let started = Instant::now();
+    let out = run(&mut cmd, BUDGET);
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "a protocol failure must exit non-zero, not fall back\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("error: pool protocol failure"),
+        "the error must name the protocol failure\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("falling back"),
+        "a broken daemon must never be masked by a fallback\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stdout.trim().is_empty(),
+        "the stateless session must not have run\nstdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the protocol failure must land inside the caller deadline, took {elapsed:?}"
+    );
+}
+
+/// The interim wiring (until the pooled session driver lands): a successful
+/// acquire is released EXACTLY ONCE via the drop path, the daemon tears the
+/// worker down and spawns a replacement, and the invocation still completes
+/// statelessly. Pins the documented interim behavior as intentional: zero
+/// releases would leak the assignment, two would double-send.
+#[test]
+fn pool_socket_interim_acquisition_releases_once_and_the_daemon_replaces_the_worker() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("1"));
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    // The interim invocation: acquire the warmed worker, release it via drop,
+    // then run the ordinary stateless session to completion.
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, Duration::from_secs(120));
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "the invocation must succeed via the stateless session\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("Hello from mock_claude"),
+        "the stateless session must have run to its answer\nstdout:\n{}",
+        out.stdout
+    );
+
+    // The daemon's side of the interim contract: one assignment, one release
+    // (the drop path), and a replacement warmed so the pool is whole again.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(10));
+    daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+    let stderr = daemon.stderr();
+    let assigned = stderr
+        .iter()
+        .filter(|l| l.contains("Assigned worker"))
+        .count();
+    let released = stderr
+        .iter()
+        .filter(|l| l.contains("Released worker"))
+        .count();
+    assert_eq!(
+        assigned, 1,
+        "exactly one worker may be handed out; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        released, 1,
+        "exactly one release (zero leaks, no double-send); stderr: {stderr:?}"
+    );
+
+    // The released worker was destroyed and reaped before the daemon answered
+    // the release, so only the replacement remains at shutdown time.
+    let out = daemon.terminate(&socket, 1);
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }

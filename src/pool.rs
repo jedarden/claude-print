@@ -29,10 +29,42 @@
 // {
 //   "type": "worker_assigned",
 //   "worker_id": "uuid",
-//   "message": "Worker ready"
+//   "message": "Worker ready",
+//   "stop_fifo": "/tmp/claude-print-<daemon-pid>-xxxx/stop.fifo",
+//   "pid": 12345,
+//   "cwd": "/working/dir"
 // }
 // ```
-// Note: The actual PTY master fd is sent as ancillary data (SCM_RIGHTS)
+// Note: The actual PTY master fd is sent as ancillary data (SCM_RIGHTS) after
+// the JSON frame. `stop_fifo` is the daemon-side Stop FIFO the worker's hook
+// writes into — the acquiring client reads the payload from it, exactly as the
+// ordinary session path reads its own; `pid` feeds the client-side watchdog;
+// `cwd` is the working directory the worker was spawned in (the daemon's), which
+// is where the child writes its `~/.claude/projects/<cwd-slug>/` transcripts and
+// therefore the directory the client's stream-json discovery must watch. All
+// three are optional on the wire (older daemons omit them); a client that
+// receives a `worker_assigned` without them treats the acquire as a protocol
+// failure — it cannot drive the session without them.
+//
+// ## Client fallback contract (ADR-005)
+//
+// `--pool-socket` is additive latency work, never a new failure surface for the
+// ordinary path. Failures are classified in [`AcquireFailure`]:
+//
+//   * **Absent / unreachable** (missing socket file, refused connect, connect
+//     timeout, permission) and **correctly-answered but unavailable** (pool
+//     full, shutting down, internal error) → the caller falls back to the
+//     stateless session path, with a diagnostic when `--verbose` is on.
+//   * **Protocol failure** (garbage response, malformed frame, incomplete
+//     worker assignment, failed fd transfer) → a hard error. The pool was
+//     reachable and answered; falling back would silently mask a broken
+//     daemon behind full-price stateless sessions. Every protocol stage is
+//     bounded by the caller's acquire deadline, so a hung daemon cannot
+//     stall the client past it.
+//
+// The invocation path implements this contract in [`acquire_for_invocation`]
+// — the entry point main() calls when `--pool-socket` is set — which returns
+// an [`InvocationAcquisition`] classification the caller owes an outcome to.
 //
 // ### Response: Error
 // ```json
@@ -46,6 +78,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -55,8 +88,9 @@ use uuid::Uuid;
 /// Default socket path for the pool daemon
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/claude-print-pool.sock";
 
-/// Maximum time a client will wait for a worker acquisition
-const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 60;
+/// Maximum time a client will wait for a worker acquisition. Also the cap on
+/// the client's own acquire budget — see the client section below.
+pub const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 60;
 
 /// Maximum time to wait for a worker to complete its warmup phase
 const WARMUP_TIMEOUT_SECS: u64 = 120;
@@ -166,8 +200,26 @@ fn default_acquire_timeout() -> u64 {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PoolResponse {
-    /// Worker successfully assigned (PTY fd sent as SCM_RIGHTS)
-    WorkerAssigned { worker_id: String, message: String },
+    /// Worker successfully assigned (PTY fd sent as SCM_RIGHTS after this
+    /// frame).
+    ///
+    /// `stop_fifo`, `pid`, and `cwd` carry everything the client needs to drive
+    /// the session end to end: the daemon-side Stop FIFO to read the payload
+    /// from, the worker process for watchdog signalling, and the working
+    /// directory the child writes its transcripts under (the stream-json
+    /// discovery directory). All three default to empty on the wire so an
+    /// older client can still parse the frame; a *current* client treats any
+    /// empty one as a protocol failure (see [`AcquiredWorker::validate_parts`]).
+    WorkerAssigned {
+        worker_id: String,
+        message: String,
+        #[serde(default)]
+        stop_fifo: String,
+        #[serde(default)]
+        pid: u32,
+        #[serde(default)]
+        cwd: String,
+    },
     /// Error response
     Error { error: String, code: ErrorCode },
 }
@@ -1206,17 +1258,37 @@ impl PoolServer {
 
         match worker_id {
             Ok(id) => {
-                // Get the worker to extract its PTY fd
-                let master_fd = {
+                // Get the worker to extract its PTY fd and everything the
+                // client needs to drive the session. The Stop FIFO lives in
+                // the worker's own hook installer (per-worker temp dir), the
+                // pid feeds the client watchdog, and the cwd is the daemon's
+                // working directory — the child inherited it at spawn, so it
+                // is where the child writes `~/.claude/projects/` transcripts
+                // and the directory the client's stream-json discovery must
+                // watch. The daemon never chdirs, so the process cwd is the
+                // worker's cwd for every worker it holds.
+                let (master_fd, stop_fifo, pid) = {
                     let mgr = manager.lock().unwrap();
                     let worker = mgr.get_worker(&id).unwrap();
-                    worker.master_fd
+                    let fifo = worker
+                        .hook_installer
+                        .as_ref()
+                        .map(|h| h.fifo_path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let pid = u32::try_from(worker.child_pid.as_raw()).unwrap_or(0);
+                    (worker.master_fd, fifo, pid)
                 };
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
 
                 // Send success response + PTY fd via SCM_RIGHTS
                 let response = PoolResponse::WorkerAssigned {
                     worker_id: id.clone(),
                     message: "Worker ready".to_string(),
+                    stop_fifo,
+                    pid,
+                    cwd,
                 };
 
                 let json = serde_json::to_vec(&response)?;
@@ -1262,6 +1334,12 @@ impl PoolServer {
             Ok(()) => PoolResponse::WorkerAssigned {
                 worker_id: worker_id.to_string(),
                 message: "Worker released".to_string(),
+                // A release reply carries no assignment payload — the client
+                // treats any WorkerAssigned here as success and ignores the
+                // extras.
+                stop_fifo: String::new(),
+                pid: 0,
+                cwd: String::new(),
             },
             Err(err) => err,
         };
@@ -1370,6 +1448,563 @@ impl PoolServer {
     }
 }
 
+/// Why an acquire did not yield a usable worker, and what the caller owes it
+/// (ADR-005 fallback contract — see the module header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquireFailure {
+    /// No pool answered at the socket path: missing socket file, refused or
+    /// otherwise failed connect, connect timeout, permission. ADR-005's
+    /// documented stateless fallback applies.
+    Unreachable {
+        socket: std::path::PathBuf,
+        reason: String,
+    },
+    /// A well-formed pool answered but cannot serve right now (`pool_full`,
+    /// `shutting_down`, `internal_error`, `acquire_timeout`). The pool is up;
+    /// it just has nothing to hand out. Stateless fallback applies here too —
+    /// the flag is additive latency work, never a new way to fail.
+    PoolUnavailable { code: String, error: String },
+    /// The pool answered with protocol garbage, an incomplete worker
+    /// assignment, or a failed fd transfer. The daemon is reachable but
+    /// broken — a hard error, NOT a fallback: silently spawning an unpooled
+    /// full-price session would mask the breakage. Always produced within the
+    /// caller's acquire deadline; a daemon that accepts and then goes silent
+    /// surfaces as this variant when the deadline expires.
+    Protocol(String),
+}
+
+impl std::fmt::Display for AcquireFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcquireFailure::Unreachable { socket, reason } => {
+                write!(f, "no pool reachable at {}: {}", socket.display(), reason)
+            }
+            AcquireFailure::PoolUnavailable { code, error } => {
+                write!(f, "pool cannot serve a worker ({}: {})", code, error)
+            }
+            AcquireFailure::Protocol(msg) => write!(f, "pool protocol failure: {msg}"),
+        }
+    }
+}
+
+/// Does this failure route the caller to the ADR-005 stateless fallback?
+pub fn is_stateless_fallback(failure: &AcquireFailure) -> bool {
+    matches!(
+        failure,
+        AcquireFailure::Unreachable { .. } | AcquireFailure::PoolUnavailable { .. }
+    )
+}
+
+/// What the invocation path owes for each acquire outcome (the caller-facing
+/// half of the ADR-005 client contract).
+#[derive(Debug)]
+pub enum InvocationAcquisition {
+    /// `--pool-socket` was absent: no pool code ran, the ordinary hot path is
+    /// untouched.
+    NotRequested,
+    /// A prewarmed worker was acquired. The caller owes it exactly one
+    /// prompt; a caller that cannot drive it yet (the interim wiring) must
+    /// release it via the [`AcquiredWorker`] drop path so the daemon tears it
+    /// down and spawns a replacement.
+    Acquired(AcquiredWorker),
+    /// The pool did not yield a worker for a reason the ADR-005 contract
+    /// routes to the stateless path. By construction the carried failure
+    /// satisfies [`is_stateless_fallback`]; the caller owes one verbose
+    /// diagnostic line and then the ordinary stateless session.
+    Fallback(AcquireFailure),
+}
+
+/// The invocation-path acquisition step (ADR-005): when `--pool-socket` names
+/// a pool daemon, acquire one prewarmed worker inside the caller's existing
+/// timeout budget and classify the outcome.
+///
+/// `socket: None` (flag absent) returns [`InvocationAcquisition::NotRequested`]
+/// before a [`PoolClient`] is ever constructed — the default path runs no pool
+/// code and pays nothing.
+///
+/// The budget is [`DEFAULT_ACQUIRE_TIMEOUT_SECS`] (60s) capped by the
+/// caller's invocation timeout: a short `--timeout` is never spent mostly on
+/// waiting for a busy pool, and the client cap keeps a wedged daemon from
+/// stalling an hour-long invocation for an hour. The budget bounds the whole
+/// exchange (connect, request, response, fd transfer), so no outcome of this
+/// function can hang.
+pub fn acquire_for_invocation(
+    socket: Option<&std::path::Path>,
+    caller_timeout_secs: u64,
+) -> Result<InvocationAcquisition, AcquireFailure> {
+    let Some(socket) = socket else {
+        return Ok(InvocationAcquisition::NotRequested);
+    };
+    let budget_secs = DEFAULT_ACQUIRE_TIMEOUT_SECS.min(caller_timeout_secs.max(1));
+    match PoolClient::new(socket.to_path_buf()).acquire(budget_secs) {
+        Ok(worker) => Ok(InvocationAcquisition::Acquired(worker)),
+        Err(failure) if is_stateless_fallback(&failure) => {
+            Ok(InvocationAcquisition::Fallback(failure))
+        }
+        Err(protocol) => Err(protocol),
+    }
+}
+
+/// One-time budget for a client release exchange. Teardown is best-effort by
+/// contract (a dead daemon has nothing left to release), but it must never
+/// hang the client: this bounds the connect + frame + reply.
+const RELEASE_TIMEOUT_SECS: u64 = 10;
+
+/// Wait until `fd` is ready for `events` (POLLIN/POLLOUT) or `deadline`
+/// passes. The returned error names the timeout so protocol failures can
+/// distinguish a hung daemon from a closed one.
+fn wait_ready(fd: RawFd, events: i16, deadline: Instant) -> Result<(), String> {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("timed out waiting for the pool".to_string());
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut fds = [libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        }];
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
+        if ret < 0 {
+            let errno = nix::errno::Errno::last();
+            if errno == nix::errno::Errno::EINTR {
+                continue;
+            }
+            return Err(format!("poll failed: {errno}"));
+        }
+        if ret == 0 {
+            return Err("timed out waiting for the pool".to_string());
+        }
+        if fds[0].revents & libc::POLLNVAL != 0 {
+            return Err("pool socket fd went invalid".to_string());
+        }
+        return Ok(());
+    }
+}
+
+/// Read exactly `buf.len()` bytes from a non-blocking `stream`, or fail once
+/// `deadline` passes. Unlike `read_exact` over a socket timeout, the deadline
+/// is enforced across the WHOLE read: a daemon dribbling one byte per interval
+/// cannot stretch the exchange past it.
+fn read_exact_bounded(
+    stream: &mut std::os::unix::net::UnixStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        wait_ready(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err("pool closed the connection mid-response".to_string());
+            }
+            Ok(n) => filled += n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(e) => return Err(format!("read from pool failed: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Write all of `buf` to a non-blocking `stream`, or fail once `deadline`
+/// passes (same whole-exchange bound as [`read_exact_bounded`]).
+fn write_all_bounded(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    while !buf.is_empty() {
+        wait_ready(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+        match stream.write(buf) {
+            Ok(0) => return Err("wrote nothing to the pool".to_string()),
+            Ok(n) => buf = &buf[n..],
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(e) => return Err(format!("write to pool failed: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Send one length-prefixed frame (the client half of the daemon's
+/// [`PoolServer::read_frame`] wire format).
+fn send_frame(
+    stream: &mut std::os::unix::net::UnixStream,
+    payload: &[u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| "request frame does not fit the wire length prefix".to_string())?;
+    write_all_bounded(stream, &len.to_be_bytes(), deadline)?;
+    write_all_bounded(stream, payload, deadline)
+}
+
+/// Read one length-prefixed frame, rejecting prefixes past
+/// [`MAX_REQUEST_BYTES`] (the same cap the daemon applies to requests — the
+/// wire length is an unbounded u32 and must not pin client memory either).
+fn read_frame_bounded(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 4];
+    read_exact_bounded(stream, &mut len_buf, deadline)?;
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    if msg_len > MAX_REQUEST_BYTES {
+        return Err(format!(
+            "response length prefix {} exceeds the {}-byte maximum",
+            msg_len, MAX_REQUEST_BYTES
+        ));
+    }
+    let mut buf = vec![0u8; msg_len];
+    read_exact_bounded(stream, &mut buf, deadline)?;
+    Ok(buf)
+}
+
+/// Receive one file descriptor via SCM_RIGHTS from a non-blocking `stream`,
+/// bounded by `deadline`.
+///
+/// The control buffer is a properly sized, properly aligned byte array that
+/// the kernel fills in — never a `cmsghdr` with 1 KiB of tail read past it,
+/// and the payload iovec points at real storage (a NULL base with a nonzero
+/// length faults the recvmsg the moment the sender's data byte arrives,
+/// losing the fd with it).
+fn recv_fd_bounded(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+) -> Result<OwnedFd, String> {
+    use std::os::unix::io::AsRawFd;
+
+    /// Big enough for one SCM_RIGHTS cmsghdr carrying several fds, aligned
+    /// for `cmsghdr` (which contains a usize length).
+    #[repr(C, align(8))]
+    struct ControlBuffer([u8; 128]);
+
+    let mut control = ControlBuffer([0u8; 128]);
+    let mut payload_byte = [0u8; 1];
+
+    loop {
+        wait_ready(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+        let mut iov = [libc::iovec {
+            iov_base: payload_byte.as_mut_ptr() as *mut libc::c_void,
+            iov_len: payload_byte.len(),
+        }];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.0.len();
+
+        let ret = unsafe {
+            libc::recvmsg(
+                stream.as_raw_fd(),
+                &mut msg,
+                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+            )
+        };
+        if ret < 0 {
+            let errno = nix::errno::Errno::last();
+            if errno == nix::errno::Errno::EINTR || errno == nix::errno::Errno::EAGAIN {
+                continue;
+            }
+            return Err(format!("failed to receive the worker fd: {errno}"));
+        }
+
+        // Walk every ancillary header the kernel wrote and take the first
+        // SCM_RIGHTS fd. CMSG_NXTHDR is the only safe iteration: headers are
+        // kernel-formatted and their lengths are data.
+        let mut hdr = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        while !hdr.is_null() {
+            let hdr_ref = unsafe { &*hdr };
+            if hdr_ref.cmsg_level == libc::SOL_SOCKET && hdr_ref.cmsg_type == libc::SCM_RIGHTS {
+                let data_len = hdr_ref
+                    .cmsg_len
+                    .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
+                if data_len as usize >= std::mem::size_of::<RawFd>() {
+                    let fd =
+                        unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(hdr) as *const RawFd) };
+                    if fd >= 0 {
+                        // SAFETY: the kernel installed a fresh descriptor in
+                        // this process's table; we now own its lifetime.
+                        // MSG_CMSG_CLOEXEC keeps it out of any child exec.
+                        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+                    }
+                }
+            }
+            hdr = unsafe { libc::CMSG_NXTHDR(&msg, hdr) };
+        }
+
+        // Data arrived (ret >= 0) but no usable fd: the daemon's transfer is
+        // broken — do not wait for a second message, fail.
+        return Err("pool sent no usable fd with the worker assignment".to_string());
+    }
+}
+
+/// A worker acquired from a pool daemon: a prewarmed PTY plus everything the
+/// client session needs to drive it to exactly one prompt (ADR-005).
+///
+/// Owning this struct owns the PTY master fd. Dropping it — on any path,
+/// including error returns and panics — releases the worker back to the
+/// daemon, which tears the worker down and spawns a replacement: a released
+/// worker is never handed a second prompt, so no session id, hook path,
+/// transcript offset, environment, or fd can leak between callers.
+pub struct AcquiredWorker {
+    worker_id: String,
+    master: OwnedFd,
+    child_pid: u32,
+    stop_fifo: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+    socket_path: std::path::PathBuf,
+    released: bool,
+}
+
+impl std::fmt::Debug for AcquiredWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcquiredWorker")
+            .field("worker_id", &self.worker_id)
+            .field("child_pid", &self.child_pid)
+            .field("stop_fifo", &self.stop_fifo)
+            .field("cwd", &self.cwd)
+            .field("socket_path", &self.socket_path)
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcquiredWorker {
+    /// Cross-check the assignment against what driving a session actually
+    /// requires. `serde(default)` lets a legacy (pre-fifo) daemon's frame
+    /// parse with empty fields; any empty field means the daemon predates the
+    /// client and the acquire is a protocol failure, not a session.
+    fn validate_parts(worker_id: &str, stop_fifo: &str, pid: u32, cwd: &str) -> Result<(), String> {
+        if worker_id.is_empty() {
+            return Err("worker_assigned carried an empty worker_id".to_string());
+        }
+        if stop_fifo.is_empty() {
+            return Err(
+                "worker_assigned carried no stop_fifo — the daemon predates the \
+                 Stop-FIFO handoff this client requires"
+                    .to_string(),
+            );
+        }
+        if pid == 0 {
+            return Err("worker_assigned carried no worker pid".to_string());
+        }
+        if cwd.is_empty() {
+            return Err("worker_assigned carried no worker cwd".to_string());
+        }
+        Ok(())
+    }
+
+    fn from_parts(
+        worker_id: String,
+        stop_fifo: String,
+        pid: u32,
+        cwd: String,
+        master: OwnedFd,
+        socket_path: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        Self::validate_parts(&worker_id, &stop_fifo, pid, &cwd)?;
+        Ok(Self {
+            worker_id,
+            master,
+            child_pid: pid,
+            stop_fifo: std::path::PathBuf::from(stop_fifo),
+            cwd: std::path::PathBuf::from(cwd),
+            socket_path,
+            released: false,
+        })
+    }
+
+    /// The daemon's id for this worker.
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    /// The worker's process id (for client-side watchdog signalling).
+    pub fn pid(&self) -> nix::unistd::Pid {
+        nix::unistd::Pid::from_raw(self.child_pid as i32)
+    }
+
+    /// The prewarmed PTY master fd — polled by the client's event loop, closed
+    /// when this struct drops.
+    pub fn master_fd(&self) -> RawFd {
+        self.master.as_raw_fd()
+    }
+
+    /// The daemon-side Stop FIFO the worker's hook writes its payload into.
+    /// The client reads the payload from here instead of a FIFO in its own
+    /// temp dir — the child was launched with the daemon's hook settings.
+    pub fn stop_fifo(&self) -> &std::path::Path {
+        &self.stop_fifo
+    }
+
+    /// The working directory the worker was spawned in (the daemon's). The
+    /// child writes its transcripts under `$HOME/.claude/projects/<this-cwd's
+    /// slug>/`, so this — not the client's cwd — is the directory the
+    /// stream-json discovery must watch.
+    pub fn worker_cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    /// Whether the worker has already been released.
+    pub fn is_released(&self) -> bool {
+        self.released
+    }
+
+    /// Release the worker: tell the daemon to tear it down and spawn a
+    /// replacement. Idempotent; best-effort (a dead daemon has nothing left
+    /// to release, and Drop must never panic). Also runs on Drop for every
+    /// exit path that did not reach an explicit release.
+    pub fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Err(reason) = self.release_inner() {
+            eprintln!(
+                "claude-print: pool: releasing worker {} failed ({reason}) — \
+                 the daemon tears the worker down on its own shutdown either way",
+                self.worker_id
+            );
+        }
+    }
+
+    /// Wire half of [`Self::release`]: one bounded exchange asking the daemon
+    /// to destroy the worker. Errors are collected, never panicked on.
+    fn release_inner(&self) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(RELEASE_TIMEOUT_SECS);
+        let mut stream = connect_socket(&self.socket_path, deadline)
+            .map_err(|f| format!("pool unreachable: {f}"))?;
+        let request = PoolRequest::Release {
+            worker_id: self.worker_id.clone(),
+        };
+        let json =
+            serde_json::to_vec(&request).map_err(|e| format!("serialize release request: {e}"))?;
+        send_frame(&mut stream, &json, deadline)?;
+        // Read the reply so the daemon's connection thread completes cleanly;
+        // the content is informational — the teardown is already triggered.
+        let _ = read_frame_bounded(&mut stream, deadline);
+        Ok(())
+    }
+}
+
+impl Drop for AcquiredWorker {
+    fn drop(&mut self) {
+        self.release();
+        // `master` (OwnedFd) closes here — after the release, so the daemon's
+        // teardown never races a client still polling the PTY.
+    }
+}
+
+/// Connect to the pool daemon at `socket_path`, with the whole attempt
+/// bounded by `deadline`. std has no connect-timeout for Unix sockets, so
+/// this drives a raw non-blocking connect and polls for completion — a full
+/// backlog or a wedged daemon fails the attempt instead of hanging the
+/// caller. The returned stream is non-blocking, which the bounded read/write
+/// helpers require anyway.
+fn connect_socket(
+    socket_path: &std::path::Path,
+    deadline: Instant,
+) -> Result<std::os::unix::net::UnixStream, AcquireFailure> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let unreachable = |reason: String| AcquireFailure::Unreachable {
+        socket: socket_path.to_path_buf(),
+        reason,
+    };
+
+    let path_bytes = socket_path.as_os_str().as_bytes();
+    if path_bytes.is_empty() {
+        return Err(unreachable("empty socket path".to_string()));
+    }
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if path_bytes.len() >= addr.sun_path.len() {
+        return Err(unreachable(format!(
+            "socket path exceeds the {}-byte sockaddr_un limit",
+            addr.sun_path.len() - 1
+        )));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            addr.sun_path.as_mut_ptr() as *mut u8,
+            path_bytes.len(),
+        );
+    }
+
+    // SAFETY: plain socket creation; CLOEXEC keeps the descriptor out of any
+    // child exec, NONBLOCK bounds the connect below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(unreachable(format!(
+            "socket(2) failed: {}",
+            nix::errno::Errno::last()
+        )));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    // SAFETY: `addr` is a fully initialized sockaddr_un for this family and
+    // `fd` is a live descriptor we just created.
+    let connect_result = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if connect_result < 0 {
+        let errno = nix::errno::Errno::last();
+        // EINPROGRESS (and EAGAIN on a full backlog): completion is pending —
+        // poll for writability, then read the outcome out of SO_ERROR.
+        if errno != nix::errno::Errno::EINPROGRESS && errno != nix::errno::Errno::EAGAIN {
+            return Err(unreachable(errno.to_string()));
+        }
+        wait_ready(fd, libc::POLLOUT, deadline).map_err(unreachable)?;
+        let mut so_error: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: standard SO_ERROR probe on a live descriptor.
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_error as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        } < 0
+        {
+            return Err(unreachable(format!(
+                "getsockopt(SO_ERROR) failed: {}",
+                nix::errno::Errno::last()
+            )));
+        }
+        if so_error != 0 {
+            return Err(unreachable(
+                nix::errno::Errno::from_raw(so_error).to_string(),
+            ));
+        }
+    }
+
+    Ok(std::os::unix::net::UnixStream::from(owned))
+}
+
 /// Client for connecting to the pool daemon
 pub struct PoolClient {
     /// Socket path
@@ -1382,170 +2017,73 @@ impl PoolClient {
         Self { socket_path }
     }
 
-    /// Connect to the pool and acquire a worker
+    /// Connect to the pool and acquire one prewarmed worker (ADR-005).
     ///
-    /// Returns the worker ID and PTY master fd
-    pub fn acquire(&self, timeout_secs: u64) -> Result<(String, RawFd), PoolResponse> {
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&self.socket_path).map_err(|_| {
-                PoolResponse::Error {
-                    error: format!(
-                        "Failed to connect to pool at {}",
-                        self.socket_path.display()
-                    ),
-                    code: ErrorCode::InternalError,
-                }
-            })?;
+    /// `timeout_secs` bounds the WHOLE exchange — connect, request, response,
+    /// and fd transfer — so a hung daemon can never stall the caller past it.
+    /// On success the returned [`AcquiredWorker`] owns the PTY master fd and
+    /// releases the worker on drop; the caller drives exactly one prompt
+    /// through it.
+    pub fn acquire(&self, timeout_secs: u64) -> Result<AcquiredWorker, AcquireFailure> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
 
-        // Send acquire request
-        let request = PoolRequest::Acquire { timeout_secs };
-        let json = serde_json::to_vec(&request)?;
+        let mut stream = connect_socket(&self.socket_path, deadline)?;
 
-        // Send length + JSON
-        let len_buf = (json.len() as u32).to_be_bytes();
-        stream
-            .write_all(&len_buf)
-            .map_err(|_| PoolResponse::Error {
-                error: "Failed to send request".to_string(),
-                code: ErrorCode::InternalError,
-            })?;
-        stream.write_all(&json).map_err(|_| PoolResponse::Error {
-            error: "Failed to send request".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        // Everything past a successful connect is protocol territory: the
+        // daemon exists and answered, so failures are hard errors, not
+        // fallbacks.
+        let protocol = |msg: String| AcquireFailure::Protocol(msg);
 
-        // Receive response length
-        let mut len_buf = [0u8; 4];
-        stream
-            .read_exact(&mut len_buf)
-            .map_err(|_| PoolResponse::Error {
-                error: "Failed to read response".to_string(),
-                code: ErrorCode::InternalError,
-            })?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-        // Receive response JSON
-        let mut buf = vec![0u8; msg_len];
-        stream
-            .read_exact(&mut buf)
-            .map_err(|_| PoolResponse::Error {
-                error: "Failed to read response".to_string(),
-                code: ErrorCode::InternalError,
-            })?;
-
-        let response: PoolResponse = serde_json::from_slice(&buf)?;
-
-        match response {
-            PoolResponse::WorkerAssigned { worker_id, .. } => {
-                // Receive the PTY fd via SCM_RIGHTS
-                let fd = Self::recv_fd(&stream)?;
-                Ok((worker_id, fd))
-            }
-            PoolResponse::Error { .. } => Err(response),
-        }
-    }
-
-    /// Release a worker back to the pool
-    pub fn release(&self, worker_id: &str) -> Result<(), PoolResponse> {
-        let mut stream =
-            std::os::unix::net::UnixStream::connect(&self.socket_path).map_err(|_| {
-                PoolResponse::Error {
-                    error: format!(
-                        "Failed to connect to pool at {}",
-                        self.socket_path.display()
-                    ),
-                    code: ErrorCode::InternalError,
-                }
-            })?;
-
-        let request = PoolRequest::Release {
-            worker_id: worker_id.to_string(),
+        let request = PoolRequest::Acquire {
+            timeout_secs: timeout_secs.max(1),
         };
-        let json = serde_json::to_vec(&request)?;
+        let json = serde_json::to_vec(&request)
+            .map_err(|e| protocol(format!("serialize acquire request: {e}")))?;
+        send_frame(&mut stream, &json, deadline).map_err(protocol)?;
 
-        let len_buf = (json.len() as u32).to_be_bytes();
-        stream
-            .write_all(&len_buf)
-            .map_err(|_| PoolResponse::Error {
-                error: "Failed to send request".to_string(),
-                code: ErrorCode::InternalError,
-            })?;
-        stream.write_all(&json).map_err(|_| PoolResponse::Error {
-            error: "Failed to send request".to_string(),
-            code: ErrorCode::InternalError,
-        })?;
+        let body = read_frame_bounded(&mut stream, deadline).map_err(protocol)?;
+        let response: PoolResponse = serde_json::from_slice(&body)
+            .map_err(|e| protocol(format!("malformed response: {e}")))?;
 
-        let mut len_buf = [0u8; 4];
-        stream
-            .read_exact(&mut len_buf)
-            .map_err(|_| PoolResponse::Error {
-                error: "Failed to read response".to_string(),
-                code: ErrorCode::InternalError,
-            })?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-        let mut buf = vec![0u8; msg_len];
-        stream
-            .read_exact(&mut buf)
-            .map_err(|_| PoolResponse::Error {
-                error: "Failed to read response".to_string(),
-                code: ErrorCode::InternalError,
-            })?;
-
-        let response: PoolResponse = serde_json::from_slice(&buf)?;
-
-        match response {
-            PoolResponse::WorkerAssigned { .. } => Ok(()),
-            PoolResponse::Error { .. } => Err(response),
-        }
-    }
-
-    /// Receive a file descriptor via SCM_RIGHTS
-    fn recv_fd(stream: &std::os::unix::net::UnixStream) -> Result<RawFd, PoolResponse> {
-        use std::os::unix::io::AsRawFd;
-
-        let socket_fd = stream.as_raw_fd();
-
-        unsafe {
-            let mut cmsg: libc::cmsghdr = std::mem::zeroed();
-            let mut msg: libc::msghdr = std::mem::zeroed();
-
-            let mut iov = [std::mem::zeroed::<libc::iovec>(); 1];
-            iov[0].iov_base = std::ptr::null_mut();
-            iov[0].iov_len = 1;
-
-            msg.msg_iov = iov.as_mut_ptr();
-            msg.msg_iovlen = 1;
-            msg.msg_control = &mut cmsg as *mut _ as *mut _;
-            msg.msg_controllen = std::mem::size_of::<libc::cmsghdr>() + 1024;
-
-            let fd_buf: [RawFd; 1] = [-1];
-            let cmsg_data = (msg.msg_control as *mut u8).add(std::mem::size_of::<libc::cmsghdr>());
-            *(cmsg_data as *mut RawFd) = fd_buf[0];
-
-            let ret = libc::recvmsg(socket_fd, &mut msg, 0);
-            if ret < 0 {
-                return Err(PoolResponse::Error {
-                    error: "Failed to receive fd".to_string(),
-                    code: ErrorCode::InternalError,
+        let (worker_id, stop_fifo, pid, cwd) = match response {
+            PoolResponse::Error { error, code } => {
+                let code = match code {
+                    ErrorCode::PoolFull => "pool_full",
+                    ErrorCode::AcquireTimeout => "acquire_timeout",
+                    ErrorCode::InvalidWorkerId => "invalid_worker_id",
+                    ErrorCode::InternalError => "internal_error",
+                    ErrorCode::ShuttingDown => "shutting_down",
+                };
+                return Err(AcquireFailure::PoolUnavailable {
+                    code: code.to_string(),
+                    error,
                 });
             }
+            PoolResponse::WorkerAssigned {
+                worker_id,
+                stop_fifo,
+                pid,
+                cwd,
+                ..
+            } => (worker_id, stop_fifo, pid, cwd),
+        };
 
-            // Extract fd from cmsghdr
-            if cmsg.cmsg_type == libc::SCM_RIGHTS {
-                let data_ptr =
-                    (msg.msg_control as *const u8).add(std::mem::size_of::<libc::cmsghdr>());
-                let fd = *(data_ptr as *const RawFd);
-                if fd >= 0 {
-                    return Ok(fd);
-                }
-            }
+        // The assignment is only usable with its fd: receive it before
+        // validating the frame so a broken transfer is reported as exactly
+        // that. (The kernel discards an un-received in-flight fd when this
+        // socket closes, so failing here leaks nothing.)
+        let master = recv_fd_bounded(&mut stream, deadline)
+            .map_err(|e| protocol(format!("fd transfer failed: {e}")))?;
 
-            Err(PoolResponse::Error {
-                error: "No fd received".to_string(),
-                code: ErrorCode::InternalError,
-            })
-        }
+        AcquiredWorker::from_parts(
+            worker_id,
+            stop_fifo,
+            pid,
+            cwd,
+            master,
+            self.socket_path.clone(),
+        )
+        .map_err(protocol)
     }
 }
 
@@ -1584,6 +2122,9 @@ mod tests {
         let resp = PoolResponse::WorkerAssigned {
             worker_id: "uuid-123".to_string(),
             message: "Worker ready".to_string(),
+            stop_fifo: "/tmp/stop.fifo".to_string(),
+            pid: 100,
+            cwd: "/srv/daemon".to_string(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("worker_assigned"));
@@ -2264,5 +2805,530 @@ mod tests {
 
         server.cleanup();
         assert!(!path.exists());
+    }
+
+    // ---- client (PoolClient::acquire) ----
+
+    /// Serve exactly `connections` sequential connections from a background
+    /// thread, handing each to `handler`. Returns once the thread is parked;
+    /// the listener (and its socket file, inside `dir`) dies with the test.
+    fn fake_daemon(
+        path: &std::path::Path,
+        connections: usize,
+        handler: impl Fn(std::os::unix::net::UnixStream) + Send + 'static,
+    ) {
+        let listener = bind_socket(path).unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                match listener.accept() {
+                    Ok((stream, _)) => handler(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    fn write_frame(stream: &mut std::os::unix::net::UnixStream, payload: &[u8]) {
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        stream.write_all(payload).unwrap();
+    }
+
+    #[test]
+    fn worker_assigned_parses_with_and_without_the_extended_fields() {
+        let full: PoolResponse = serde_json::from_str(
+            r#"{"type":"worker_assigned","worker_id":"w1","message":"ready",
+                "stop_fifo":"/tmp/f","pid":99,"cwd":"/srv"}"#,
+        )
+        .unwrap();
+        let PoolResponse::WorkerAssigned {
+            worker_id,
+            stop_fifo,
+            pid,
+            cwd,
+            ..
+        } = full
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(worker_id, "w1");
+        assert_eq!(stop_fifo, "/tmp/f");
+        assert_eq!(pid, 99);
+        assert_eq!(cwd, "/srv");
+
+        // A pre-fifo daemon's frame carries only the original two fields.
+        let legacy: PoolResponse = serde_json::from_str(
+            r#"{"type":"worker_assigned","worker_id":"w2","message":"ready"}"#,
+        )
+        .unwrap();
+        let PoolResponse::WorkerAssigned {
+            stop_fifo,
+            pid,
+            cwd,
+            ..
+        } = legacy
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(stop_fifo, "");
+        assert_eq!(pid, 0);
+        assert_eq!(cwd, "");
+    }
+
+    #[test]
+    fn from_parts_rejects_a_legacy_assignment_missing_any_field() {
+        // Any live fd works — validation rejects the frame before the
+        // descriptor is ever used, and drop closes it.
+        let (probe, _probe_keep) = stream_pair();
+        let master: OwnedFd = unsafe { OwnedFd::from_raw_fd(probe.into_raw_fd()) };
+        let err = AcquiredWorker::from_parts(
+            "w1".to_string(),
+            String::new(),
+            99,
+            "/srv".to_string(),
+            master,
+            std::path::PathBuf::from("/tmp/x.sock"),
+        )
+        .unwrap_err();
+        assert!(err.contains("stop_fifo"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn send_and_recv_roundtrip_a_real_descriptor() {
+        // `a` sends the control message, `b` receives it; (p1, p2) is the
+        // descriptor under transfer. Write on p2, read through the received
+        // fd — proves recv recovered the same open file description, not
+        // just some fd.
+        let (a, mut b) = stream_pair();
+        let (p1, mut p2) = stream_pair();
+
+        PoolServer::send_fd(&a, p1.as_raw_fd()).unwrap();
+        drop(p1); // the receiver's copy must keep the description alive
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        b.set_nonblocking(true).unwrap();
+        let received = recv_fd_bounded(&mut b, deadline).unwrap();
+        let mut received_stream = std::os::unix::net::UnixStream::from(received);
+        assert!(received_stream.as_raw_fd() >= 0);
+
+        p2.write_all(b"pong").unwrap();
+
+        let mut buf = [0u8; 4];
+        received_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        received_stream.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong");
+    }
+
+    #[test]
+    fn acquire_reports_unreachable_for_a_missing_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = PoolClient::new(dir.path().join("absent.sock"));
+
+        let failure = client.acquire(2).unwrap_err();
+        assert!(matches!(failure, AcquireFailure::Unreachable { .. }));
+        assert!(is_stateless_fallback(&failure));
+    }
+
+    #[test]
+    fn acquire_reports_unreachable_for_a_stale_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+
+        let failure = PoolClient::new(path).acquire(2).unwrap_err();
+        assert!(matches!(failure, AcquireFailure::Unreachable { .. }));
+        assert!(is_stateless_fallback(&failure));
+    }
+
+    #[test]
+    fn acquire_reports_pool_unavailable_on_an_error_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            let request = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            let _request: PoolRequest = serde_json::from_slice(&request).unwrap();
+            let response = PoolResponse::Error {
+                error: "all workers busy".to_string(),
+                code: ErrorCode::PoolFull,
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+        });
+
+        let failure = PoolClient::new(path).acquire(5).unwrap_err();
+        assert_eq!(
+            failure,
+            AcquireFailure::PoolUnavailable {
+                code: "pool_full".to_string(),
+                error: "all workers busy".to_string(),
+            }
+        );
+        assert!(is_stateless_fallback(&failure));
+    }
+
+    #[test]
+    fn acquire_yields_protocol_failure_on_garbage_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            write_frame(&mut stream, b"\x00\xff not json");
+        });
+
+        let failure = PoolClient::new(path).acquire(5).unwrap_err();
+        assert!(
+            matches!(failure, AcquireFailure::Protocol(_)),
+            "{failure:?}"
+        );
+        assert!(!is_stateless_fallback(&failure));
+    }
+
+    #[test]
+    fn acquire_yields_protocol_failure_within_the_caller_deadline_when_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            // Read the request, then say nothing — the wedged-daemon case.
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        let started = Instant::now();
+        let failure = PoolClient::new(path).acquire(2).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(matches!(failure, AcquireFailure::Protocol(ref m) if m.contains("timed out")));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "acquire must honor the caller deadline, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn acquire_rejects_a_legacy_assignment_without_a_stop_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            let response = PoolResponse::WorkerAssigned {
+                worker_id: "w-old".to_string(),
+                message: "Worker ready".to_string(),
+                stop_fifo: String::new(),
+                pid: 0,
+                cwd: String::new(),
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+            let (_pty, probe) = stream_pair();
+            PoolServer::send_fd(&stream, probe.into_raw_fd()).unwrap();
+        });
+
+        let failure = PoolClient::new(path).acquire(5).unwrap_err();
+        assert!(
+            matches!(failure, AcquireFailure::Protocol(ref m) if m.contains("stop_fifo")),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn acquire_rejects_a_response_length_prefix_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            // 1 GiB length prefix: must be refused before any allocation.
+            stream.write_all(&0x4000_0000u32.to_be_bytes()).unwrap();
+        });
+
+        let failure = PoolClient::new(path).acquire(5).unwrap_err();
+        assert!(
+            matches!(failure, AcquireFailure::Protocol(ref m) if m.contains("maximum")),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn acquire_and_release_speak_the_documented_wire_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mode_for_handler = mode.clone();
+        fake_daemon(&path, 2, move |stream| {
+            let mut stream = stream;
+            let request = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            match mode_for_handler.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    let _request: PoolRequest = serde_json::from_slice(&request).unwrap();
+                    let response = PoolResponse::WorkerAssigned {
+                        worker_id: "w-1".to_string(),
+                        message: "Worker ready".to_string(),
+                        stop_fifo: "/tmp/stop.fifo".to_string(),
+                        pid: 4321,
+                        cwd: "/srv/daemon".to_string(),
+                    };
+                    write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+                    let (_pty, probe) = stream_pair();
+                    PoolServer::send_fd(&stream, probe.into_raw_fd()).unwrap();
+                }
+                _ => {
+                    // Release connection: assert the frame, then echo it back
+                    // as the reply so the client's bounded read completes.
+                    let request: PoolRequest = serde_json::from_slice(&request).unwrap();
+                    assert!(
+                        matches!(request, PoolRequest::Release { ref worker_id } if worker_id == "w-1")
+                    );
+                    write_frame(&mut stream, &serde_json::to_vec(&request).unwrap());
+                }
+            }
+        });
+
+        let mut worker = PoolClient::new(path).acquire(5).unwrap();
+        assert_eq!(worker.worker_id(), "w-1");
+        assert_eq!(worker.pid(), nix::unistd::Pid::from_raw(4321));
+        assert_eq!(worker.stop_fifo(), std::path::Path::new("/tmp/stop.fifo"));
+        assert_eq!(worker.worker_cwd(), std::path::Path::new("/srv/daemon"));
+        assert!(worker.master_fd() >= 0);
+        assert!(!worker.is_released());
+
+        worker.release();
+        assert!(worker.is_released());
+        // Idempotent: a second release must not re-send or error.
+        worker.release();
+    }
+
+    #[test]
+    fn dropping_a_worker_releases_it_implicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_for_handler = released.clone();
+        fake_daemon(&path, 2, move |stream| {
+            let mut stream = stream;
+            let request = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            match serde_json::from_slice::<PoolRequest>(&request).unwrap() {
+                PoolRequest::Acquire { .. } => {
+                    let response = PoolResponse::WorkerAssigned {
+                        worker_id: "w-drop".to_string(),
+                        message: "Worker ready".to_string(),
+                        stop_fifo: "/tmp/stop.fifo".to_string(),
+                        pid: 7,
+                        cwd: "/srv".to_string(),
+                    };
+                    write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+                    let (_pty, probe) = stream_pair();
+                    PoolServer::send_fd(&stream, probe.into_raw_fd()).unwrap();
+                }
+                PoolRequest::Release { worker_id } => {
+                    assert_eq!(worker_id, "w-drop");
+                    released_for_handler.store(true, Ordering::SeqCst);
+                    write_frame(&mut stream, &request);
+                }
+            }
+        });
+
+        {
+            let _worker = PoolClient::new(path).acquire(5).unwrap();
+            // Dropped here without an explicit release.
+        }
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    // ---- invocation-path acquisition (acquire_for_invocation) ----
+
+    #[test]
+    fn invocation_acquisition_is_not_requested_without_a_socket() {
+        // The flag-absent hot path: classified before any client exists, so
+        // no pool code runs and nothing is owed.
+        match acquire_for_invocation(None, 3600).unwrap() {
+            InvocationAcquisition::NotRequested => {}
+            other => panic!("no --pool-socket must stay off the pool path: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invocation_acquisition_falls_back_on_an_absent_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = acquire_for_invocation(Some(&dir.path().join("absent.sock")), 60).unwrap();
+        match outcome {
+            InvocationAcquisition::Fallback(ref failure) => {
+                assert!(matches!(failure, AcquireFailure::Unreachable { .. }));
+                assert!(is_stateless_fallback(failure));
+            }
+            other => panic!("absent socket must classify as fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invocation_acquisition_falls_back_on_an_unreachable_socket() {
+        // A real socket file whose listener is gone: connect answers
+        // ECONNREFUSED — the daemon-died-and-left-the-file case, distinct
+        // from the socket never existing at all.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        let listener = bind_socket(&path).unwrap();
+        drop(listener);
+
+        match acquire_for_invocation(Some(&path), 60).unwrap() {
+            InvocationAcquisition::Fallback(ref failure) => {
+                assert!(matches!(failure, AcquireFailure::Unreachable { .. }));
+                assert!(is_stateless_fallback(failure));
+            }
+            other => panic!("unreachable socket must classify as fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invocation_acquisition_falls_back_when_the_pool_reports_it_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            let response = PoolResponse::Error {
+                error: "Pool full - no ready workers".to_string(),
+                code: ErrorCode::PoolFull,
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+        });
+
+        match acquire_for_invocation(Some(&path), 30).unwrap() {
+            InvocationAcquisition::Fallback(failure) => {
+                assert_eq!(
+                    failure,
+                    AcquireFailure::PoolUnavailable {
+                        code: "pool_full".to_string(),
+                        error: "Pool full - no ready workers".to_string(),
+                    }
+                );
+            }
+            other => panic!("pool_full must classify as fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invocation_acquisition_hard_errors_on_a_malformed_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            write_frame(&mut stream, b"\x00\xff garbage");
+        });
+
+        let failure = acquire_for_invocation(Some(&path), 5).unwrap_err();
+        assert!(
+            matches!(failure, AcquireFailure::Protocol(_)),
+            "{failure:?}"
+        );
+        assert!(!is_stateless_fallback(&failure));
+    }
+
+    #[test]
+    fn invocation_acquisition_hard_errors_within_the_caller_budget_when_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            // Read the request, then say nothing — the wedged-daemon case.
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+
+        // A caller budget below the 60s default also proves the budget is
+        // the caller's, not the compiled-in cap.
+        let started = Instant::now();
+        let failure = acquire_for_invocation(Some(&path), 2).unwrap_err();
+        assert!(
+            matches!(failure, AcquireFailure::Protocol(ref m) if m.contains("timed out")),
+            "{failure:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "acquire must honor the caller budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn invocation_acquisition_sends_the_capped_budget_to_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        fake_daemon(&path, 1, |stream| {
+            let mut stream = stream;
+            let request = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            let request: PoolRequest = serde_json::from_slice(&request).unwrap();
+            // The wire carries min(DEFAULT_ACQUIRE_TIMEOUT_SECS, caller), so
+            // the daemon-side wait cannot outlive the invocation's budget.
+            assert!(
+                matches!(request, PoolRequest::Acquire { timeout_secs: 5 }),
+                "expected the capped budget on the wire, got {request:?}"
+            );
+            let response = PoolResponse::Error {
+                error: "shutting down".to_string(),
+                code: ErrorCode::ShuttingDown,
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+        });
+
+        // Caller budget 5 < default 60: the cap applied, and the (fallback
+        // classified) shutting_down error still resolves to Ok.
+        assert!(matches!(
+            acquire_for_invocation(Some(&path), 5).unwrap(),
+            InvocationAcquisition::Fallback(_)
+        ));
+    }
+
+    #[test]
+    fn invocation_acquisition_hands_back_a_worker_the_drop_path_releases_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let releases_for_handler = releases.clone();
+        fake_daemon(&path, 2, move |stream| {
+            let mut stream = stream;
+            let request = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            match serde_json::from_slice::<PoolRequest>(&request).unwrap() {
+                PoolRequest::Acquire { .. } => {
+                    let response = PoolResponse::WorkerAssigned {
+                        worker_id: "w-inv".to_string(),
+                        message: "Worker ready".to_string(),
+                        stop_fifo: "/tmp/stop.fifo".to_string(),
+                        pid: 4242,
+                        cwd: "/srv/daemon".to_string(),
+                    };
+                    write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+                    let (_pty, probe) = stream_pair();
+                    PoolServer::send_fd(&stream, probe.into_raw_fd()).unwrap();
+                }
+                PoolRequest::Release { .. } => {
+                    releases_for_handler.fetch_add(1, Ordering::SeqCst);
+                    write_frame(&mut stream, &request);
+                }
+            }
+        });
+
+        let worker = match acquire_for_invocation(Some(&path), 5).unwrap() {
+            InvocationAcquisition::Acquired(worker) => worker,
+            other => panic!("a ready daemon must hand back a worker, got {other:?}"),
+        };
+        assert_eq!(worker.worker_id(), "w-inv");
+
+        // The interim caller never drives the worker: dropping it must send
+        // EXACTLY ONE release — the daemon then tears the worker down and
+        // spawns a replacement. Zero (leaked assignment) or two (double
+        // send) both fail this pin.
+        drop(worker);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while releases.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 }
