@@ -3,8 +3,10 @@ use crate::error::{Error, Result};
 use crate::event_loop::{EventLoop, ExitReason};
 use crate::hook::HookInstaller;
 use crate::poller::{
-    open_fifo_nonblock, parse_stop_payload, projects_dir_for_cwd, resolve_stop_info,
+    open_fifo_nonblock, parse_stop_payload, projects_dir_for, projects_dir_for_cwd,
+    resolve_stop_info, StopInfo,
 };
+use crate::pool::AcquiredWorker;
 use crate::pty::PtySpawner;
 use crate::startup::{StartupAction, StartupPhase, StartupSeq};
 use crate::terminal::TerminalEmu;
@@ -798,73 +800,13 @@ impl Session {
                     )));
                 }
 
-                // Parse stop payload. On error, `?` returns and Drop joins the
-                // reader without draining (INV-8, exit-immediately on error).
-                let stop_payload = parse_stop_payload(&payload)?;
-                let stop_info = resolve_stop_info(stop_payload)?;
-
-                // --verbose "Stop received" trace (plan §"`--verbose` Trace
-                // Points`"): emit the session id Claude Code reported in the Stop
-                // payload, if any. This marks the instant the model finished its
-                // turn, ahead of the transcript-read retry trace below.
-                tracer.trace(format!(
-                    "stop received session_id={}",
-                    stop_info.session_id.as_deref().unwrap_or("(none)")
-                ));
-
-                // Read transcript. On error, `?` returns and Drop joins the
-                // reader without draining (INV-8, exit-immediately on error).
-                let transcript = if let Some(path) = stop_info.transcript_path.as_ref() {
-                    let t = read_transcript_traced(
-                        path,
-                        stop_info.last_assistant_message.as_deref(),
-                        &tracer,
-                    )?;
-                    // bf-416c: Claude Code's own transcript result event reported
-                    // is_error:true (rate limit, tool failure, any assistant-side
-                    // error). This is a COMPLETED turn that the assistant itself
-                    // flagged as failed — distinct from a claude-print Setup error.
-                    // Surface it as exit-1 AssistantError so callers that gate on
-                    // exit code / is_error (NEEDLE's output_transform) don't
-                    // silently treat a failed turn as success. The reader handle
-                    // is dropped (joined without draining) on this return — same
-                    // INV-8 exit-immediately pattern as the `?` propagations above.
-                    if t.is_error {
-                        return Err(Error::AssistantError(t.text));
-                    }
-                    t
-                } else if let Some(msg) = stop_info
-                    .last_assistant_message
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                {
-                    // Sparse payload (forward-compat contract,
-                    // docs/notes/hook-design.md "Sparse Stop Payloads"): no
-                    // `transcript_path` in the payload AND derivation impossible
-                    // (`session_id`/`cwd` absent or empty) — but the payload
-                    // still carries the response text. Mirror the file-level
-                    // fallback in `read_transcript_traced`: a turn that produced
-                    // an answer must not be discarded because its metadata was
-                    // sparse. Same degraded shape: the payload's own message,
-                    // ANSI-stripped by `from_fallback` (EC-9), zero turns/usage,
-                    // session_id from the payload (possibly None), `is_error`
-                    // false (no transcript reported one). Falls through to the
-                    // normal Stop tail below: kill_child, drain, Ok.
-                    tracer.trace(
-                        "no transcript path in payload and none derivable; using \
-                         last_assistant_message fallback",
-                    );
-                    TranscriptResult::from_fallback(msg, stop_info.session_id.clone(), false)
-                } else {
-                    // Derivation impossible and no `last_assistant_message`
-                    // fallback either: the bounded setup error (exit 2,
-                    // `internal_error` in json/stream-json). No crash, no hang —
-                    // Drop joins the reader without draining (INV-8).
-                    return Err(Error::Internal(anyhow::anyhow!(
-                        "Stop payload had no transcript path, none derivable \
-                         (session_id/cwd absent), and no last_assistant_message fallback"
-                    )));
-                };
+                // Parse stop payload, resolve the transcript path, read the
+                // transcript, and gate on is_error — [`read_transcript_after_stop`]
+                // is the shared tail with the pool path (`run_pooled_inner`), so
+                // billing/usage capture is identical on both by construction.
+                // On error, `?` returns and Drop joins the reader without
+                // draining (INV-8, exit-immediately on error).
+                let (stop_info, transcript) = read_transcript_after_stop(&payload, &tracer)?;
 
                 // Wait for child to exit.
                 kill_child(spawner.child_pid);
@@ -920,6 +862,481 @@ impl Session {
         }
     }
 
+    /// Run one prompt on a **prewarmed pool worker** (ADR-005 pool path).
+    ///
+    /// The daemon has already spawned `claude` under a PTY, driven it through
+    /// trust-dismiss, and settled it idle. This driver attaches the same event
+    /// loop, Stop-FIFO handoff, watchdog deadlines, and emitters the stateless
+    /// path uses ([`Session::run`]) to that live worker instead of a fresh
+    /// spawn: every post-acquisition behavior is shared, and the two paths
+    /// differ only where the worker being daemon-owned forces it to:
+    ///
+    /// * No `HookInstaller` / client temp dir: the worker already carries the
+    ///   daemon's Stop-hook settings, and the payload arrives on the daemon's
+    ///   FIFO (`worker.stop_fifo()`).
+    /// * No `PtySpawner`: the PTY already exists (`worker.master_fd()`).
+    /// * The startup sequencer starts at TrustDismissed
+    ///   ([`StartupSeq::prewarmed`]) — the worker is past the trust dialog and
+    ///   must never re-enter the Waiting-phase decision paths.
+    /// * The watchdog runs with child signaling suppressed
+    ///   ([`Watchdog::without_child_signals`]): every deadline fires and
+    ///   surfaces the same `Error::Timeout`, but the worker process is never
+    ///   signalled directly — teardown belongs to the daemon protocol.
+    /// * `kill_child` never runs: after a normal Stop the worker is RELEASED
+    ///   ([`AcquiredWorker::release`] — the daemon tears it down and warms a
+    ///   replacement), and nothing is reaped client-side on any path.
+    /// * Stream-json discovery watches the directory derived from
+    ///   `worker.worker_cwd()` — where the worker-side claude writes its
+    ///   transcript — not the client process's own cwd.
+    ///
+    /// `claude_bin` is used only to fill the result's `claude_version` field
+    /// (the worker's actual binary was chosen by the daemon at warmup).
+    /// Per-invocation child-launch flags (`--model`, `--max-turns`,
+    /// `--mcp-config`, `--pretrust-cwd`, `--no-inherit-hooks`) cannot reach an
+    /// already-running child; callers needing them must fall back to the
+    /// stateless path. `verbose` and `show_child_stderr` carry the two
+    /// session-side [`LaunchOptions`] fields; the launch-side ones have no
+    /// pooled meaning.
+    ///
+    /// The worker is consumed: released exactly once (explicitly on the
+    /// success path, before the stream-json drain — mirroring the stateless
+    /// kill-before-drain ordering; via Drop on every other path), and its
+    /// master fd closes with it.
+    ///
+    /// # Errors
+    ///
+    /// Same variants as [`Session::run`] for the same child-byte situations —
+    /// `Timeout` with the same per-deadline descriptions, the same
+    /// child-exited-without-Stop `Internal`, `TrustDialogUnresolved`,
+    /// `Interrupted`, `AssistantError`, and the EC-7 identity-leak `Internal` —
+    /// so the CLI error mapping in `main.rs` is shared unchanged. `get_home`'s
+    /// strict `Error::Config` contract applies at entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_pooled(
+        claude_bin: &Path,
+        worker: AcquiredWorker,
+        prompt: Vec<u8>,
+        timeout_secs: Option<u64>,
+        first_output_timeout_secs: Option<u64>,
+        stream_json_timeout_secs: Option<u64>,
+        stop_hook_timeout_secs: Option<u64>,
+        output_format: crate::cli::OutputFormat,
+        verbose: bool,
+        show_child_stderr: bool,
+    ) -> Result<SessionResult> {
+        // Keep direct library callers consistent with the CLI (same strict
+        // contract as Session::run): fail before touching the worker.
+        get_home()?;
+
+        // Use a catch_unwind to ensure cleanup happens even on panics. The
+        // worker drops inside the closure on a panic — releasing it and
+        // closing the master fd — so nothing leaks past the boundary.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::run_pooled_inner(
+                claude_bin,
+                worker,
+                prompt,
+                timeout_secs,
+                first_output_timeout_secs,
+                stream_json_timeout_secs,
+                stop_hook_timeout_secs,
+                output_format,
+                verbose,
+                show_child_stderr,
+            )
+        }));
+
+        match result {
+            Ok(inner_result) => inner_result,
+            Err(_) => Err(Error::Internal(anyhow::anyhow!("Session panicked"))),
+        }
+    }
+
+    /// Inner implementation of [`Session::run_pooled`] (panic boundary).
+    ///
+    /// Mirrors `run_inner` step for step; the numbering below matches the
+    /// stateless comments so the two drivers can be diffed side by side.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pooled_inner(
+        claude_bin: &Path,
+        mut worker: AcquiredWorker,
+        prompt: Vec<u8>,
+        timeout_secs: Option<u64>,
+        first_output_timeout_secs: Option<u64>,
+        stream_json_timeout_secs: Option<u64>,
+        stop_hook_timeout_secs: Option<u64>,
+        output_format: crate::cli::OutputFormat,
+        verbose: bool,
+        show_child_stderr: bool,
+    ) -> Result<SessionResult> {
+        let start_time = Instant::now();
+        let tracer = Tracer::new(verbose, start_time);
+
+        // 1. No HookInstaller / TEMP_DIR_PATH here: the worker carries the
+        //    daemon's hook settings, and there is no client-owned temp dir to
+        //    install or clean up. (TEMP_DIR_PATH also stays unset — there is
+        //    no process::exit cleanup owed on this path.)
+
+        // 2. Resolve Claude Code version (result field; see run_pooled docs).
+        let claude_version = Self::resolve_claude_version(claude_bin)?;
+
+        tracer.trace(format!(
+            "pool session: driving prewarmed worker {} (pid {})",
+            worker.worker_id(),
+            worker.pid()
+        ));
+
+        // 4. Self-pipe for SIGINT/SIGTERM — identical wiring to the stateless
+        //    path (the pool path adds no new signal surface).
+        let (self_pipe_read, self_pipe_write) = nix::unistd::pipe()
+            .map_err(|e| Error::Internal(anyhow::anyhow!("pipe() failed: {e}")))?;
+        unsafe {
+            let write_ptr = &raw mut SELF_PIPE_WRITE;
+            *write_ptr = Some(self_pipe_write.try_clone().unwrap());
+            signal::signal(signal::Signal::SIGINT, SigHandler::Handler(sigint_handler))
+                .map_err(|e| Error::SignalHandlerFailed(format!("SIGINT: {e}")))?;
+            signal::signal(
+                signal::Signal::SIGTERM,
+                SigHandler::Handler(sigterm_handler),
+            )
+            .map_err(|e| Error::SignalHandlerFailed(format!("SIGTERM: {e}")))?;
+        }
+
+        // Restore default signal handlers on drop.
+        let _signal_guard = SignalGuard;
+
+        // 5a. Watchdog: the same four deadlines with the same arming formula,
+        //     but child signaling suppressed — the worker is daemon-owned, so
+        //     a deadline reroutes through worker release → daemon teardown
+        //     instead of a direct SIGTERM. No temp dir is passed, so the
+        //     Phase-2 transcript monitor is never spawned; in production
+        //     nothing writes <temp_dir>/transcript.jsonl anyway (bf-lu1h), so
+        //     this is observably identical to the stateless wiring.
+        let is_stream_json = matches!(output_format, crate::cli::OutputFormat::StreamJson);
+        let stream_json_first_output = if is_stream_json {
+            stream_json_timeout_secs.or(first_output_timeout_secs)
+        } else {
+            Some(0) // explicitly disabled outside stream-json mode
+        };
+        let watchdog_config = WatchdogConfig::new(
+            first_output_timeout_secs,
+            stream_json_first_output,
+            timeout_secs,
+            stop_hook_timeout_secs,
+            is_stream_json,
+        );
+        let watchdog = Watchdog::new(
+            watchdog_config,
+            worker.pid(),
+            None,
+            Some(self_pipe_write.as_raw_fd()),
+        )
+        .without_child_signals();
+
+        let watchdog_state = watchdog.state();
+        let _timeout_thread = watchdog.spawn_timeout_thread();
+
+        // 6. Event loop over the worker's PTY master (no spawn — step 5 of the
+        //    stateless path does not exist here).
+        let master_fd = worker.master_fd();
+        let mut event_loop = EventLoop::new(master_fd, self_pipe_read.as_raw_fd());
+
+        // 7. Terminal emulator.
+        let mut terminal = TerminalEmu::new(24, 80);
+
+        // 8. PREWARMED startup sequence: the daemon's warmup already dismissed
+        //    trust and settled the REPL, so this sequencer starts at
+        //    TrustDismissed and owes only the injection quiet window. It never
+        //    re-enters the Waiting-phase scanner (no dialog re-detection, no
+        //    hard timeout, no bare-CR idle fallback).
+        let mut startup = StartupSeq::prewarmed(prompt);
+
+        // 9. The worker's OWN Stop FIFO: the child was launched with the
+        //    daemon's hook settings, so its payload arrives on the daemon-side
+        //    FIFO, not one in a client temp dir. Same both-ends-open contract
+        //    as the stateless path.
+        let (_fifo_read, _fifo_keeper) = match open_fifo_nonblock(worker.stop_fifo()) {
+            Ok((read_fd, keeper)) => {
+                event_loop.add_fifo_fd(read_fd.as_raw_fd());
+                tracer.trace("fifo opened");
+                (Some(read_fd), Some(keeper))
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to open worker FIFO, continuing without Stop detection: {e}"
+                );
+                tracer.trace(format!("fifo open failed: {e}"));
+                (None, None)
+            }
+        };
+
+        // 12. Stream-json reader scaffolding — spawned at PROMPT_INJECTED,
+        //     discovered under the WORKER's projects dir. INV-8 cleanup is
+        //     identical to the stateless path.
+        let mut stream_json_handle: Option<emitter::StreamJsonHandle> = None;
+        let stream_json_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let watchdog_state_clone = watchdog_state.clone();
+        let mut last_phase = startup.phase().clone();
+        let stream_json_spawned_clone = stream_json_spawned.clone();
+        let tracer_clone = tracer;
+        let mut child_capture = ChildCapture::new(show_child_stderr);
+        // Defensive: StartupSeq::prewarmed never produces Refuse (it never
+        // runs the Waiting-phase scanner), but if a future sequencer change
+        // ever does, the closure below records the reason and wakes the event
+        // loop through the self-pipe — there is no child to kill here.
+        let mut startup_refusal: Option<String> = None;
+        let self_pipe_write_fd = self_pipe_write.as_raw_fd();
+
+        let exit_reason = event_loop.run(|chunk| {
+            // Empty chunk = timer tick from the event loop (poll timeout with no data).
+            if !chunk.is_empty() {
+                watchdog_state_clone.mark_pty_output();
+                child_capture.feed(chunk);
+                let probe_responses = terminal.feed(chunk);
+
+                if !probe_responses.is_empty() {
+                    unsafe {
+                        libc::write(
+                            master_fd,
+                            probe_responses.as_ptr() as *const libc::c_void,
+                            probe_responses.len(),
+                        );
+                    }
+                }
+            }
+
+            let action = if !chunk.is_empty() {
+                startup.feed(chunk)
+            } else {
+                StartupAction::None
+            };
+
+            match &action {
+                StartupAction::Write(bytes) => unsafe {
+                    libc::write(
+                        master_fd,
+                        bytes.as_ptr() as *const libc::c_void,
+                        bytes.len(),
+                    );
+                },
+                StartupAction::HardTimeout => {
+                    // Handled after event loop exits.
+                }
+                StartupAction::Refuse(reason) => {
+                    // Defensive — unreachable with StartupSeq::prewarmed (see
+                    // startup_refusal above). Unlike the stateless arm there is
+                    // no child to kill: record the reason, wake the event loop
+                    // via the self-pipe, and let the post-loop tail return
+                    // TrustDialogUnresolved. The worker releases on return.
+                    if startup_refusal.is_none() {
+                        startup_refusal = Some(reason.clone());
+                    }
+                    eprintln!("claude-print: {}", reason);
+                    tracer_clone.trace(format!(
+                        "startup refused: {}",
+                        reason.lines().next().unwrap_or("trust dialog unresolved")
+                    ));
+                    let byte: [u8; 1] = [1];
+                    unsafe {
+                        let _ = libc::write(
+                            self_pipe_write_fd,
+                            byte.as_ptr() as *const libc::c_void,
+                            1,
+                        );
+                    }
+                }
+                StartupAction::None => {}
+            }
+
+            // Poll timers for startup sequence.
+            let timer_action = startup.poll_timers();
+
+            let current_phase = startup.phase();
+            if last_phase != *current_phase {
+                tracer_clone.trace(format!(
+                    "phase transition: {} -> {}",
+                    phase_name(&last_phase),
+                    phase_name(current_phase)
+                ));
+            }
+            if last_phase != *current_phase && current_phase.is_prompt_injected() {
+                watchdog_state_clone.mark_prompt_injected();
+                // INV-3: the "prompt injected" trace must follow "fifo opened".
+                tracer_clone.trace("prompt injected");
+
+                // Spawn the stream-json reader at PROMPT_INJECTED, discovering
+                // this session's JSONL in the WORKER's projects dir: the claude
+                // process runs with the worker's cwd and writes its transcript
+                // under that slug — deriving from this client process's cwd
+                // would watch the wrong directory.
+                if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
+                    match projects_dir_for(worker.worker_cwd()) {
+                        Ok(projects_dir) => {
+                            let pre_existing = emitter::snapshot_jsonl_sizes(&projects_dir);
+                            stream_json_handle = Some(emitter::spawn_stream_json_reader_discover(
+                                projects_dir,
+                                pre_existing,
+                            ));
+                            stream_json_spawned_clone
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "claude-print: warning: could not derive the worker's projects \
+                                 dir for the stream-json reader: {}; live transcript tailing \
+                                 disabled",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            last_phase = current_phase.clone();
+
+            match &timer_action {
+                StartupAction::Write(bytes) => unsafe {
+                    libc::write(
+                        master_fd,
+                        bytes.as_ptr() as *const libc::c_void,
+                        bytes.len(),
+                    );
+                },
+                StartupAction::HardTimeout => {
+                    // Handled after event loop exits.
+                }
+                StartupAction::Refuse(reason) => {
+                    // Same defensive refusal via the timer-driven path (see above).
+                    if startup_refusal.is_none() {
+                        startup_refusal = Some(reason.clone());
+                    }
+                    eprintln!("claude-print: {}", reason);
+                    tracer_clone.trace(format!(
+                        "startup refused: {}",
+                        reason.lines().next().unwrap_or("trust dialog unresolved")
+                    ));
+                    let byte: [u8; 1] = [1];
+                    unsafe {
+                        let _ = libc::write(
+                            self_pipe_write_fd,
+                            byte.as_ptr() as *const libc::c_void,
+                            1,
+                        );
+                    }
+                }
+                StartupAction::None => {}
+            }
+        })?;
+
+        // Defensive refusal tail (see the closure arms above): report the
+        // refusal, release the worker on return, and skip the misleading
+        // child-exit error the stateless path used to mask this with.
+        if let Some(reason) = startup_refusal {
+            // INV-8: the reader was never spawned (the prompt was never
+            // injected), so this drop is a no-op; kept for symmetry with the
+            // other error arms — Drop joins without draining.
+            drop(stream_json_handle);
+            return Err(Error::TrustDialogUnresolved(reason));
+        }
+
+        // 13. Watchdog timeout: the same deadlines and the same error, but no
+        //     direct kill and no "sending SIGTERM" claim — enforcement already
+        //     rerouted through suppression; the worker releases on return and
+        //     the daemon tears it down.
+        if watchdog_state.has_timeout_fired() {
+            let timeout_type = watchdog_state
+                .get_timeout_type()
+                .unwrap_or(TimeoutType::OverallTimeout);
+            let timeout_msg = timeout_type.description();
+
+            eprintln!("claude-print: {}", timeout_msg);
+            tracer.trace(format!("cleanup reason: timeout ({})", timeout_msg));
+
+            child_capture.dump(timeout_msg);
+
+            // INV-8: Timeout path — drop the reader WITHOUT a drain signal.
+            drop(stream_json_handle);
+
+            return Err(Error::Timeout(timeout_msg.to_string()));
+        }
+
+        // 14. Handle exit reason. Same arms, same error shapes as the
+        //     stateless path; the differences are all "who owns the child":
+        //     no kill_child, no waitpid — the daemon reaps its own worker.
+        let prompt_injected = startup.phase().is_prompt_injected();
+        match exit_reason {
+            ExitReason::FifoPayload(payload) => {
+                // EC-7 gate — identical rationale to the stateless arm: a Stop
+                // hook firing before the prompt was injected is a session
+                // identity leak (an unsent prompt answered), gated BEFORE the
+                // payload is touched.
+                if !prompt_injected {
+                    drop(stream_json_handle);
+                    return Err(Error::Internal(anyhow::anyhow!(
+                        "Stop hook fired before prompt was injected (EC-7: response to an unsent prompt — possible session identity leak)"
+                    )));
+                }
+
+                // Shared Stop tail with the stateless path: parse, resolve,
+                // trace, read transcript, is_error gate — billing/usage
+                // capture is byte-identical by construction. On error, `?`
+                // returns and Drop joins the reader without draining (INV-8).
+                let (stop_info, transcript) = read_transcript_after_stop(&payload, &tracer)?;
+
+                // Release BEFORE the drain signal — mirrors the stateless
+                // kill-before-drain ordering: the daemon starts tearing the
+                // worker down (and warming its replacement) while the last
+                // transcript lines drain. Idempotent; Drop will not re-release.
+                worker.release();
+                tracer.trace(format!("worker {} released", worker.worker_id()));
+
+                let transcript_path = stop_info
+                    .transcript_path
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from("transcript.jsonl"));
+
+                // Normal Stop transition: signal the reader to drain its
+                // remaining transcript lines, then drop it (INV-8).
+                if let Some(handle) = stream_json_handle.as_ref() {
+                    handle.signal_drain();
+                }
+                drop(stream_json_handle);
+
+                Ok(SessionResult {
+                    transcript,
+                    claude_version,
+                    duration_ms: start_time.elapsed().as_millis() as u64,
+                    transcript_path,
+                    stream_json_handle: None, // reader drained + joined via Drop above
+                })
+            }
+            ExitReason::ChildExited => {
+                // The worker's claude exited without a Stop payload. Not our
+                // child — no waitpid (the daemon reaps; its destroy path
+                // handles ECHILD). Same error message as stateless so the CLI
+                // mapping is shared.
+                if !prompt_injected {
+                    child_capture.dump("child exited before prompt was injected");
+                }
+                // Drop joins the reader without draining (INV-8).
+                drop(stream_json_handle);
+                Err(Error::Internal(anyhow::anyhow!(
+                    "Child exited without sending Stop payload"
+                )))
+            }
+            ExitReason::Interrupted => {
+                // No kill: the worker releases on return and the daemon's
+                // teardown stops the session — the protocol-shaped equivalent
+                // of the stateless kill_child.
+                if !prompt_injected {
+                    child_capture.dump("interrupted before prompt was injected");
+                }
+                drop(stream_json_handle);
+                Err(Error::Interrupted("interrupted by signal".to_string()))
+            }
+        }
+    }
+
     /// Resolve Claude Code version string.
     ///
     /// Runs `claude --version` and captures the first line of output.
@@ -947,6 +1364,82 @@ fn phase_name(phase: &StartupPhase) -> &'static str {
         StartupPhase::TrustDismissed => "trust-dismissed",
         StartupPhase::PromptInjected => "prompt-injected",
     }
+}
+
+/// The shared Stop-payload tail: parse → resolve → trace → read the
+/// transcript → gate on `is_error`.
+///
+/// Used by BOTH drivers — the stateless `run_inner` and the pool path
+/// `run_pooled_inner` — so billing/usage capture and every degraded-payload
+/// contract are identical on the two paths *by construction*, not by two
+/// copies that can drift. Returns the resolved [`StopInfo`] (the caller still
+/// needs `transcript_path` for the result) alongside the transcript.
+///
+/// On error the caller's `?` returns while its `StreamJsonHandle` is still
+/// alive, so Drop joins the reader without draining (INV-8,
+/// exit-immediately on error) — the same contract every direct `?` in the
+/// old inline code had.
+fn read_transcript_after_stop(
+    payload: &[u8],
+    tracer: &Tracer,
+) -> Result<(StopInfo, TranscriptResult)> {
+    let stop_payload = parse_stop_payload(payload)?;
+    let stop_info = resolve_stop_info(stop_payload)?;
+
+    // --verbose "Stop received" trace (plan §"`--verbose` Trace Points"):
+    // emit the session id Claude Code reported in the Stop payload, if any.
+    // This marks the instant the model finished its turn, ahead of the
+    // transcript-read retry trace below.
+    tracer.trace(format!(
+        "stop received session_id={}",
+        stop_info.session_id.as_deref().unwrap_or("(none)")
+    ));
+
+    let transcript = if let Some(path) = stop_info.transcript_path.as_ref() {
+        let t = read_transcript_traced(path, stop_info.last_assistant_message.as_deref(), tracer)?;
+        // bf-416c: Claude Code's own transcript result event reported
+        // is_error:true (rate limit, tool failure, any assistant-side error).
+        // This is a COMPLETED turn that the assistant itself flagged as
+        // failed — distinct from a claude-print Setup error. Surface it as
+        // exit-1 AssistantError so callers that gate on exit code / is_error
+        // (NEEDLE's output_transform) don't silently treat a failed turn as
+        // success.
+        if t.is_error {
+            return Err(Error::AssistantError(t.text));
+        }
+        t
+    } else if let Some(msg) = stop_info
+        .last_assistant_message
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        // Sparse payload (forward-compat contract,
+        // docs/notes/hook-design.md "Sparse Stop Payloads"): no
+        // `transcript_path` in the payload AND derivation impossible
+        // (`session_id`/`cwd` absent or empty) — but the payload still
+        // carries the response text. Mirror the file-level fallback in
+        // `read_transcript_traced`: a turn that produced an answer must not
+        // be discarded because its metadata was sparse. Same degraded shape:
+        // the payload's own message, ANSI-stripped by `from_fallback` (EC-9),
+        // zero turns/usage, session_id from the payload (possibly None),
+        // `is_error` false (no transcript reported one). Falls through to the
+        // caller's normal Stop tail: teardown, drain, Ok.
+        tracer.trace(
+            "no transcript path in payload and none derivable; using \
+             last_assistant_message fallback",
+        );
+        TranscriptResult::from_fallback(msg, stop_info.session_id.clone(), false)
+    } else {
+        // Derivation impossible and no `last_assistant_message` fallback
+        // either: the bounded setup error (exit 2, `internal_error` in
+        // json/stream-json). No crash, no hang.
+        return Err(Error::Internal(anyhow::anyhow!(
+            "Stop payload had no transcript path, none derivable \
+             (session_id/cwd absent), and no last_assistant_message fallback"
+        )));
+    };
+
+    Ok((stop_info, transcript))
 }
 
 /// Send SIGTERM to `pid`, wait up to 2 seconds, then SIGKILL if still alive.

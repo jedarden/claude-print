@@ -249,6 +249,15 @@ pub struct Watchdog {
     temp_dir_path: Option<PathBuf>,
     /// Self-pipe write end raw fd for signaling the event loop on timeout.
     self_pipe_write_fd: Option<i32>,
+    /// Whether deadline enforcement may SIGTERM the child directly.
+    ///
+    /// `true` on the stateless path (claude-print spawned the child, so it owns
+    /// teardown). `false` on the pool path: the worker process belongs to the
+    /// daemon, and killing it behind the daemon's back desynchronizes the
+    /// daemon's worker registry — the daemon protocol decides teardown
+    /// (claudepr-f1e93af1). Deadlines still fire and the self-pipe still wakes
+    /// the event loop; only the enforcement reroutes.
+    signal_child: bool,
 }
 
 impl Watchdog {
@@ -265,7 +274,20 @@ impl Watchdog {
             child_pid,
             temp_dir_path,
             self_pipe_write_fd,
+            signal_child: true,
         }
+    }
+
+    /// Suppress direct child signaling (deadline state and self-pipe wake are
+    /// unchanged).
+    ///
+    /// Pool path only: every deadline still fires and the session still
+    /// observes its `Timeout` error, but enforcement reroutes through worker
+    /// release → daemon teardown instead of a raw SIGTERM to a process we do
+    /// not own.
+    pub fn without_child_signals(mut self) -> Self {
+        self.signal_child = false;
+        self
     }
 
     /// Get the shared state for use in the main thread.
@@ -295,6 +317,17 @@ impl Watchdog {
         let temp_dir_path = self.temp_dir_path.clone();
         // Copy the raw fd for signaling the event loop
         let self_pipe_write_fd = self.self_pipe_write_fd;
+        // Enforcement helper. On the pool path (`without_child_signals`) the
+        // kill is suppressed — the deadline bookkeeping below (timeout_fired,
+        // timeout_type, self-pipe wake) is identical either way, so the session
+        // observes the same Timeout error and run_pooled reroutes teardown
+        // through the daemon protocol.
+        let signal_child = self.signal_child;
+        let terminate_child = move |pid: nix::unistd::Pid| {
+            if signal_child {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+            }
+        };
 
         thread::spawn(move || {
             let session_start_time = Instant::now();
@@ -343,7 +376,7 @@ impl Watchdog {
                     && !has_pty_output
                     && elapsed >= Duration::from_secs(config.pty_first_output_timeout_secs)
                 {
-                    let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                    terminate_child(child_pid);
                     timeout_fired.store(true, Ordering::SeqCst);
                     timeout_type.store(1, Ordering::SeqCst); // PtyFirstOutput
                                                              // Signal the event loop via self-pipe
@@ -366,7 +399,7 @@ impl Watchdog {
                     && !has_stream_json_output
                     && elapsed >= Duration::from_secs(config.stream_json_first_output_timeout_secs)
                 {
-                    let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                    terminate_child(child_pid);
                     timeout_fired.store(true, Ordering::SeqCst);
                     timeout_type.store(2, Ordering::SeqCst); // StreamJsonFirstOutput
                                                              // Signal the event loop via self-pipe
@@ -383,7 +416,7 @@ impl Watchdog {
                 if config.overall_timeout_secs > 0
                     && elapsed >= Duration::from_secs(config.overall_timeout_secs)
                 {
-                    let _ = nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGTERM);
+                    terminate_child(child_pid);
                     timeout_fired.store(true, Ordering::SeqCst);
                     timeout_type.store(3, Ordering::SeqCst); // OverallTimeout
                                                              // Signal the event loop via self-pipe
@@ -403,10 +436,7 @@ impl Watchdog {
                         if time_since_injection
                             >= Duration::from_secs(config.stop_hook_timeout_secs)
                         {
-                            let _ = nix::sys::signal::kill(
-                                child_pid,
-                                nix::sys::signal::Signal::SIGTERM,
-                            );
+                            terminate_child(child_pid);
                             timeout_fired.store(true, Ordering::SeqCst);
                             timeout_type.store(4, Ordering::SeqCst); // StopHookTimeout
                                                                      // Signal the event loop via self-pipe
@@ -669,6 +699,59 @@ mod tests {
         );
 
         // The watchdog SIGTERM'd the child; reap it.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Pool path (claudepr-f1e93af1): `without_child_signals` must leave the
+    /// deadline machinery fully intact — the timeout fires, the type is
+    /// recorded, the event loop would be woken — while the child process
+    /// survives. The daemon owns the worker; only the daemon protocol may tear
+    /// it down.
+    #[test]
+    fn without_child_signals_fires_timeout_but_leaves_child_alive() {
+        let config = WatchdogConfig::new(Some(0), Some(0), Some(1), Some(0), false);
+        let (mut child, child_pid) = spawn_sleep_child();
+        let watchdog = Watchdog::new(config, child_pid, None, None).without_child_signals();
+        assert!(!watchdog.signal_child, "builder must clear the flag");
+        let state = watchdog.state();
+        let _handle = watchdog.spawn_timeout_thread();
+
+        // Wait past the 1s overall deadline (100ms poll granularity).
+        std::thread::sleep(Duration::from_millis(2000));
+
+        assert!(
+            state.has_timeout_fired(),
+            "the overall deadline must still fire under signal suppression"
+        );
+        assert_eq!(
+            state.get_timeout_type(),
+            Some(TimeoutType::OverallTimeout),
+            "the fired deadline type must be recorded unchanged"
+        );
+
+        // The child must still be alive — no SIGTERM reached it.
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                let _ = child.wait();
+                panic!("child should have survived signal suppression, but exited with {status}")
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+
+        // For contrast with the stateless default: a fresh watchdog without
+        // the builder still signals (flag default true), so the suppression is
+        // opt-in, not a global behavior change.
+        let watchdog2 = Watchdog::new(
+            WatchdogConfig::new(Some(0), Some(0), Some(1), Some(0), false),
+            child_pid,
+            None,
+            None,
+        );
+        assert!(watchdog2.signal_child, "default must keep direct signaling");
+
+        // Cleanup.
         let _ = child.kill();
         let _ = child.wait();
     }

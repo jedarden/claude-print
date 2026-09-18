@@ -1503,9 +1503,11 @@ pub enum InvocationAcquisition {
     /// untouched.
     NotRequested,
     /// A prewarmed worker was acquired. The caller owes it exactly one
-    /// prompt; a caller that cannot drive it yet (the interim wiring) must
-    /// release it via the [`AcquiredWorker`] drop path so the daemon tears it
-    /// down and spawns a replacement.
+    /// prompt, driven through [`crate::session::Session::run_pooled`]; the
+    /// worker is released exactly once — explicitly after a successful drive
+    /// (before the stream-json drain), via the [`AcquiredWorker`] drop path on
+    /// every other exit — so the daemon tears it down and spawns a
+    /// replacement.
     Acquired(AcquiredWorker),
     /// The pool did not yield a worker for a reason the ADR-005 contract
     /// routes to the stateless path. By construction the carried failure
@@ -3320,9 +3322,10 @@ mod tests {
         };
         assert_eq!(worker.worker_id(), "w-inv");
 
-        // The interim caller never drives the worker: dropping it must send
-        // EXACTLY ONE release — the daemon then tears the worker down and
-        // spawns a replacement. Zero (leaked assignment) or two (double
+        // Dropping a worker the caller never drove (any exit before the
+        // pooled session's explicit release) must send EXACTLY ONE
+        // release — the daemon then tears the worker down and spawns a
+        // replacement. Zero (leaked assignment) or two (double
         // send) both fail this pin.
         drop(worker);
         let deadline = Instant::now() + Duration::from_secs(5);

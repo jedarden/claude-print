@@ -206,6 +206,46 @@ impl StartupSeq {
         }
     }
 
+    /// Construct for a **prewarmed** worker (ADR-005 pool path).
+    ///
+    /// The daemon's own warmup (`warm_worker_to_outcome`) has already driven the
+    /// child through trust-dismiss and the post-dismiss settle — it reuses
+    /// `WARMUP_SETTLE_MS`, which is [`DEFAULT_POST_DISMISS_IDLE_MS`] by
+    /// construction, so both paths agree on what "settled" means. This
+    /// sequencer therefore starts at [`StartupPhase::TrustDismissed`] and owes
+    /// only the quiet-window wait before injecting the prompt.
+    ///
+    /// Starting at `Waiting` would be wrong twice over on an idle prewarmed
+    /// REPL: its startup output stream finished during warmup, so fresh bytes
+    /// never reach [`IDLE_THRESHOLD_BYTES`] and the 45 s hard timeout would
+    /// eventually fire — and the Waiting-phase idle fallback would send a bare
+    /// CR at an already-idle prompt, submitting an empty turn.
+    ///
+    /// `last_output_at` is stamped `now` (and `trust_dismiss_at`, for the
+    /// trace, records the handoff instant): the caller still gets a full
+    /// `idle_gap_ms` of observed silence before any bytes are written to the
+    /// worker, re-establishing client-side the same settled-before-injection
+    /// guarantee the daemon's warmup provided.
+    pub fn prewarmed(prompt: Vec<u8>) -> Self {
+        Self::prewarmed_with_idle_gap(prompt, DEFAULT_POST_DISMISS_IDLE_MS)
+    }
+
+    /// [`Self::prewarmed`] with a custom injection quiet window (ms).
+    pub fn prewarmed_with_idle_gap(prompt: Vec<u8>, idle_gap_ms: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            phase: StartupPhase::TrustDismissed,
+            prompt,
+            bytes_received: 0,
+            last_output_at: now,
+            phase_start: now,
+            trust_dismiss_at: Some(now),
+            dialog_detected_at: None,
+            capture: Vec::new(),
+            idle_gap_ms,
+        }
+    }
+
     pub fn phase(&self) -> &StartupPhase {
         &self.phase
     }
@@ -1470,5 +1510,135 @@ mod tests {
             _ => panic!("expected Write action from poll_timers for large prompt"),
         }
         assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
+    }
+
+    // ── prewarmed (ADR-005 pool path) ─────────────────────────────────────────
+    //
+    // The daemon hands over a worker whose REPL is already past trust-dismiss
+    // and idle-settled. The sequencer must start at TrustDismissed: it owes
+    // only the injection quiet window, and it must never re-enter the Waiting
+    // decision paths (dialog scan, hard timeout, bare-CR idle fallback) — an
+    // idle prewarmed REPL would trip the 45 s hard timeout and a bare CR would
+    // submit an empty turn.
+
+    #[test]
+    fn prewarmed_starts_at_trust_dismissed() {
+        let seq = StartupSeq::prewarmed(b"p".to_vec());
+        assert_eq!(
+            *seq.phase(),
+            StartupPhase::TrustDismissed,
+            "a prewarmed worker is already past trust-dismiss"
+        );
+    }
+
+    #[test]
+    fn prewarmed_ignores_dialog_looking_output() {
+        // Post-handoff repaints (or anything dialog-shaped) must not re-enter
+        // the Waiting-phase scanner: feed() provably scans nothing outside
+        // Waiting, so this holds by construction — pin it anyway, since a
+        // future refactor that lets prewarmed start in Waiting would silently
+        // reintroduce both the bare-CR and hard-timeout failure modes.
+        let gap_ms: u64 = 1_000;
+        let mut seq = StartupSeq::prewarmed_with_idle_gap(b"p".to_vec(), gap_ms);
+        let start = Instant::now();
+
+        // A full trust dialog arrives after handoff. No dismissal keys may be
+        // produced — the scanner does not run on this path.
+        let action = seq.feed_at(DIALOG_2_1_263.as_bytes(), start);
+        assert!(
+            matches!(action, StartupAction::None),
+            "no dismissal keys may be produced on the prewarmed path, got {action:?}"
+        );
+        assert_eq!(*seq.phase(), StartupPhase::TrustDismissed);
+
+        // The output restarted the quiet window (feed updates last_output_at
+        // before the phase check), so nothing fires inside it.
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(gap_ms - 1)),
+            StartupAction::None
+        ));
+
+        // Well past every Waiting-phase deadline (hard timeout 45 s, dialog
+        // identify ceiling, idle fallback) AND past the quiet window: the ONLY
+        // thing that may fire is the bracketed-paste prompt injection — never
+        // dismissal keys, never a bare CR.
+        match seq.poll_timers_at(start + Duration::from_secs(60)) {
+            StartupAction::Write(payload) => {
+                assert!(
+                    payload.starts_with(b"\x1b[200~"),
+                    "expected bracketed-paste injection, got {payload:?}"
+                );
+                assert_ne!(
+                    payload, b"\r",
+                    "the Waiting-phase idle fallback's bare CR must never fire here"
+                );
+            }
+            other => panic!("expected prompt injection, got {other:?}"),
+        }
+        assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
+    }
+
+    #[test]
+    fn prewarmed_injects_after_quiet_window_without_bare_cr() {
+        let gap_ms: u64 = 1_000;
+        let mut seq = StartupSeq::prewarmed_with_idle_gap(b"hello pool".to_vec(), gap_ms);
+        let start = Instant::now();
+
+        // Before the quiet window elapses: nothing is written to the worker.
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(gap_ms - 1)),
+            StartupAction::None
+        ));
+
+        // At the quiet window: the bracketed-paste payload, never a bare CR.
+        match seq.poll_timers_at(start + Duration::from_millis(gap_ms)) {
+            StartupAction::Write(payload) => {
+                assert!(
+                    payload.starts_with(b"\x1b[200~"),
+                    "missing bracketed-paste open"
+                );
+                assert!(
+                    payload.ends_with(b"\x1b[201~\r"),
+                    "missing bracketed-paste close + CR"
+                );
+                assert!(
+                    payload.windows(10).any(|w| w == b"hello pool"),
+                    "prompt text not present in payload"
+                );
+                assert_ne!(
+                    payload, b"\r",
+                    "the Waiting-phase idle fallback's bare CR must never reach a prewarmed REPL"
+                );
+            }
+            other => panic!("expected prompt injection after the quiet window, got {other:?}"),
+        }
+        assert_eq!(*seq.phase(), StartupPhase::PromptInjected);
+
+        // And the sequencer is spent, like every injected state.
+        assert!(matches!(seq.poll_timers(), StartupAction::None));
+    }
+
+    #[test]
+    fn prewarmed_quiet_window_restarts_on_worker_output() {
+        // Post-handoff repaint output restarts the injection quiet window,
+        // exactly as it does on the stateless post-dismiss path: bytes are
+        // never written into a TUI that is still painting.
+        let gap_ms: u64 = 1_000;
+        let mut seq = StartupSeq::prewarmed_with_idle_gap(b"p".to_vec(), gap_ms);
+        let start = Instant::now();
+
+        seq.feed_at(b"\x1b[2Krepaint\r\n", start + Duration::from_millis(500));
+
+        // 600 ms of silence after the repaint: < gap_ms since last output.
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(1_100)),
+            StartupAction::None
+        ));
+
+        // A full gap after the repaint: inject.
+        assert!(matches!(
+            seq.poll_timers_at(start + Duration::from_millis(1_501)),
+            StartupAction::Write(_)
+        ));
     }
 }

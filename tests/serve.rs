@@ -1483,15 +1483,17 @@ fn serve_survives_malformed_clients_and_keeps_serving() {
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
 
-// ── client acquisition fallback (claudepr-12e0cd23) ─────────────────────────
+// ── client acquisition + pooled driving (claudepr-12e0cd23, claudepr-f1e93af1) ──
 //
 // The ADR-005 client contract, end to end through the compiled binary. The
 // mechanism-level pins live in src/pool.rs's unit tests (classification,
 // deadline bounding, wire format); these pin what only a real invocation can:
 // that a fallback actually runs the ordinary stateless session to a successful
 // exit, that the diagnostic is exactly one verbose stderr line, that a
-// protocol failure exits 2 instead of falling back, and that the interim
-// acquire-then-release leaves the daemon's pool whole.
+// protocol failure exits 2 instead of falling back, and that a successful
+// acquire DRIVES the prompt through the prewarmed worker via the ordinary
+// Session event loop, releases it exactly once, and leaves the daemon's pool
+// whole.
 
 /// A `--pool-socket` invocation with no daemon at the path must succeed
 /// statelessly, and quietly: the ADR-005 fallback is additive, so without
@@ -1644,13 +1646,21 @@ fn pool_socket_protocol_failure_fails_safely_instead_of_falling_back() {
     );
 }
 
-/// The interim wiring (until the pooled session driver lands): a successful
-/// acquire is released EXACTLY ONCE via the drop path, the daemon tears the
-/// worker down and spawns a replacement, and the invocation still completes
-/// statelessly. Pins the documented interim behavior as intentional: zero
-/// releases would leak the assignment, two would double-send.
+/// The pooled session (claudepr-f1e93af1): a successful acquire is DRIVEN —
+/// the client attaches its ordinary Session event loop to the worker's PTY,
+/// injects the prompt through the prewarmed REPL, reads the answer off the
+/// worker's own Stop FIFO, and releases the worker exactly once; the daemon
+/// tears the driven worker down and warms a replacement.
+///
+/// The proof this is the pooled path and not a quiet fallback to a fresh
+/// stateless spawn is threefold: the `--verbose` trace names the prewarmed
+/// worker being driven (the stateless dispatch never prints it), the answer
+/// arrives via the pool's worker (one assignment / one release — a stateless
+/// spawn would still show exactly one acquire+release, but would answer
+/// without the driving trace), and the emitted answer text is the transcript
+/// the WORKER-side claude wrote, read through the shared Stop tail.
 #[test]
-fn pool_socket_interim_acquisition_releases_once_and_the_daemon_replaces_the_worker() {
+fn pool_socket_pooled_session_drives_the_prompt_and_releases_once() {
     use std::fs;
     let mock = workspace_bin("mock-claude");
     let dir = tempfile::tempdir().unwrap();
@@ -1662,30 +1672,49 @@ fn pool_socket_interim_acquisition_releases_once_and_the_daemon_replaces_the_wor
     let mut daemon = Daemon::start(&mock, &socket, Some("1"));
     daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
 
-    // The interim invocation: acquire the warmed worker, release it via drop,
-    // then run the ordinary stateless session to completion.
+    // The pooled invocation: acquire, drive, release — exit 0.
     let mut cmd = claude_print();
     cmd.env("XDG_CONFIG_HOME", dir.path())
         .arg("--pool-socket")
         .arg(&socket)
+        .arg("--verbose")
         .arg("Reply with exactly one word: pong");
     let out = run(&mut cmd, Duration::from_secs(120));
 
     assert_eq!(
         out.code,
         Some(0),
-        "the invocation must succeed via the stateless session\nstdout:\n{}\nstderr:\n{}",
+        "the pooled invocation must succeed\nstdout:\n{}\nstderr:\n{}",
         out.stdout,
         out.stderr
     );
     assert!(
         out.stdout.contains("Hello from mock_claude"),
-        "the stateless session must have run to its answer\nstdout:\n{}",
+        "the answer must come from the driven worker's transcript\nstdout:\n{}",
         out.stdout
     );
+    assert!(
+        out.stderr
+            .contains("pool session: driving prewarmed worker"),
+        "the client must trace that the prewarmed worker is being driven \
+         (this is the pooled-path proof)\nstderr:\n{}",
+        out.stderr
+    );
+    // The shared Stop tail ran: the session id from the worker's Stop payload
+    // is traced exactly as the stateless path traces it.
+    assert!(
+        out.stderr.contains("stop received session_id="),
+        "the pooled session must trace the Stop payload's session id\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("released"),
+        "the worker must be released after the Stop tail\nstderr:\n{}",
+        out.stderr
+    );
 
-    // The daemon's side of the interim contract: one assignment, one release
-    // (the drop path), and a replacement warmed so the pool is whole again.
+    // The daemon's side: one assignment, one release (the explicit
+    // release-before-drain), and a replacement warmed so the pool is whole.
     daemon.wait_for("Released worker", 1, Duration::from_secs(10));
     daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
     daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
@@ -1709,6 +1738,277 @@ fn pool_socket_interim_acquisition_releases_once_and_the_daemon_replaces_the_wor
 
     // The released worker was destroyed and reaped before the daemon answered
     // the release, so only the replacement remains at shutdown time.
+    let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// Stream-json over the pool: the live transcript reader must discover the
+/// session's JSONL in the WORKER's projects dir (derived from the worker's
+/// cwd under the shared HOME) — not the client process's own directory
+/// derivation, which on a same-cwd test would pass vacuously. The hermetic
+/// HOME is set on BOTH the daemon (forwarded to workers, which write the
+/// transcript) and the client (which derives the discovery dir), so the
+/// reader tails exactly the file the worker-side claude writes.
+#[test]
+fn pool_socket_pooled_stream_json_tails_the_worker_transcript() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+    let home = tempfile::tempdir().unwrap();
+
+    let mut daemon = Daemon::start_with_env(
+        &mock,
+        &socket,
+        Some("1"),
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .env("HOME", home.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, Duration::from_secs(120));
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "the pooled stream-json invocation must succeed\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    // The worker's transcript was discovered under the worker's projects dir
+    // and forwarded as stream-json lines: the assistant turn and the final
+    // result event must both be present. (The mock's default transcript
+    // carries its own response text; the exact event shapes are pinned by the
+    // stateless stream-json suites — here the pooled discovery dir is what's
+    // under test.)
+    assert!(
+        out.stdout.contains("assistant") && out.stdout.contains("result"),
+        "stream-json output must carry the worker transcript's events\nstdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        !out.stderr.contains("could not derive"),
+        "deriving the worker's projects dir must not fail\nstderr:\n{}",
+        out.stderr
+    );
+
+    // Same pool contract as the text-format pooled run.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(10));
+    daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+    let stderr = daemon.stderr();
+    assert_eq!(
+        stderr
+            .iter()
+            .filter(|l| l.contains("Assigned worker"))
+            .count(),
+        1,
+        "exactly one worker handed out; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        stderr
+            .iter()
+            .filter(|l| l.contains("Released worker"))
+            .count(),
+        1,
+        "exactly one release; stderr: {stderr:?}"
+    );
+    let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// Json format over the pool: the emitted result object must be
+/// indistinguishable from the stateless path's for the same child bytes —
+/// the same `type`/`subtype`/`is_error` shape, the transcript-sourced text,
+/// and NON-ZERO usage (the discriminator: a run that fell back to the
+/// payload's `last_assistant_message` would still carry the answer text and
+/// session id, but zeroed token counts). Non-zero usage therefore proves the
+/// shared Stop tail read the WORKER's transcript file, i.e. billing/usage
+/// capture survives the pool path. The hermetic HOME is set on BOTH the
+/// daemon (forwarded to workers, which write the transcript there) and the
+/// client (which reads the `transcript_path` the worker's Stop payload
+/// advertises and derives stream-json-style discovery dirs from it).
+#[test]
+fn pool_socket_pooled_json_format_emits_the_shared_result_object() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+    let home = tempfile::tempdir().unwrap();
+
+    let mut daemon = Daemon::start_with_env(
+        &mock,
+        &socket,
+        Some("1"),
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .env("HOME", home.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--verbose")
+        .arg("--output-format")
+        .arg("json")
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, Duration::from_secs(120));
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "the pooled json invocation must succeed\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    // Pooled-path proof, same as the text-format run: the client traces the
+    // prewarmed worker being driven (a quiet stateless fallback never does).
+    assert!(
+        out.stderr
+            .contains("pool session: driving prewarmed worker"),
+        "the client must trace that the prewarmed worker is being driven \
+         (this is the pooled-path proof)\nstderr:\n{}",
+        out.stderr
+    );
+
+    // Single-line, valid JSON, same shape the stateless json emitter produces
+    // (emitter::emit_success is shared code — this pins the observable).
+    let trimmed = out.stdout.trim();
+    assert!(
+        !trimmed.contains('\n'),
+        "the json result must be a single line, got:\n{}",
+        out.stdout
+    );
+    let v: serde_json::Value = serde_json::from_str(trimmed)
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\nraw:\n{}", out.stdout));
+    assert_eq!(v["type"], "result");
+    assert_eq!(v["subtype"], "success");
+    assert_eq!(v["is_error"], false);
+    let text = v["result"]
+        .as_str()
+        .unwrap_or_else(|| panic!("result must be a string, got: {:?}", v["result"]));
+    assert!(
+        text.contains("Hello from mock_claude"),
+        "the result text must be the worker transcript's answer, got: {text:?}"
+    );
+    assert_eq!(
+        v["session_id"], "mock-session-abc123",
+        "the session id must come from the worker's transcript result event"
+    );
+    // Transcript-sourced usage: the mock's assistant event carries
+    // {input:10, output:25, cache_creation:5, cache_read:15}; the
+    // last_assistant_message fallback would report zeros.
+    assert_eq!(v["usage"]["input_tokens"], 10, "usage: {}", v["usage"]);
+    assert_eq!(v["usage"]["output_tokens"], 25, "usage: {}", v["usage"]);
+    assert_eq!(
+        v["usage"]["cache_creation_input_tokens"], 5,
+        "usage: {}",
+        v["usage"]
+    );
+    assert_eq!(
+        v["usage"]["cache_read_input_tokens"], 15,
+        "usage: {}",
+        v["usage"]
+    );
+    assert!(
+        v.get("claude_version").and_then(|c| c.as_str()).is_some(),
+        "claude_version must be present and a string: {v}"
+    );
+
+    // Same pool contract as the text-format pooled run: one assignment, one
+    // release, replacement warmed, and (via terminate's reaping check) no
+    // worker process left behind.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(10));
+    daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+    let stderr = daemon.stderr();
+    assert_eq!(
+        stderr
+            .iter()
+            .filter(|l| l.contains("Assigned worker"))
+            .count(),
+        1,
+        "exactly one worker handed out; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        stderr
+            .iter()
+            .filter(|l| l.contains("Released worker"))
+            .count(),
+        1,
+        "exactly one release; stderr: {stderr:?}"
+    );
+    let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// The timeout chain applies UNCHANGED on the pool path, but enforcement is
+/// rerouted: a worker that never fires its Stop payload runs out the client's
+/// stop-hook deadline, the client exits 124 with the same timeout diagnostic
+/// as the stateless path — and does NOT signal the worker process (the
+/// watchdog's child signaling is suppressed on this path); the daemon learns
+/// of the release over the protocol and does the teardown itself.
+#[test]
+fn pool_socket_pooled_deadline_fires_without_signalling_the_worker() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    // Workers warm normally (the delay only defers the post-injection Stop)
+    // but hold the session open far past the client's stop-hook deadline.
+    let mut daemon =
+        Daemon::start_with_env(&mock, &socket, Some("1"), &[("MOCK_DELAY_STOP", "60000")]);
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .args(["--stop-hook-timeout", "3"])
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, Duration::from_secs(120));
+
+    assert_eq!(
+        out.code,
+        Some(124),
+        "the stop-hook deadline must map to the same exit code as the \
+         stateless path (GNU timeout convention)\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr
+            .contains("Stop hook did not fire within deadline"),
+        "the timeout diagnostic must be the shared watchdog description\nstderr:\n{}",
+        out.stderr
+    );
+
+    // The daemon-owned teardown still happened — over the protocol, not via a
+    // client-side SIGTERM: the release arrived, the worker was destroyed, and
+    // a replacement warmed so the pool is whole.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(15));
+    daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
     let out = daemon.terminate(&socket, 1);
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }

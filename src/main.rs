@@ -403,41 +403,64 @@ fn main() {
         }
     };
 
-    // INTERIM (claudepr-12e0cd23, child 1 of the claudepr-309d826d split):
-    // acquisition is wired into the invocation path, but driving a prompt
-    // through the acquired PTY is child 2's work (claudepr-f1e93af1 — the
-    // Session event loop over the worker's master fd, Stop FIFO, and
-    // transcript cwd). Until that lands, a successfully acquired worker is
-    // released here EXACTLY ONCE via the drop path: Drop calls
-    // AcquiredWorker::release, the daemon tears the worker down and spawns a
-    // replacement, so a worker is never handed a second prompt and no
-    // prewarmed slot stays pinned to a client that cannot drive it. This is
-    // deliberate interim behavior, not a bug or a leak — child 2 replaces
-    // this block with the pooled session run and keeps the worker alive
-    // for it.
-    if let Some(worker) = pooled_worker {
-        pool_tracer.trace(format!(
-            "pool: acquired worker {} (pid {}) — interim: pooled session driving \
-             lands in claudepr-f1e93af1; releasing via drop, running the ordinary \
-             stateless session",
-            worker.worker_id(),
-            worker.pid()
-        ));
-        drop(worker);
-    }
-
-    // Call session::Session::run()
-    let result = session::Session::run(
-        &claude_bin,
-        &claude_args,
-        prompt_bytes,
-        Some(resolved_timeout),
-        Some(cli.first_output_timeout),
-        Some(cli.stream_json_timeout),
-        Some(cli.stop_hook_timeout),
-        output_format,
-        &launch,
-    );
+    // ADR-005 (claudepr-f1e93af1): a successfully acquired worker is driven
+    // through the SAME Session event loop the stateless path uses, via
+    // Session::run_pooled — same watchdog deadlines, same Stop-FIFO handoff
+    // (on the worker's own FIFO), same emitters, same error shapes. The
+    // stateless `None` arm is untouched: with --pool-socket absent, no pool
+    // code has run at all and this is byte-for-byte the old dispatch.
+    let result = match pooled_worker {
+        None => session::Session::run(
+            &claude_bin,
+            &claude_args,
+            prompt_bytes,
+            Some(resolved_timeout),
+            Some(cli.first_output_timeout),
+            Some(cli.stream_json_timeout),
+            Some(cli.stop_hook_timeout),
+            output_format,
+            &launch,
+        ),
+        Some(worker) => {
+            // The worker's `claude` is already running with the daemon's
+            // launch decisions, so per-invocation child-launch flags cannot
+            // reach it. ADR-005 keeps the pool strictly additive — this is a
+            // verbose note, not an error; the prompt still runs (on the
+            // daemon's launch), only unmodelled by these flags.
+            let mut inapplicable: Vec<&str> = Vec::new();
+            if !claude_args.is_empty() {
+                inapplicable.push("--model/--max-turns/tool-permission flags");
+            }
+            if resolved_no_inherit_hooks {
+                inapplicable.push("--no-inherit-hooks");
+            }
+            if !launch.mcp_configs.is_empty() {
+                inapplicable.push("--mcp-config");
+            }
+            if launch.pretrust_cwd {
+                inapplicable.push("--pretrust-cwd");
+            }
+            if !inapplicable.is_empty() {
+                pool_tracer.trace(format!(
+                    "pool: worker already running with the daemon's launch; not \
+                     applied: {}",
+                    inapplicable.join(", ")
+                ));
+            }
+            session::Session::run_pooled(
+                &claude_bin,
+                worker,
+                prompt_bytes,
+                Some(resolved_timeout),
+                Some(cli.first_output_timeout),
+                Some(cli.stream_json_timeout),
+                Some(cli.stop_hook_timeout),
+                output_format,
+                cli.verbose,
+                cli.show_child_stderr,
+            )
+        }
+    };
 
     // Lock stdout and stderr for output
     let mut stdout = io::stdout().lock();

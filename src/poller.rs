@@ -199,8 +199,21 @@ pub fn cwd_to_slug(cwd: &str) -> Result<String> {
 /// `Error::Config`; failure to read the current directory returns `Error::Io`.
 pub fn projects_dir_for_cwd() -> Result<PathBuf> {
     let cwd = std::env::current_dir().map_err(Error::Io)?;
+    projects_dir_for(&cwd)
+}
+
+/// [`projects_dir_for_cwd`] for an explicit working directory: the projects
+/// directory a session started in `cwd` must be discovered in.
+///
+/// The pool path (claudepr-f1e93af1) needs this: the claude process runs with
+/// the **worker's** cwd, not the client's, so stream-json discovery must scan
+/// the directory derived from `worker.worker_cwd()` — the same directory the
+/// worker-side claude will report in its Stop payload — rather than one derived
+/// from the client process's own cwd. The `HOME` resolution and its strict
+/// validation stay in [`get_home`], whose error contract applies unchanged.
+pub fn projects_dir_for(cwd: &Path) -> Result<PathBuf> {
     let home = get_home()?;
-    projects_dir_at(&home, &cwd)
+    projects_dir_at(&home, cwd)
 }
 
 /// Pure core of [`projects_dir_for_cwd`], taking the `HOME` root and working
@@ -674,6 +687,30 @@ mod tests {
         assert!(result.is_ok());
         let path = result.unwrap();
         assert_eq!(path, home_dir.path().join(".claude/projects/-project-dir"));
+    }
+
+    /// Pool path (claudepr-f1e93af1): `projects_dir_for` must derive the
+    /// discovery directory from the WORKER's cwd (the cwd claude runs in and
+    /// reports in its Stop payload), not from this process's own cwd. Same
+    /// real-HOME contract as `projects_dir_for_cwd` — the layout identity is
+    /// what the test pins; the HOME source is shared with the wrapper above.
+    #[test]
+    fn projects_dir_for_matches_cwd_derivation_for_explicit_dir() {
+        let cwd = std::env::current_dir().unwrap();
+        let via_cwd = projects_dir_for_cwd().unwrap();
+        let explicit = projects_dir_for(&cwd).unwrap();
+        assert_eq!(
+            via_cwd, explicit,
+            "projects_dir_for(cwd) must agree with projects_dir_for_cwd()"
+        );
+        // The directory NAME is the cwd's slug (the slug layout itself —
+        // full cwd path, non-alnum folded to '-' — is pinned by
+        // projects_dir_at_builds_correct_path below).
+        let slug = cwd_to_slug(&cwd.to_string_lossy()).unwrap();
+        assert_eq!(
+            explicit.file_name().and_then(|s| s.to_str()),
+            Some(slug.as_str())
+        );
     }
 
     // ── open_fifo_nonblock (OQ-4: FIFO open race) ─────────────────────────────
