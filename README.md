@@ -212,7 +212,7 @@ the first failure is reported.
 
 | Key | Constraint |
 |-----|------------|
-| `model` | Non-empty, at most 100 characters; only alphanumeric characters (Unicode-aware), `-`, `_`, `.`; must start with lowercase `claude-` |
+| `model` | Non-empty, at most 100 bytes (the length check is `model.len()`, so multi-byte characters count per byte); only alphanumeric characters (Unicode-aware), `-`, `_`, `.`; must start with lowercase `claude-` |
 | `max_turns` | 1–1000 |
 | `timeout_secs` | 1–86400 (24 hours) |
 | `inherit_hooks` | Must be a TOML boolean |
