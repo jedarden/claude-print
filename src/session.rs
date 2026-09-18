@@ -900,8 +900,10 @@ impl Session {
     ///
     /// The worker is consumed: released exactly once (explicitly on the
     /// success path, before the stream-json drain — mirroring the stateless
-    /// kill-before-drain ordering; via Drop on every other path), and its
-    /// master fd closes with it.
+    /// kill-before-drain ordering; via Drop on every other path that leaves
+    /// the process alive), and its master fd closes with it. A panic under the
+    /// shipped `panic = "abort"` release profile terminates the process before
+    /// any of this can run — see [`AcquiredWorker`] for the exact boundary.
     ///
     /// # Errors
     ///
@@ -931,6 +933,10 @@ impl Session {
         // Use a catch_unwind to ensure cleanup happens even on panics. The
         // worker drops inside the closure on a panic — releasing it and
         // closing the master fd — so nothing leaks past the boundary.
+        // Effective under an unwinding panic strategy (dev and test builds
+        // both unwind); the shipped release profile sets panic = "abort",
+        // where a panic kills the process before this boundary can run (see
+        // [`AcquiredWorker`]).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::run_pooled_inner(
                 claude_bin,

@@ -1506,8 +1506,9 @@ pub enum InvocationAcquisition {
     /// prompt, driven through [`crate::session::Session::run_pooled`]; the
     /// worker is released exactly once — explicitly after a successful drive
     /// (before the stream-json drain), via the [`AcquiredWorker`] drop path on
-    /// every other exit — so the daemon tears it down and spawns a
-    /// replacement.
+    /// every other exit that leaves the process alive (see
+    /// [`AcquiredWorker`] for the hard boundary) — so the daemon tears it
+    /// down and spawns a replacement.
     Acquired(AcquiredWorker),
     /// The pool did not yield a worker for a reason the ADR-005 contract
     /// routes to the stateless path. By construction the carried failure
@@ -1753,11 +1754,20 @@ fn recv_fd_bounded(
 /// A worker acquired from a pool daemon: a prewarmed PTY plus everything the
 /// client session needs to drive it to exactly one prompt (ADR-005).
 ///
-/// Owning this struct owns the PTY master fd. Dropping it — on any path,
-/// including error returns and panics — releases the worker back to the
-/// daemon, which tears the worker down and spawns a replacement: a released
-/// worker is never handed a second prompt, so no session id, hook path,
-/// transcript offset, environment, or fd can leak between callers.
+/// Owning this struct owns the PTY master fd. Dropping it releases the worker
+/// back to the daemon, which tears the worker down and spawns a replacement: a
+/// released worker is never handed a second prompt, so no session id, hook
+/// path, transcript offset, environment, or fd can leak between callers.
+///
+/// The release runs exactly once on every exit path that leaves the process
+/// alive to run destructors: the explicit release after a successful drive,
+/// every `?` / error return, and a panic under an unwinding panic strategy
+/// (all test builds, through `Session::run_pooled`'s `catch_unwind`). It
+/// cannot run when the process dies without destructors — a panic under the
+/// shipped `panic = "abort"` release profile, `SIGKILL`, or a signal at its
+/// default disposition. Nothing client-side can release then; the daemon
+/// reclaims the worker at its own shutdown. (A daemon-side lease would be the
+/// fix if that window ever matters; it is deliberately out of scope here.)
 pub struct AcquiredWorker {
     worker_id: String,
     master: OwnedFd,
@@ -2170,6 +2180,11 @@ mod tests {
     // binary, so it starts clear.
     #[test]
     fn serve_signal_delivery_flips_the_observable_flag() {
+        // The raises below are process-directed: take the drive lock so one
+        // cannot land inside a concurrent session drive's scoped handler
+        // window (and a drive's SignalGuard restore cannot leave these
+        // raises hitting a default disposition).
+        let _drive = drive_signal_lock();
         assert!(
             !SERVE_SIGNALED.load(Ordering::SeqCst),
             "SERVE_SIGNALED must start clear; another test leaked a delivery"
@@ -3334,4 +3349,822 @@ mod tests {
         }
         assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
+
+    // ── pooled session exit paths: the integrated drive (claudepr-8b0e6e78) ──
+    //
+    // The AcquiredWorker contract — the worker is released exactly once on
+    // every exit path that leaves the process alive, and nothing crosses
+    // between two callers of the same pool — is exercised here through
+    // `Session::run_pooled`, the exact integrated invocation path, against a
+    // scripted daemon handing out real per-worker identities (its own
+    // freshly-created Stop FIFO per worker, its own PTY-pair end, its own
+    // pid). tests/serve.rs pins the same contract through the compiled binary;
+    // these pins hold at the level where each exit path can be driven
+    // deterministically, with a fake worker on the far side of the PTY pair.
+
+    /// Serializes every in-process session drive and every process-directed
+    /// signal in this binary.
+    ///
+    /// `Session::run_pooled` installs process-global SIGINT/SIGTERM handlers
+    /// for the drive and its `SignalGuard` restores default dispositions at
+    /// the end; a SIGINT raised for one test while another test sits outside
+    /// that window would kill the whole test binary at default disposition.
+    /// The same exclusivity protects `serve_signal_delivery_flips_the_
+    /// observable_flag`'s `raise` from landing inside a drive's handler
+    /// window (and vice versa). Holding the lock across a whole drive also
+    /// keeps `SELF_PIPE_WRITE` — the handler's process-global target —
+    /// pointing at the driving test's own pipe.
+    static DRIVE_SIGNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`DRIVE_SIGNAL_LOCK`], tolerating a poisoned lock: a panic inside
+    /// one drive must not cascade into every later drive.
+    fn drive_signal_lock() -> std::sync::MutexGuard<'static, ()> {
+        DRIVE_SIGNAL_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The daemon-side end of a scripted worker's PTY pair: bytes the client
+    /// writes to its master arrive here; bytes written here arrive on the
+    /// client's master. Dropping it hangs the client's master up — the
+    /// `ExitReason::ChildExited` input.
+    type WorkerSide = std::os::unix::net::UnixStream;
+
+    /// What one scripted acquire advertised to its caller.
+    #[derive(Debug, Clone)]
+    struct ScriptedAssignment {
+        worker_id: String,
+        stop_fifo: std::path::PathBuf,
+        pid: u32,
+        cwd: std::path::PathBuf,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedPoolState {
+        dir: std::path::PathBuf,
+        next_index: usize,
+        assigned: Vec<ScriptedAssignment>,
+        released: Vec<String>,
+        worker_sides: HashMap<String, Option<WorkerSide>>,
+    }
+
+    /// A scripted pool daemon for driving whole pooled sessions: every
+    /// acquire is answered with one distinct worker (fresh id, its own
+    /// newly-created Stop FIFO, its own PTY-pair end, its own pid) and every
+    /// release frame is counted by worker id. Serves `2 * workers + 2`
+    /// connections — the one-acquire-one-release shape of each driven
+    /// invocation plus slack, so a DOUBLE release is still served and counted
+    /// by the assertion instead of dying on a closed listener.
+    struct ScriptedPool {
+        socket: std::path::PathBuf,
+        state: Arc<Mutex<ScriptedPoolState>>,
+    }
+
+    impl ScriptedPool {
+        fn assignment_of(&self, worker_id: &str) -> ScriptedAssignment {
+            self.state
+                .lock()
+                .unwrap()
+                .assigned
+                .iter()
+                .find(|a| a.worker_id == worker_id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no scripted assignment for {worker_id}"))
+        }
+
+        fn take_worker_side(&self, worker_id: &str) -> WorkerSide {
+            self.state
+                .lock()
+                .unwrap()
+                .worker_sides
+                .get_mut(worker_id)
+                .and_then(|slot| slot.take())
+                .unwrap_or_else(|| panic!("no worker side for {worker_id}"))
+        }
+
+        fn released(&self) -> Vec<String> {
+            self.state.lock().unwrap().released.clone()
+        }
+
+        fn release_count(&self) -> usize {
+            self.state.lock().unwrap().released.len()
+        }
+    }
+
+    fn scripted_pool(base: &std::path::Path, workers: usize) -> ScriptedPool {
+        let socket = base.join("scripted.sock");
+        let listener = bind_socket(&socket).unwrap();
+        let state = Arc::new(Mutex::new(ScriptedPoolState {
+            dir: base.to_path_buf(),
+            next_index: 0,
+            assigned: Vec::new(),
+            released: Vec::new(),
+            worker_sides: HashMap::new(),
+        }));
+        let state_for_thread = state.clone();
+        std::thread::spawn(move || {
+            for _ in 0..(workers * 2 + 2) {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut stream = stream;
+                let frame = match PoolServer::read_frame(&mut stream) {
+                    Ok(Some(frame)) => frame,
+                    _ => break,
+                };
+                let request: PoolRequest = match serde_json::from_slice(&frame) {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                match request {
+                    PoolRequest::Acquire { .. } => {
+                        let assignment = {
+                            let mut st = state_for_thread.lock().unwrap();
+                            let idx = st.next_index;
+                            st.next_index += 1;
+                            let stop_fifo = st.dir.join(format!("stop-{idx}.fifo"));
+                            nix::unistd::mkfifo(
+                                &stop_fifo,
+                                nix::sys::stat::Mode::from_bits_truncate(0o600),
+                            )
+                            .expect("create the scripted worker's Stop FIFO");
+                            let assignment = ScriptedAssignment {
+                                worker_id: format!("w-script-{idx}"),
+                                stop_fifo,
+                                pid: 4000 + idx as u32,
+                                cwd: st.dir.clone(),
+                            };
+                            st.assigned.push(assignment.clone());
+                            assignment
+                        };
+                        let (client_side, worker_side) = stream_pair();
+                        state_for_thread
+                            .lock()
+                            .unwrap()
+                            .worker_sides
+                            .insert(assignment.worker_id.clone(), Some(worker_side));
+                        let response = PoolResponse::WorkerAssigned {
+                            worker_id: assignment.worker_id.clone(),
+                            message: "Worker ready".to_string(),
+                            stop_fifo: assignment.stop_fifo.to_string_lossy().into_owned(),
+                            pid: assignment.pid,
+                            cwd: assignment.cwd.to_string_lossy().into_owned(),
+                        };
+                        write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+                        PoolServer::send_fd(&stream, client_side.as_raw_fd()).unwrap();
+                        // `client_side` drops here: the sent copy is the
+                        // client's master fd; nothing else holds it.
+                    }
+                    PoolRequest::Release { worker_id } => {
+                        state_for_thread.lock().unwrap().released.push(worker_id);
+                        // Echo the frame so the client's bounded read
+                        // completes; the content is informational.
+                        write_frame(&mut stream, &frame);
+                    }
+                }
+            }
+        });
+        ScriptedPool { socket, state }
+    }
+
+    /// What the scripted worker does once it has observed its caller's
+    /// injected prompt (the worker-side behaviour per scenario).
+    enum WorkerScript {
+        /// Deliver this Stop payload on this worker's own Stop FIFO.
+        Stop(String),
+        /// Hang up the PTY pair: the worker died without a Stop payload.
+        HangUp,
+        /// Hold the PTY open and do nothing (deadline/signal scenarios).
+        Hold,
+        /// Run this after the prompt is observed (signal scenarios).
+        Custom(Box<dyn FnOnce() + Send>),
+    }
+
+    /// Spawn the worker-side half of a scripted session: wait for the
+    /// client's bracketed-paste prompt on the worker's PTY-pair end (recording
+    /// everything seen into `prompt_sink`), then run `script`. The PTY end is
+    /// held open for as long as the scenario needs it; the thread detaches.
+    fn drive_worker(
+        worker_side: WorkerSide,
+        stop_fifo: std::path::PathBuf,
+        script: WorkerScript,
+        prompt_sink: Arc<Mutex<Vec<u8>>>,
+    ) {
+        std::thread::spawn(move || {
+            let mut worker_side = worker_side;
+            let _ = worker_side.set_read_timeout(Some(Duration::from_millis(100)));
+            let mut seen: Vec<u8> = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            // The bracketed-paste end marker is what the session traces as
+            // "prompt injected"; scan with a window as long as the marker
+            // itself (a shorter window can never equal it).
+            while !seen.windows(b"\x1b[201~".len()).any(|w| w == b"\x1b[201~") {
+                assert!(
+                    Instant::now() < deadline,
+                    "the client never injected its prompt; saw {} bytes so far",
+                    seen.len()
+                );
+                let mut buf = [0u8; 4096];
+                match worker_side.read(&mut buf) {
+                    Ok(0) => panic!("worker side saw EOF before the prompt was injected"),
+                    Ok(n) => {
+                        seen.extend_from_slice(&buf[..n]);
+                        prompt_sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue;
+                    }
+                    Err(e) => panic!("worker side read failed: {e}"),
+                }
+            }
+            match script {
+                WorkerScript::Stop(payload) => {
+                    deliver_stop(&stop_fifo, &payload);
+                    hold_pty_open(worker_side);
+                }
+                WorkerScript::HangUp => drop(worker_side),
+                WorkerScript::Hold => hold_pty_open(worker_side),
+                WorkerScript::Custom(after) => {
+                    after();
+                    hold_pty_open(worker_side);
+                }
+            }
+        });
+    }
+
+    /// Keep the scripted worker's PTY end open past the scenario (a pending
+    /// deadline or signal wins over a hang-up only while the hang-up never
+    /// comes). Detached: the test process exits long before this sleeps out.
+    fn hold_pty_open(side: WorkerSide) {
+        std::thread::sleep(Duration::from_secs(10));
+        drop(side);
+    }
+
+    /// Deliver a Stop payload on `stop_fifo` (the client opens the read end
+    /// at session start, before the prompt is injected, so the writer's open
+    /// never blocks once the drive has begun).
+    fn deliver_stop(stop_fifo: &std::path::Path, payload: &str) {
+        let mut w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(stop_fifo)
+            .expect("the client holds the Stop FIFO's read end open");
+        w.write_all(payload.as_bytes())
+            .expect("write the Stop payload");
+        // Dropping the writer ends the payload: the client's bounded FIFO
+        // read sees EOF after the complete line, exactly as the hook writes.
+    }
+
+    /// A transcript JSONL in the mock-claude shape: one assistant event (with
+    /// non-zero usage, so transcript-sourced capture is distinguishable from
+    /// the payload fallback) and one result event naming the session.
+    fn write_transcript(path: &std::path::Path, answer: &str, session: &str) {
+        let assistant = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"id\":\"msg_{session}\",\
+             \"content\":[{{\"type\":\"text\",\"text\":\"{answer}\"}}],\
+             \"usage\":{{\"input_tokens\":10,\"output_tokens\":25,\
+             \"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":15}}}}}}"
+        );
+        let result =
+            format!("{{\"type\":\"result\",\"session_id\":\"{session}\",\"is_error\":false}}");
+        std::fs::write(path, format!("{assistant}\n{result}\n")).unwrap();
+    }
+
+    /// The Stop payload advertising `session` and its transcript.
+    fn stop_payload(session: &str, transcript: &std::path::Path, answer: &str) -> String {
+        format!(
+            "{{\"hook_event_name\":\"Stop\",\"session_id\":\"{session}\",\
+             \"transcript_path\":\"{path}\",\"cwd\":\"{cwd}\",\
+             \"last_assistant_message\":\"{answer}\"}}\n",
+            path = transcript.display(),
+            cwd = transcript
+                .parent()
+                .unwrap_or(std::path::Path::new("/"))
+                .display(),
+        )
+    }
+
+    /// A real executable for the version probe `run_pooled` runs at entry
+    /// (`claude_bin --version`); unit tests cannot assume the workspace
+    /// binaries are built.
+    fn version_probe_bin() -> std::path::PathBuf {
+        which::which("bash").expect("bash must be on PATH for the version probe")
+    }
+
+    /// Poll until the scripted daemon has seen `n` release frames.
+    fn await_release_count(pool: &ScriptedPool, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pool.release_count() < n {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {n} expected releases arrived; released: {:?}",
+                pool.release_count(),
+                pool.released()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// After the expected count, no further release may arrive: the explicit
+    /// release and the Drop path must not both go over the wire.
+    fn assert_release_quiet(pool: &ScriptedPool, n: usize) {
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            pool.release_count(),
+            n,
+            "unexpected extra release(s); released: {:?}",
+            pool.released()
+        );
+    }
+
+    /// What `/proc/self/fd/<fd>` currently points at, if anything.
+    fn fd_target(fd: RawFd) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
+
+    /// The master fd the caller owned must be closed by the time `run_pooled`
+    /// returned. The number may have been reused by another thread in this
+    /// heavily parallel test process — reuse resolves to a DIFFERENT target
+    /// and passes; only the original open file description still sitting at
+    /// the number is the leak this catches.
+    fn assert_master_fd_closed(fd: RawFd, was: &Option<std::path::PathBuf>) {
+        match fd_target(fd) {
+            None => {} // closed
+            Some(now) => assert_ne!(
+                &Some(now),
+                was,
+                "master fd {fd} is still open after run_pooled returned"
+            ),
+        }
+    }
+
+    /// The whole-process environment must still equal the pre-drive snapshot:
+    /// the pooled drive sets no variable, so a value a drive leaked between
+    /// callers would persist forever. Other tests in this binary (config's
+    /// EnvGuard pins) mutate process env on their own threads and restore it
+    /// when they finish, so a mismatch is only meaningful if it PERSISTS —
+    /// tolerate the transient, fail on what survives the grace window. Only
+    /// differing KEY names are named: values are not this test's business.
+    fn assert_env_stable(before: &std::collections::BTreeMap<String, String>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let now: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+            if now == *before {
+                return;
+            }
+            let changed: Vec<String> = before
+                .keys()
+                .chain(now.keys())
+                .filter(|k| before.get(*k) != now.get(*k))
+                .cloned()
+                .collect();
+            assert!(
+                Instant::now() < deadline,
+                "the pooled drives must not touch the environment, and the \
+                 change never settled: changed keys: {changed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn pooled_session_success_releases_the_worker_exactly_once() {
+        let _drive = drive_signal_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 1);
+
+        let transcript = dir.path().join("t1.jsonl");
+        write_transcript(&transcript, "answer one", "sess-one");
+
+        let worker = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let assignment = pool.assignment_of(worker.worker_id());
+        let master_fd = worker.master_fd();
+        let master_target = fd_target(master_fd);
+        let prompt_sink = Arc::new(Mutex::new(Vec::new()));
+        drive_worker(
+            pool.take_worker_side(worker.worker_id()),
+            assignment.stop_fifo.clone(),
+            WorkerScript::Stop(stop_payload("sess-one", &transcript, "answer one")),
+            prompt_sink.clone(),
+        );
+
+        let result = crate::session::Session::run_pooled(
+            &version_probe_bin(),
+            worker,
+            b"prompt one".to_vec(),
+            Some(60),
+            Some(0),
+            None,
+            Some(10),
+            crate::cli::OutputFormat::Text,
+            true,
+            false,
+        )
+        .expect("the driven pooled session must succeed");
+
+        // The answer came from THIS invocation's transcript, read through the
+        // shared Stop tail.
+        assert!(
+            result.transcript.text.contains("answer one"),
+            "transcript text: {:?}",
+            result.transcript.text
+        );
+        assert_eq!(result.transcript.session_id.as_deref(), Some("sess-one"));
+        assert!(!result.transcript.is_error);
+        assert_eq!(result.transcript_path, transcript);
+
+        // Exactly one release — the explicit pre-drain release; the Drop path
+        // stayed silent.
+        await_release_count(&pool, 1);
+        assert_release_quiet(&pool, 1);
+        assert_eq!(pool.released(), vec![assignment.worker_id.clone()]);
+
+        // The worker's master fd closed with the run.
+        assert_master_fd_closed(master_fd, &master_target);
+
+        // The injected prompt reached THIS worker.
+        assert!(
+            prompt_sink
+                .lock()
+                .unwrap()
+                .windows(10)
+                .any(|w| w == b"prompt one"),
+            "the worker must receive its caller's prompt"
+        );
+    }
+
+    #[test]
+    fn pooled_session_child_exit_releases_the_worker_exactly_once() {
+        let _drive = drive_signal_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 1);
+
+        let worker = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let assignment = pool.assignment_of(worker.worker_id());
+        let prompt_sink = Arc::new(Mutex::new(Vec::new()));
+        drive_worker(
+            pool.take_worker_side(worker.worker_id()),
+            assignment.stop_fifo.clone(),
+            WorkerScript::HangUp,
+            prompt_sink,
+        );
+
+        let err = crate::session::Session::run_pooled(
+            &version_probe_bin(),
+            worker,
+            b"prompt one".to_vec(),
+            Some(60),
+            Some(0),
+            None,
+            Some(10),
+            crate::cli::OutputFormat::Text,
+            false,
+            false,
+        )
+        .expect_err("a worker that dies without a Stop payload is an error");
+        assert!(
+            matches!(err, crate::error::Error::Internal(ref e)
+                if e.to_string().contains("Child exited without sending Stop payload")),
+            "unexpected error: {err:?}"
+        );
+
+        // The error return dropped the worker → exactly one release.
+        await_release_count(&pool, 1);
+        assert_release_quiet(&pool, 1);
+    }
+
+    #[test]
+    fn pooled_session_timeout_releases_the_worker_exactly_once() {
+        let _drive = drive_signal_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 1);
+
+        let worker = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let assignment = pool.assignment_of(worker.worker_id());
+        let prompt_sink = Arc::new(Mutex::new(Vec::new()));
+        drive_worker(
+            pool.take_worker_side(worker.worker_id()),
+            assignment.stop_fifo.clone(),
+            WorkerScript::Hold,
+            prompt_sink,
+        );
+
+        let started = Instant::now();
+        let err = crate::session::Session::run_pooled(
+            &version_probe_bin(),
+            worker,
+            b"prompt one".to_vec(),
+            Some(60),
+            Some(0),
+            None,
+            Some(2), // the stop-hook deadline is the one that fires
+            crate::cli::OutputFormat::Text,
+            false,
+            false,
+        )
+        .expect_err("a worker that never fires Stop must hit the deadline");
+        assert!(
+            matches!(err, crate::error::Error::Timeout(ref m) if m.contains("Stop hook")),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the deadline must end the session promptly, took {:?}",
+            started.elapsed()
+        );
+
+        // Enforcement rerouted through the daemon: exactly one release, and
+        // (via Watchdog::without_child_signals) the worker pid was never
+        // signalled client-side — the scripted pid stays a fiction.
+        await_release_count(&pool, 1);
+        assert_release_quiet(&pool, 1);
+    }
+
+    #[test]
+    fn pooled_session_sigint_releases_the_worker_exactly_once() {
+        let _drive = drive_signal_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 1);
+
+        let worker = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let assignment = pool.assignment_of(worker.worker_id());
+        let prompt_sink = Arc::new(Mutex::new(Vec::new()));
+        // The prompt marker proves the session installed its scoped SIGINT
+        // handler (step 4 precedes the injection); the interrupt lands inside
+        // the handler window, never at default disposition.
+        drive_worker(
+            pool.take_worker_side(worker.worker_id()),
+            assignment.stop_fifo.clone(),
+            WorkerScript::Custom(Box::new(|| {
+                nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT)
+                    .expect("raise SIGINT");
+            })),
+            prompt_sink,
+        );
+
+        let err = crate::session::Session::run_pooled(
+            &version_probe_bin(),
+            worker,
+            b"prompt one".to_vec(),
+            Some(60),
+            Some(0),
+            None,
+            Some(30),
+            crate::cli::OutputFormat::Text,
+            false,
+            false,
+        )
+        .expect_err("a SIGINTed pooled session is Interrupted");
+        assert!(
+            matches!(err, crate::error::Error::Interrupted(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // The Interrupted return dropped the worker → exactly one release.
+        await_release_count(&pool, 1);
+        assert_release_quiet(&pool, 1);
+    }
+
+    /// Session::run_pooled's panic boundary shape: the worker is owned inside
+    /// a `catch_unwind` closure that has ALREADY released it (the success-path
+    /// discipline) when the panic hits. The unwind drop must not re-send.
+    #[test]
+    fn explicit_release_then_panic_releases_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 1);
+
+        let worker = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let assignment = pool.assignment_of(worker.worker_id());
+        await_release_count(&pool, 0); // nothing released yet (trivially true)
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut worker = worker;
+            worker.release();
+            panic!("the session exploded after a successful drive");
+        }));
+        assert!(outcome.is_err(), "the panic must surface as Err");
+
+        await_release_count(&pool, 1);
+        assert_release_quiet(&pool, 1);
+        assert_eq!(pool.released(), vec![assignment.worker_id]);
+    }
+
+    /// The other half of the boundary: a panic while still HOLDING the worker
+    /// drops it during unwinding, which releases exactly once — a leaked
+    /// assignment (zero) or a double send (two) both fail this pin.
+    #[test]
+    fn panic_while_holding_the_worker_releases_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 1);
+
+        let socket = pool.socket.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _worker = PoolClient::new(socket).acquire(10).unwrap();
+            panic!("the session exploded holding its worker");
+        }));
+        assert!(outcome.is_err(), "the panic must surface as Err");
+
+        await_release_count(&pool, 1);
+        assert_release_quiet(&pool, 1);
+    }
+
+    /// Two sequential invocations against the same pool must observe zero
+    /// leakage: distinct worker identity (id, pid, Stop FIFO, PTY) per
+    /// caller, each driven through its own hook path and transcript, each
+    /// worker receiving only its own caller's prompt, the first caller's
+    /// master fd closed before the second runs, and no environment value
+    /// crossing callers. `tests/serve.rs` pins the same contract through the
+    /// compiled binary against the real daemon; this holds it at the level
+    /// where every identity is directly observable.
+    #[test]
+    fn two_sequential_pooled_invocations_observe_zero_cross_caller_leakage() {
+        let _drive = drive_signal_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 2);
+
+        let env_before: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+
+        // ── invocation 1 ────────────────────────────────────────────────────
+        let transcript1 = dir.path().join("t-one.jsonl");
+        write_transcript(&transcript1, "answer one", "sess-one");
+        let worker1 = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let a1 = pool.assignment_of(worker1.worker_id());
+        let master_fd1 = worker1.master_fd();
+        let master_target1 = fd_target(master_fd1);
+        let sink1 = Arc::new(Mutex::new(Vec::new()));
+        drive_worker(
+            pool.take_worker_side(worker1.worker_id()),
+            a1.stop_fifo.clone(),
+            WorkerScript::Stop(stop_payload("sess-one", &transcript1, "answer one")),
+            sink1.clone(),
+        );
+        let result1 = crate::session::Session::run_pooled(
+            &version_probe_bin(),
+            worker1,
+            b"prompt one".to_vec(),
+            Some(60),
+            Some(0),
+            None,
+            Some(10),
+            crate::cli::OutputFormat::Text,
+            false,
+            false,
+        )
+        .expect("invocation 1 must succeed");
+        await_release_count(&pool, 1);
+
+        assert_eq!(result1.transcript.session_id.as_deref(), Some("sess-one"));
+        assert!(result1.transcript.text.contains("answer one"));
+        assert_eq!(result1.transcript_path, transcript1);
+        assert_master_fd_closed(master_fd1, &master_target1);
+
+        // Invocation 1's hook path is gone: its Stop FIFO has no reader left,
+        // so a late payload for the OLD caller is undeliverable (ENXIO) —
+        // nothing of invocation 1 is still listening for invocation 2 to
+        // trip over.
+        let stale = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&a1.stop_fifo)
+        };
+        assert_eq!(
+            stale
+                .expect_err("invocation 1's FIFO must have no reader left")
+                .raw_os_error(),
+            Some(nix::errno::Errno::ENXIO as i32),
+            "opening a readerless FIFO must fail with ENXIO"
+        );
+
+        // ── invocation 2 ────────────────────────────────────────────────────
+        let transcript2 = dir.path().join("t-two.jsonl");
+        write_transcript(&transcript2, "answer two", "sess-two");
+        let worker2 = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let a2 = pool.assignment_of(worker2.worker_id());
+        let master_fd2 = worker2.master_fd();
+        let master_target2 = fd_target(master_fd2);
+
+        // Identity: every field the daemon advertises differs per caller.
+        assert_ne!(
+            a1.worker_id, a2.worker_id,
+            "worker id reused across callers"
+        );
+        assert_ne!(a1.pid, a2.pid, "worker pid reused across callers");
+        assert_ne!(
+            a1.stop_fifo, a2.stop_fifo,
+            "hook path reused across callers"
+        );
+        assert_ne!(
+            master_target1, master_target2,
+            "the second caller was handed the first caller's PTY"
+        );
+
+        let sink2 = Arc::new(Mutex::new(Vec::new()));
+        drive_worker(
+            pool.take_worker_side(worker2.worker_id()),
+            a2.stop_fifo.clone(),
+            WorkerScript::Stop(stop_payload("sess-two", &transcript2, "answer two")),
+            sink2.clone(),
+        );
+        let result2 = crate::session::Session::run_pooled(
+            &version_probe_bin(),
+            worker2,
+            b"prompt two".to_vec(),
+            Some(60),
+            Some(0),
+            None,
+            Some(10),
+            crate::cli::OutputFormat::Text,
+            false,
+            false,
+        )
+        .expect("invocation 2 must succeed");
+        await_release_count(&pool, 2);
+        assert_release_quiet(&pool, 2);
+
+        // Session identity did not cross: invocation 2 resolved ITS stop
+        // payload, ITS transcript, and none of invocation 1's data.
+        assert_eq!(result2.transcript.session_id.as_deref(), Some("sess-two"));
+        assert!(result2.transcript.text.contains("answer two"));
+        assert!(
+            !result2.transcript.text.contains("answer one"),
+            "invocation 2 must not read invocation 1's transcript"
+        );
+        assert_eq!(result2.transcript_path, transcript2);
+        assert_ne!(result1.transcript_path, result2.transcript_path);
+        assert_master_fd_closed(master_fd2, &master_target2);
+
+        // Exactly one release per caller, each naming its own worker.
+        assert_eq!(
+            pool.released(),
+            vec![a1.worker_id.clone(), a2.worker_id.clone()]
+        );
+
+        // Prompts did not cross: each scripted worker saw exactly its own
+        // caller's prompt.
+        let seen1 = sink1.lock().unwrap().clone();
+        let seen2 = sink2.lock().unwrap().clone();
+        assert!(seen1.windows(10).any(|w| w == b"prompt one"));
+        assert!(!seen1.windows(10).any(|w| w == b"prompt two"));
+        assert!(seen2.windows(10).any(|w| w == b"prompt two"));
+        assert!(!seen2.windows(10).any(|w| w == b"prompt one"));
+
+        // No environment value crossed the two drives.
+        assert_env_stable(&env_before);
+    }
+
+    /// An acquire that finds no ready worker waits out the daemon's hold on
+    /// the request, bounded by the caller's deadline, and then resolves to
+    /// the child-1 fallback classification (ADR-005 stateless path), never a
+    /// hang and never a hard error.
+    #[test]
+    fn acquire_with_no_ready_worker_waits_out_the_daemon_hold_then_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        const HOLD: Duration = Duration::from_millis(1200);
+        fake_daemon(&path, 1, move |stream| {
+            let mut stream = stream;
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            // The daemon holds the acquire while waiting for a worker to
+            // free up, then reports none became available.
+            std::thread::sleep(HOLD);
+            let response = PoolResponse::Error {
+                error: "Pool full - no ready workers".to_string(),
+                code: ErrorCode::PoolFull,
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+        });
+
+        let started = Instant::now();
+        match acquire_for_invocation(Some(&path), 30).unwrap() {
+            InvocationAcquisition::Fallback(failure) => {
+                assert_eq!(
+                    failure,
+                    AcquireFailure::PoolUnavailable {
+                        code: "pool_full".to_string(),
+                        error: "Pool full - no ready workers".to_string(),
+                    }
+                );
+                assert!(is_stateless_fallback(&failure));
+            }
+            other => panic!("a pool with no ready worker must classify as fallback, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= HOLD,
+            "the caller must wait out the daemon's hold, returned after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the wait must stay bounded by the caller deadline, took {elapsed:?}"
+        );
+    }
+
+    // (A throwaway fd-probe test that lived here during development was
+    // removed once the drive_worker marker scan was fixed — its diagnosis,
+    // that the scripted worker side does receive the client's prompt bytes,
+    // is pinned by every drive test above.)
 }

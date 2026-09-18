@@ -2012,3 +2012,403 @@ fn pool_socket_pooled_deadline_fires_without_signalling_the_worker() {
     let out = daemon.terminate(&socket, 1);
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
 }
+
+// ── Single-prompt teardown & cross-caller isolation (claudepr-8b0e6e78) ─────
+
+/// Extract the (worker id, worker pid) the pooled drive traced. The trace
+/// only exists on the pooled path, so finding it doubles as the proof the
+/// invocation was driven through a prewarmed worker rather than statelessly.
+fn driven_worker(stderr: &str) -> (String, u32) {
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("driving prewarmed worker"))
+        .expect("the pooled drive must trace the worker it drives");
+    let rest = line
+        .split("driving prewarmed worker ")
+        .nth(1)
+        .expect("worker id segment");
+    let (id, pid) = rest.split_once(" (pid ").expect("pid segment");
+    let pid = pid
+        .trim_end_matches(')')
+        .trim()
+        .parse::<u32>()
+        .expect("pid must be numeric");
+    (id.trim().to_string(), pid)
+}
+
+/// Poll until `pid` has vanished from /proc (the daemon reaps a released
+/// worker before it answers the release, so this converges fast; the window
+/// only absorbs scheduler lag).
+fn assert_pid_gone(pid: u32, grace: Duration) {
+    let start = Instant::now();
+    while proc_state(pid).is_some() {
+        assert!(
+            start.elapsed() < grace,
+            "worker pid {pid} must be gone after its release was processed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Count the daemon's open PTY masters (`/dev/ptmx` readlinks): the pool's
+/// worker master fds live in the daemon, so at rest with one ready worker
+/// this is exactly 1 — a leaked assignment would read 2.
+fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
+    let fd_dir = format!("/proc/{daemon_pid}/fd");
+    std::fs::read_dir(&fd_dir)
+        .unwrap_or_else(|e| panic!("read {fd_dir}: {e}"))
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter(|t| t.to_string_lossy() == "/dev/ptmx")
+        .count()
+}
+
+/// SIGINT mid-drive: the scoped session handlers take it (exit 130, the
+/// Interrupted contract), the interrupt path releases the worker EXACTLY
+/// once, and the daemon destroys the interrupted worker and warms a
+/// replacement — the interrupted worker is never handed to a second caller.
+#[test]
+fn pool_socket_pooled_sigint_releases_the_worker_exactly_once() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    // The delay keeps the worker holding Stop after injection, so the
+    // session is mid-drive when the interrupt lands.
+    let mut daemon =
+        Daemon::start_with_env(&mock, &socket, Some("1"), &[("MOCK_DELAY_STOP", "60000")]);
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--verbose")
+        .arg("Reply with exactly one word: pong");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn claude-print: {e}"));
+
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
+    let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    let reader = std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr_pipe);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => sink.lock().unwrap().push(line),
+                Err(_) => break,
+            }
+        }
+    });
+    let stderr_lines = || lines.lock().unwrap().clone();
+
+    // Readiness: "prompt injected" is traced only after the session
+    // installed its scoped signal handlers (INV-3 ordering), so the
+    // interrupt can never land at default disposition — and the delayed Stop
+    // keeps the session alive past it.
+    let start = Instant::now();
+    loop {
+        if stderr_lines().iter().any(|l| l.contains("prompt injected")) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "session never reached prompt injection; stderr: {:?}",
+            stderr_lines()
+        );
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "session exited before signaling ({status:?}); stderr: {:?}",
+                stderr_lines()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    kill(Pid::from_raw(child.id() as i32), Signal::SIGINT).expect("signal the pooled session");
+
+    let start = Instant::now();
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {
+                assert!(
+                    start.elapsed() < SHUTDOWN_BOUND,
+                    "pooled session ignored SIGINT; stderr: {:?}",
+                    stderr_lines()
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("failed to reap pooled session after SIGINT: {e}"),
+        }
+    };
+
+    let mut stdout_bytes = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_end(&mut stdout_bytes);
+    }
+    reader.join().expect("stderr reader thread");
+    let stderr = stderr_lines().join("\n");
+
+    assert_eq!(
+        code,
+        Some(130),
+        "SIGINT mid-drive must take the Interrupted contract (exit 130)\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&stdout_bytes)
+    );
+
+    // The interrupt's Drop released the worker exactly once — the daemon saw
+    // one release and no double-send, then destroyed that worker and warmed
+    // a replacement.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(15));
+    daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+    let daemon_stderr = daemon.stderr();
+    let released = daemon_stderr
+        .iter()
+        .filter(|l| l.contains("Released worker"))
+        .count();
+    assert_eq!(
+        released, 1,
+        "the SIGINT path must release exactly once (no double release); stderr: {daemon_stderr:?}"
+    );
+
+    // The interrupted worker itself was destroyed, not re-handed.
+    let (worker_id, worker_pid) = driven_worker(&stderr);
+    assert_pid_gone(worker_pid, Duration::from_secs(10));
+    assert!(
+        daemon_stderr
+            .iter()
+            .any(|l| l.contains("Assigned worker") && l.contains(&worker_id)),
+        "the assigned worker must be the one the client drove; stderr: {daemon_stderr:?}"
+    );
+
+    let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// Two sequential invocations against the same pool must observe zero
+/// cross-caller leakage, asserted over live processes: each caller is driven
+/// through a DISTINCT worker (id and pid), the first worker is destroyed
+/// before the second runs (its pid is gone and the daemon at rest holds
+/// exactly one PTY master — the replacement's, not a second copy of the
+/// first), and the daemon's ledger shows two assignments and two releases
+/// with distinct ids.
+#[test]
+fn pool_socket_two_sequential_invocations_get_isolated_workers() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("1"));
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+    let daemon_pid = daemon.child.id();
+
+    // ── invocation 1 ────────────────────────────────────────────────────────
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--verbose")
+        .arg("Reply with exactly one word: pong");
+    let out1 = run(&mut cmd, Duration::from_secs(120));
+    assert_eq!(
+        out1.code,
+        Some(0),
+        "invocation 1 must succeed\nstdout:\n{}\nstderr:\n{}",
+        out1.stdout,
+        out1.stderr
+    );
+    let (id1, pid1) = driven_worker(&out1.stderr);
+
+    // Fully released before invocation 2 starts.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(10));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+
+    // ── invocation 2 ────────────────────────────────────────────────────────
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--verbose")
+        .arg("Reply with exactly one word: pong");
+    let out2 = run(&mut cmd, Duration::from_secs(120));
+    assert_eq!(
+        out2.code,
+        Some(0),
+        "invocation 2 must succeed\nstdout:\n{}\nstderr:\n{}",
+        out2.stdout,
+        out2.stderr
+    );
+    let (id2, pid2) = driven_worker(&out2.stderr);
+
+    // Identity: a released worker is never handed a second caller.
+    assert_ne!(id1, id2, "worker id reused across callers");
+    assert_ne!(pid1, pid2, "worker pid reused across callers");
+
+    // The first worker's process was destroyed after its release — nothing
+    // of invocation 1 survived to meet invocation 2.
+    assert_pid_gone(pid1, Duration::from_secs(10));
+
+    // At rest the daemon holds exactly ONE PTY master: the first worker's
+    // master fd was closed at destroy, and the pool is exactly the one
+    // replacement worker. (A leaked assignment would read 2.)
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        daemon_pty_fd_count(daemon_pid),
+        1,
+        "the daemon must hold exactly one PTY master at rest (first worker's \
+         fd closed with its release, replacement warm)"
+    );
+
+    // The daemon's ledger: two assignments with the two distinct ids, two
+    // releases — zero leaks, no double-send on either caller.
+    let daemon_stderr = daemon.stderr();
+    let assigned: Vec<&String> = daemon_stderr
+        .iter()
+        .filter(|l| l.contains("Assigned worker"))
+        .collect();
+    let released = daemon_stderr
+        .iter()
+        .filter(|l| l.contains("Released worker"))
+        .count();
+    assert_eq!(
+        assigned.len(),
+        2,
+        "exactly two workers may be handed out; stderr: {daemon_stderr:?}"
+    );
+    assert!(
+        assigned.iter().any(|l| l.contains(&id1)) && assigned.iter().any(|l| l.contains(&id2)),
+        "the two assignments must be the two workers the clients drove; stderr: {daemon_stderr:?}"
+    );
+    assert_eq!(
+        released, 2,
+        "each caller must release exactly once; stderr: {daemon_stderr:?}"
+    );
+
+    // Both callers got the worker's answer.
+    assert!(
+        out1.stdout.contains("Hello from mock_claude"),
+        "stdout: {}",
+        out1.stdout
+    );
+    assert!(
+        out2.stdout.contains("Hello from mock_claude"),
+        "stdout: {}",
+        out2.stdout
+    );
+
+    let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
+/// An acquire that finds NO ready worker — the pool is up but fully handed
+/// out — must wait bounded by the caller's budget, then follow the ADR-005
+/// fallback classification to a successful stateless session, never a hang
+/// and never a hard error. The pre-taken worker stays held (never released),
+/// proving the invocation ran statelessly rather than slipping in through a
+/// release race.
+#[test]
+fn pool_socket_falls_back_when_no_ready_worker() {
+    use std::fs;
+    use std::os::unix::net::UnixStream;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+
+    let mut daemon = Daemon::start(&mock, &socket, Some("1"));
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    // A raw client takes the pool's only worker and holds it: the pool is
+    // now up but has nothing ready to hand out.
+    let mut raw = UnixStream::connect(&socket).expect("connect to the pool");
+    send_frame(&mut raw, br#"{"type":"acquire","timeout_secs":60}"#);
+    let response = read_response(&mut raw)
+        .expect("read the acquire response")
+        .expect("the daemon must answer the acquire");
+    assert!(
+        response.contains("worker_assigned"),
+        "the external client must take the only ready worker: {response}"
+    );
+
+    // The pooled invocation finds no ready worker: bounded fallback, then a
+    // successful stateless session.
+    let started = Instant::now();
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--verbose")
+        .args(["--timeout", "20"])
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, Duration::from_secs(60));
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "a pool with no ready worker must fall back, not fail\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "the fallback must stay bounded by the caller deadline, took {elapsed:?}"
+    );
+    let pool_lines: Vec<&str> = out.stderr.lines().filter(|l| l.contains("pool:")).collect();
+    assert_eq!(
+        pool_lines.len(),
+        1,
+        "exactly one verbose diagnostic line expected\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        pool_lines[0].contains("pool_full") && pool_lines[0].contains("falling back"),
+        "the diagnostic must classify the no-ready-worker case and name the fallback: {}",
+        pool_lines[0]
+    );
+    assert!(
+        out.stdout.contains("Hello from mock_claude"),
+        "the stateless session must have run to its answer\nstdout:\n{}",
+        out.stdout
+    );
+
+    // The invocation never touched the pool's worker: the externally-held
+    // one was never released (and no second worker was assigned to it).
+    let daemon_stderr = daemon.stderr();
+    let released = daemon_stderr
+        .iter()
+        .filter(|l| l.contains("Released worker"))
+        .count();
+    assert_eq!(
+        released, 0,
+        "the stateless fallback must not acquire or release pooled workers; stderr: {daemon_stderr:?}"
+    );
+
+    // While the raw client holds the only worker, maintain() still sees zero
+    // Warming+Ready against target 1 and tops the pool back up — the warm
+    // replacement exists BY DESIGN next to the held worker, so the daemon
+    // legitimately holds 2 worker processes here, not 1. Wait for that
+    // top-up so the count at terminate is deterministic.
+    daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+    drop(raw);
+    let out = daemon.terminate(&socket, 2);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
