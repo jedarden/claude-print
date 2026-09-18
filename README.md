@@ -206,40 +206,70 @@ cannot be read, parsed, or validated is fatal.
 
 ### Validation
 
+A file that parses is then checked field by field (`Defaults::validate` in
+`src/config.rs`): `model` first, then `max_turns`, then `timeout_secs` — only
+the first failure is reported.
+
 | Key | Constraint |
 |-----|------------|
-| `model` | Non-empty, at most 100 characters; only letters, digits, `-`, `_`, `.`; must start with lowercase `claude-` |
+| `model` | Non-empty, at most 100 characters; only alphanumeric characters (Unicode-aware), `-`, `_`, `.`; must start with lowercase `claude-` |
 | `max_turns` | 1–1000 |
 | `timeout_secs` | 1–86400 (24 hours) |
 | `inherit_hooks` | Must be a TOML boolean |
 
 Types are strict: `max_turns = "50"` (quoted), `max_turns = 50.5`, or
-`model = 123` are all rejected — values are not coerced.
+`model = 123` are all rejected — values are not coerced. A wrong type fails at
+parse time with `invalid type: string "50", expected u32`, before validation
+runs.
+
+Unknown keys are rejected at parse time (`deny_unknown_fields` on `Defaults`)
+with an error naming the four expected fields:
+
+```text
+error: invalid config: unknown-key.toml: TOML parse error at line 2, column 1
+  |
+2 | frobnicate = 1
+  | ^^^^^^^^^^
+unknown field `frobnicate`, expected one of `inherit_hooks`, `model`, `max_turns`, `timeout_secs`
+```
 
 ### Errors
 
 If an existing config file cannot be read, parsed, or validated,
 `claude-print` exits with status 2 and never starts a session — it does not
-fall back to defaults with a warning.
+fall back to defaults with a warning. Stdout is empty in every mode; the error
+goes to stderr, shaped by the output format.
 
-- **`text` mode:** one line on stderr:
+- **`text` mode:** one line on stderr (stdout empty):
 
   ```text
   error: invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'
   ```
 
+  The doubled `invalid config:` is not a typo — the per-field reason carries
+  its own prefix, and the path wrapper adds another.
+
 - **`json` / `stream-json` mode:** stdout stays empty and a structured `result`
-  object is written to **stderr** — config errors fire before a session exists,
-  so stdout, which carries the response payload, is left clean:
+  object (exit code still 2, subtype `internal_error` for every config
+  failure) is written to **stderr** — config errors fire before a session
+  exists, so stdout, which carries the response payload, is left clean:
 
   ```json
-  {"claude_version":"2.1.238 (Claude Code)","error_message":"invalid config: /tmp/config.toml: TOML parse error ...","is_error":true,"subtype":"internal_error","type":"result"}
+  {"claude_version":"2.1.276 (Claude Code)","error_message":"invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n","is_error":true,"subtype":"internal_error","type":"result"}
   ```
 
-A parse failure reports the TOML line and column (`invalid config: <path>:
-TOML parse error at line 1, column 10 ...`); a value that parses but fails a
-constraint reports `invalid config: config validation failed at <path>:
-<reason>` instead.
+All three failure tiers share the `error: invalid config:` prefix and exit 2;
+they differ in what follows:
+
+- **Unreadable file** — exists but `read` fails (permissions, or the path is a
+  directory): `error: invalid config: cannot read config at <path>: Permission
+  denied (os error 13)`
+- **Parse failure** — malformed TOML, unknown key, or wrong type: reports the
+  TOML line and column plus a source excerpt — `error: invalid config: <path>:
+  TOML parse error at line 1, column 3` …
+- **Constraint violation** — parses, then fails a check above: reports the
+  reason instead of a position — `error: invalid config: config validation
+  failed at <path>: invalid config: model name 'gpt-4' must start with 'claude-'`
 
 For a quick check without touching the default config:
 
