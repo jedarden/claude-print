@@ -160,31 +160,49 @@ Unknown keys are rejected at parse time; the error lists the four valid names.
 
 ### Precedence
 
-An explicit CLI flag wins over the config file, which wins over the built-in
-default:
+Resolution has two tiers: which *file* is read, then how each *value* is
+chosen.
+
+**Which file:** `main.rs` loads exactly one file. An explicit `--config <FILE>`
+replaces path discovery entirely — the discovered file is never read, so
+nothing is merged. Otherwise `Config::default_path` (`src/config.rs`) prefers
+`$XDG_CONFIG_HOME/claude-print/config.toml` over
+`$HOME/.config/claude-print/config.toml`. Either way,
+`Config::load_or_default` (`src/config.rs`) reads that single path.
+
+**Which value:** for each setting, the `Config::resolve_*` functions
+(`src/config.rs`) pick the first tier that has a value — CLI flag, then config
+file, then built-in default:
 
 | Setting | Resolution order |
 |---------|------------------|
-| `model` | `--model` → `defaults.model` → `claude-sonnet-4-6` |
-| `inherit_hooks` | `--no-inherit-hooks` → `defaults.inherit_hooks` → `true` |
+| `model` | `--model` → `defaults.model` → `claude-sonnet-4-6` (`resolve_model`) |
+| `inherit_hooks` | `--no-inherit-hooks` → `defaults.inherit_hooks` → `true` (`resolve_inherit_hooks`) |
 | `max_turns` | `--max-turns` (built-in default `30`); `defaults.max_turns` is not consulted |
 | `timeout` | `--timeout` (built-in default `3600`); `defaults.timeout_secs` is not consulted |
 
-**Known limitation:** `--max-turns` and `--timeout` carry their built-in
-defaults in the argument parser, and an absent flag is indistinguishable from
-an explicitly passed one — so `defaults.max_turns` and `defaults.timeout_secs`
-are parsed and validated but currently have no effect. Control these two with
-the CLI flags (or, for NEEDLE, the `invoke_template` in `claude-print.yaml`).
-The config keys are accepted so a future fix can honor them without a format
-change. `model` and `inherit_hooks` have no flag default, so their config
-values apply whenever the flag is absent.
+**Known limitation:** `defaults.max_turns` and `defaults.timeout_secs` are
+parsed and validated but currently have no effect. The clap `default_value`s
+on `--max-turns` (`30`) and `--timeout` (`3600`) in `src/cli.rs` make an
+absent flag indistinguishable from an explicitly passed one, so `main.rs`
+always passes `Some(cli.max_turns)` / `Some(cli.timeout)` into
+`Config::resolve_max_turns` and `Config::resolve_timeout_secs`
+(`src/config.rs`) — the config tier of those resolvers never fires. Control
+these two with the CLI flags (or, for NEEDLE, the `invoke_template` in
+`claude-print.yaml`). The config keys are accepted so a future fix can honor
+them without a format change. `--model` and `--no-inherit-hooks` have no
+parser default, so their absence is detectable and their config values apply
+whenever the flag is absent.
 
 ### Missing file
 
 A missing config file is not an error: `claude-print` runs on built-in
-defaults. This holds for the default path *and* for an explicit `--config
-<FILE>` that does not exist. Only a file that exists but cannot be read,
-parsed, or validated is fatal.
+defaults. `Config::load_or_default` (`src/config.rs`) returns `Config::default()`
+when opening the path fails with `NotFound` — pinned by the
+`load_or_default_returns_defaults_when_file_missing` test. This holds for the
+default path *and* for an explicit `--config <FILE>` that does not exist, since
+`main.rs` routes both through the same call. Only a file that exists but
+cannot be read, parsed, or validated is fatal.
 
 ### Validation
 
