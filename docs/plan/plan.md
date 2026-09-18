@@ -409,6 +409,8 @@ Use this when running as a NEEDLE worker to prevent hook noise, or when the user
 
 `$XDG_CONFIG_HOME/claude-print/config.toml` if `$XDG_CONFIG_HOME` is set, otherwise `~/.config/claude-print/config.toml`. The file is optional and never auto-created — `claude-print` only reads it, and a missing file simply runs on the built-in defaults shown below.
 
+`--config <FILE>` (`src/cli.rs`) supplies an explicit path that is used as given: it replaces the default resolution entirely and the two paths are never merged. Resolution order, first match wins — explicit `--config`, then `$XDG_CONFIG_HOME/claude-print/config.toml`, then `~/.config/claude-print/config.toml`. A valid `HOME` is required in every case, even when `--config` supplies the path (`util::get_home` is called unconditionally at startup). A missing file runs on built-in defaults whether the path came from the default resolution or from `--config`; only a file that exists but cannot be read, parsed, or validated is fatal (exit code 2).
+
 ```toml
 [defaults]
 inherit_hooks = true      # do not pass --setting-sources; let claude use its default source loading
@@ -416,6 +418,8 @@ model = "claude-sonnet-4-6"
 max_turns = 30
 timeout_secs = 3600
 ```
+
+The schema is the `Defaults` struct in `src/config.rs`, marked `#[serde(deny_unknown_fields)]`. All four keys are optional and so is the `[defaults]` table itself — a bare `[defaults]` line parses cleanly, so partial configurations are fine. Unknown keys are rejected at parse time: the serde error names the offending key and lists the four valid names (`inherit_hooks`, `model`, `max_turns`, `timeout_secs`), surfaced as `invalid config at <path>: …` with exit code 2.
 
 CLI flags override config file values. `inherit_hooks = true` — Setting to `false` is equivalent to passing `--no-inherit-hooks` on the command line: `--setting-sources=` (measured per OQ-2: suppresses standard sources, leaves the `--settings` file active) is forwarded to the inner `claude` process, suppressing user hook inheritance. CLI `--no-inherit-hooks` takes precedence over the config file value.
 
