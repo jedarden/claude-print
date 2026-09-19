@@ -1055,6 +1055,127 @@ fn stream_json_reader_retarget_same_path_does_not_duplicate() {
     );
 }
 
+/// The retarget's other half: when it names a transcript the reader is NOT
+/// bound to, the bind starts at that file's INJECTION-TIME size — a transcript
+/// that already existed at injection (the `claude --resume` shape: this run
+/// appends to earlier-run history) must not have its pre-injection prefix
+/// forwarded, only the bytes written after the snapshot. Paired with
+/// [`stream_json_reader_retarget_same_path_does_not_duplicate`], which pins
+/// the same-path no-op.
+#[test]
+fn stream_json_reader_retarget_binds_from_snapshot_offset() {
+    let dir = TempDir::new().unwrap();
+    let projects_dir = dir.path().join("projects").join("shared-cwd");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+    let identity_path = dir.path().join("no-such-identity.json");
+
+    // Our transcript predates the injection: it carries earlier-run history
+    // that must stay out of this run's output.
+    let ours_path = projects_dir.join("ours-session.jsonl");
+    write_jsonl(
+        &ours_path,
+        &[assistant_event(
+            "h1",
+            "PRE-SNAPSHOT HISTORY MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+
+    let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+
+    let handle = spawn_stream_json_reader_bound_to(
+        identity_path,
+        projects_dir.clone(),
+        pre_existing,
+        writer,
+    );
+
+    // No identity ever lands. Two sibling sessions start after the injection:
+    // their two new transcripts make the new-candidate scan ambiguous, so the
+    // identity-less fallback must refuse to guess and stay silent regardless
+    // of how long the grace window runs. (Our own file, present in the
+    // snapshot, is never a fallback candidate.) Then this run appends its
+    // first event to our transcript.
+    let sibling_a = projects_dir.join("sibling-a.jsonl");
+    let sibling_b = projects_dir.join("sibling-b.jsonl");
+    write_jsonl(
+        &sibling_a,
+        &[assistant_event(
+            "a1",
+            "SIBLING-A MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+    write_jsonl(
+        &sibling_b,
+        &[assistant_event(
+            "b1",
+            "SIBLING-B MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ours_path)
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant_event("m1", "post-snapshot live chunk", 10, 5, 0, 0)
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.trim().is_empty(),
+            "reader forwarded transcript content while the candidate set was \
+             ambiguous and no identity existed — it must refuse to guess; \
+             got:\n{text}"
+        );
+    }
+
+    // Stop fires, naming our (pre-existing, grown) transcript. The retarget
+    // must bind it at its injection-time size: history skipped, this run's
+    // bytes forwarded.
+    handle.retarget(ours_path.clone());
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.contains("post-snapshot live chunk"),
+        "retarget did not forward the bytes written after the injection \
+         snapshot; got:\n{text}"
+    );
+    assert!(
+        !text.contains("PRE-SNAPSHOT HISTORY MUST NOT FORWARD"),
+        "retarget forwarded the transcript's pre-injection prefix — the bind \
+         did not start at the snapshot offset; got:\n{text}"
+    );
+    assert!(
+        !text.contains("SIBLING-A MUST NOT FORWARD")
+            && !text.contains("SIBLING-B MUST NOT FORWARD"),
+        "sibling transcript content leaked into the output; got:\n{text}"
+    );
+}
+
 // ── Conformance harness ───────────────────────────────────────────────────────
 
 /// Wire-format conformance: JSON output has every field that `claude -p` emits.
