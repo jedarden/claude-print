@@ -477,7 +477,6 @@ fn main() {
             // triggers the append.
             if env_flag("MOCK_APPEND_ON_TERM") {
                 let file = std::fs::OpenOptions::new()
-                    .write(true)
                     .append(true)
                     .open(&path)
                     .unwrap_or_else(|e| panic!("mock-claude: cannot append-open {path}: {e}"));
