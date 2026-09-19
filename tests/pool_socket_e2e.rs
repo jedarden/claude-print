@@ -1020,9 +1020,11 @@ fn serve_one_abusive_exchange(socket: &Path, abuse: Abuse) -> std::thread::JoinH
                 std::thread::sleep(Duration::from_millis(300));
             }
             Abuse::AssignmentWithoutFd => {
-                let body: &[u8] = br#"{"type":"worker_assigned","worker_id":"fake-worker",\
-                    "message":"warm","stop_fifo":"/tmp/no-such-stop.fifo","pid":424242,\
-                    "cwd":"/tmp"}"#;
+                // One line on purpose: a raw string does NOT fold `\`-newline,
+                // so the folded form shipped literal backslashes and failed the
+                // JSON parse instead of exercising the missing fd transfer —
+                // the malformation this arm exists to pin.
+                let body: &[u8] = br#"{"type":"worker_assigned","worker_id":"fake-worker","message":"warm","stop_fifo":"/tmp/no-such-stop.fifo","pid":424242,"cwd":"/tmp"}"#;
                 stream
                     .write_all(&(body.len() as u32).to_be_bytes())
                     .expect("write the assignment prefix");
