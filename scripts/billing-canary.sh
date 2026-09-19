@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # billing-canary.sh - Automated AS-4 billing-classification canary
+#
+# CLAUDE_PRINT_POOL=1 runs the canary session against a warm pool instead of
+# a stateless spawn: a `claude-print serve` daemon (pool size 1) is started on
+# a private socket in the state dir, the one-turn Haiku session acquires its
+# prewarmed worker via --pool-socket, and the daemon is torn down afterwards.
+# This proves the ADR-005 invariant that POOLED sessions bill as `cli` too —
+# the same transcript check runs either way. The default (no env) stateless
+# leg is what the systemd timer exercises daily; the pooled leg is for
+# manual/periodic verification of the pool path.
 
 set -eu
 
@@ -12,6 +21,11 @@ STATE_DIR=${CLAUDE_PRINT_BILLING_STATE_DIR:-"$STATE_HOME/claude-print/billing-ca
 RESULT_FILE="$STATE_DIR/last-result"
 WORK_DIR="$STATE_DIR/workdir"
 
+MODE=stateless
+DAEMON_PID=
+POOL_SOCKET=
+DAEMON_LOG=
+
 mkdir -p "$STATE_DIR" "$WORK_DIR"
 chmod 700 "$STATE_DIR"
 chmod 700 "$WORK_DIR"
@@ -21,6 +35,19 @@ STDERR_FILE=$(mktemp "$STATE_DIR/.stderr.XXXXXX")
 START_MARKER=$(mktemp "$STATE_DIR/.started.XXXXXX")
 CHECK_OUTPUT=
 cleanup() {
+    if [ -n "$DAEMON_PID" ]; then
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        i=0
+        while [ "$i" -lt 100 ] && kill -0 "$DAEMON_PID" 2>/dev/null; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        kill -KILL "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+    fi
+    if [ -n "$POOL_SOCKET" ]; then
+        rm -f "$POOL_SOCKET"
+    fi
     rm -f "$STDOUT_FILE" "$STDERR_FILE" "$START_MARKER"
     if [ -n "$CHECK_OUTPUT" ]; then
         rm -f "$CHECK_OUTPUT"
@@ -36,11 +63,11 @@ write_result() {
     shift
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     result_tmp=$(mktemp "$STATE_DIR/.last-result.XXXXXX")
-    printf '%s timestamp=%s %s\n' "$status" "$timestamp" "$*" > "$result_tmp"
+    printf '%s timestamp=%s mode=%s %s\n' "$status" "$timestamp" "$MODE" "$*" > "$result_tmp"
     chmod 600 "$result_tmp"
     mv -f "$result_tmp" "$RESULT_FILE"
-    printf 'CLAUDE_PRINT_BILLING_CANARY status=%s timestamp=%s %s\n' \
-        "$status" "$timestamp" "$*"
+    printf 'CLAUDE_PRINT_BILLING_CANARY status=%s timestamp=%s mode=%s %s\n' \
+        "$status" "$timestamp" "$MODE" "$*"
 }
 
 fail() {
@@ -59,10 +86,54 @@ if [ ! -x "$CHECK_BILLING" ]; then
     fail billing_check_not_executable "path=$CHECK_BILLING"
 fi
 
-printf '[INFO] Running one-turn Haiku billing canary\n'
+# Pooled leg (CLAUDE_PRINT_POOL=1): start the daemon and wait until its one
+# worker is warm — benchmarking a cold pool would test warmup, and acquiring
+# before readiness would silently fall back stateless and prove nothing about
+# the pool path. The --verbose "settled and ready" line is the readiness
+# contract the e2e suites pin; the daemon log is kept for diagnosis. The wait
+# is 0.1 s per try, 1200 tries = 120 s by default; CLAUDE_PRINT_POOL_WARMUP_
+# TRIES shortens it for hermetic tests of the failure shapes.
+if [ "${CLAUDE_PRINT_POOL:-0}" = 1 ]; then
+    MODE=pooled
+    POOL_SOCKET="$STATE_DIR/pool.sock"
+    DAEMON_LOG="$STATE_DIR/pool-daemon.log"
+    WARMUP_TRIES=${CLAUDE_PRINT_POOL_WARMUP_TRIES:-1200}
+    printf '[INFO] Starting warm-pool daemon (pool size 1)\n'
+    (cd "$WORK_DIR" && exec "$CLAUDE_PRINT_BIN" serve \
+        --pool-size 1 --socket "$POOL_SOCKET" --verbose) >"$DAEMON_LOG" 2>&1 &
+    DAEMON_PID=$!
+    warm=0
+    i=0
+    while [ "$i" -lt "$WARMUP_TRIES" ]; do
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            sed -n '1,20p' "$DAEMON_LOG" >&2
+            fail pool_daemon_exited "pid=$DAEMON_PID"
+        fi
+        settled=$(grep -c 'settled and ready' "$DAEMON_LOG" 2>/dev/null || true)
+        if [ "${settled:-0}" -ge 1 ]; then
+            warm=1
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ "$warm" != 1 ]; then
+        sed -n '1,20p' "$DAEMON_LOG" >&2
+        fail pool_daemon_warmup_timeout "pid=$DAEMON_PID"
+    fi
+fi
+
+printf '[INFO] Running one-turn Haiku billing canary (mode=%s)\n' "$MODE"
+POOL_ARGS=()
+if [ -n "$POOL_SOCKET" ]; then
+    POOL_ARGS=(--pool-socket "$POOL_SOCKET")
+fi
+# ${POOL_ARGS[@]+...} keeps the empty-array expansion legal under `set -u` on
+# bash < 4.4 (the daily timer runs the stateless leg, where POOL_ARGS is empty).
 if (
     cd "$WORK_DIR"
     "$CLAUDE_PRINT_BIN" \
+        ${POOL_ARGS[@]+"${POOL_ARGS[@]}"} \
         --model haiku \
         --max-turns 1 \
         --timeout 300 \
@@ -74,7 +145,7 @@ if (
 else
     invocation_status=$?
     sed -n '1,20p' "$STDERR_FILE" >&2
-    fail invocation_failed "exit_code=$invocation_status"
+    fail invocation_failed "exit_code=$invocation_status" "mode=$MODE"
 fi
 
 SESSION_ID=
