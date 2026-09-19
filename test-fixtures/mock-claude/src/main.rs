@@ -133,6 +133,17 @@ fn main() {
     // the firing loop near the end of main for the exact payload shapes.
     let mock_extra_stops: u64 = env_u64("MOCK_EXTRA_STOPS", 0);
 
+    // MOCK_ECHO_PROMPT=1 (claudepr-29abb756): answer with the prompt that was
+    // actually injected instead of MOCK_RESPONSE. The pool isolation tests
+    // need prompt cross-contamination to be OBSERVABLE: with the knob set each
+    // driven session's answer is the exact text between the bracketed-paste
+    // markers, so a caller that somehow received another caller's prompt —
+    // across sequential drives or concurrent pooled workers — emits the wrong
+    // words and fails the isolation assertion instead of passing silently.
+    // Empty when no complete envelope arrived (legacy direct-spawn mode never
+    // injects one); the knob is only meaningful in claude-print-driven mode.
+    let echo_prompt = env_flag("MOCK_ECHO_PROMPT");
+
     // MOCK_IGNORE_TERM_HUP: survive the daemon's teardown instead of ending at
     // the first signal or terminal hangup. Installs SIG_IGN for SIGTERM (what
     // pool teardown sends the worker's whole process group) and SIGHUP (what
@@ -286,9 +297,21 @@ fn main() {
     //
     // Skipped under MOCK_STOP_BEFORE_INJECT (the deliberate EC-7 negative case)
     // and in legacy direct-spawn mode (no claude-print sequencer injects a prompt).
-    if driven_by_claude_print && !mock_stop_before_inject {
-        wait_for_prompt();
-    }
+    let injected_prompt = if driven_by_claude_print && !mock_stop_before_inject {
+        wait_for_prompt()
+    } else {
+        String::new()
+    };
+
+    // MOCK_ECHO_PROMPT (see its parsing above): the injected prompt IS the
+    // answer. Shadowed here — every consumer of the response (the
+    // last_assistant_message in the Stop payload, the transcript's assistant
+    // text) sits below this point.
+    let mock_response = if echo_prompt {
+        injected_prompt
+    } else {
+        mock_response
+    };
 
     // MOCK_IGNORE_TERM_HUP (see its installation above): the prompt wait just
     // ended — for a pool worker only the teardown's master close ends it — so
@@ -713,37 +736,55 @@ fn dismiss_trust_dialog() {
     }
 }
 
-/// Block until claude-print injects the prompt via bracketed paste (bf-5206).
+/// Block until claude-print injects the prompt via bracketed paste (bf-5206),
+/// returning the injected prompt text.
 ///
 /// See the call site for why this gating is required. Reads stdin until the
-/// bracketed-paste close marker `ESC[201~` is observed, then returns. EOF or a
-/// read error returns immediately (defensive: there is nothing to wait for if
-/// stdin is closed or not a TTY).
-fn wait_for_prompt() {
+/// bracketed-paste close marker `ESC[201~` is observed, then returns the bytes
+/// between the open marker `ESC[200~` and that close marker as lossy UTF-8 —
+/// the prompt exactly as claude-print delivered it. The trust-dialog dismissal
+/// keys arrive before the envelope, so they never leak into the capture; the
+/// trailing `CR` sits outside the close marker, so it never leaks in either.
+/// EOF or a read error without a complete envelope returns an empty string
+/// (defensive: there is nothing to wait for if stdin is closed or not a TTY).
+///
+/// The capture is capped: a writer past the cap still unblocks at the close
+/// marker, but cannot pin unbounded fixture memory.
+fn wait_for_prompt() -> String {
     use std::io::Read;
-    // Bracketed-paste close marker. Its presence on stdin means claude-print has
-    // delivered the prompt.
+    // Bracketed-paste markers. The close marker's presence on stdin means
+    // claude-print has delivered the prompt; the text between the two is the
+    // prompt itself (MOCK_ECHO_PROMPT).
+    const PASTE_OPEN: &[u8] = b"\x1b[200~";
     const PASTE_CLOSE: &[u8] = b"\x1b[201~";
+    const CAP: usize = 1 << 20;
 
     let stdin = std::io::stdin();
     let mut handle = stdin.lock();
     let mut buf = [0u8; 256];
-    // Sliding window of recently-read bytes, capped so a marker split across two
-    // reads is still matched without unbounded growth.
-    let mut tail: Vec<u8> = Vec::with_capacity(PASTE_CLOSE.len() * 4);
+    // Everything read so far, capped. Small by construction (one prompt per
+    // session), so a full-buffer marker scan per read stays trivial.
+    let mut all: Vec<u8> = Vec::with_capacity(PASTE_CLOSE.len() * 4);
+    let mut open_at: Option<usize> = None;
     loop {
         match handle.read(&mut buf) {
-            Ok(0) | Err(_) => return, // EOF / unreadable stdin: nothing to wait for.
+            Ok(0) | Err(_) => return String::new(), // EOF: envelope never completed.
             Ok(n) => {
-                tail.extend_from_slice(&buf[..n]);
-                if tail.windows(PASTE_CLOSE.len()).any(|w| w == PASTE_CLOSE) {
-                    return;
+                if all.len() < CAP {
+                    all.extend_from_slice(&buf[..n]);
                 }
-                // Keep only enough trailing bytes to detect a marker spanning a
-                // chunk boundary on the next read.
-                if tail.len() > PASTE_CLOSE.len() * 2 {
-                    let drain = tail.len() - PASTE_CLOSE.len() * 2;
-                    tail.drain(..drain);
+                if open_at.is_none() {
+                    open_at = all.windows(PASTE_OPEN.len()).position(|w| w == PASTE_OPEN);
+                }
+                if let Some(open) = open_at {
+                    let body_from = open + PASTE_OPEN.len();
+                    if let Some(rel) = all[body_from..]
+                        .windows(PASTE_CLOSE.len())
+                        .position(|w| w == PASTE_CLOSE)
+                    {
+                        return String::from_utf8_lossy(&all[body_from..body_from + rel])
+                            .into_owned();
+                    }
                 }
             }
         }

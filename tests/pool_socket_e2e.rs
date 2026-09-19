@@ -30,6 +30,22 @@
 //!     `assignment_without_fd_transfer_fails_safely_within_the_caller_timeout`:
 //!     reachable-but-broken daemons exit 2 with the protocol-failure diagnostic
 //!     and never fall back, well inside the `--timeout` budget.
+//!   * **concurrent acquisition and pool exhaustion** (claudepr-29abb756) —
+//!     `concurrent_clients_exhaust_the_pool_and_the_surplus_caller_falls_back_statelessly`:
+//!     two simultaneous callers take a `--pool-size 2` daemon's only two
+//!     workers; a third caller arriving mid-exhaustion is answered `pool_full`
+//!     and falls back statelessly behind exactly one verbose diagnostic; both
+//!     pooled callers drive distinct workers and neither sees the other's
+//!     prompt (`MOCK_ECHO_PROMPT` makes the injected prompt the answer).
+//!   * **a released worker is never reused; sequential requests never cross** —
+//!     `a_released_worker_is_never_reused_and_sequential_prompts_stay_isolated`:
+//!     three callers with distinct prompts; each released worker's id is
+//!     assigned exactly once, its process is gone before the next caller runs,
+//!     a raw re-release of the id is refused `invalid_worker_id` at the wire,
+//!     every caller's output carries only its own prompt/session/transcript,
+//!     and the daemon's descriptors return to their at-rest count after every
+//!     completed cycle (children, PTY masters, and the socket file are gone at
+//!     clean shutdown).
 //!
 //! Every pooled run proves it really drove a prewarmed worker (not a quiet
 //! stateless fallback) via the `driving prewarmed worker` verbose trace, which
@@ -188,9 +204,16 @@ impl Fixture {
     /// the fixture's HOME, plus extra environment (forwarded by the daemon's
     /// `build_child_env` to every mock-claude worker it spawns).
     fn daemon(&self, extra_env: &[(&str, &str)]) -> Daemon {
+        self.daemon_sized(1, extra_env)
+    }
+
+    /// The same, with an explicit pool size — the concurrent-acquisition
+    /// coverage needs a pool that more callers can exhaust.
+    fn daemon_sized(&self, pool_size: usize, extra_env: &[(&str, &str)]) -> Daemon {
         Daemon::start(
             &self.socket,
             self.home.path().to_str().expect("utf-8 home"),
+            pool_size,
             extra_env,
         )
     }
@@ -210,14 +233,14 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start(socket: &Path, home: &str, extra_env: &[(&str, &str)]) -> Daemon {
+    fn start(socket: &Path, home: &str, pool_size: usize, extra_env: &[(&str, &str)]) -> Daemon {
         let bin = workspace_bin("claude-print");
         let mock = workspace_bin("mock-claude");
         let mut cmd = Command::new(&bin);
         cmd.arg("--claude-binary")
             .arg(&mock)
             .arg("serve")
-            .args(["--pool-size", "1"])
+            .args(["--pool-size", &pool_size.to_string()])
             .arg("--socket")
             .arg(socket)
             .arg("--verbose")
@@ -415,6 +438,51 @@ fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
         .count()
 }
 
+/// Count EVERY descriptor the daemon holds open. The generic counterpart to
+/// [`daemon_pty_fd_count`]: a leaked pipe (a warmup that never ended), an
+/// accepted pool-socket connection nobody closed, or an unreaped worker's
+/// descriptors all grow this number across warm/replace cycles, while a clean
+/// daemon returns to its at-rest count after every one of them.
+fn daemon_fd_count(daemon_pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{daemon_pid}/fd"))
+        .unwrap_or_else(|e| panic!("read /proc/{daemon_pid}/fd: {e}"))
+        .filter_map(|e| e.ok())
+        .count()
+}
+
+/// Sample the daemon's fd count a few times and take the minimum — an at-rest
+/// reading. A sample taken the instant "settled and ready" prints can still
+/// carry the finishing warmup thread's self-pipe; the minimum over three
+/// samples 200 ms apart is the count a clean daemon comes back to.
+fn at_rest_fd_count(daemon_pid: u32) -> usize {
+    let mut floor = usize::MAX;
+    for _ in 0..3 {
+        floor = floor.min(daemon_fd_count(daemon_pid));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    floor
+}
+
+/// Poll until the daemon's total fd count is back at or under `baseline`.
+/// `baseline` is an at-rest count taken before any client ran, so a count
+/// that will not come back down is a descriptor from a completed cycle that
+/// the daemon leaked and will leak again on every future one.
+fn wait_fds_back_to_baseline(daemon_pid: u32, baseline: usize, grace: Duration) {
+    let start = Instant::now();
+    loop {
+        let count = daemon_fd_count(daemon_pid);
+        if count <= baseline {
+            return;
+        }
+        assert!(
+            start.elapsed() < grace,
+            "daemon fd count must return to its at-rest {baseline} after a \
+             completed cycle; stuck at {count} — a descriptor leaked"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Extract the (worker id, worker pid) a pooled drive traced. The trace only
 /// exists on the pooled path, so finding it doubles as the proof the
 /// invocation drove a prewarmed worker rather than falling back statelessly.
@@ -481,6 +549,32 @@ fn result_event_count(stream: &str) -> usize {
             )
         })
         .count()
+}
+
+/// Speak one length-prefixed pool-protocol request directly to the daemon and
+/// return its decoded reply. A test-side raw client: the happy-path tests
+/// drive the compiled CLI, but "a released worker id is out of the pool" is a
+/// daemon-ledger property the CLI never surfaces — it discards release
+/// replies — so it is pinned at the wire itself.
+fn raw_exchange(socket: &Path, request: serde_json::Value) -> serde_json::Value {
+    use std::io::{Read, Write};
+
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket).expect("connect to the pool socket");
+    let body = serde_json::to_vec(&request).expect("serialize request");
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .expect("write the request length prefix");
+    stream.write_all(&body).expect("write the request body");
+
+    let mut prefix = [0u8; 4];
+    stream
+        .read_exact(&mut prefix)
+        .expect("read the reply length prefix");
+    let len = u32::from_be_bytes(prefix) as usize;
+    let mut reply = vec![0u8; len];
+    stream.read_exact(&mut reply).expect("read the reply body");
+    serde_json::from_slice(&reply).expect("the reply must be valid JSON")
 }
 
 // ── Bullet 1: text / json / stream-json over an acquired worker ─────────────
@@ -1103,4 +1197,497 @@ fn daemon_wrong_shape_response_fails_safely_within_the_caller_timeout() {
 fn assignment_without_fd_transfer_fails_safely_within_the_caller_timeout() {
     let fx = Fixture::start();
     assert_malformed_daemon_fails_safely(&fx, Abuse::AssignmentWithoutFd, "assignment without fd");
+}
+
+// ── Bullet 4: concurrent acquisition, exhaustion, and released-worker reuse ──
+
+/// Two clients acquire a `--pool-size 2` daemon's only two workers
+/// CONCURRENTLY; a third caller arriving while the pool is exhausted is
+/// answered `pool_full` and falls back statelessly behind exactly one verbose
+/// diagnostic; the two pooled callers drive distinct workers and neither sees
+/// the other's prompt.
+///
+/// Determinism: `MOCK_DELAY_STOP` holds each driven worker's Stop payload for
+/// 8 s, so once the daemon ledger shows both assignments the exhaustion window
+/// is ~8 s wide while the surplus caller's whole stateless run takes ~1 s —
+/// its `pool_full` answer is not a race outcome. Both assignments are awaited
+/// on the ledger BEFORE the surplus caller connects, so its acquire cannot
+/// precede an assignment, and its fallback cannot itself be the reason the
+/// pool had nothing ready.
+///
+/// `MOCK_ECHO_PROMPT` makes each worker answer with the prompt it was actually
+/// injected (the stateless surplus caller, whose own env carries no MOCK_*
+/// knobs, keeps the default response) — so prompt isolation between concurrent
+/// callers is asserted, not assumed, and any leak of the daemon's worker
+/// environment into the fallback path is visible as a wrong answer.
+#[test]
+fn concurrent_clients_exhaust_the_pool_and_the_surplus_caller_falls_back_statelessly() {
+    let fx = Fixture::start();
+    let mut daemon = fx.daemon_sized(
+        2,
+        &[
+            ("MOCK_UNIQUE_SESSION_ID", "1"),
+            ("MOCK_ECHO_PROMPT", "1"),
+            ("MOCK_DELAY_STOP", "8000"),
+        ],
+    );
+    daemon.wait_for("settled and ready", 2, WARMUP);
+    let daemon_pid = daemon.child.id();
+
+    // The at-rest descriptor count BEFORE any client ran: the floor every
+    // completed cycle must return to.
+    let baseline_fds = at_rest_fd_count(daemon_pid);
+
+    let alpha = "pool alpha prompt";
+    let beta = "pool beta prompt";
+    let mut driven: Option<((String, u32), (String, u32))> = None;
+
+    std::thread::scope(|scope| {
+        let alpha_run = scope.spawn(|| {
+            let mut cmd = fx.client();
+            cmd.arg("--pool-socket")
+                .arg(&fx.socket)
+                .arg("--verbose")
+                .args(["--timeout", "90"])
+                .arg(alpha);
+            run(&mut cmd, POOLED_BUDGET)
+        });
+        let beta_run = scope.spawn(|| {
+            let mut cmd = fx.client();
+            cmd.arg("--pool-socket")
+                .arg(&fx.socket)
+                .arg("--verbose")
+                .args(["--timeout", "90", "--output-format", "json"])
+                .arg(beta);
+            run(&mut cmd, POOLED_BUDGET)
+        });
+
+        // Both workers handed out: the pool is exhausted by construction.
+        daemon.wait_for("Assigned worker", 2, REPLACE);
+
+        // ── the surplus caller: pool_full → one diagnostic → stateless run ──
+        let mut cmd = fx.client();
+        cmd.arg("--pool-socket")
+            .arg(&fx.socket)
+            .arg("--verbose")
+            .args(["--timeout", "60"])
+            .arg("surplus pool prompt");
+        let surplus = run(&mut cmd, FAST_BUDGET);
+
+        assert_eq!(
+            surplus.code,
+            Some(0),
+            "the surplus caller must still succeed, statelessly\nstdout:\n{}\nstderr:\n{}",
+            surplus.stdout,
+            surplus.stderr
+        );
+        assert!(
+            surplus.stdout.contains("Hello from mock_claude"),
+            "the surplus caller must answer from its own stateless mock — the \
+             pool daemon's MOCK_* environment must not leak into the fallback \
+             (the echoed surplus prompt would prove it did)\nstdout:\n{}",
+            surplus.stdout
+        );
+        let pool_lines: Vec<&str> = surplus
+            .stderr
+            .lines()
+            .filter(|l| l.contains("pool:"))
+            .collect();
+        assert_eq!(
+            pool_lines.len(),
+            1,
+            "exactly one verbose diagnostic for the exhausted pool\nstderr:\n{}",
+            surplus.stderr
+        );
+        assert!(
+            pool_lines[0].contains("pool cannot serve")
+                && pool_lines[0].contains("pool_full")
+                && pool_lines[0].contains("falling back"),
+            "the diagnostic must name the exhaustion and the fallback: {}",
+            pool_lines[0]
+        );
+        assert!(
+            !surplus.stderr.contains("driving prewarmed worker"),
+            "the surplus caller must not claim a pooled worker\nstderr:\n{}",
+            surplus.stderr
+        );
+        // The exhaustion answer is the whole documented behavior: no third
+        // assignment may exist for the surplus caller, however briefly.
+        assert_eq!(
+            daemon
+                .stderr()
+                .iter()
+                .filter(|l| l.contains("Assigned worker"))
+                .count(),
+            2,
+            "an exhausted pool must not grow a third assignment; stderr: {:?}",
+            daemon.stderr()
+        );
+
+        // ── the two pooled callers: distinct workers, isolated answers ──────
+        let out_alpha = alpha_run.join().expect("alpha runner thread");
+        let out_beta = beta_run.join().expect("beta runner thread");
+
+        assert_eq!(
+            out_alpha.code,
+            Some(0),
+            "the alpha caller must succeed\nstdout:\n{}\nstderr:\n{}",
+            out_alpha.stdout,
+            out_alpha.stderr
+        );
+        assert!(
+            out_alpha.stderr.contains("driving prewarmed worker"),
+            "the alpha caller must drive a prewarmed worker\nstderr:\n{}",
+            out_alpha.stderr
+        );
+        assert!(
+            out_alpha.stdout.contains(alpha),
+            "the alpha caller's answer must echo its own prompt\nstdout:\n{}",
+            out_alpha.stdout
+        );
+        assert!(
+            !out_alpha.stdout.contains(beta),
+            "the alpha caller must not see the beta caller's prompt\nstdout:\n{}",
+            out_alpha.stdout
+        );
+        let a = driven_worker(&out_alpha.stderr);
+
+        assert_eq!(
+            out_beta.code,
+            Some(0),
+            "the beta caller must succeed\nstdout:\n{}\nstderr:\n{}",
+            out_beta.stdout,
+            out_beta.stderr
+        );
+        assert!(
+            out_beta.stderr.contains("driving prewarmed worker"),
+            "the beta caller must drive a prewarmed worker\nstderr:\n{}",
+            out_beta.stderr
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(out_beta.stdout.trim()).unwrap_or_else(|e| {
+                panic!(
+                    "beta stdout is not valid JSON: {e}\nraw:\n{}",
+                    out_beta.stdout
+                )
+            });
+        let text = v["result"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the beta result must be a string: {v}"));
+        assert!(
+            text.contains(beta),
+            "the beta caller's answer must echo its own prompt, got: {text:?}"
+        );
+        assert!(
+            !text.contains(alpha),
+            "the beta caller must not see the alpha caller's prompt: {text:?}"
+        );
+        let sess_beta = v["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the beta result must carry a session id: {v}"));
+        assert!(
+            sess_beta.starts_with("mock-session-pid-"),
+            "the beta caller must answer from its own worker's unique session, \
+             got {sess_beta:?}"
+        );
+        let b = driven_worker(&out_beta.stderr);
+
+        assert_ne!(
+            a.0, b.0,
+            "concurrent callers must drive distinct worker ids"
+        );
+        assert_ne!(
+            a.1, b.1,
+            "concurrent callers must drive distinct worker processes"
+        );
+        driven = Some((a, b));
+    });
+
+    let (a, b) = driven.expect("both pooled callers must have been driven");
+
+    // ── replacement after the completed handoffs, and cleanup at rest ───────
+    daemon.wait_for("Released worker", 2, LEDGER);
+    assert_pid_gone(a.1, Duration::from_secs(10));
+    assert_pid_gone(b.1, Duration::from_secs(10));
+    daemon.wait_for("Spawning worker", 4, REPLACE);
+    daemon.wait_for("settled and ready", 4, WARMUP);
+
+    // Ledger: exactly two assignments — each id exactly once, never re-issued
+    // — and exactly two teardowns. Teardowns are counted via "Destroying
+    // worker", which only a real destroy prints: the daemon's "Released
+    // worker" line also fires for a REFUSED release (it logs after the
+    // attempt, success or not), so it is not a ledger of actual releases.
+    let ledger = daemon.stderr();
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|l| l.contains("Assigned worker"))
+            .count(),
+        2,
+        "exactly two workers may be handed out in total; stderr: {ledger:?}"
+    );
+    for id in [&a.0, &b.0] {
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|l| l.contains(&format!("Assigned worker {id}")))
+                .count(),
+            1,
+            "worker {id} must be assigned exactly once — never re-issued; stderr: {ledger:?}"
+        );
+    }
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|l| l.contains("Destroying worker"))
+            .count(),
+        2,
+        "each released worker must be torn down exactly once; stderr: {ledger:?}"
+    );
+    for id in [&a.0, &b.0] {
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|l| l.contains(&format!("Destroying worker {id} (pid ")))
+                .count(),
+            1,
+            "worker {id} must be destroyed exactly once; stderr: {ledger:?}"
+        );
+    }
+
+    // At rest the daemon holds exactly one PTY master per pool slot...
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        daemon_pty_fd_count(daemon_pid),
+        2,
+        "the daemon must hold exactly one PTY master per pool worker at rest"
+    );
+    // ...and nothing else: the total descriptor count is back at the
+    // pre-client at-rest floor.
+    wait_fds_back_to_baseline(daemon_pid, baseline_fds, Duration::from_secs(10));
+
+    // Clean shutdown with a full pool: both workers reaped, exit 0, socket
+    // file removed.
+    daemon.terminate(2);
+}
+
+/// Sequential callers against a pool-size-1 daemon: a released worker is never
+/// reused — never re-issued per the ledger, never again a live process, and
+/// refused `invalid_worker_id` at the wire after its release — and no caller's
+/// prompt, session, transcript, or answer reaches any later caller.
+///
+/// `MOCK_ECHO_PROMPT` is what turns this into assertions rather than hopes:
+/// each worker answers with the exact prompt it was injected, so cross-caller
+/// contamination of prompts AND results is visible as the wrong words in the
+/// output. `MOCK_UNIQUE_SESSION_ID` makes every worker mint a pid-derived
+/// session id and transcript file, so transcript-path isolation is visible as
+/// distinct sessions and, for the stream-json caller, as a stream carrying
+/// exactly its own result event.
+#[test]
+fn a_released_worker_is_never_reused_and_sequential_prompts_stay_isolated() {
+    let fx = Fixture::start();
+    let mut daemon = fx.daemon(&[("MOCK_UNIQUE_SESSION_ID", "1"), ("MOCK_ECHO_PROMPT", "1")]);
+    daemon.wait_for("settled and ready", 1, WARMUP);
+    let daemon_pid = daemon.child.id();
+    let baseline_fds = at_rest_fd_count(daemon_pid);
+
+    let p1 = "sequential prompt one alpha";
+    let p2 = "sequential prompt two beta";
+    let p3 = "sequential prompt three gamma";
+
+    // ── caller 1: text ──────────────────────────────────────────────────────
+    let mut cmd = fx.client();
+    cmd.arg("--pool-socket")
+        .arg(&fx.socket)
+        .arg("--verbose")
+        .arg(p1);
+    let out1 = run(&mut cmd, POOLED_BUDGET);
+    assert_eq!(
+        out1.code,
+        Some(0),
+        "caller 1 must succeed\nstdout:\n{}\nstderr:\n{}",
+        out1.stdout,
+        out1.stderr
+    );
+    assert!(
+        out1.stdout.contains(p1),
+        "caller 1's answer must echo its own prompt\nstdout:\n{}",
+        out1.stdout
+    );
+    let (id1, pid1) = driven_worker(&out1.stderr);
+
+    // Released: the process is reaped before the reply is even answered, so
+    // once the pid is gone the worker can never receive a second prompt.
+    daemon.wait_for("Released worker", 1, LEDGER);
+    assert_pid_gone(pid1, Duration::from_secs(10));
+
+    // And the id is out of the pool at the wire: a raw re-release is refused
+    // as unknown — the released worker can neither be handed out again nor
+    // released again. (The CLI discards release replies, so this ledger
+    // property is only observable with a raw protocol client.)
+    let reply = raw_exchange(
+        &fx.socket,
+        serde_json::json!({"type": "release", "worker_id": id1}),
+    );
+    assert_eq!(
+        reply["type"], "error",
+        "a released id must be refused, not re-released: {reply}"
+    );
+    assert_eq!(
+        reply["code"], "invalid_worker_id",
+        "a released id must be refused as unknown, not reusable: {reply}"
+    );
+
+    // Replacement warm; the daemon's descriptors back at their at-rest floor.
+    daemon.wait_for("settled and ready", 2, WARMUP);
+    wait_fds_back_to_baseline(daemon_pid, baseline_fds, Duration::from_secs(10));
+
+    // ── caller 2: json ──────────────────────────────────────────────────────
+    let mut cmd = fx.client();
+    cmd.arg("--pool-socket")
+        .arg(&fx.socket)
+        .arg("--verbose")
+        .args(["--output-format", "json"])
+        .arg(p2);
+    let out2 = run(&mut cmd, POOLED_BUDGET);
+    assert_eq!(
+        out2.code,
+        Some(0),
+        "caller 2 must succeed\nstdout:\n{}\nstderr:\n{}",
+        out2.stdout,
+        out2.stderr
+    );
+    let v2: serde_json::Value = serde_json::from_str(out2.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "caller 2 stdout is not valid JSON: {e}\nraw:\n{}",
+            out2.stdout
+        )
+    });
+    let text2 = v2["result"]
+        .as_str()
+        .unwrap_or_else(|| panic!("caller 2's result must be a string: {v2}"));
+    assert!(
+        text2.contains(p2) && !text2.contains(p1) && !text2.contains(p3),
+        "caller 2's result must carry its own prompt and no earlier caller's, \
+         got: {text2:?}"
+    );
+    let sess2 = v2["session_id"]
+        .as_str()
+        .expect("caller 2's result must carry a session id")
+        .to_string();
+    assert!(
+        sess2.starts_with("mock-session-pid-"),
+        "caller 2 must answer from its own worker's unique transcript, got {sess2:?}"
+    );
+    let (id2, pid2) = driven_worker(&out2.stderr);
+
+    daemon.wait_for("Released worker", 2, LEDGER);
+    daemon.wait_for("Spawning worker", 3, REPLACE);
+    daemon.wait_for("settled and ready", 3, WARMUP);
+    assert_pid_gone(pid2, Duration::from_secs(10));
+    wait_fds_back_to_baseline(daemon_pid, baseline_fds, Duration::from_secs(10));
+
+    // ── caller 3: stream-json, third caller deep ────────────────────────────
+    let mut cmd = fx.client();
+    cmd.arg("--pool-socket")
+        .arg(&fx.socket)
+        .arg("--verbose")
+        .args(["--output-format", "stream-json"])
+        .arg(p3);
+    let out3 = run(&mut cmd, POOLED_BUDGET);
+    assert_eq!(
+        out3.code,
+        Some(0),
+        "caller 3 must succeed\nstdout:\n{}\nstderr:\n{}",
+        out3.stdout,
+        out3.stderr
+    );
+    let sess3 = result_session_id(&out3.stdout)
+        .unwrap_or_else(|| panic!("caller 3 must forward a result event\nstdout: {out3:?}"));
+    assert_ne!(
+        sess2, sess3,
+        "caller 3 must answer from its own worker's transcript, not caller 2's"
+    );
+    assert_eq!(
+        result_event_count(&out3.stdout),
+        1,
+        "caller 3's stream must carry exactly its own result event\nstdout:\n{}",
+        out3.stdout
+    );
+    assert!(
+        out3.stdout.contains(p3),
+        "caller 3's stream must carry its own prompt's answer\nstdout:\n{}",
+        out3.stdout
+    );
+    assert!(
+        !out3.stdout.contains(p1) && !out3.stdout.contains(p2),
+        "caller 3's stream must carry no earlier caller's prompt or transcript \
+         events\nstdout:\n{}",
+        out3.stdout
+    );
+    let (id3, pid3) = driven_worker(&out3.stderr);
+
+    daemon.wait_for("Released worker", 3, LEDGER);
+    daemon.wait_for("Spawning worker", 4, REPLACE);
+    daemon.wait_for("settled and ready", 4, WARMUP);
+    assert_pid_gone(pid3, Duration::from_secs(10));
+    wait_fds_back_to_baseline(daemon_pid, baseline_fds, Duration::from_secs(10));
+
+    // ── the never-reused ledger, in full ────────────────────────────────────
+    let ledger = daemon.stderr();
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|l| l.contains("Assigned worker"))
+            .count(),
+        3,
+        "exactly three workers may be handed out; stderr: {ledger:?}"
+    );
+    for id in [&id1, &id2, &id3] {
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|l| l.contains(&format!("Assigned worker {id}")))
+                .count(),
+            1,
+            "worker {id} must be assigned exactly once — never re-issued for a \
+             second prompt; stderr: {ledger:?}"
+        );
+    }
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|l| l.contains("Destroying worker"))
+            .count(),
+        3,
+        "each released worker must be torn down exactly once (counted via \
+         'Destroying worker' — the daemon's 'Released worker' line also fires \
+         for a refused release); stderr: {ledger:?}"
+    );
+    for id in [&id1, &id2, &id3] {
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|l| l.contains(&format!("Destroying worker {id} (pid ")))
+                .count(),
+            1,
+            "worker {id} must be destroyed exactly once; stderr: {ledger:?}"
+        );
+    }
+    assert_ne!(id1, id2, "worker id reused across callers 1 and 2");
+    assert_ne!(id2, id3, "worker id reused across callers 2 and 3");
+    assert_ne!(id1, id3, "worker id reused across callers 1 and 3");
+    assert_ne!(pid1, pid2, "worker pid reused across callers 1 and 2");
+    assert_ne!(pid2, pid3, "worker pid reused across callers 2 and 3");
+    assert_ne!(pid1, pid3, "worker pid reused across callers 1 and 3");
+
+    // At rest: one PTY master (the replacement), then a clean shutdown — the
+    // held worker reaped, exit 0, socket file removed.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        daemon_pty_fd_count(daemon_pid),
+        1,
+        "the daemon must hold exactly one PTY master at rest"
+    );
+    daemon.terminate(1);
 }
