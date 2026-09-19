@@ -399,6 +399,40 @@ fn main() {
         "{{\"hook_event_name\":\"Stop\"{session_id_part}{transcript_path_part}{cwd_part}{last_msg_part}{unknown_fields_part}}}\n"
     );
 
+    // claudepr-a927ec0c: emulate the UserPromptSubmit hook real claude fires at
+    // prompt submission. claude-print installs a relay hook (--settings=) that
+    // cats this payload into `session-identity.json` beside stop.fifo, giving
+    // the stream-json reader an exact per-drive binding BEFORE any assistant
+    // event exists — under same-cwd concurrency the discovery fallback cannot
+    // tell this session's transcript from a sibling's, so identity is what the
+    // reader binds to. Same omit knobs as the Stop payload above, so every
+    // sparse shape is expressible on both; a field omitted here is one the
+    // reader must not rely on for binding either. Gated like wait_for_prompt:
+    // no prompt was ever submitted in the MOCK_STOP_BEFORE_INJECT case, and
+    // legacy direct-spawn mode has no claude-print settings dir to write into.
+    // Timed just before the Stop write: the reader must never see transcript
+    // content before identity, and the transcript JSONL below lands after Stop
+    // (later still with MOCK_DELAY_JSONL), so this ordering preserves that
+    // invariant on every scenario.
+    if driven_by_claude_print && !mock_stop_before_inject {
+        let identity_payload = format!(
+            "{{\"hook_event_name\":\"UserPromptSubmit\"{session_id_part}{transcript_path_part}{cwd_part}}}\n"
+        );
+        if let Some(settings_path) = &settings_arg {
+            if let Some(settings_dir) = std::path::Path::new(settings_path).parent() {
+                let identity_file = settings_dir.join("session-identity.json");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&identity_file)
+                {
+                    let _ = file.write_all(identity_payload.as_bytes());
+                }
+            }
+        }
+    }
+
     // O_WRONLY on a FIFO blocks until a reader opens the other end.
     if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&fifo_path) {
         let _ = file.write_all(payload.as_bytes());

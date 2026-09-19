@@ -121,11 +121,26 @@ where
     }
 }
 
+/// Name of the per-drive session-identity file the UserPromptSubmit relay hook
+/// writes, sibling of `stop.fifo` in the drive's temp dir.
+///
+/// The stream-json reader binds to the transcript this file names (bead
+/// claudepr-a927ec0c): the Stop payload carries the same fields but only
+/// arrives after the turn, far too late for live forwarding, so identity has
+/// to come from a hook that fires at prompt-submission time. Pool clients
+/// derive the path as `stop_fifo().with_file_name(SESSION_IDENTITY_FILE)` —
+/// the worker's Stop FIFO lives in the same HookInstaller dir, so the sibling
+/// relationship is part of the daemon/client contract.
+pub const SESSION_IDENTITY_FILE: &str = "session-identity.json";
+
 pub struct HookInstaller {
     pub dir: TempDir,
     pub settings_path: PathBuf,
     pub hook_path: PathBuf,
     pub fifo_path: PathBuf,
+    /// Per-drive identity file the UserPromptSubmit relay hook writes its
+    /// payload into (see [`SESSION_IDENTITY_FILE`]).
+    pub identity_path: PathBuf,
     /// Flag to track whether cleanup has already been performed.
     /// This prevents double-panic issues during cleanup.
     cleanup_performed: Arc<AtomicBool>,
@@ -141,9 +156,12 @@ impl HookInstaller {
         let settings_path = dir.path().join("settings.json");
         let hook_path = dir.path().join("hook.sh");
         let fifo_path = dir.path().join("stop.fifo");
+        let identity_path = dir.path().join(SESSION_IDENTITY_FILE);
 
+        let identity_hook_path = dir.path().join("identity.sh");
         write_hook_sh(&hook_path, &fifo_path)?;
-        write_settings_json(&settings_path, &hook_path)?;
+        write_identity_sh(&identity_hook_path, &identity_path)?;
+        write_settings_json(&settings_path, &hook_path, &identity_hook_path)?;
 
         mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)
             .map_err(|e| Error::Internal(anyhow::anyhow!("mkfifo failed: {e}")))?;
@@ -153,6 +171,7 @@ impl HookInstaller {
             settings_path,
             hook_path,
             fifo_path,
+            identity_path,
             cleanup_performed: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -221,36 +240,72 @@ impl HookInstaller {
     }
 }
 
+/// Single-quote a path for safe embedding in a POSIX shell command.
+///
+/// `'` => `'\''` — the canonical escape; the payload path is interpolated
+/// inside single quotes in the generated hook scripts, so metacharacters in
+/// the temp-dir path can never become shell syntax (bf-5sj7).
+fn shell_single_quoted(path: &Path) -> String {
+    path.to_string_lossy().replace('\'', "'\\''")
+}
+
 fn write_hook_sh(hook_path: &Path, fifo_path: &Path) -> Result<()> {
-    let fifo_str = fifo_path.to_string_lossy();
-    // Escape single quotes for shell: ' => '\''
-    // This ensures the path is safely quoted when interpolated into the shell script
-    let escaped = fifo_str.replace('\'', "'\\''");
-    let content = format!("#!/bin/sh\ncat > '{}' 2>/dev/null || true\n", escaped);
-    std::fs::write(hook_path, &content)
-        .map_err(|e| Error::Internal(anyhow::anyhow!("failed to write hook.sh: {e}")))?;
+    write_cat_script(hook_path, fifo_path, "hook.sh")
+}
+
+/// Write the identity relay script: the UserPromptSubmit hook `cat`s its
+/// stdin payload into the per-drive `session-identity.json` (truncating —
+/// a one-prompt session fires the event once; a rewritten file always
+/// describes the current session). Same shape and escaping as hook.sh.
+fn write_identity_sh(hook_path: &Path, identity_path: &Path) -> Result<()> {
+    write_cat_script(hook_path, identity_path, "identity.sh")
+}
+
+/// Shared body of the two relay scripts: `cat > '<target>'`, executable 0o750.
+fn write_cat_script(script_path: &Path, target: &Path, name: &str) -> Result<()> {
+    let content = format!(
+        "#!/bin/sh\ncat > '{}' 2>/dev/null || true\n",
+        shell_single_quoted(target)
+    );
+    std::fs::write(script_path, &content)
+        .map_err(|e| Error::Internal(anyhow::anyhow!("failed to write {name}: {e}")))?;
 
     // Make executable
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(hook_path)
-            .map_err(|e| Error::Internal(anyhow::anyhow!("stat hook.sh: {e}")))?
+        let mut perms = std::fs::metadata(script_path)
+            .map_err(|e| Error::Internal(anyhow::anyhow!("stat {name}: {e}")))?
             .permissions();
         perms.set_mode(0o750);
-        std::fs::set_permissions(hook_path, perms)
-            .map_err(|e| Error::Internal(anyhow::anyhow!("chmod hook.sh: {e}")))?;
+        std::fs::set_permissions(script_path, perms)
+            .map_err(|e| Error::Internal(anyhow::anyhow!("chmod {name}: {e}")))?;
     }
 
     Ok(())
 }
 
-fn write_settings_json(settings_path: &Path, hook_path: &Path) -> Result<()> {
+fn write_settings_json(
+    settings_path: &Path,
+    hook_path: &Path,
+    identity_hook_path: &Path,
+) -> Result<()> {
     let hook_str = hook_path.to_string_lossy();
+    let identity_str = identity_hook_path.to_string_lossy();
     let json = serde_json::json!({
         "hooks": {
             "Stop": [{
                 "hooks": [{"type": "command", "command": hook_str, "timeout": 10}]
+            }],
+            // claudepr-a927ec0c: second relay hook firing at prompt-submission
+            // time. Its payload carries the same envelope as Stop (session_id,
+            // transcript_path, cwd) but arrives BEFORE the assistant's first
+            // transcript event, giving the stream-json reader a per-drive
+            // identity to bind to instead of guessing among same-cwd
+            // transcripts by mtime. Merges alongside user hooks exactly like
+            // the Stop relay (PO-1).
+            "UserPromptSubmit": [{
+                "hooks": [{"type": "command", "command": identity_str, "timeout": 10}]
             }]
         }
     });
@@ -283,6 +338,71 @@ mod tests {
         let hooks = &stop[0]["hooks"];
         assert!(hooks.is_array());
         assert_eq!(hooks[0]["type"], "command");
+    }
+
+    // ── claudepr-a927ec0c: UserPromptSubmit identity relay hook ──────────────
+
+    /// The settings must carry a UserPromptSubmit relay pointing at
+    /// identity.sh — the per-drive identity channel the stream-json reader
+    /// binds to. A settings file that loses this hook silently regresses the
+    /// reader to mtime-guessing among same-cwd transcripts.
+    #[test]
+    fn settings_json_has_user_prompt_submit_identity_hook() {
+        let installer = HookInstaller::new().unwrap();
+        let content = std::fs::read_to_string(&installer.settings_path).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let ups = &val["hooks"]["UserPromptSubmit"];
+        assert!(ups.is_array(), "UserPromptSubmit must be an array");
+        let hook = &ups[0]["hooks"][0];
+        assert_eq!(hook["type"], "command");
+        let cmd = hook["command"].as_str().unwrap_or("");
+        assert!(
+            cmd.contains("identity.sh"),
+            "UserPromptSubmit relay must reference identity.sh, got: {cmd:?}"
+        );
+    }
+
+    /// The identity file is the session-identity.json SIBLING of stop.fifo.
+    /// Pool clients reconstruct the path from `stop_fifo()` alone, so this
+    /// layout is a daemon/client contract, not an implementation detail.
+    #[test]
+    fn identity_path_is_stop_fifo_sibling() {
+        let installer = HookInstaller::new().unwrap();
+        assert_eq!(
+            installer.identity_path.file_name().and_then(|n| n.to_str()),
+            Some(SESSION_IDENTITY_FILE)
+        );
+        assert_eq!(
+            installer.identity_path.parent(),
+            installer.fifo_path.parent(),
+            "session-identity.json must live in the same dir as stop.fifo"
+        );
+    }
+
+    /// identity.sh mirrors hook.sh: cat stdin into its target, executable,
+    /// shell-safe against metacharacters in the temp-dir path.
+    #[test]
+    fn identity_sh_is_executable_and_targets_identity_file() {
+        let installer = HookInstaller::new().unwrap();
+        let script = installer.dir_path().join("identity.sh");
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(content.starts_with("#!/bin/sh"));
+        assert!(content.contains("cat > '"));
+        let quoted = shell_single_quoted(&installer.identity_path);
+        assert!(
+            content.contains(&quoted),
+            "identity.sh must target {quoted:?}; got:\n{content}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert!(mode & 0o100 != 0, "identity.sh must be executable by owner");
+        // Syntactic validity: the script must survive sh -n even with
+        // hostile bytes in the temp-dir path.
+        let out = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .output();
+        assert!(matches!(out, Ok(ref o) if o.status.success()));
     }
 
     #[test]
