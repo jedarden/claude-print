@@ -1841,7 +1841,11 @@ impl AcquiredWorker {
         &self.worker_id
     }
 
-    /// The worker's process id (for client-side watchdog signalling).
+    /// The worker's process id. Fed to the client watchdog's deadline
+    /// machinery, which on the pool path never signals it
+    /// ([`crate::watchdog::Watchdog::without_child_signals`]): the worker is
+    /// daemon-owned, so deadline enforcement reroutes through worker release
+    /// → daemon teardown instead of a direct signal.
     pub fn pid(&self) -> nix::unistd::Pid {
         nix::unistd::Pid::from_raw(self.child_pid as i32)
     }
@@ -3882,6 +3886,54 @@ mod tests {
         assert_release_quiet(&pool, 1);
     }
 
+    /// The `?`-after-Stop route: a Stop payload that fails to parse returns
+    /// from the shared Stop tail BEFORE the explicit pre-drain release is
+    /// reached, so this is the one error exit where the release happens via
+    /// Drop after the drive already got far enough to attempt it. The
+    /// "every `?` / error return" promise needs this shape pinned separately
+    /// from the pre-Stop error returns (child exit, timeout, signal).
+    #[test]
+    fn pooled_session_stop_payload_parse_error_releases_the_worker_exactly_once() {
+        let _drive = drive_signal_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = scripted_pool(dir.path(), 1);
+
+        let worker = PoolClient::new(pool.socket.clone()).acquire(10).unwrap();
+        let assignment = pool.assignment_of(worker.worker_id());
+        let prompt_sink = Arc::new(Mutex::new(Vec::new()));
+        drive_worker(
+            pool.take_worker_side(worker.worker_id()),
+            assignment.stop_fifo.clone(),
+            // Garbage on the FIFO: the payload fires (a real Stop transition
+            // from the driver's perspective) but parse_stop_payload rejects it.
+            WorkerScript::Stop("not json at all".to_string()),
+            prompt_sink,
+        );
+
+        let err = crate::session::Session::run_pooled(
+            &version_probe_bin(),
+            worker,
+            b"prompt one".to_vec(),
+            Some(60),
+            Some(0),
+            None,
+            Some(10),
+            crate::cli::OutputFormat::Text,
+            false,
+            false,
+        )
+        .expect_err("an unparseable Stop payload is an error");
+        assert!(
+            matches!(err, crate::error::Error::Internal(ref e)
+                if e.to_string().contains("stop payload")),
+            "unexpected error: {err:?}"
+        );
+
+        // The `?` return dropped the worker → exactly one release.
+        await_release_count(&pool, 1);
+        assert_release_quiet(&pool, 1);
+    }
+
     #[test]
     fn pooled_session_sigint_releases_the_worker_exactly_once() {
         let _drive = drive_signal_lock();
@@ -3968,6 +4020,53 @@ mod tests {
 
         await_release_count(&pool, 1);
         assert_release_quiet(&pool, 1);
+    }
+
+    /// The other half of [`AcquiredWorker::release`]'s "best-effort" promise:
+    /// a dead daemon has nothing left to release, so the release attempt must
+    /// fail fast (the unreachable connect is refused immediately, never held
+    /// for the whole [`RELEASE_TIMEOUT_SECS`] budget), never panic, still
+    /// mark the worker released — and the subsequent Drop must be a silent
+    /// no-op rather than a second attempt. Every exit-path pin above runs
+    /// against a LIVE daemon; this holds the boundary where the daemon is
+    /// already gone.
+    #[test]
+    fn release_against_a_dead_daemon_is_bounded_and_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.sock");
+        // Serve only the acquire: after this one connection the listener
+        // thread ends and the listening socket closes, leaving the socket
+        // FILE naming a daemon that no longer answers.
+        fake_daemon(&path, 1, move |stream| {
+            let mut stream = stream;
+            let _ = PoolServer::read_frame(&mut stream).unwrap().unwrap();
+            let response = PoolResponse::WorkerAssigned {
+                worker_id: "w-dead".to_string(),
+                message: "Worker ready".to_string(),
+                stop_fifo: "/tmp/stop.fifo".to_string(),
+                pid: 4242,
+                cwd: "/srv/daemon".to_string(),
+            };
+            write_frame(&mut stream, &serde_json::to_vec(&response).unwrap());
+            let (_pty, probe) = stream_pair();
+            PoolServer::send_fd(&stream, probe.into_raw_fd()).unwrap();
+        });
+
+        let mut worker = PoolClient::new(path).acquire(5).unwrap();
+        assert_eq!(worker.worker_id(), "w-dead");
+        assert!(!worker.is_released());
+
+        let started = Instant::now();
+        worker.release();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a release against a dead daemon must fail fast, not burn its \
+             bounded exchange budget: took {elapsed:?}"
+        );
+        // The failed attempt still counts: Drop must never retry it.
+        assert!(worker.is_released());
+        drop(worker);
     }
 
     /// Two sequential invocations against the same pool must observe zero

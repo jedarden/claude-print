@@ -1831,6 +1831,99 @@ fn pool_socket_pooled_stream_json_tails_the_worker_transcript() {
 /// Json format over the pool: the emitted result object must be
 /// indistinguishable from the stateless path's for the same child bytes —
 /// the same `type`/`subtype`/`is_error` shape, the transcript-sourced text,
+/// Release-before-drain ordering on the integrated pooled path — the last
+/// unpinned clause of the `InvocationAcquisition::Acquired` comment ("released
+/// exactly once — explicitly after a successful drive (before the stream-json
+/// drain)"). Exactly-once and explicit-on-success are pinned elsewhere; this
+/// pins the ORDERING.
+///
+/// The discriminator is the worker's own death. The daemon is started with
+/// MOCK_APPEND_ON_TERM: its worker, after answering the prompt, holds itself
+/// alive with a SIGTERM/SIGHUP trap that appends one extra result line to the
+/// transcript and then exits. The line therefore lands on disk INSIDE the
+/// daemon's `release_worker` — after the client's release frame arrives,
+/// before the release REPLY is written (destroy_worker observes the child's
+/// exit before returning). The client's code order is release → reply →
+/// `signal_drain`, so the reader is still alive when the line appears and the
+/// drain must forward it. A client that drained first would join its reader
+/// before the release could trigger the append, and the line could never
+/// surface. Presence of `late-teardown-line` in the client's stdout is thus
+/// proof the release was sent and processed BEFORE the drain ran.
+#[test]
+fn pool_socket_pooled_release_precedes_the_stream_json_drain() {
+    use std::fs;
+    let mock = workspace_bin("mock-claude");
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("claude-print");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("config.toml"), "").unwrap();
+    let socket = dir.path().join("pool.sock");
+    let home = tempfile::tempdir().unwrap();
+
+    let mut daemon = Daemon::start_with_env(
+        &mock,
+        &socket,
+        Some("1"),
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("MOCK_APPEND_ON_TERM", "1"),
+        ],
+    );
+    daemon.wait_for("settled and ready", 1, Duration::from_secs(90));
+
+    let mut cmd = claude_print();
+    cmd.env("XDG_CONFIG_HOME", dir.path())
+        .env("HOME", home.path())
+        .arg("--pool-socket")
+        .arg(&socket)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("Reply with exactly one word: pong");
+    let out = run(&mut cmd, Duration::from_secs(120));
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "the pooled stream-json invocation must succeed\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("assistant") && out.stdout.contains("result"),
+        "the drive must have forwarded the worker transcript's events first\nstdout:\n{}",
+        out.stdout
+    );
+
+    // The ordering discriminator — see this test's doc comment.
+    assert!(
+        out.stdout.contains("late-teardown-line"),
+        "the drain must forward the line the worker appended during its \
+         teardown: proof the release was processed before the drain signal \
+         ran\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    // Ordinary pool discipline around it: exactly one assignment and one
+    // release, and the released worker's replacement warmed before shutdown.
+    daemon.wait_for("Released worker", 1, Duration::from_secs(10));
+    daemon.wait_for("Spawning worker", 2, Duration::from_secs(30));
+    daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
+    let stderr = daemon.stderr();
+    assert_eq!(
+        stderr.iter().filter(|l| l.contains("Assigned worker")).count(),
+        1,
+        "exactly one worker handed out; stderr: {stderr:?}"
+    );
+    assert_eq!(
+        stderr.iter().filter(|l| l.contains("Released worker")).count(),
+        1,
+        "exactly one release; stderr: {stderr:?}"
+    );
+    let out = daemon.terminate(&socket, 1);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+}
+
 /// and NON-ZERO usage (the discriminator: a run that fell back to the
 /// payload's `last_assistant_message` would still carry the answer text and
 /// session id, but zeroed token counts). Non-zero usage therefore proves the

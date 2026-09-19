@@ -459,6 +459,44 @@ fn main() {
                 thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
             }
             write_transcript_jsonl(&path, &mock_response, &session_id, mock_is_error);
+
+            // MOCK_APPEND_ON_TERM=1 (claudepr-61cb0f95): arm the teardown
+            // window. On SIGTERM (pool teardown's group signal) or SIGHUP
+            // (what the master close delivers first), append one extra result
+            // line to the transcript just written, then _exit — the last
+            // thing the worker does before the daemon observes its exit and
+            // replies to the release. The stream-json reader of a caller
+            // whose release reached the daemon BEFORE the drain signal must
+            // therefore forward this line; a caller that drained first joins
+            // its reader before the release can trigger the append, and the
+            // line never surfaces. That asymmetry is the release-before-drain
+            // pin. Arming happens here — after the transcript exists — so
+            // only a teardown of a fully-served worker can fire it; the
+            // hold-alive at the end of main keeps the worker from exiting on
+            // its own, so the client's release (not an early exit) is what
+            // triggers the append.
+            if env_flag("MOCK_APPEND_ON_TERM") {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap_or_else(|e| panic!("mock-claude: cannot append-open {path}: {e}"));
+                APPEND_ON_TERM_FD.store(file.into_raw_fd(), Ordering::Relaxed);
+                // SAFETY: signal(2) installs the handlers above; nothing else
+                // runs first. Raw libc rather than nix for the same reason as
+                // the SIGINT trap: this workspace member's only dependency is
+                // libc.
+                unsafe {
+                    libc::signal(
+                        libc::SIGTERM,
+                        append_on_term_handler as *const () as libc::sighandler_t,
+                    );
+                    libc::signal(
+                        libc::SIGHUP,
+                        append_on_term_handler as *const () as libc::sighandler_t,
+                    );
+                }
+            }
         }
     }
 
@@ -498,6 +536,17 @@ fn main() {
         }
     }
 
+    // MOCK_APPEND_ON_TERM: the teardown signal is the exit path (the handler
+    // armed after the transcript write appends the late line and _exits), so
+    // hold the worker here instead of exiting after Stop — a worker that died
+    // on its own would never run the append, and the release ordering test
+    // would have nothing to observe.
+    if env_flag("MOCK_APPEND_ON_TERM") {
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
     // Exit 0 if stdin is a controlling TTY (login_tty succeeded), 1 otherwise.
     let has_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     std::process::exit(if has_tty { 0 } else { 1 });
@@ -524,6 +573,34 @@ extern "C" fn sigint_trap_handler(_: libc::c_int) {
     }
     // SAFETY: _exit(2) is async-signal-safe.
     unsafe { libc::_exit(130) };
+}
+
+/// Raw fd of the MOCK_APPEND_ON_TERM transcript, append-mode, pre-opened on
+/// the normal path (see the knob's block after the transcript write) so the
+/// handler below only touches async-signal-safe calls. -1 = the knob is unset
+/// and the handler can never run.
+static APPEND_ON_TERM_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// Teardown trap for MOCK_APPEND_ON_TERM (see the knob's block in main).
+///
+/// Appends one extra `"type":"result"` event to the transcript via write(2)
+/// on the pre-opened append fd, then _exit(0)s — so the line is on disk
+/// before the pool daemon observes this worker's exit and answers the
+/// client's release. Forwarded by a caller that released before draining;
+/// invisible to one that drained first. That discriminator is the release-
+/// before-drain pin (tests/serve.rs
+/// pool_socket_pooled_release_precedes_the_stream_json_drain).
+extern "C" fn append_on_term_handler(_: libc::c_int) {
+    let fd = APPEND_ON_TERM_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let line = b"{\"type\":\"result\",\"session_id\":\"late-teardown-line\"}\n";
+        // SAFETY: write(2) is async-signal-safe; fd was opened before install.
+        unsafe {
+            libc::write(fd, line.as_ptr() as *const libc::c_void, line.len());
+        }
+    }
+    // SAFETY: _exit(2) is async-signal-safe.
+    unsafe { libc::_exit(0) };
 }
 
 fn env_flag(key: &str) -> bool {

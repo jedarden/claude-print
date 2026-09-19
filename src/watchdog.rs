@@ -314,8 +314,15 @@ impl Watchdog {
     /// 3. Overall session timeout
     /// 4. Stop hook watchdog timeout (after prompt injection)
     ///
-    /// Returns a thread handle that should be dropped (not joined) - the thread
-    /// runs until timeout or completion, and late SIGTERMs to a dead child are harmless.
+    /// Returns a thread handle that should be dropped, not joined: the thread
+    /// is deliberately detached and may fire long after its drive returned.
+    /// A late fire is harmless by construction — it records the timeout in
+    /// the shared state nobody reads anymore and signals through its OWN
+    /// duplicate of the self-pipe write end (taken here at spawn; see the
+    /// `self_pipe_write_fd` field doc), so the byte lands in the ORIGINAL
+    /// pipe or hits a dead one (EPIPE, ignored) and can never cross into a
+    /// later drive's self-pipe at a reused fd number. Direct child signaling
+    /// (stateless path only) targets a dead child and is ignored.
     pub fn spawn_timeout_thread(&self) -> thread::JoinHandle<()> {
         let config = self.config.clone();
         let child_pid = self.child_pid;
