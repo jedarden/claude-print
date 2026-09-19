@@ -1,0 +1,1031 @@
+{
+  "schema": "claude-print/startup-overhead-benchmark/1",
+  "measured_at_utc": "2026-09-19T20:22:18+00:00",
+  "scope": "startup/prompt-injection overhead only (process start -> 'prompt injected' verbose trace); does NOT establish model-latency savings",
+  "environment": {
+    "host": "codinghome",
+    "kernel": "6.18.46",
+    "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+    "python": "3.13.15",
+    "git_commit_at_measurement": "03062de"
+  },
+  "versions": {
+    "claude_print": "claude-print 0.2.2 (wrapping claude 2.1.278 (Claude Code))",
+    "claude_backend": "mock-claude-version-1.0.0",
+    "claude_backend_note": "mock-claude test fixture, not real Claude Code"
+  },
+  "harness": {
+    "argv": [
+      "scripts/bench_startup_overhead.py",
+      "--bin-dir",
+      "/build/target-workers/release",
+      "--samples",
+      "10",
+      "--warmup",
+      "3",
+      "--mode",
+      "both",
+      "--output",
+      "docs/notes/startup-overhead-benchmark.json"
+    ],
+    "bin_dir": "/build/target-workers/release",
+    "claude_print_path": "/build/target-workers/release/claude-print",
+    "mock_claude_path": "/build/target-workers/release/mock-claude"
+  },
+  "config": {
+    "prompt": "Reply with exactly one word: pong",
+    "output_format": "json",
+    "invocation_timeout_secs": 60,
+    "backend": "mock-claude (hermetic: no credentials, no network)",
+    "home": "throwaway temp dir (same for daemon and clients)",
+    "xdg_config_home": "throwaway temp dir with an empty config.toml",
+    "concurrency": "sequential \u2014 one client at a time, idle box required"
+  },
+  "method": {
+    "overhead_definition": "wall-clock from just before client spawn to arrival of the 'prompt injected' line on the client's stderr (external clock; the pooled session's internal tracer re-anchors at run_pooled entry, after acquisition)",
+    "warmup_policy": "3 discarded samples per mode before recording; warm mode additionally waits for the daemon to log 'settled and ready' for every worker up front AND again after every sample (each driven worker is destroyed and replaced) before the next sample starts",
+    "outlier_policy": "no sample is discarded or trimmed; any invalid run (nonzero exit, missing 'prompt injected' trace, pooled sample without a 'driving prewarmed worker' trace, or stdout that is not a result object) aborts the benchmark with the full log; p95 and cv_pct are reported so dispersion stays visible"
+  },
+  "pool": {
+    "socket": "temp dir/bench-pool.sock",
+    "pool_size": 1,
+    "daemon_initial_warmup_ms": 1455.581,
+    "daemon_warmup_note": "daemon start -> first 'settled and ready' log; this is the per-daemon cost ADR-005 amortizes across invocations",
+    "daemon_exit_code": 0,
+    "socket_removed_after_shutdown": true
+  },
+  "results": {
+    "cold": {
+      "path": "stateless cold (no pool; full fork/trust/startup)",
+      "samples": [
+        {
+          "overhead_ms": 1430.257,
+          "wall_ms": 1546.011,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 0,
+            "fifo_opened": 0,
+            "prompt_injected": 1405,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-130347-PA3m24"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 0,
+              "message": "child forked pid=130358"
+            },
+            {
+              "internal_ms": 0,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 401,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1455,
+              "message": "transcript read on attempt 2"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1452.227,
+          "wall_ms": 1569.591,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 1,
+            "fifo_opened": 1,
+            "prompt_injected": 1414,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-130811-jhpmEp"
+            },
+            {
+              "internal_ms": 1,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 1,
+              "message": "child forked pid=130821"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 408,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1414,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1414,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1415,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1415,
+              "message": "transcript read on attempt 1"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1442.459,
+          "wall_ms": 1556.206,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 0,
+            "fifo_opened": 0,
+            "prompt_injected": 1407,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-131250-Y1VI0g"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 0,
+              "message": "child forked pid=131255"
+            },
+            {
+              "internal_ms": 0,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 405,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1407,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1407,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1407,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1407,
+              "message": "transcript read on attempt 1"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1438.438,
+          "wall_ms": 1556.026,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 1,
+            "fifo_opened": 1,
+            "prompt_injected": 1405,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-131502-5kEzu5"
+            },
+            {
+              "internal_ms": 1,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 1,
+              "message": "child forked pid=131557"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 402,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1406,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1456,
+              "message": "transcript read on attempt 2"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1450.78,
+          "wall_ms": 1564.878,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 4,
+            "fifo_opened": 4,
+            "prompt_injected": 1411,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-131916-AJp3pA"
+            },
+            {
+              "internal_ms": 4,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 4,
+              "message": "child forked pid=131945"
+            },
+            {
+              "internal_ms": 4,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 406,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1411,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1411,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1411,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1411,
+              "message": "transcript read on attempt 1"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1444.061,
+          "wall_ms": 1559.597,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 1,
+            "fifo_opened": 1,
+            "prompt_injected": 1406,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-132342-Yqlwn0"
+            },
+            {
+              "internal_ms": 1,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 1,
+              "message": "child forked pid=132358"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 402,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1406,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1406,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1407,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1457,
+              "message": "transcript read on attempt 2"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1446.154,
+          "wall_ms": 1560.762,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 2,
+            "fifo_opened": 2,
+            "prompt_injected": 1405,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-132912-PDK3vo"
+            },
+            {
+              "internal_ms": 2,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 2,
+              "message": "child forked pid=132937"
+            },
+            {
+              "internal_ms": 2,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 403,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1405,
+              "message": "transcript read on attempt 1"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1443.884,
+          "wall_ms": 1558.808,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 1,
+            "fifo_opened": 1,
+            "prompt_injected": 1403,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-133245-YbYYfy"
+            },
+            {
+              "internal_ms": 1,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 1,
+              "message": "child forked pid=133261"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 402,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1403,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1403,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1403,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1453,
+              "message": "transcript read on attempt 2"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1442.578,
+          "wall_ms": 1557.933,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 1,
+            "fifo_opened": 1,
+            "prompt_injected": 1403,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-133585-AH6aku"
+            },
+            {
+              "internal_ms": 1,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 1,
+              "message": "child forked pid=133603"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 402,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1403,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1403,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1403,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1454,
+              "message": "transcript read on attempt 2"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1444.812,
+          "wall_ms": 1560.037,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": 1,
+            "fifo_opened": 1,
+            "prompt_injected": 1404,
+            "drove_prewarmed_worker": false
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "temp dir created at /tmp/claude-print-133907-TNrblu"
+            },
+            {
+              "internal_ms": 1,
+              "message": "pty opened"
+            },
+            {
+              "internal_ms": 1,
+              "message": "child forked pid=133918"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 402,
+              "message": "phase transition: waiting -> trust-dismissed"
+            },
+            {
+              "internal_ms": 1404,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1404,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1404,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1404,
+              "message": "transcript read on attempt 1"
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "n": 10,
+        "mean_ms": 1443.565,
+        "stdev_ms": 6.158,
+        "min_ms": 1430.257,
+        "p50_ms": 1443.972,
+        "p90_ms": 1450.925,
+        "p95_ms": 1451.576,
+        "max_ms": 1452.227,
+        "cv_pct": 0.43
+      }
+    },
+    "warm": {
+      "path": "warm pool (--pool-socket; prewarmed worker acquired over the unix socket)",
+      "samples": [
+        {
+          "overhead_ms": 1046.003,
+          "wall_ms": 1112.358,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 1,
+            "prompt_injected": 1006,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker 2cb70541-eef7-416f-8820-db69007b21a7 (pid 135299)"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1006,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1006,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1007,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1057,
+              "message": "transcript read on attempt 2"
+            },
+            {
+              "internal_ms": 1057,
+              "message": "worker 2cb70541-eef7-416f-8820-db69007b21a7 released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1038.729,
+          "wall_ms": 1040.514,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 0,
+            "prompt_injected": 1003,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker 2716ac18-9972-4352-9421-3532b7b652e6 (pid 135562)"
+            },
+            {
+              "internal_ms": 0,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "transcript read on attempt 1"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "worker 2716ac18-9972-4352-9421-3532b7b652e6 released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1040.168,
+          "wall_ms": 1104.698,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 0,
+            "prompt_injected": 1002,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker 31b7546d-9798-4350-95bb-a20102a17f7f (pid 135804)"
+            },
+            {
+              "internal_ms": 0,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1052,
+              "message": "transcript read on attempt 2"
+            },
+            {
+              "internal_ms": 1052,
+              "message": "worker 31b7546d-9798-4350-95bb-a20102a17f7f released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1043.55,
+          "wall_ms": 1052.342,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 0,
+            "prompt_injected": 1005,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker 15657e44-af64-460e-ad10-28853fcf3454 (pid 136041)"
+            },
+            {
+              "internal_ms": 0,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1005,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1005,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1007,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1007,
+              "message": "transcript read on attempt 1"
+            },
+            {
+              "internal_ms": 1008,
+              "message": "worker 15657e44-af64-460e-ad10-28853fcf3454 released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1100.852,
+          "wall_ms": 1140.243,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 1,
+            "prompt_injected": 1006,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 1,
+              "message": "pool session: driving prewarmed worker bc6cab1f-fc28-4f53-93ab-2de03c06c981 (pid 136719)"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1006,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1006,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1006,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1006,
+              "message": "transcript read on attempt 1"
+            },
+            {
+              "internal_ms": 1033,
+              "message": "worker bc6cab1f-fc28-4f53-93ab-2de03c06c981 released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1036.213,
+          "wall_ms": 1099.716,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 0,
+            "prompt_injected": 1002,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker cf479b24-98e7-4e6c-aa77-4ce61c5f90f4 (pid 137316)"
+            },
+            {
+              "internal_ms": 0,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1052,
+              "message": "transcript read on attempt 2"
+            },
+            {
+              "internal_ms": 1052,
+              "message": "worker cf479b24-98e7-4e6c-aa77-4ce61c5f90f4 released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1041.218,
+          "wall_ms": 1104.888,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 1,
+            "prompt_injected": 1002,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker fd74abad-beaf-4045-b21d-5d7d4bccb69b (pid 137578)"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1052,
+              "message": "transcript read on attempt 2"
+            },
+            {
+              "internal_ms": 1053,
+              "message": "worker fd74abad-beaf-4045-b21d-5d7d4bccb69b released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1048.709,
+          "wall_ms": 1051.078,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 1,
+            "prompt_injected": 1003,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker 8a8bc3cd-4f20-4cd7-9608-181cbdf6ce38 (pid 137853)"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "transcript read on attempt 1"
+            },
+            {
+              "internal_ms": 1004,
+              "message": "worker 8a8bc3cd-4f20-4cd7-9608-181cbdf6ce38 released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1063.14,
+          "wall_ms": 1099.345,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 3,
+            "prompt_injected": 1007,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 2,
+              "message": "pool session: driving prewarmed worker da9f6ca0-7574-4955-b484-ace7723e22ee (pid 138529)"
+            },
+            {
+              "internal_ms": 3,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1007,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1007,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1008,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1008,
+              "message": "transcript read on attempt 1"
+            },
+            {
+              "internal_ms": 1033,
+              "message": "worker da9f6ca0-7574-4955-b484-ace7723e22ee released"
+            }
+          ]
+        },
+        {
+          "overhead_ms": 1046.973,
+          "wall_ms": 1078.849,
+          "exit_code": 0,
+          "internal_trace_ms": {
+            "child_forked": null,
+            "fifo_opened": 1,
+            "prompt_injected": 1002,
+            "drove_prewarmed_worker": true
+          },
+          "traces": [
+            {
+              "internal_ms": 0,
+              "message": "pool: worker already running with the daemon's launch; not applied: --model/--max-turns/tool-permission flags"
+            },
+            {
+              "internal_ms": 0,
+              "message": "pool session: driving prewarmed worker d3bd1899-3d56-4b28-b39b-1d4d56cbd187 (pid 139264)"
+            },
+            {
+              "internal_ms": 1,
+              "message": "fifo opened"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "phase transition: trust-dismissed -> prompt-injected"
+            },
+            {
+              "internal_ms": 1002,
+              "message": "prompt injected"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "stop received session_id=mock-session-abc123"
+            },
+            {
+              "internal_ms": 1003,
+              "message": "transcript read on attempt 1"
+            },
+            {
+              "internal_ms": 1028,
+              "message": "worker d3bd1899-3d56-4b28-b39b-1d4d56cbd187 released"
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "n": 10,
+        "mean_ms": 1050.555,
+        "stdev_ms": 19.191,
+        "min_ms": 1036.213,
+        "p50_ms": 1044.776,
+        "p90_ms": 1066.911,
+        "p95_ms": 1083.882,
+        "max_ms": 1100.852,
+        "cv_pct": 1.83
+      }
+    }
+  }
+}
