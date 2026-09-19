@@ -317,6 +317,7 @@ If you use NEEDLE for LLM fleet dispatch, `install.sh` automatically copies `cla
 - **Claude Code must be authenticated** — `claude-print` delegates entirely to the `claude` binary; it cannot authenticate on its own.
 - **One prompt per invocation** — there is no multi-turn session mode; each call starts a fresh session.
 - **Startup latency ~2–5s** — the PTY handshake and Claude Code startup add overhead versus a direct HTTP call.
+- **Concurrent `stream-json` invocations sharing a cwd** — safe for every configuration that writes the per-drive `session-identity.json` (real `claude` on both the stateless and `--pool-socket` paths, and `mock-claude`): the stream-json reader binds to this session's exact transcript at prompt-submission time, before any assistant event exists, so a sibling session's events are never forwarded. The residual limit is identity-less sessions — a `claude` without UserPromptSubmit hook support: under same-cwd concurrency such a run binds only an unambiguous single new transcript, and otherwise forwards nothing live until the Stop payload names the transcript at the end (output arrives whole and uncontaminated, but not streamed). `text` and `json` are exact in every configuration.
 
 ## Troubleshooting
 
