@@ -60,6 +60,7 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/stop_sparse_payloads_e2e.rs` | Sparse Stop payload regression: absent optional fields derive, fall back to `last_assistant_message`, or produce a bounded setup error — across text/json/stream-json (`MOCK_OMIT_*`, `MOCK_WRITE_DERIVED_JSONL`, `MOCK_UNKNOWN_FIELDS`; bead claudepr-f3ed858a) |
 | `tests/stop_delayed_payload_e2e.rs` | FIFO keeper-lifetime regression (key invariant 7): a Stop payload withheld ~1.5 s (`MOCK_DELAY_STOP`) is still received exactly once through the live event loop — no premature exit, no lost write, normal cleanup — plus a poller-level delayed hook-shaped write pin (bead claudepr-a847d4de) |
 | `tests/transcript_flush_window.rs` | Flush-window regression: final assistant line absent/truncated on first read, present on retry; decoy `last_assistant_message` suppressed; bounded retries; text/json/stream-json all carry the complete final message |
+| `tests/pool_socket_e2e.rs` | `--pool-socket` client matrix end-to-end through the compiled CLI (bead claudepr-c7824b71): text/json/stream-json over an acquired worker, stateless fallback for absent and stale sockets, three sequential clients with teardown/replace and zero cross-caller leakage, and three malformed-daemon acquire shapes (close mid-exchange, wrong-shape response, assignment without fd) failing safely within the caller timeout |
 | `tests/fixtures/` | Shared fixture helpers |
 
 ### mock_claude
