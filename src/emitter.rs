@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Emit a successful response.
 ///
@@ -148,16 +148,18 @@ fn write_error_json(
 /// transcript parse error). `main()` always terminates via `process::exit()`,
 /// so an unjoined reader would be killed mid-write, truncating its output.
 ///
-/// This is enforced by `Drop`, which disconnects the drain channel and joins
+/// This is enforced by `Drop`, which disconnects the channels and joins
 /// the thread — so simply letting the handle go out of scope (including via
 /// `?` propagation) is always safe and never orphans the reader.
 ///
 /// Drain vs. exit-immediately is the caller's choice:
-/// - **Normal Stop transition:** call [`StreamJsonHandle::signal_drain`] first
-///   so the reader forwards its remaining transcript lines before exiting.
+/// - **Normal Stop transition:** call [`StreamJsonHandle::retarget`] (binding
+///   the reader to the transcript the Stop payload names) and then
+///   [`StreamJsonHandle::signal_drain`] so the reader forwards the remainder
+///   of the CORRECT transcript before exiting.
 /// - **Every other path (timeout, interrupt, error):** drop the handle without
-///   signaling. `Drop` disconnects the channel; the reader treats `Disconnected`
-///   as "exit immediately" and the join returns promptly.
+///   signaling. `Drop` disconnects the channels; the reader treats
+///   `Disconnected` as "exit immediately" and the join returns promptly.
 #[derive(Debug)]
 pub struct StreamJsonHandle {
     /// `Some` while the sender is held; `take()`n by `Drop` so the channel is
@@ -166,6 +168,10 @@ pub struct StreamJsonHandle {
     /// the channel would stay connected, the reader would never exit, and
     /// `join()` would hang.)
     drain_tx: Option<mpsc::SyncSender<()>>,
+    /// Bind/retarget channel: carries the transcript path the session wants
+    /// the reader bound to (claudepr-a927ec0c). `take()`n by `Drop` together
+    /// with `drain_tx`.
+    retarget_tx: Option<mpsc::SyncSender<PathBuf>>,
     /// `Some` while the handle is held; `take()`n by `Drop` so the join can
     /// *consume* it. `JoinHandle::join` takes `self` by value, so it cannot be
     /// called on `&mut self.join_handle` directly — without this `Option` the
@@ -186,17 +192,48 @@ impl StreamJsonHandle {
             let _ = tx.send(());
         }
     }
+
+    /// Bind (or re-bind) the reader to an exact transcript path.
+    ///
+    /// The Stop-payload backstop of the claudepr-a927ec0c design: the reader
+    /// spawned at `PROMPT_INJECTED` binds from the per-drive identity file and
+    /// only falls back to discovery when that is absent, but the Stop payload
+    /// is the first AUTHORITATIVE statement of which transcript is ours. The
+    /// session calls this right before [`Self::signal_drain`] with the
+    /// resolved `transcript_path`:
+    ///
+    /// - reader already tailing this exact path (the normal identity-bound
+    ///   run) → no-op: no offset reset, no duplicate forwarding;
+    /// - reader bound to a DIFFERENT file (a legacy identity-less run that
+    ///   mis-discovered under concurrency) or still unbound (ambiguity
+    ///   refusal) → swap to this path at the injection-snapshot offset, so the
+    ///   drained tail carries THIS session's final events, result event
+    ///   included. Lines already forwarded from a wrong file cannot be
+    ///   retracted — that residue is the documented bound of the fallback.
+    ///
+    /// Ordering with `signal_drain` matters: the reader checks a pending
+    /// retarget BEFORE a pending drain at every idle tick, so a retarget sent
+    /// first is always honored before the drain lets it exit.
+    pub fn retarget(&self, transcript_path: PathBuf) {
+        if let Some(tx) = &self.retarget_tx {
+            // try_send on the capacity-1 channel: a retarget already pending in
+            // the buffer wins (the reader consumes it at the next idle tick),
+            // and this call must never block the session thread.
+            let _ = tx.try_send(transcript_path);
+        }
+    }
 }
 
 impl Drop for StreamJsonHandle {
     fn drop(&mut self) {
-        // 1. Disconnect the channel FIRST. The reader polls try_recv every ~5ms;
-        //    on Disconnected it returns immediately (no drain). This MUST happen
-        //    before the join — otherwise the reader never exits and join() hangs.
-        //    On the Stop path, signal_drain() already delivered the drain value,
-        //    so the reader observes Ok(()), drains remaining lines, and only then
-        //    sees the disconnect.
+        // 1. Disconnect the channels FIRST. The reader polls try_recv every
+        //    ~5ms; on Disconnected it returns immediately (no drain). This MUST
+        //    happen before the join — otherwise the reader never exits and
+        //    join() hangs. On the Stop path, signal_drain() already delivered
+        //    the drain value, so the reader observes Ok(()), drains remaining
+        //    lines, and only then sees the disconnect.
         self.drain_tx.take();
+        self.retarget_tx.take();
         // 2. Join so the caller is guaranteed the thread has fully exited — and
         //    all buffered stdout writes are flushed — before control returns
         //    (INV-8). `take()` moves the handle out of `&mut self` so `join`
@@ -253,31 +290,73 @@ pub fn spawn_stream_json_reader_to(
     )
 }
 
-/// Spawn a stream-json reader that DISCOVERS the session's transcript at
-/// runtime, then tails it to stdout.
+/// Spawn a stream-json reader that BINDS to this session's transcript via the
+/// per-drive identity file, then tails it to stdout.
 ///
 /// Spawned at `PROMPT_INJECTED`, where the `session_id` — and thus the exact
 /// transcript filename `<session_id>.jsonl` — is still unknown (it arrives only
 /// in the Stop payload, after injection). The reader therefore cannot be handed
-/// a final path; instead it polls `projects_dir` for the newest `.jsonl` that is
-/// new or has grown since the injection `pre_existing` snapshot, reusing the
-/// existing 50ms/5s open-retry loop until the file appears, then tails it like
-/// the exact-path reader.
-pub fn spawn_stream_json_reader_discover(
+/// a final path; instead it polls `identity_path` (claudepr-a927ec0c): the
+/// UserPromptSubmit relay hook writes this session's `session_id` /
+/// `transcript_path` there the instant the prompt is submitted, BEFORE any
+/// assistant event exists, and the reader tails exactly that file.
+///
+/// Until a binding exists the reader forwards NOTHING — under same-cwd
+/// concurrency the newest-growing `.jsonl` can be a SIBLING session's, and the
+/// old newest-mtime guess forwarded that sibling wholesale. See
+/// [`spawn_stream_json_reader_bound_to`] for the full binding ladder; the only
+/// guess it still makes is a single transcript created after injection, which
+/// no sibling started before us can produce.
+pub fn spawn_stream_json_reader_bound(
+    identity_path: PathBuf,
     projects_dir: PathBuf,
     pre_existing: HashMap<PathBuf, u64>,
 ) -> StreamJsonHandle {
-    spawn_stream_json_reader_discover_to(projects_dir, pre_existing, Box::new(std::io::stdout()))
+    spawn_stream_json_reader_bound_to(
+        identity_path,
+        projects_dir,
+        pre_existing,
+        Box::new(std::io::stdout()),
+    )
 }
 
-/// Testable variant of [`spawn_stream_json_reader_discover`] writing to `writer`.
-pub fn spawn_stream_json_reader_discover_to(
+/// Testable variant of [`spawn_stream_json_reader_bound`] writing to `writer`.
+///
+/// Binding ladder, polled every 50ms until one resolves (or the reader is
+/// told to exit):
+///
+/// 1. **Identity** — `identity_path` parses to a usable payload; the reader
+///    binds to its `transcript_path` (preferred) or
+///    `<projects_dir>/<session_id>.jsonl` (fallback), at the injection-time
+///    size for a file present in `pre_existing` (skip pre-injection bytes of
+///    an ongoing session's file) and 0 otherwise. The UserPromptSubmit hook
+///    fires before the first assistant event exists, so this is the normal
+///    path and live forwarding is unaffected.
+/// 2. **Unambiguous new candidate** — the identity-less fallback (a claude
+///    without UserPromptSubmit hook support): exactly one `.jsonl` created
+///    after the injection snapshot is bound, once it has stayed sole for
+///    [`IDENTITY_GRACE`] — identity keeps outranking it at every tick, so a
+///    payload landing mid-grace wins. See
+///    [`resolve_unambiguous_new_binding`] for why "created after injection"
+///    (not the old new-or-grown rule) is what makes a single candidate
+///    unambiguous under same-cwd concurrency.
+/// 3. **Stop-payload retarget** — the authoritative backstop when neither
+///    rung above resolves (no identity, and zero or several new candidates):
+///    [`StreamJsonHandle::retarget`] delivers the resolved `StopInfo` path,
+///    binding from the snapshot offset. An identity-less ambiguous run
+///    therefore forwards NOTHING live and its output arrives whole — correct
+///    and uncontaminated — at the drain; lines already forwarded from a
+///    wrongly-fallback-bound file cannot be retracted, the documented bound
+///    of the fallback.
+pub fn spawn_stream_json_reader_bound_to(
+    identity_path: PathBuf,
     projects_dir: PathBuf,
     pre_existing: HashMap<PathBuf, u64>,
     writer: Box<dyn Write + Send + 'static>,
 ) -> StreamJsonHandle {
     spawn_reader(
-        TranscriptSource::Discover {
+        TranscriptSource::Bind {
+            identity_path,
             projects_dir,
             pre_existing,
         },
@@ -291,11 +370,11 @@ enum TranscriptSource {
     /// A concrete, already-known path. The reader opens it directly, retrying for
     /// up to 5s if it does not exist yet, then seeks to `start_offset`.
     Exact { path: PathBuf, start_offset: u64 },
-    /// Discover the session's transcript inside a projects directory at runtime.
-    /// Used at `PROMPT_INJECTED`, where the exact `<session_id>.jsonl` filename
-    /// is unknown. `pre_existing` (see [`snapshot_jsonl_sizes`]) lets the reader
-    /// skip pre-injection bytes of an ongoing session's file.
-    Discover {
+    /// Bind to this session's transcript at runtime (see
+    /// [`spawn_stream_json_reader_bound_to`]). Used at `PROMPT_INJECTED`, where
+    /// the exact `<session_id>.jsonl` filename is unknown.
+    Bind {
+        identity_path: PathBuf,
         projects_dir: PathBuf,
         pre_existing: HashMap<PathBuf, u64>,
     },
@@ -306,51 +385,296 @@ fn spawn_reader(
     writer: Box<dyn Write + Send + 'static>,
 ) -> StreamJsonHandle {
     let (drain_tx, drain_rx) = mpsc::sync_channel(1);
+    let (retarget_tx, retarget_rx) = mpsc::sync_channel(1);
     let join_handle = thread::spawn(move || {
-        stream_json_reader_loop(source, writer, drain_rx);
+        stream_json_reader_loop(source, writer, drain_rx, retarget_rx);
     });
     StreamJsonHandle {
         drain_tx: Some(drain_tx),
+        retarget_tx: Some(retarget_tx),
         join_handle: Some(join_handle),
     }
 }
 
 fn stream_json_reader_loop(
     source: TranscriptSource,
-    mut writer: Box<dyn Write + Send + 'static>,
+    writer: Box<dyn Write + Send + 'static>,
     drain_rx: mpsc::Receiver<()>,
+    retarget_rx: mpsc::Receiver<PathBuf>,
+) {
+    let (initial_path, initial_offset, pre_existing, identity) = match source {
+        TranscriptSource::Exact { path, start_offset } => {
+            (path, start_offset, HashMap::new(), None)
+        }
+        TranscriptSource::Bind {
+            identity_path,
+            projects_dir,
+            pre_existing,
+        } => {
+            // Resolve the transcript file and the byte offset to seek to.
+            // Polls until a binding resolves; `None` → the reader was told to
+            // drain/exit before anything bound: nothing to forward, return.
+            // No timeout: the session lifetime bounds the wait, and the
+            // Stop-payload retarget resolves even a never-identifying run.
+            match bind_with_retry(
+                &identity_path,
+                &projects_dir,
+                &pre_existing,
+                &drain_rx,
+                &retarget_rx,
+            ) {
+                Some((path, offset)) => (
+                    path,
+                    offset,
+                    pre_existing,
+                    Some((identity_path, projects_dir)),
+                ),
+                None => return,
+            }
+        }
+    };
+
+    tail_loop(
+        initial_path,
+        initial_offset,
+        &pre_existing,
+        identity,
+        writer,
+        &drain_rx,
+        &retarget_rx,
+    );
+}
+
+/// Poll for the first binding (identity, then the identity-less unambiguous
+/// fallback, then the Stop-payload retarget), 50ms ticks, until one resolves
+/// or the reader is told to exit.
+fn bind_with_retry(
+    identity_path: &Path,
+    projects_dir: &Path,
+    pre_existing: &HashMap<PathBuf, u64>,
+    drain_rx: &mpsc::Receiver<()>,
+    retarget_rx: &mpsc::Receiver<PathBuf>,
+) -> Option<(PathBuf, u64)> {
+    // First sighting of the current lone new candidate (run 2's grace timer,
+    // see [`IDENTITY_GRACE`]); reset whenever the scan stops agreeing.
+    let mut sole_since: Option<(PathBuf, Instant)> = None;
+    loop {
+        // A pending Stop-payload retarget outranks everything: the session
+        // reached Stop, and the payload is authoritative. Offset per the
+        // snapshot rules — for a file that existed at injection the
+        // pre-injection bytes are skipped, otherwise the file is tailed whole.
+        if let Some(path) = take_retarget(retarget_rx, None) {
+            let offset = snapshot_offset(&path, pre_existing);
+            return Some((path, offset));
+        }
+        // Identity outranks the fallback, so a payload landing mid-grace binds
+        // immediately instead of leaving the fallback to mature onto a file
+        // identity is about to contradict.
+        if let Some(path) = resolve_identity_binding(identity_path, projects_dir) {
+            let offset = snapshot_offset(&path, pre_existing);
+            return Some((path, offset));
+        }
+        // Identity-less fallback: bind only when exactly ONE transcript was
+        // created after the injection snapshot (claudepr-a927ec0c rung 2),
+        // and only once it has stayed sole for the grace window.
+        if let Some(path) =
+            resolve_unambiguous_new_binding(projects_dir, pre_existing, &mut sole_since)
+        {
+            let offset = snapshot_offset(&path, pre_existing);
+            return Some((path, offset));
+        }
+        match drain_rx.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return None,
+            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// The byte offset a newly-bound transcript starts at: its injection-time size
+/// when it was already present (skip pre-injection bytes of an ongoing
+/// session's file), 0 for a file created after injection.
+fn snapshot_offset(path: &Path, pre_existing: &HashMap<PathBuf, u64>) -> u64 {
+    pre_existing.get(path).copied().unwrap_or(0)
+}
+
+/// Read the per-drive identity file and resolve the transcript path it names.
+///
+/// `None` while the file is absent, mid-write (empty or unparseable — the hook
+/// may still be writing), or unusable (sparse payload without either field);
+/// the caller simply polls again. `transcript_path` is preferred — the exact
+/// path claude itself reports; `session_id` joins the same projects dir the
+/// reader was handed.
+fn resolve_identity_binding(identity_path: &Path, projects_dir: &Path) -> Option<PathBuf> {
+    let bytes = fs::read(identity_path).ok()?;
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    let payload = crate::poller::parse_stop_payload(&bytes).ok()?;
+    let explicit = payload
+        .transcript_path
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    explicit.or_else(|| {
+        payload
+            .session_id
+            .filter(|s| !s.is_empty())
+            .map(|sid| projects_dir.join(format!("{sid}.jsonl")))
+    })
+}
+
+/// How long a lone new transcript must remain the ONLY new candidate before
+/// the identity-less fallback binds it (claudepr-a927ec0c rung 2).
+///
+/// The grace closes the misbind race a raw scan has: a sibling that started
+/// AFTER us also produces a new file, and in the window before our own
+/// transcript exists a bare scan would see exactly one new candidate — the
+/// sibling's — and bind it. Holding the bind until the sole candidate has
+/// stayed sole for this long gives a landing identity the first chance at
+/// every tick in between (identity is polled BEFORE the fallback), and a
+/// sibling's second file turns the scan ambiguous and resets the wait. With
+/// working hooks identity lands within milliseconds of prompt submission, so
+/// the normal run never pays the grace; only a legacy identity-less claude
+/// waits it out before live forwarding starts.
+const IDENTITY_GRACE: Duration = Duration::from_millis(250);
+
+/// The identity-less fallback binding (claudepr-a927ec0c rung 2): scan
+/// `projects_dir` and return the single `.jsonl` created after the injection
+/// snapshot — but only a candidate that has now been scanned as the SOLE new
+/// candidate for at least [`IDENTITY_GRACE`] (`sole_since` tracks the
+/// first sighting; the caller resets it whenever the scan result changes).
+///
+/// Candidates are files ABSENT from `pre_existing` — claude-print drives fresh
+/// sessions, so this session's transcript is always a new file; a file present
+/// in the snapshot belongs to a session OLDER than ours (its post-injection
+/// growth is another session's live turn) and is never a candidate. A sibling
+/// started after us contributes a SECOND new file, which returns `None` (the
+/// ambiguity the old newest-mtime discovery guessed wrong); the grace window
+/// additionally covers the sub-tick window where the sibling's file exists and
+/// ours does not yet. `None` → not yet bound: the caller keeps polling, and
+/// the Stop-payload retarget resolves even a never-identifying run at drain.
+fn resolve_unambiguous_new_binding(
+    projects_dir: &Path,
+    pre_existing: &HashMap<PathBuf, u64>,
+    sole_since: &mut Option<(PathBuf, Instant)>,
+) -> Option<PathBuf> {
+    let entries = fs::read_dir(projects_dir).ok()?;
+    let mut candidate: Option<PathBuf> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if pre_existing.contains_key(&path) || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if candidate.is_some() {
+            // Two or more new transcripts: attribution is impossible — the
+            // refusal IS the fix (the old rule picked the newest and got the
+            // sibling). The Stop retarget resolves this run at drain.
+            *sole_since = None;
+            return None;
+        }
+        candidate = Some(path);
+    }
+    match candidate {
+        Some(path) => {
+            let now = Instant::now();
+            let matured = matches!(sole_since.as_ref(), Some((p, since)) if *p == path && now.duration_since(*since) >= IDENTITY_GRACE);
+            if matured {
+                *sole_since = None;
+                return Some(path);
+            }
+            sole_since.get_or_insert((path, now));
+            None
+        }
+        None => {
+            *sole_since = None;
+            None
+        }
+    }
+}
+
+/// Consume a pending retarget request, if any.
+///
+/// A request naming the path the reader is already bound to is consumed and
+/// dropped (already correct — re-binding to the same path at its snapshot
+/// offset would duplicate already-forwarded lines); `current` is that bound
+/// path, `None` while unbound.
+fn take_retarget(retarget_rx: &mpsc::Receiver<PathBuf>, current: Option<&Path>) -> Option<PathBuf> {
+    match retarget_rx.try_recv() {
+        Ok(path) if current == Some(path.as_path()) => None,
+        Ok(path) => Some(path),
+        Err(_) => None,
+    }
+}
+
+/// Outcome of pointing the tail at a newly-bound path.
+enum Rebind {
+    /// `reader`/`path` now name the new file, positioned at its snapshot
+    /// offset; the caller continues tailing.
+    Swapped,
+    /// The new file never opened within the retry budget — fall through to
+    /// the normal drain/shutdown checks on the OLD reader.
+    OpenFailed,
+    /// Seek into the new file failed; the tail is over — block on the drain
+    /// and exit, like every other fatal tail error.
+    Fatal,
+}
+
+/// Bind the tail to `new_path`: open it, seek to its snapshot offset, and
+/// point `reader`/`path` at it. Shared by the Stop-payload retarget and the
+/// post-bind identity re-check (claudepr-a927ec0c).
+fn rebind(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    path: &mut PathBuf,
+    new_path: PathBuf,
+    pre_existing: &HashMap<PathBuf, u64>,
+    drain_rx: &mpsc::Receiver<()>,
+) -> Rebind {
+    use std::io::{BufReader, Seek, SeekFrom};
+    let Some(file) = open_with_retry(|| std::fs::File::open(&new_path).ok(), drain_rx) else {
+        return Rebind::OpenFailed;
+    };
+    let mut new_reader = BufReader::new(file);
+    let offset = snapshot_offset(&new_path, pre_existing);
+    if new_reader.seek(SeekFrom::Start(offset)).is_err() {
+        return Rebind::Fatal;
+    }
+    *reader = new_reader;
+    *path = new_path;
+    Rebind::Swapped
+}
+
+/// Open, seek, and forward transcript lines until drained — retargeting to a
+/// newly-bound path whenever the session asks.
+fn tail_loop(
+    initial_path: PathBuf,
+    initial_offset: u64,
+    pre_existing: &HashMap<PathBuf, u64>,
+    identity: Option<(PathBuf, PathBuf)>,
+    mut writer: Box<dyn Write + Send + 'static>,
+    drain_rx: &mpsc::Receiver<()>,
+    retarget_rx: &mpsc::Receiver<PathBuf>,
 ) {
     use std::fs::File;
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
-    // Resolve the transcript file and the byte offset to seek to, per the source.
-    // Both modes retry the open for up to 5s with 50ms sleeps and bail on a drain
-    // signal or channel disconnect. `None` → the file never appeared (or the
-    // reader was told to drain/exit first): nothing to forward, return.
-    let (file, start_offset): (File, u64) = match source {
-        TranscriptSource::Exact { path, start_offset } => {
-            let Some(file) = open_with_retry(|| File::open(&path).ok(), &drain_rx) else {
-                return;
-            };
-            (file, start_offset)
-        }
-        TranscriptSource::Discover {
-            projects_dir,
-            pre_existing,
-        } => {
-            let Some((file, offset)) = discover_with_retry(&projects_dir, &pre_existing, &drain_rx)
-            else {
-                return;
-            };
-            (file, offset)
-        }
+    let mut path = initial_path;
+    let mut reader = match open_with_retry(|| File::open(&path).ok(), drain_rx) {
+        Some(file) => BufReader::new(file),
+        None => return,
     };
-
-    let mut reader = BufReader::new(file);
-    if reader.seek(SeekFrom::Start(start_offset)).is_err() {
+    if reader.seek(SeekFrom::Start(initial_offset)).is_err() {
         let _ = drain_rx.recv();
         return;
     }
+
+    // Post-bind identity re-check (claudepr-a927ec0c): a Bind-source tail keeps
+    // polling the identity file at the bind loop's 50ms cadence, so an identity
+    // landing AFTER a fallback bind (a hook slower than [`IDENTITY_GRACE`])
+    // still rebinds the tail onto the right transcript. Throttled — idle ticks
+    // are 5ms and the check is a file read + JSON parse.
+    let mut last_identity_poll = Instant::now();
 
     let mut draining = false;
     let mut line = String::new();
@@ -359,6 +683,54 @@ fn stream_json_reader_loop(
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
+                // Idle tick. A pending retarget is honored BEFORE a pending
+                // drain: the session sends retarget-then-drain, and honoring
+                // them in that order is what makes the drained tail come from
+                // the CORRECT transcript.
+                if let Some(new_path) = take_retarget(retarget_rx, Some(&path)) {
+                    match rebind(&mut reader, &mut path, new_path, pre_existing, drain_rx) {
+                        Rebind::Swapped => continue,
+                        // The retargeted file never opened or seek failed —
+                        // nothing more to forward; fall through to the drain
+                        // checks so the normal shutdown still applies.
+                        Rebind::OpenFailed => {}
+                        Rebind::Fatal => {
+                            let _ = drain_rx.recv();
+                            return;
+                        }
+                    }
+                }
+                // A late identity overrides a fallback binding (never the
+                // Stop payload's: that arrives with `retarget`, above, and
+                // the session stops polling identity once Stop resolves the
+                // transcript itself).
+                if let Some((identity_path, projects_dir)) = &identity {
+                    if Instant::now().duration_since(last_identity_poll)
+                        >= Duration::from_millis(50)
+                    {
+                        last_identity_poll = Instant::now();
+                        if let Some(new_path) =
+                            resolve_identity_binding(identity_path, projects_dir)
+                        {
+                            if new_path != path {
+                                match rebind(
+                                    &mut reader,
+                                    &mut path,
+                                    new_path,
+                                    pre_existing,
+                                    drain_rx,
+                                ) {
+                                    Rebind::Swapped => continue,
+                                    Rebind::OpenFailed => {}
+                                    Rebind::Fatal => {
+                                        let _ = drain_rx.recv();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if draining {
                     break;
                 }
@@ -379,6 +751,16 @@ fn stream_json_reader_loop(
                 }
             }
             Err(_) => {
+                if let Some(new_path) = take_retarget(retarget_rx, Some(&path)) {
+                    match rebind(&mut reader, &mut path, new_path, pre_existing, drain_rx) {
+                        Rebind::Swapped => continue,
+                        Rebind::OpenFailed => {}
+                        Rebind::Fatal => {
+                            let _ = drain_rx.recv();
+                            return;
+                        }
+                    }
+                }
                 if draining {
                     break;
                 }
@@ -417,76 +799,236 @@ where
     }
 }
 
-/// Discover the session's transcript JSONL inside `projects_dir`, retrying every
-/// 50ms for up to 5s. Returns the opened file and the byte offset to seek to.
-fn discover_with_retry(
-    projects_dir: &Path,
-    pre_existing: &HashMap<PathBuf, u64>,
-    drain_rx: &mpsc::Receiver<()>,
-) -> Option<(std::fs::File, u64)> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some((path, offset)) = discover_session_jsonl(projects_dir, pre_existing) {
-            if let Ok(file) = std::fs::File::open(&path) {
-                return Some((file, offset));
-            }
-            // File vanished between readdir and open — fall through and retry.
-        }
-        match drain_rx.try_recv() {
-            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return None,
-            Err(mpsc::TryRecvError::Empty) => {
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
 
-/// Pick this session's transcript JSONL from `projects_dir`.
-///
-/// A candidate `.jsonl` is one that either did NOT exist at injection (absent
-/// from `pre_existing` — a freshly-created session file) or has GROWN past its
-/// injection-time size (an ongoing session receiving new events). Among
-/// candidates the newest by modification time wins, resolving concurrent
-/// sessions in the same cwd to the most-recently-active one. The returned byte
-/// offset is the injection-time size for pre-existing files (so pre-injection
-/// events are skipped) and 0 for files created after injection.
-fn discover_session_jsonl(
-    projects_dir: &Path,
-    pre_existing: &HashMap<PathBuf, u64>,
-) -> Option<(PathBuf, u64)> {
-    let entries = fs::read_dir(projects_dir).ok()?;
-    let mut best: Option<(PathBuf, u64, SystemTime)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
+    /// Collects everything the reader forwards so assertions can inspect it.
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
         }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let size_now = meta.len();
-        let offset = match pre_existing.get(&path) {
-            Some(&size_at_injection) => {
-                if size_now <= size_at_injection {
-                    // Existed at injection and has not grown — not this session.
-                    continue;
-                }
-                size_at_injection // skip pre-injection bytes
-            }
-            None => 0, // created after injection — tail from the start
-        };
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let is_newest = match &best {
-            Some((_, _, best_mtime)) => mtime > *best_mtime,
-            None => true,
-        };
-        if is_newest {
-            best = Some((path, offset, mtime));
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
-    best.map(|(path, offset, _)| (path, offset))
+
+    fn capture() -> (Arc<Mutex<Vec<u8>>>, Box<CaptureWriter>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Box::new(CaptureWriter(Arc::clone(&buf)));
+        (buf, writer)
+    }
+
+    fn forwarded(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Append verbatim marker lines (the reader forwards any non-empty line).
+    fn append_markers(path: &Path, markers: &[&str]) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for m in markers {
+            writeln!(f, r#"{{"marker":"{m}"}}"#).unwrap();
+        }
+    }
+
+    fn write_identity(identity_path: &Path, payload: &str) {
+        std::fs::write(identity_path, payload).unwrap();
+    }
+
+    fn spawn_bound(dir: &TempDir) -> (PathBuf, PathBuf, Arc<Mutex<Vec<u8>>>, StreamJsonHandle) {
+        let projects_dir = dir.path().join("projects").join("shared-cwd");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let identity_path = dir.path().join("session-identity.json");
+        let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+        let (buf, writer) = capture();
+        let handle = spawn_stream_json_reader_bound_to(
+            identity_path.clone(),
+            projects_dir.clone(),
+            pre_existing,
+            writer,
+        );
+        (identity_path, projects_dir, buf, handle)
+    }
+
+    /// The core contract of claudepr-a927ec0c: ZERO bytes are forwarded while
+    /// the binding is unresolved. The wrong-file prefix cannot be retracted, so
+    /// nothing may be emitted on a guess — not with two new candidates under
+    /// same-cwd concurrency, not with an identity file that is empty (mid-write)
+    /// or unparseable. Silence persists past [`IDENTITY_GRACE`], where the old
+    /// newest-mtime discovery had already forwarded a sibling.
+    #[test]
+    fn bound_reader_forwards_nothing_while_identity_unresolved() {
+        let dir = TempDir::new().unwrap();
+        let (identity_path, projects_dir, buf, handle) = spawn_bound(&dir);
+
+        // Two simultaneous new transcripts: attribution is impossible. The
+        // ambiguity refusal IS the fix.
+        append_markers(
+            &projects_dir.join("sibling-a.jsonl"),
+            &["SIBLING-A MUST NOT FORWARD"],
+        );
+        append_markers(
+            &projects_dir.join("sibling-b.jsonl"),
+            &["SIBLING-B MUST NOT FORWARD"],
+        );
+
+        // Past the identity-less grace window: still nothing, and none of the
+        // unresolved identity shapes below may flip it to a guess.
+        thread::sleep(IDENTITY_GRACE + Duration::from_millis(150));
+        let text = forwarded(&buf);
+        assert!(
+            text.trim().is_empty(),
+            "reader forwarded bytes with no positive bind (identity absent, \
+             candidates ambiguous); got:\n{text}"
+        );
+
+        // Identity file present but mid-write (empty / whitespace): unresolved.
+        write_identity(&identity_path, "  \n");
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            forwarded(&buf).trim().is_empty(),
+            "reader forwarded bytes while the identity file was mid-write"
+        );
+
+        // Identity file present but unparseable: unresolved.
+        write_identity(&identity_path, "not json at all\n");
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            forwarded(&buf).trim().is_empty(),
+            "reader forwarded bytes while the identity file was unparseable"
+        );
+
+        // Dropping an unbound handle must terminate the bind poll (join inside
+        // Drop; would hang the test otherwise).
+        drop(handle);
+        assert!(
+            forwarded(&buf).trim().is_empty(),
+            "bytes appeared without any positive bind"
+        );
+    }
+
+    /// The binding must follow the identity payload's EXACT transcript_path —
+    /// not the newest-mtime candidate. Two candidates grow while identity is
+    /// unresolved (silence pinned mid-test); the payload then names the OLDER
+    /// file, and only that file is forwarded, from its first byte.
+    #[test]
+    fn bound_reader_binds_identity_exact_path_not_newest_mtime() {
+        let dir = TempDir::new().unwrap();
+        let (identity_path, projects_dir, buf, handle) = spawn_bound(&dir);
+
+        let ours_path = projects_dir.join("ours-session.jsonl");
+        append_markers(&ours_path, &["OURS-FIRST-LINE"]);
+        // Strictly newer mtime for the sibling: under the old newest-mtime rule
+        // THIS is the file discovery would have forwarded.
+        thread::sleep(Duration::from_millis(20));
+        let sibling_path = projects_dir.join("sibling-newest.jsonl");
+        append_markers(&sibling_path, &["SIBLING-NEWEST MUST NOT FORWARD"]);
+
+        // Ambiguous + unresolved: silence.
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            forwarded(&buf).trim().is_empty(),
+            "reader guessed while identity was unresolved and candidates were \
+             ambiguous; got:\n{}",
+            forwarded(&buf)
+        );
+
+        // Identity resolves: it names OURS, the OLDER of the two candidates.
+        write_identity(
+            &identity_path,
+            &format!(
+                "{}\n",
+                serde_json::json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "ours-session",
+                    "transcript_path": ours_path.display().to_string(),
+                })
+            ),
+        );
+
+        thread::sleep(Duration::from_millis(400));
+        append_markers(&ours_path, &["OURS-SECOND-LINE"]);
+        handle.signal_drain();
+        drop(handle);
+
+        let text = forwarded(&buf);
+        assert!(
+            text.contains("OURS-FIRST-LINE") && text.contains("OURS-SECOND-LINE"),
+            "identity-named transcript was not forwarded whole (pre-bind bytes \
+             included); got:\n{text}"
+        );
+        assert!(
+            !text.contains("SIBLING-NEWEST"),
+            "reader forwarded the newest-mtime candidate instead of the \
+             identity payload's exact transcript_path; got:\n{text}"
+        );
+    }
+
+    /// `resolve_identity_binding` field ladder: explicit `transcript_path`
+    /// preferred, `session_id` joined into the projects dir as fallback, and
+    /// every unusable shape resolves to `None` (the caller keeps polling).
+    #[test]
+    fn resolve_identity_binding_prefers_explicit_path_then_session_id() {
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let identity_path = dir.path().join("session-identity.json");
+
+        // Absent, empty, garbage, and field-less payloads all stay unresolved.
+        assert_eq!(
+            resolve_identity_binding(&identity_path, &projects_dir),
+            None
+        );
+        std::fs::write(&identity_path, "").unwrap();
+        assert_eq!(
+            resolve_identity_binding(&identity_path, &projects_dir),
+            None
+        );
+        std::fs::write(&identity_path, "{{{ nope").unwrap();
+        assert_eq!(
+            resolve_identity_binding(&identity_path, &projects_dir),
+            None
+        );
+        std::fs::write(&identity_path, r#"{"cwd":"/tmp"}"#).unwrap();
+        assert_eq!(
+            resolve_identity_binding(&identity_path, &projects_dir),
+            None
+        );
+
+        // Both fields: the explicit transcript_path wins.
+        let explicit = "/tmp/explicit/transcript.jsonl";
+        std::fs::write(
+            &identity_path,
+            serde_json::json!({
+                "session_id": "sid-1",
+                "transcript_path": explicit,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_identity_binding(&identity_path, &projects_dir),
+            Some(PathBuf::from(explicit))
+        );
+
+        // Only session_id: joined into the reader's projects dir.
+        std::fs::write(
+            &identity_path,
+            serde_json::json!({ "session_id": "sid-2" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_identity_binding(&identity_path, &projects_dir),
+            Some(projects_dir.join("sid-2.jsonl"))
+        );
+    }
 }

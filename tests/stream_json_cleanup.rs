@@ -103,17 +103,26 @@ fn test_stream_json_handle_multiple_drop_safe() {
 }
 
 #[test]
-fn test_stream_json_discover_reader_drop_joins_thread() {
-    // Test the discovery reader (used at PROMPT_INJECTED) also cleans up properly.
+fn test_stream_json_bound_reader_drop_joins_thread_while_unbound() {
+    // Test the identity-bound reader (used at PROMPT_INJECTED) also cleans up
+    // properly — including while STILL UNBOUND (identity file absent, nothing
+    // new-or-grown in the projects dir): the bind poll must exit on channel
+    // disconnect just like every other phase. The poll has no deadline by
+    // design (the session lifetime bounds it), so disconnect is the only
+    // guaranteed exit while unbound — this test pins that it works.
     let projects_dir = tempfile::TempDir::new().unwrap();
     let projects_path = projects_dir.path().to_path_buf();
+    let identity_path = projects_path.join("session-identity.json");
 
     // Create a pre-existing snapshot (empty in this case)
     let pre_existing = claude_print::emitter::snapshot_jsonl_sizes(&projects_path);
 
-    // Spawn the discovery reader
-    let handle =
-        claude_print::emitter::spawn_stream_json_reader_discover(projects_path, pre_existing);
+    // Spawn the bound reader; no identity file, no candidates
+    let handle = claude_print::emitter::spawn_stream_json_reader_bound(
+        identity_path,
+        projects_path,
+        pre_existing,
+    );
 
     // Give it time to start polling
     thread::sleep(Duration::from_millis(100));

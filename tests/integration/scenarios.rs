@@ -8,7 +8,7 @@
 /// callers.
 use claude_print::cli::OutputFormat;
 use claude_print::emitter::{
-    emit_error, emit_success, snapshot_jsonl_sizes, spawn_stream_json_reader_discover_to,
+    emit_error, emit_success, snapshot_jsonl_sizes, spawn_stream_json_reader_bound_to,
     spawn_stream_json_reader_to,
 };
 use claude_print::error::{ClaudePrintError, Error};
@@ -494,32 +494,37 @@ fn stream_json_reader_forwards_lines_incrementally_as_file_grows() {
     assert!(output_lines[1].contains("second chunk"));
 }
 
-/// Stream-JSON DISCOVER reader tails the session JSONL claude writes under a
-/// projects directory, forwarding lines INCREMENTALLY as the file grows — even
-/// though the exact `<session_id>.jsonl` filename is unknown at spawn time.
+/// Stream-JSON BOUND reader tails THIS session's transcript under a projects
+/// directory, forwarding lines INCREMENTALLY as the file grows — even though
+/// the exact `<session_id>.jsonl` filename is unknown at spawn time.
 ///
-/// This is the bf-3c7c acceptance primitive: it pins the production behavior of
-/// `spawn_stream_json_reader_discover_to` (the reader spawned at PROMPT_INJECTED
-/// in `session.rs`) independent of mock_claude. Real claude and mock_claude both
-/// write the transcript at `~/.claude/projects/<cwd-slug>/<session_id>.jsonl`,
-/// and the `session_id` only surfaces in the Stop payload (after injection), so
-/// the reader cannot be handed a final path. Instead it snapshots the projects
-/// dir, then DISCOVERS the new session file at runtime and tails it.
+/// This is the bf-3c7c acceptance primitive, updated for claudepr-a927ec0c: it
+/// pins the production behavior of `spawn_stream_json_reader_bound_to` (the
+/// reader spawned at PROMPT_INJECTED in `session.rs`) independent of
+/// mock_claude. The session_id only surfaces in the Stop payload (after
+/// injection), so the reader binds from the per-drive identity file the
+/// UserPromptSubmit relay hook writes; this test covers the IDENTITY-LESS
+/// fallback: with no identity file, a single transcript created since the
+/// injection snapshot is bound (nothing to mis-attribute), a pre-existing
+/// stale session is excluded, and the file is tailed as it grows.
 ///
 /// Mirrors mock_claude's layout (`~/.claude/projects/mock-cwd/<id>.jsonl`):
 ///   - a STALE pre-existing session file (present at injection) must be skipped,
-///   - a NEW session file created AFTER spawn (this session) must be discovered
-///     and tailed, line by line, as it grows.
+///   - a NEW session file created AFTER spawn (this session, the only candidate)
+///     must be bound and tailed, line by line, as it grows.
 #[test]
-fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
+fn stream_json_reader_binds_single_candidate_and_tails_projects_dir_jsonl() {
     // Projects-dir-style layout matching mock_claude's real write location.
     let dir = TempDir::new().unwrap();
     let projects_dir = dir.path().join(".claude").join("projects").join("mock-cwd");
     std::fs::create_dir_all(&projects_dir).unwrap();
 
+    // No identity file ever appears (legacy claude without the relay hook).
+    let identity_path = dir.path().join("no-such-identity.json");
+
     // A stale session from a PREVIOUS run, present at injection time. The reader
-    // must NOT forward it: it existed in the snapshot and has not grown, so it is
-    // excluded as "not this session".
+    // must NOT forward it: it existed in the snapshot, so it belongs to a
+    // session OLDER than ours and is excluded from the fallback candidates.
     let stale_path = projects_dir.join("stale-session.jsonl");
     write_jsonl(
         &stale_path,
@@ -544,39 +549,45 @@ fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
     let out_buf = Arc::new(Mutex::new(Vec::new()));
     let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
 
-    // Spawn the DISCOVER reader. At this instant the new session's file does NOT
-    // exist yet (session_id unknown) — exactly the PROMPT_INJECTED condition. The
-    // reader must discover the file claude creates after this point.
-    let handle = spawn_stream_json_reader_discover_to(projects_dir.clone(), pre_existing, writer);
+    // Spawn the BOUND reader. At this instant the new session's file does NOT
+    // exist yet (session_id unknown) — exactly the PROMPT_INJECTED condition.
+    let handle = spawn_stream_json_reader_bound_to(
+        identity_path,
+        projects_dir.clone(),
+        pre_existing,
+        writer,
+    );
 
     // claude now creates THIS session's transcript and writes the first event.
-    // The reader's 50ms discovery loop must find the new file at runtime.
+    // The reader's 50ms bind loop must find the (only) new file at runtime.
     let live_path = projects_dir.join("new-session-id.jsonl");
     write_jsonl(
         &live_path,
         &[assistant_event("m1", "discovered chunk", 10, 5, 0, 0)],
     );
 
-    // Let the live tail discover the file and forward the first line. Discovery
-    // polls every 50ms; 150ms comfortably covers discovery + the first read.
-    std::thread::sleep(Duration::from_millis(150));
+    // Let the live tail bind to the file and forward the first line. The bind
+    // poll runs every 50ms and the identity-less fallback holds the bind for
+    // IDENTITY_GRACE (250ms) before maturing; 700ms comfortably covers grace
+    // + binding + the first read.
+    std::thread::sleep(Duration::from_millis(700));
 
     {
         let bytes = out_buf.lock().unwrap().clone();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(
             text.contains("discovered chunk"),
-            "discover reader did not forward the first line of the newly-created \
+            "bound reader did not forward the first line of the newly-created \
              session transcript; got:\n{text}"
         );
         assert!(
             !text.contains("STALE MUST NOT FORWARD"),
-            "discover reader forwarded a pre-existing (stale) session's bytes — \
+            "bound reader forwarded a pre-existing (stale) session's bytes — \
              the injection snapshot must exclude it; got:\n{text}"
         );
     }
 
-    // Append a second event; the live tail must pick it up without re-discovering.
+    // Append a second event; the live tail must pick it up without re-binding.
     {
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -596,7 +607,7 @@ fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(
             text.contains("appended chunk"),
-            "discover reader did not forward the appended second line; got:\n{text}"
+            "bound reader did not forward the appended second line; got:\n{text}"
         );
     }
 
@@ -617,6 +628,430 @@ fn stream_json_reader_discovers_and_tails_projects_dir_jsonl() {
     assert!(
         !text.contains("STALE MUST NOT FORWARD"),
         "stale pre-existing session line leaked into the final output; got:\n{text}"
+    );
+}
+
+/// claudepr-a927ec0c core pin: with TWO transcripts created since the
+/// injection snapshot in the same
+/// projects dir (a concurrent sibling session), the reader must bind the one
+/// the IDENTITY file names — never the newest by mtime, which under the old
+/// discovery rule was the sibling as often as not.
+#[test]
+fn stream_json_reader_identity_binding_wins_over_newest_sibling() {
+    let dir = TempDir::new().unwrap();
+    let projects_dir = dir.path().join("projects").join("shared-cwd");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+    let identity_path = dir.path().join("session-identity.json");
+
+    let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+
+    let handle = spawn_stream_json_reader_bound_to(
+        identity_path.clone(),
+        projects_dir.clone(),
+        pre_existing,
+        writer,
+    );
+
+    // The SIBLING session creates its transcript first (so it is older) — and
+    // then keeps growing, which would make it the newest-mtime candidate under
+    // the old rule.
+    let sibling_path = projects_dir.join("sibling-session.jsonl");
+    write_jsonl(
+        &sibling_path,
+        &[assistant_event(
+            "s1",
+            "SIBLING MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+
+    // Identity arrives: this session's transcript is `ours-session.jsonl`.
+    std::fs::write(
+        &identity_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "ours-session",
+                "transcript_path": projects_dir.join("ours-session.jsonl"),
+            })
+        ),
+    )
+    .unwrap();
+
+    // THIS session's transcript appears after its sibling's.
+    let ours_path = projects_dir.join("ours-session.jsonl");
+    write_jsonl(
+        &ours_path,
+        &[assistant_event("m1", "our first chunk", 10, 5, 0, 0)],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Drain + join, then assert ONLY our lines were forwarded.
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.contains("our first chunk"),
+        "reader did not forward the identity-named transcript; got:\n{text}"
+    );
+    assert!(
+        !text.contains("SIBLING MUST NOT FORWARD"),
+        "reader forwarded the sibling session's transcript under same-cwd \
+         concurrency — the identity binding was ignored; got:\n{text}"
+    );
+}
+
+/// claudepr-a927ec0c core pin: with identity ABSENT and TWO candidates (the
+/// ambiguous same-cwd shape), the reader must forward NOTHING — refusing to
+/// guess — until the Stop-payload retarget names the correct transcript, whose
+/// tail (result event included) is then forwarded whole.
+#[test]
+fn stream_json_reader_refuses_ambiguous_candidates_until_retarget() {
+    let dir = TempDir::new().unwrap();
+    let projects_dir = dir.path().join("projects").join("shared-cwd");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+    // No identity file ever appears.
+    let identity_path = dir.path().join("no-such-identity.json");
+
+    let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+
+    let handle = spawn_stream_json_reader_bound_to(
+        identity_path,
+        projects_dir.clone(),
+        pre_existing,
+        writer,
+    );
+
+    // Two concurrent sessions create transcripts — neither ours.
+    let sibling_a = projects_dir.join("sibling-a.jsonl");
+    let sibling_b = projects_dir.join("sibling-b.jsonl");
+    write_jsonl(
+        &sibling_a,
+        &[assistant_event(
+            "a1",
+            "SIBLING-A MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+    write_jsonl(
+        &sibling_b,
+        &[assistant_event(
+            "b1",
+            "SIBLING-B MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.trim().is_empty(),
+            "reader forwarded transcript content while the candidate set was \
+             ambiguous and no identity existed — it must refuse to guess; \
+             got:\n{text}"
+        );
+    }
+
+    // Stop fires: the payload retargets the reader at OUR transcript, which
+    // this session's writer has meanwhile produced.
+    let ours_path = projects_dir.join("ours-session.jsonl");
+    write_jsonl(
+        &ours_path,
+        &[
+            assistant_event("m1", "our only chunk", 10, 5, 0, 0),
+            result_event("ours-session", false),
+        ],
+    );
+    handle.retarget(ours_path.clone());
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.contains("our only chunk"),
+        "retarget did not bind our transcript for the drained tail; got:\n{text}"
+    );
+    assert!(
+        !text.contains("SIBLING-A MUST NOT FORWARD")
+            && !text.contains("SIBLING-B MUST NOT FORWARD"),
+        "sibling transcript content leaked into the output; got:\n{text}"
+    );
+}
+
+/// Identity arriving LATE (a slow hook, mid-turn) must still bind: the reader
+/// holds silent through the ambiguous window, then binds the identity-named
+/// transcript from its snapshot offset and streams the rest live.
+#[test]
+fn stream_json_reader_binds_when_identity_arrives_late() {
+    let dir = TempDir::new().unwrap();
+    let projects_dir = dir.path().join("projects").join("shared-cwd");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+    let identity_path = dir.path().join("session-identity.json");
+
+    let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+
+    let handle = spawn_stream_json_reader_bound_to(
+        identity_path.clone(),
+        projects_dir.clone(),
+        pre_existing,
+        writer,
+    );
+
+    // Ambiguous window: two candidates, no identity yet.
+    let sibling_path = projects_dir.join("sibling-session.jsonl");
+    write_jsonl(
+        &sibling_path,
+        &[assistant_event(
+            "s1",
+            "SIBLING MUST NOT FORWARD",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+    std::thread::sleep(Duration::from_millis(120));
+
+    // Identity lands mid-turn and names OUR transcript, which so far holds one
+    // event (pre-identity content the reader must skip via the offset rules —
+    // it was created after injection, so tailing starts at 0 and this first
+    // event IS forwarded, matching the no-snapshot rule for new files).
+    std::fs::write(
+        &identity_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "ours-session",
+                "transcript_path": projects_dir.join("ours-session.jsonl"),
+            })
+        ),
+    )
+    .unwrap();
+    let ours_path = projects_dir.join("ours-session.jsonl");
+    write_jsonl(
+        &ours_path,
+        &[assistant_event("m1", "our early chunk", 10, 5, 0, 0)],
+    );
+    std::thread::sleep(Duration::from_millis(120));
+
+    // The post-identity event must stream live.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ours_path)
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant_event("m2", "our late chunk", 10, 5, 0, 0)
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(120));
+
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.contains("our early chunk") && text.contains("our late chunk"),
+        "reader did not bind the identity-named transcript and stream it live; \
+         got:\n{text}"
+    );
+    assert!(
+        !text.contains("SIBLING MUST NOT FORWARD"),
+        "sibling content leaked during the ambiguous window; got:\n{text}"
+    );
+}
+
+/// An identity landing AFTER the identity-less fallback has matured its bind
+/// (a hook slower than IDENTITY_GRACE) must still rebind: the tail keeps
+/// polling the identity file and switches to the named transcript from its
+/// snapshot offset. Lines already forwarded from the fallback-bound file
+/// before the identity landed cannot be retracted — the documented bound of
+/// the identity-less fallback — so they remain in the output here.
+#[test]
+fn stream_json_reader_late_identity_rebinds_after_fallback_bind_matured() {
+    let dir = TempDir::new().unwrap();
+    let projects_dir = dir.path().join("projects").join("solo-cwd");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+    let identity_path = dir.path().join("session-identity.json");
+
+    let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+
+    let handle = spawn_stream_json_reader_bound_to(
+        identity_path.clone(),
+        projects_dir.clone(),
+        pre_existing,
+        writer,
+    );
+
+    // Sole new candidate: the fallback matures after IDENTITY_GRACE and binds
+    // it, forwarding its first event live.
+    let fallback_path = projects_dir.join("fallback-bound.jsonl");
+    write_jsonl(
+        &fallback_path,
+        &[assistant_event("f1", "fallback-bound chunk", 1, 1, 0, 0)],
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("fallback-bound chunk"),
+            "fallback bind did not mature and stream the sole candidate; got:\n{text}"
+        );
+    }
+
+    // NOW identity lands naming a DIFFERENT transcript — the tail must switch.
+    let override_path = projects_dir.join("override-session.jsonl");
+    write_jsonl(
+        &override_path,
+        &[assistant_event(
+            "o1",
+            "post-bind identity chunk",
+            1,
+            1,
+            0,
+            0,
+        )],
+    );
+    std::fs::write(
+        &identity_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "override-session",
+                "transcript_path": override_path,
+            })
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    {
+        let bytes = out_buf.lock().unwrap().clone();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("post-bind identity chunk"),
+            "late identity did not rebind the tail onto the named transcript; \
+             got:\n{text}"
+        );
+    }
+
+    // The switched tail keeps streaming the override transcript live.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&override_path)
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant_event("o2", "override live chunk", 1, 1, 0, 0)
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(150));
+
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.contains("override live chunk"),
+        "tail stopped streaming the override transcript after rebinding; got:\n{text}"
+    );
+    // And the identity-file content never leaked into the tail as transcript.
+    assert!(
+        !text.contains("hook_event_name"),
+        "identity payload itself was forwarded as transcript content; got:\n{text}"
+    );
+}
+
+/// A Stop-payload retarget naming the transcript the reader is ALREADY bound to
+/// (the normal identity-bound run) must be a no-op: no offset reset, no
+/// duplicate forwarding of lines already streamed.
+#[test]
+fn stream_json_reader_retarget_same_path_does_not_duplicate() {
+    let dir = TempDir::new().unwrap();
+    let projects_dir = dir.path().join("projects").join("solo-cwd");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+    let identity_path = dir.path().join("session-identity.json");
+
+    let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let writer = Box::new(CaptureWriter(Arc::clone(&out_buf)));
+
+    let handle = spawn_stream_json_reader_bound_to(
+        identity_path.clone(),
+        projects_dir.clone(),
+        pre_existing,
+        writer,
+    );
+
+    // Identity binds us to our transcript; it gets a first event.
+    let ours_path = projects_dir.join("ours-session.jsonl");
+    std::fs::write(
+        &identity_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "ours-session",
+                "transcript_path": ours_path,
+            })
+        ),
+    )
+    .unwrap();
+    write_jsonl(
+        &ours_path,
+        &[assistant_event("m1", "first forward", 10, 5, 0, 0)],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Stop fires, naming the same transcript. Drain from the retarget.
+    handle.retarget(ours_path);
+    handle.signal_drain();
+    drop(handle);
+
+    let bytes = out_buf.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let count = text.matches("first forward").count();
+    assert_eq!(
+        count, 1,
+        "same-path retarget re-forwarded already-streamed lines; got:\n{text}"
     );
 }
 

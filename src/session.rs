@@ -666,16 +666,24 @@ impl Session {
                 // session_id — and thus the exact filename — is assigned by claude
                 // and only surfaces in the Stop payload, which arrives AFTER
                 // injection, so the reader cannot be handed a final path here.
-                // Instead point it at the projects dir and let it DISCOVER this
-                // session's JSONL at runtime (newest .jsonl new or grown since the
-                // injection snapshot), reusing the existing 50ms/5s open-retry
-                // loop. The snapshot captures each file's size at injection so the
-                // reader can skip pre-injection events (start_offset).
+                // Instead point it at the per-drive identity file
+                // (claudepr-a927ec0c): the UserPromptSubmit relay hook writes this
+                // session's session_id/transcript_path there the instant the
+                // prompt is submitted, and the reader binds to exactly that
+                // transcript — never to a sibling's, however concurrent the cwd.
+                // Legacy claude without the identity hook still works: with a
+                // single transcript CREATED since the snapshot the reader binds
+                // it (an older sibling's growing file is excluded by the
+                // snapshot, two new ones refuse the guess), and the Stop
+                // payload retargets the reader before the final drain. The
+                // snapshot captures each file's size at injection so the reader
+                // can skip pre-injection events (start_offset).
                 if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
                     match projects_dir_for_cwd() {
                         Ok(projects_dir) => {
                             let pre_existing = emitter::snapshot_jsonl_sizes(&projects_dir);
-                            stream_json_handle = Some(emitter::spawn_stream_json_reader_discover(
+                            stream_json_handle = Some(emitter::spawn_stream_json_reader_bound(
+                                installer.identity_path.clone(),
                                 projects_dir,
                                 pre_existing,
                             ));
@@ -816,11 +824,19 @@ impl Session {
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from("transcript.jsonl"));
 
-                // Normal Stop transition: signal the reader to drain its
-                // remaining transcript lines to stdout, then drop it so Drop
-                // disconnects the channel and joins (draining completes inside
-                // the join before we return). INV-8.
+                // Normal Stop transition: the Stop payload is the authoritative
+                // statement of which transcript is ours (claudepr-a927ec0c) —
+                // retarget the reader to it BEFORE signaling the drain, so the
+                // drained tail comes from THIS session's transcript even if the
+                // identity file never appeared (legacy claude) or discovery was
+                // refused under sibling ambiguity. Already-correct bindings
+                // make this a no-op inside the reader. Then signal the drain,
+                // and drop the handle so Drop disconnects the channel and joins
+                // (draining completes inside the join before we return). INV-8.
                 if let Some(handle) = stream_json_handle.as_ref() {
+                    if let Some(path) = &stop_info.transcript_path {
+                        handle.retarget(path.clone());
+                    }
                     handle.signal_drain();
                 }
                 drop(stream_json_handle);
@@ -1171,16 +1187,26 @@ impl Session {
                 // INV-3: the "prompt injected" trace must follow "fifo opened".
                 tracer_clone.trace("prompt injected");
 
-                // Spawn the stream-json reader at PROMPT_INJECTED, discovering
-                // this session's JSONL in the WORKER's projects dir: the claude
+                // Spawn the stream-json reader at PROMPT_INJECTED, binding to this
+                // session's JSONL in the WORKER's projects dir: the claude
                 // process runs with the worker's cwd and writes its transcript
                 // under that slug — deriving from this client process's cwd
-                // would watch the wrong directory.
+                // would watch the wrong directory. The binding goes through the
+                // identity file SITTING NEXT TO the worker's stop.fifo
+                // (claudepr-a927ec0c): the pool daemon installed the same
+                // UserPromptSubmit relay hook the stateless client uses, so the
+                // identity file appears there the moment the worker is driven.
+                // Same-cwd concurrency is the warm pool's steady state, so a
+                // discovery guess here would be wrong exactly when it matters.
                 if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
                     match projects_dir_for(worker.worker_cwd()) {
                         Ok(projects_dir) => {
                             let pre_existing = emitter::snapshot_jsonl_sizes(&projects_dir);
-                            stream_json_handle = Some(emitter::spawn_stream_json_reader_discover(
+                            let identity_path = worker
+                                .stop_fifo()
+                                .with_file_name(crate::hook::SESSION_IDENTITY_FILE);
+                            stream_json_handle = Some(emitter::spawn_stream_json_reader_bound(
+                                identity_path,
                                 projects_dir,
                                 pre_existing,
                             ));
@@ -1301,9 +1327,19 @@ impl Session {
                     .clone()
                     .unwrap_or_else(|| std::path::PathBuf::from("transcript.jsonl"));
 
-                // Normal Stop transition: signal the reader to drain its
-                // remaining transcript lines, then drop it (INV-8).
+                // Normal Stop transition: retarget the reader to the Stop
+                // payload's transcript BEFORE the drain — same claudepr-a927ec0c
+                // backstop as the stateless arm, and more important here since
+                // same-cwd concurrency (a warm pool with siblings in the same
+                // worker cwd) is the exact shape the misbinding lived in. The
+                // ordering is load-bearing: the reader honors a pending
+                // retarget before a pending drain at every idle tick, so a
+                // retarget sent first is always applied to the drained tail.
+                // Then signal the drain and drop the handle (INV-8).
                 if let Some(handle) = stream_json_handle.as_ref() {
+                    if let Some(path) = &stop_info.transcript_path {
+                        handle.retarget(path.clone());
+                    }
                     handle.signal_drain();
                 }
                 drop(stream_json_handle);
