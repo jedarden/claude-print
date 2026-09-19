@@ -1911,12 +1911,18 @@ fn pool_socket_pooled_release_precedes_the_stream_json_drain() {
     daemon.wait_for("settled and ready", 2, Duration::from_secs(90));
     let stderr = daemon.stderr();
     assert_eq!(
-        stderr.iter().filter(|l| l.contains("Assigned worker")).count(),
+        stderr
+            .iter()
+            .filter(|l| l.contains("Assigned worker"))
+            .count(),
         1,
         "exactly one worker handed out; stderr: {stderr:?}"
     );
     assert_eq!(
-        stderr.iter().filter(|l| l.contains("Released worker")).count(),
+        stderr
+            .iter()
+            .filter(|l| l.contains("Released worker"))
+            .count(),
         1,
         "exactly one release; stderr: {stderr:?}"
     );
@@ -2570,12 +2576,18 @@ fn pool_socket_two_sequential_stream_json_invocations_tail_only_their_own_transc
     // workers handed out and released, one per caller.
     let stderr = daemon.stderr();
     assert_eq!(
-        stderr.iter().filter(|l| l.contains("Assigned worker")).count(),
+        stderr
+            .iter()
+            .filter(|l| l.contains("Assigned worker"))
+            .count(),
         2,
         "exactly two workers may be handed out; stderr: {stderr:?}"
     );
     assert_eq!(
-        stderr.iter().filter(|l| l.contains("Released worker")).count(),
+        stderr
+            .iter()
+            .filter(|l| l.contains("Released worker"))
+            .count(),
         2,
         "each caller must release exactly once; stderr: {stderr:?}"
     );
