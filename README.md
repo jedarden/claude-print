@@ -108,6 +108,9 @@ claude-print --timeout 30 "quick question"
 | `--pool-socket <PATH>` | | | Acquire a prewarmed worker from the pool daemon at this Unix socket instead of spawning a fresh `claude`; falls back to the ordinary stateless session when the pool can't serve — see [Warm PTY pool](#warm-pty-pool-adr-005) |
 | `--config <FILE>` | | XDG or user config | Read configuration from an explicit TOML file |
 | `--no-inherit-hooks` | | | Disable user hook inheritance |
+| `--mcp-config <MCP_CONFIG>` | | | MCP config (path or inline JSON) to load; may be repeated or comma-separated for multiple files. Headless runs always pass `--strict-mcp-config` to the child, so only configs named here load — inherited/project/global MCP servers cannot wedge startup |
+| `--pretrust-cwd` | | off | Pre-grant folder trust for the working dir by writing `hasTrustDialogAccepted: true` into `~/.claude.json` before spawning the child — the only way to keep the one-time trust dialog from stalling an untrusted cwd without relying on the PTY keyword scanner. Off by default to avoid mutating the shared user config under fleet concurrency; enable it when you have seen trust-dialog stalls |
+| `--show-child-stderr` | | off | Surface the child's captured PTY output to stderr when startup is slow or stalls (watchdog first-output timeout, or the prompt was never injected) — useful for diagnosing MCP/init wedges |
 | `--verbose` | | | Write timing traces to stderr |
 | `--check` | | | Run installation self-test and exit |
 | `--clean` | | | With `--check`, remove orphaned temp directories older than one hour |
