@@ -1367,7 +1367,10 @@ impl PoolServer {
 
         unsafe {
             let mut cmsg: libc::cmsghdr = std::mem::zeroed();
-            cmsg.cmsg_len = std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>();
+            // cmsg_len is usize on glibc but u32 on musl — cast into the
+            // field's own type so both targets compile.
+            cmsg.cmsg_len =
+                (std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>()) as _;
             cmsg.cmsg_level = libc::SOL_SOCKET;
             cmsg.cmsg_type = libc::SCM_RIGHTS;
 
@@ -1704,7 +1707,8 @@ fn recv_fd_bounded(
         msg.msg_iov = iov.as_mut_ptr();
         msg.msg_iovlen = 1;
         msg.msg_control = control.0.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = control.0.len();
+        // msg_controllen is usize on glibc but u32 on musl.
+        msg.msg_controllen = control.0.len() as _;
 
         let ret = unsafe {
             libc::recvmsg(
@@ -1730,7 +1734,9 @@ fn recv_fd_bounded(
             if hdr_ref.cmsg_level == libc::SOL_SOCKET && hdr_ref.cmsg_type == libc::SCM_RIGHTS {
                 let data_len = hdr_ref
                     .cmsg_len
-                    .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
+                    // CMSG_LEN(0) is usize on glibc but u32 on musl, matching
+                    // cmsg_len on each — cast into the header's own type.
+                    .saturating_sub(unsafe { libc::CMSG_LEN(0) } as _);
                 if data_len as usize >= std::mem::size_of::<RawFd>() {
                     let fd =
                         unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(hdr) as *const RawFd) };
