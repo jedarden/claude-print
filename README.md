@@ -55,9 +55,10 @@ This confirms `cc_entrypoint=cli` appears in the session JSONL. `install.sh` run
 
 ```
 claude-print [OPTIONS] [PROMPT]
+claude-print serve [OPTIONS]
 ```
 
-Reads the prompt from a positional argument, `--input-file`, or stdin (when not a TTY). These are mutually exclusive.
+Reads the prompt from a positional argument, `--input-file`, or stdin (when not a TTY). These are mutually exclusive. The `serve` subcommand runs the ADR-005 warm PTY pool daemon instead of a session — see [Warm PTY pool](#warm-pty-pool-adr-005).
 
 ### Examples
 
@@ -104,6 +105,7 @@ claude-print --timeout 30 "quick question"
 | `--stream-json-timeout <SECS>` | | `90` | Stream-json first-output timeout in seconds |
 | `--stop-hook-timeout <SECS>` | | `120` | Stop hook watchdog timeout in seconds |
 | `--claude-binary <PATH>` | | PATH lookup | Path to claude binary |
+| `--pool-socket <PATH>` | | | Acquire a prewarmed worker from the pool daemon at this Unix socket instead of spawning a fresh `claude`; falls back to the ordinary stateless session when the pool can't serve — see [Warm PTY pool](#warm-pty-pool-adr-005) |
 | `--config <FILE>` | | XDG or user config | Read configuration from an explicit TOML file |
 | `--no-inherit-hooks` | | | Disable user hook inheritance |
 | `--verbose` | | | Write timing traces to stderr |
@@ -307,6 +309,82 @@ rm "$bad_config" config-error.json
 4. **Stop hook FIFO** — installs a temporary Claude Code Stop hook that writes a payload to a FIFO when the response is complete; the process blocks on the FIFO read.
 5. **Transcript read** — reads the JSONL session transcript Claude writes to `~/.claude/projects/`, extracts the assistant turn, and emits it in the requested format.
 
+## Warm PTY pool (ADR-005)
+
+`claude-print` can amortize per-invocation startup cost across a fleet by keeping pre-warmed `claude` PTY processes in a pool daemon. This is **opt-in and additive**: without the two pieces below, nothing changes about the ordinary invocation path — no pool code runs at all.
+
+Pooled workers are warmed through trust-dismiss and idle-settle but never past prompt injection, and every request still gets its own `claude` process and session: one prompt per worker, no multi-turn reuse. A released worker is destroyed and replaced, never handed to a second prompt (INV-9).
+
+### `serve` — the pool daemon
+
+```
+claude-print serve [--pool-size N] [--socket PATH] [--verbose]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pool-size <N>` | `1` | Number of workers to keep warm. `0` or anything above `256` exits 2 with an actionable message before any process is spawned |
+| `--socket <PATH>` | `/tmp/claude-print-pool.sock` | Unix socket to listen on. Replaces a stale node at the same path; created with owner-only (0600) permissions regardless of umask |
+| `--verbose` | off | Daemon lifecycle logging to stderr (spawn / warmup / assign / release / teardown) |
+
+Operating behavior:
+
+- The daemon warms `--pool-size` workers and tops the pool back up after every handout. Warmup is bounded (120 s per worker); a worker that fails or times out warmup is destroyed and replaced, never handed out half-warmed.
+- `SIGINT` or `SIGTERM` stops the daemon cleanly: every worker's process group is torn down (SIGTERM → 2 s grace → SIGKILL, exit observed and reaped — no survivors, no zombies), the socket file is removed, and the exit code is 0. A supervisor stopping the service is not a failure. Setup failures (bad `--pool-size`, unusable socket path) exit 2 before any worker is spawned.
+- Socket cleanup is ownership-checked: at shutdown the daemon removes only the socket node it created at bind time, so a daemon that lost its path to a replacement never unlinks the winner's socket.
+- The worker runs `claude` with the daemon's launch decisions (hook settings for the Stop-FIFO relay, `--setting-sources=` so user hooks do not fire inside pooled workers). Per-invocation client flags cannot reach an already-running worker — see below.
+- `serve` never reads the config file and never falls through to prompt validation. Like every entry point it requires a valid `HOME` and a resolvable `claude` binary (`--claude-binary`).
+
+### `--pool-socket` — the client flag
+
+```bash
+claude-print --pool-socket /tmp/claude-print-pool.sock "prompt"
+```
+
+All three output formats (`text`, `json`, `stream-json`) work over an acquired worker. The acquire is budgeted at `min(60 s, --timeout)`, so the flag can never stall an invocation past its own wall-clock budget. Per-invocation child-launch flags (`--model`, `--max-turns`, the tool-permission flags, `--no-inherit-hooks`, `--mcp-config`, `--pretrust-cwd`) cannot apply to an already-running pooled worker: with `--verbose`, each ignored flag is listed on a stderr diagnostic and the prompt still runs on the daemon's launch.
+
+### Failure behavior and stale sockets
+
+| Pool state | Client behavior |
+|---|---|
+| Socket file absent, stale (exists, nothing listening), connect refused, or permission denied | Stateless fallback: one `--verbose` diagnostic, then the ordinary session. Output and exit code identical to a no-flag run |
+| Daemon answers `pool_full`, `shutting_down`, `internal_error`, or `acquire_timeout` | Stateless fallback, same as above — the pool is up but has nothing to hand out |
+| Daemon answers garbage, a malformed frame, an incomplete assignment, or the fd transfer fails; daemon goes silent past the acquire budget | Hard error, exit 2, **no fallback** — a reachable-but-broken daemon must not be masked behind full-price stateless sessions |
+| Daemon dies while a client is driving | The session is daemon-independent once assigned: the client finishes inside its `--timeout`; the best-effort release against the dead daemon is bounded (10 s) and non-fatal |
+| Client killed without cleanup (SIGKILL) | Its worker is never reassigned to a second prompt; the daemon holds it `InUse` and reclaims it only at its own shutdown |
+
+### Operating limits
+
+- `--pool-size`: 1–256 (hard cap — each worker is a full `claude` PTY process).
+- Acquire budget: `min(60 s, --timeout)`, bounding the whole connect + request + response + fd-transfer exchange; every protocol stage inside it is deadline-bounded.
+- Worker warmup: bounded at 120 s per worker.
+- Release exchange: bounded at 10 s, best-effort.
+- One client per worker at a time; concurrent acquirers get distinct workers with distinct sessions.
+
+### Measured startup overhead
+
+Startup overhead (process start → prompt injection, the plan's Benchmark Contract) was measured with the `mock-claude` fixture backend: **1443.6 ms stateless vs 1050.6 ms pooled on average (Δ 393.0 ms, 27.2%)**, release build, 2026-09-19 — see [`docs/notes/startup-overhead-benchmark.md`](docs/notes/startup-overhead-benchmark.md) for method and phase decomposition, and reproduce with `scripts/bench_startup_overhead.py`. This measures `claude-print`'s own overhead only. It does **not** measure model latency: what a real dispatch saves in wall-clock depends on real Claude Code startup and inference, which the mock deliberately removes — no model-latency savings are claimed or established here.
+
+### Billing
+
+Pooled sessions bill exactly like stateless ones — the worker is still `claude` under a PTY, so `cc_entrypoint=cli` holds on both paths (INV-15). Verify the pool path with the credential-backed canary's pooled leg:
+
+```bash
+CLAUDE_PRINT_POOL=1 ./scripts/billing-canary.sh
+```
+
+### Rollback
+
+The pool is opt-in, so rollback is removing the opt-in — no binary revert required:
+
+1. Point clients away from the pool: remove `--pool-socket <path>` from the invoking config. For NEEDLE that is the `invoke` template in `~/.needle/agents/claude-print.yaml` (which does not set the flag by default).
+2. Stop the daemon: send `SIGINT`/`SIGTERM` to the `claude-print serve` process. It exits 0, tears down every worker, and removes its socket file.
+3. Removing a stale socket file by hand (`rm /tmp/claude-print-pool.sock`) is always safe — a client that finds a socket nobody is listening on falls back statelessly anyway.
+
+Even out of order (clients still pointing at a dead daemon), behavior stays correct: those clients fall back statelessly (INV-10). A binary-level rollback follows the general release procedure — `install.sh` preserves the previous binary as `claude-print.prev`.
+
+The full invariant set (INV-9 through INV-15) is specified in `docs/plan/plan.md` (Invariants); the end-to-end pins live in `tests/pool_socket_e2e.rs`, `tests/pool_adversarial_e2e.rs`, `tests/pool_failure_e2e.rs`, and `tests/serve.rs`.
+
 ## NEEDLE integration
 
 If you use NEEDLE for LLM fleet dispatch, `install.sh` automatically copies `claude-print.yaml` to `~/.needle/agents/`. This registers `claude-print` as the adapter for Anthropic subscription models (sonnet/opus/haiku) so NEEDLE workers bill against the subscription rather than the Agent SDK credit pool. See `claude-print.yaml` in the repo root for the full adapter config, including `--no-inherit-hooks` isolation mode and the `use_or_lose` cost type.
@@ -423,8 +501,9 @@ Before cutting a release tag:
 - `docs/notes/` — design decisions, constraints, integration details
 - `docs/plan/plan.md` — complete implementation plan
 - `scripts/check-billing.sh` — AS-4 billing conformance script (run before every release)
-- `scripts/billing-canary.sh` — daily credential-backed AS-4 canary
+- `scripts/billing-canary.sh` — daily credential-backed AS-4 canary (`CLAUDE_PRINT_POOL=1` runs the pooled leg)
 - `scripts/claude-print-billing-canary.{service,timer}` — systemd user units for the canary
+- `scripts/bench_startup_overhead.py` — ADR-005 startup-overhead benchmark harness (`--self-check` for a deterministic no-subprocess pin)
 - `scripts/` — integration test scripts
 
 ---

@@ -61,6 +61,8 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/stop_delayed_payload_e2e.rs` | FIFO keeper-lifetime regression (key invariant 7): a Stop payload withheld ~1.5 s (`MOCK_DELAY_STOP`) is still received exactly once through the live event loop — no premature exit, no lost write, normal cleanup — plus a poller-level delayed hook-shaped write pin (bead claudepr-a847d4de) |
 | `tests/transcript_flush_window.rs` | Flush-window regression: final assistant line absent/truncated on first read, present on retry; decoy `last_assistant_message` suppressed; bounded retries; text/json/stream-json all carry the complete final message |
 | `tests/pool_socket_e2e.rs` | `--pool-socket` client matrix end-to-end through the compiled CLI (bead claudepr-c7824b71): text/json/stream-json over an acquired worker, stateless fallback for absent and stale sockets, three sequential clients with teardown/replace and zero cross-caller leakage, and three malformed-daemon acquire shapes (close mid-exchange, wrong-shape response, assignment without fd) failing safely within the caller timeout |
+| `tests/pool_adversarial_e2e.rs` | Pool concurrency proofs (ADR-005 umbrella claudepr-a03e32d7): concurrent clients each drive a distinct worker with proven session↔worker binding (INV-9, INV-11), and three same-cwd stream-json clients under pool concurrency forward only their own session's events — the end-to-end proof the transcript-guessing defect is dead (claudepr-a927ec0c) |
+| `tests/pool_failure_e2e.rs` | Pool failure paths end-to-end against REAL daemons/clients (bead claudepr-c470b8aa): daemon SIGKILLed mid-handoff (protocol failure, not fallback) and SIGSTOPped silent (budget expiry, no leak, recovery), daemon crash mid-drive (client still finishes inside `--timeout`), SIGKILLed client's worker orphaned but never reassigned (INV-9, INV-13), manager restart recovering on the same socket path with ownership-checked cleanup, and stateless-fallback output parity vs no-flag baselines across absent/stale/unavailable sockets in all three formats |
 | `tests/fixtures/` | Shared fixture helpers |
 
 ### mock_claude
@@ -82,7 +84,8 @@ cargo build -p mock-claude
 | `src/main.rs` | Entry point: CLI parse, claude binary resolution, calls `session::Session::run()` |
 | `src/cli.rs` | Clap argument definitions (`Cli`, `OutputFormat`) |
 | `src/config.rs` | Loads `$XDG_CONFIG_HOME/claude-print/config.toml` if set, otherwise `~/.config/claude-print/config.toml` (model default, inherit_hooks, max_turns, timeout_secs) |
-| `src/session.rs` | Session orchestrator: installs hooks, spawns PTY child, runs event loop, reads transcript. `Session::run()` is the top-level entry point for a single prompt→response cycle. |
+| `src/session.rs` | Session orchestrator: installs hooks, spawns PTY child, runs event loop, reads transcript. `Session::run()` is the top-level entry point for a single prompt→response cycle; `Session::run_pooled()` drives an already-acquired pool worker through the same event loop, watchdog deadlines, Stop-FIFO handoff, and emitters. |
+| `src/pool.rs` | ADR-005 warm PTY pool: `PoolManager`/`PoolServer` (the `serve` daemon — worker spawn, bounded warmup, SCM_RIGHTS fd handoff, SIGTERM→SIGKILL group teardown, ownership-checked socket cleanup) and the `--pool-socket` client (`AcquiredWorker` release-on-drop, acquire classification into fallback vs hard protocol failure, stateless-fallback contract). `MAX_POOL_SIZE` 256; acquire budget `min(60s, --timeout)`. |
 | `src/prompt.rs` | Prompt input validation: NUL byte rejection, file size/type checks for `--input-file` (Security T-2, EC-4) |
 | `src/verbose.rs` | `--verbose` timing traces: emits `[claude-print <ms>ms] <message>` to stderr across session lifecycle |
 | `src/pty.rs` | Forks child, opens PTY pair, calls `login_tty`, unsets `CLAUDE_CODE_SESSION_ID` in child, forwards SIGWINCH/SIGINT |
@@ -152,6 +155,90 @@ These must hold across all changes:
 
 - **Child cleanup uses `kill_child(pid)`** — `kill_child(pid)` sends SIGTERM, waits
   up to 2s, then SIGKILL. Use this for all child cleanup paths, not bare `waitpid`.
+
+## Pool operations (ADR-005)
+
+The warm PTY pool is opt-in and additive: the ordinary invocation path runs no
+pool code unless `--pool-socket` is set. Product-level docs (full flag
+descriptions, failure-behavior table, measured startup overhead) live in
+README.md §"Warm PTY pool (ADR-005)"; the normative invariant text is plan.md
+§Invariants (INV-9 through INV-15). This section is the operator quick
+reference.
+
+```bash
+# Daemon: keep N workers warm (1–256; 0 or >256 exits 2 before any spawn)
+claude-print serve --pool-size 2 --socket /tmp/claude-print-pool.sock --verbose
+
+# Client: ordinary invocation, optionally acquiring a prewarmed worker
+claude-print --pool-socket /tmp/claude-print-pool.sock "prompt"
+```
+
+Operating limits:
+
+| Limit | Value |
+|-------|-------|
+| `--pool-size` | 1–256 (`MAX_POOL_SIZE` in `src/pool.rs`; each worker is a full `claude` PTY process) |
+| Acquire budget (client) | `min(60s, --timeout)` — bounds the whole connect + request + response + fd transfer; every protocol stage inside it is deadline-bounded |
+| Worker warmup | 120 s per worker, enforced on the event-loop timer tick; a timed-out or failed warmup is destroyed and respawned, never handed out |
+| Release exchange | 10 s, best-effort — a dead daemon has nothing left to release |
+| Socket permissions | 0600 regardless of umask (narrowed umask across the bind, then `set_permissions`) |
+| Shutdown | SIGINT/SIGTERM → exit 0; per worker: close PTY master → SIGTERM group → 2 s grace (waitpid-observed) → SIGKILL group → reap |
+
+Failure behavior (the client's ADR-005 contract, `AcquireFailure` in
+`src/pool.rs`):
+
+- **Fallback to the stateless session** (exactly one `--verbose` diagnostic,
+  identical output/exit code to a no-flag run): socket absent, stale
+  (nothing listening), connect refused/timeout, permission denied; and
+  well-formed daemon refusals (`pool_full`, `shutting_down`,
+  `internal_error`, `acquire_timeout`).
+- **Hard error, exit 2, never fallback:** the daemon answered garbage, a
+  malformed frame, an incomplete `worker_assigned`, or the fd transfer
+  failed — or stayed silent past the acquire budget. The daemon was
+  reachable; falling back would mask the breakage behind full-price
+  stateless sessions.
+- **Mid-drive daemon death:** the client's session is daemon-independent
+  once assigned and finishes inside its `--timeout`; the release attempt
+  against the dead daemon is bounded and non-fatal.
+- **Client killed without destructors:** its worker stays `InUse` forever —
+  never reassigned, never destroyed early; reclaimed only at daemon
+  shutdown (a daemon-side lease is the deliberate non-fix; see
+  `AcquiredWorker`'s doc comment).
+
+Stale-socket handling: a daemon *replaces* whatever sits at its socket path
+at bind; at shutdown it removes the node only when it still resolves to the
+(dev, ino) it captured at bind time — so a replaced daemon never unlinks the
+winner's socket, and a leftover stale node is always safe to `rm` by hand.
+
+Rollback (concrete): (1) remove `--pool-socket` from the invoking config —
+for NEEDLE, the `invoke` template in `~/.needle/agents/claude-print.yaml`
+(the shipped template does not set it); (2) `kill -TERM` the `serve` process
+(clean teardown, exit 0, socket removed). Order does not matter: clients
+left pointing at a dead/stale socket fall back statelessly (INV-10). A
+binary-level rollback uses the `claude-print.prev` copy `install.sh`
+preserves.
+
+Pool invariants (full table with tests in plan.md §Invariants):
+
+- **INV-9** — one request per member: at most one prompt per pooled worker;
+  release destroys and replaces, never re-handshakes a used worker.
+- **INV-10** — stateless fallback compatibility; reachable-but-broken is a
+  hard exit 2, never a silent fallback.
+- **INV-11** — no cross-request transcript/session contamination, including
+  same-cwd stream-json concurrency (per-drive identity binding).
+- **INV-12** — bounded client return: nothing pool-related blocks a client
+  past `min(60s, --timeout)`, and mid-drive daemon death never does either.
+- **INV-13** — orphan containment: killed client ⇒ worker held `InUse` until
+  daemon shutdown.
+- **INV-14** — cleanup: no leaked PTY master fds, no survivors, no zombies;
+  socket removed only when still ours.
+- **INV-15** — pooled sessions bill `cc_entrypoint=cli` (AS-4 on the pool
+  path); verify with `CLAUDE_PRINT_POOL=1 ./scripts/billing-canary.sh`.
+
+The startup-overhead benchmark (`scripts/bench_startup_overhead.py`, results
+in `docs/notes/startup-overhead-benchmark.{md,json}`) measures process start
+→ prompt injection under the `mock-claude` fixture only. It isolates
+`claude-print`'s own overhead; it establishes **no model-latency savings**.
 
 ## Bead workflow
 

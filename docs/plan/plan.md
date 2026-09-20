@@ -976,6 +976,10 @@ Approaches considered and rejected. Document why so they are not re-proposed.
 ## Invariants
 
 Named invariants that MUST hold on all exit paths. Each is testable.
+INV-9 through INV-15 are the ADR-005 warm-pool invariants: they bind the pool
+daemon (`serve`) and every `--pool-socket` client. INV-1 through INV-8 keep
+holding unchanged on the pooled path too — a pooled drive runs the same event
+loop, FIFO handoff, and emitters as a stateless one.
 
 | # | Invariant | Test |
 |---|-----------|------|
@@ -987,6 +991,13 @@ Named invariants that MUST hold on all exit paths. Each is testable.
 | INV-6 | `cc_entrypoint=cli` in every generated transcript | AS-4 daily canary plus the manual pre-release gate |
 | INV-7 | Exit code matches the Error Handling table | Each error condition tested with mock_claude; exit code asserted |
 | INV-8 | Reader thread (stream-json) joined before process exit | Join coverage in stream-json integration test |
+| INV-9 | One request per pool member — a pooled worker is handed at most one prompt; on release it is destroyed and the daemon spawns a replacement, never a second handout | `tests/pool_socket_e2e.rs::a_released_worker_is_never_reused_and_sequential_prompts_stay_isolated`, `tests/pool_socket_e2e.rs::sequential_clients_get_fresh_replaced_workers_with_no_cross_caller_leakage` |
+| INV-10 | Stateless fallback compatibility — absent socket, stale socket (nothing listening), refused connect, and a well-formed "cannot serve" answer (`pool_full`/`shutting_down`/`internal_error`/`acquire_timeout`) all route to the ordinary stateless session behind exactly one verbose diagnostic, with output and exit code identical to a no-flag run; a reachable-but-broken daemon (garbage, malformed frame, incomplete assignment, failed fd transfer, silence past the budget) is a hard exit 2 and never a fallback | `tests/pool_socket_e2e.rs::absent_pool_socket_runs_the_stateless_session_quietly`, `::stale_pool_socket_falls_back_with_one_verbose_diagnostic`, `::daemon_close_mid_exchange_fails_safely_within_the_caller_timeout` (and siblings), `tests/pool_failure_e2e.rs::absent_socket_falls_back_compatible_across_all_output_formats` (and stale/unavailable siblings) |
+| INV-11 | No cross-request transcript/session contamination — concurrent acquirers drive distinct workers (distinct id, pid, session, transcript), and every forwarded stream-json byte is bound to the driving session's identity, never a sibling's | `tests/pool_adversarial_e2e.rs::concurrent_clients_each_drive_a_distinct_worker`, `::concurrent_stream_json_clients_share_a_cwd_without_forwarding_siblings` |
+| INV-12 | Bounded client return — the whole acquire exchange is budgeted at `min(60 s, --timeout)` and every protocol stage inside it is deadline-bounded; a manager that crashes, restarts, or goes silent never blocks a client past its `--timeout`, and a daemon dying mid-drive leaves the client's already-assigned session daemon-independent (it finishes inside its budget; the release against the dead daemon is bounded and best-effort) | `tests/pool_failure_e2e.rs::daemon_crash_during_handoff_fails_safely_within_the_caller_timeout`, `::daemon_silence_fails_within_the_caller_timeout_and_recovers_after`, `::daemon_crash_mid_drive_never_blocks_the_client_past_its_deadline`, `::manager_restart_recovers_pooled_serving_on_the_same_socket_path` |
+| INV-13 | Orphan containment — a client killed without destructors (SIGKILL, or a panic under `panic = "abort"`) leaves its worker `InUse`; the daemon never reassigns it and never destroys it early, warms replacements for new clients around it, and reclaims it only at the daemon's own shutdown | `tests/pool_failure_e2e.rs::killed_client_orphans_its_worker_which_is_never_reassigned` |
+| INV-14 | Pool cleanup — every release and shutdown leaves no leaked PTY master fd, no surviving worker process, and no unreaped zombie; the socket file is removed only when it still names the node this daemon created at bind time | at-rest fd-ledger assertions in `tests/pool_adversarial_e2e.rs` and `tests/pool_failure_e2e.rs`; child-reaping and socket-ownership pins in `tests/serve.rs` and `tests/pool_failure_e2e.rs::a_replacing_daemons_bind_survives_the_replaced_daemons_shutdown` |
+| INV-15 | Pooled sessions bill as `cli` (AS-4 holds on the pool path) — acquiring a prewarmed worker never changes the billing classification; the worker is still `claude` under a PTY | `CLAUDE_PRINT_POOL=1 scripts/billing-canary.sh` (credential-backed pooled canary leg; manual/periodic) |
 
 ## Proof Obligations
 
@@ -1122,7 +1133,7 @@ Phase ordering is sequential. Each phase MUST NOT begin until the prior phase's 
 - Malformed JSONL line (truncated JSON) → line skipped, subsequent lines parsed
 - Empty file → returns empty text, zero token counts (no panic)
 
-**Stop hook parser** (`tests/hook.rs`):
+**Stop hook parser** (`tests/hooks.rs`):
 - Full payload → all fields extracted
 - Missing `transcript_path` → fallback path derived from `session_id` + `cwd`
 - Missing `last_assistant_message` → `None` (retry-only fallback)
@@ -1365,6 +1376,8 @@ needle run --agent claude-print --workspace /home/coding/some-project
 
 Overhead is measured as wall-clock time from process start to the bracketed paste write timestamp (logged at PROMPT_INJECTED transition in `--verbose` mode). This excludes model latency, which is outside `claude-print`'s control.
 
+**Recorded run (2026-09-19):** the ADR-005 pool was measured against this contract with the `mock-claude` fixture backend — mean 1443.6 ms stateless vs 1050.6 ms pooled (Δ 393.0 ms, 27.2%), release build, n=10 per mode. Method, phase decomposition, and validity gates: `docs/notes/startup-overhead-benchmark.md`; raw samples: `docs/notes/startup-overhead-benchmark.json`; harness: `scripts/bench_startup_overhead.py` (deterministic pin: `--self-check`). The measurement isolates `claude-print`'s own per-invocation overhead only — the mock removes real Claude Code startup and inference, so it establishes no model-latency or production wall-clock savings.
+
 ### CI-Gated Benchmarks
 
 Binary size is checked in CI: after the musl release build, `ls -lh` the binary and fail if > 10 MB. No runtime performance benchmarks in CI (they require credentials or complex mock setup). Performance is validated manually against the budgets above before each release.
@@ -1398,6 +1411,7 @@ The `claude_version` field is additive (minor) and will not be removed in a majo
 
 - **Promote to stable:** AS-1 through AS-6 pass; the daily AS-4 canary is healthy and AS-4 is verified manually; no open P0 bugs.
 - **Roll back:** If AS-4 fails (entrypoint is `sdk-cli`), immediately pull the release from the CI artifact store and revert the install. The previous binary is always preserved as `claude-print.prev` by `install.sh`.
+- **Roll back the pool (ADR-005):** the pool is opt-in, so rollback is removing the opt-in, not a binary revert. (1) Remove `--pool-socket <path>` from whatever invokes the client (for NEEDLE, the `invoke` template in the adapter YAML — which does not set the flag by default). (2) Stop the daemon: `SIGINT`/`SIGTERM` on the `claude-print serve` process exits 0, tears down every worker (SIGTERM → 2 s grace → SIGKILL per worker group, survivors reaped), and removes the socket file it created. Out-of-order is safe by INV-10: clients still pointing at a dead or stale socket fall back statelessly, and a stale socket node can be `rm`'d by hand without harm. A binary-level rollback follows the general procedure above (`claude-print.prev`).
 
 ### Monitoring and Alerting
 
@@ -1496,8 +1510,21 @@ echo "Reply with exactly one word: pong" | claude-print --output-format json --t
 - This is a genuinely new component (a daemon subcommand + a small local IPC surface — JSON request/response over a Unix socket, reusing the existing bracketed-paste/Stop-FIFO machinery unchanged inside the pool manager), not a tweak to the existing event loop's state machine — hence it is scoped as v2, opt-in, and deferred rather than folded into a v0.2.x patch.
 - The default `claude-print` invocation path is completely unchanged when no pool is configured — HR-1 (single static binary, no runtime deps) and the Scope Lock's "no runtime dependency" clause hold for the default path; the pool manager is the same musl-static binary running in a different subcommand, not a new dependency.
 - Every pooled invocation still gets a unique `claude` process and session per prompt — no cross-request identity leakage, no change to the "one prompt per invocation" contract callers see.
-- New invariants will be needed before implementation (tracked as follow-up, not yet written as formal INV-N entries): e.g. "a pool member is never handed a second prompt without first being torn down and replaced," and "pool manager crash/restart never leaves a `claude-print` client blocked past `--timeout`."
+- New invariants will be needed before implementation (tracked as follow-up, not yet written as formal INV-N entries): e.g. "a pool member is never handed a second prompt without first being torn down and replaced," and "pool manager crash/restart never leaves a `claude-print` client blocked past `--timeout`." *(Written at implementation time as INV-9 through INV-15 — see the Invariants section.)*
 - Implementation is intentionally NOT started in this pass — this ADR exists to record the decision and scope it correctly for whoever picks it up next, so it isn't re-litigated from scratch.
+
+**Status update (2026-09-19): implemented and pinned (v0.2.2).** The pool shipped as the `claude-print serve` daemon (`--pool-size` 1–256, `--socket`, `--verbose`) plus the `--pool-socket <path>` client flag, exactly the shape scoped above: one prompt per member (INV-9), warmup through trust-dismiss and idle-settle but never past prompt injection, and the stateless fallback contract (INV-10). The INV-N entries this ADR promised are formal in the Invariants section. Acceptance evidence, by invariant area:
+
+| Area | Evidence |
+|------|----------|
+| Client matrix (formats, fallback, sequential isolation, malformed daemons) | `tests/pool_socket_e2e.rs` (bead claudepr-c7824b71; exhaustion shape claudepr-29abb756) |
+| Concurrency isolation — distinct workers per simultaneous client; zero sibling contamination under same-cwd stream-json | `tests/pool_adversarial_e2e.rs` (beads claudepr-29abb756, claudepr-a927ec0c; ADR-005 proof umbrella claudepr-a03e32d7) |
+| Failure paths — daemon SIGKILL/SIGSTOP mid-handoff and mid-drive, orphan containment, manager restart on the same socket path, fallback parity across all output formats | `tests/pool_failure_e2e.rs` (bead claudepr-c470b8aa) |
+| Serve contract — bind/teardown, pool-size validation, 0600 socket, clean bounded shutdown, child reaping, serve-only signal handlers | `tests/serve.rs` (beads claudepr-7f088327, claudepr-41b6a99b, claudepr-b78932de, claudepr-e7bc9482, claudepr-1feb2d1b; pooled drive claudepr-f1e93af1) |
+| Startup-overhead benchmark | `scripts/bench_startup_overhead.py`; results and interpretation in `docs/notes/startup-overhead-benchmark.md` + `.json` (bead claudepr-9ac75b58) — **startup overhead only; establishes no model-latency savings** |
+| Billing classification on the pool path (AS-4 / INV-15) | `CLAUDE_PRINT_POOL=1` pooled leg of `scripts/billing-canary.sh` |
+
+Benchmark interpretation (Benchmark Contract, measured 2026-09-19 against `mock-claude`, release build): mean 1443.6 ms stateless vs 1050.6 ms pooled (Δ 393.0 ms, 27.2%), n=10 each, cv ≤ 1.9%. Both paths are dominated by `claude-print`'s two sleep-bounded quiet windows; the warm pool removes the trust-dismiss window per drive (the worker was pretrusted by the daemon) while the post-CR settle window still re-runs by design — the conservative redraw-race guard re-verifies PTY quiet before injecting even on a prewarmed worker. The daemon's one-off initial warmup (1455.6 ms in the recorded run) is the cost it amortizes across subsequent invocations. The mock backend removes real Claude Code's JS-runtime startup, MCP init, and inference, so these numbers isolate `claude-print`'s own overhead and do not estimate production wall-clock savings in absolute terms; nothing here re-opens the ADR-005 decision. Raw samples and the reproducible command live alongside the committed JSON artifact (`docs/notes/startup-overhead-benchmark.json`, schema `claude-print/startup-overhead-benchmark/1`).
 
 ## Open Questions
 
