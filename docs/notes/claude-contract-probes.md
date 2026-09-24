@@ -1,6 +1,6 @@
 # Claude Code Runtime Contract Probes — measured behavior
 
-**Measured against:** `claude` 2.1.270 (`2.1.270 (Claude Code)`), 2026-09-13, on the
+**Measured against:** `claude` 2.1.282 (`2.1.282 (Claude Code)`), 2026-09-24, on the
 claude-print dev host. Probe harness: `scripts/probe-claude-contracts.sh` (merge /
 suppression / single-turn Stop), `scripts/probe-stop-toolallowed.sh` (multi-round
 Stop contract, print mode), and `scripts/probe-tui-second-turn.sh` (TUI
@@ -9,9 +9,26 @@ version-pinned — the maintenance workflow (drift detection, re-run procedure,
 re-pin checklist, follow-up rule) is defined in §Maintenance at the bottom of
 this file and made executable by `scripts/contract-maintenance-gate.sh`
 (detection step: `scripts/check-claude-version-bump.sh`), which CI runs on
-every push.
+every push as a mandatory gate — drift fails the build until the re-pin lands
+(see §Maintenance → Wiring).
 Resolves plan PO-1, PO-2, OQ-1, OQ-2 and the Stop-poller
 assumption (plan §7 Stop Poller and the glossary Stop-hook note).
+
+**Re-measurement history.** First measured against 2.1.270 on 2026-09-13
+(claudepr-6ef2541c). On 2026-09-24 (claudepr-3094ab2e — the re-pin that also
+made drift a mandatory CI gate) the suite ran **twice**: fully against
+2.1.281, then the host auto-updated to 2.1.282 mid-re-pin and the whole
+suite was re-run against 2.1.282 the same evening — two consecutive versions,
+identical contracts, and a live demonstration of the drift cadence the gate
+exists for. The runs: merge (P2/P6), suppression (P3), `=none` rejection
+(P5) and the once-per-source single-turn Stop all reproduced exactly on both;
+the `--max-turns` cutoff again fired no Stop (T3, exit 1); the permitted-tool
+arms re-measured the multi-round and TUI Stop contracts
+(`probe-stop-toolallowed.sh`, `probe-tui-second-turn.sh` — outcomes recorded
+in §Stop firing contract below). Evidence tables below retain the original
+2.1.270 timings where cited; per-version fixtures:
+`tests/fixtures/claude_contracts_v2.1.281.json` (the earlier same-day run)
+and `tests/fixtures/claude_contracts_v2.1.282.json` (the pinned one).
 
 **Isolation:** every probe ran with `HOME` redirected into a throwaway
 `mktemp` sandbox (fresh `.claude.json`, trust pre-seeded for the probe cwd
@@ -103,6 +120,19 @@ contract was re-measured with tools actually permitted
 | TUI, turn 2 in the same session (plain reply) | **1** | firing + reply both observed (15.1 s); TUI status line showed `(running stop hook)` |
 | `claude -p` cut off by `--max-turns 2` mid-task | **0** | exit code 1, zero firings across the run |
 
+*(Timings above are the 2.1.270 measurement. Re-confirmed unchanged twice on
+2026-09-24 — against 2.1.281 and, after the host auto-updated again, against
+2.1.282 (the pinned version). On 2.1.282: Arm P — exit 0, one firing,
+`last_assistant_message: "DONE"`, `stop_hook_active: false`; T1 — completed
+(exit 0) with exactly one firing of its own; TUI turns — 1 Stop each,
+62.5 s / 32.5 s (probe-1 T2, per loaded source), 60.5 s (Arm T multi-round),
+and 41.6 s / 3.3 s (probe-tui-second-turn, verdict "once-per-turn
+confirmed", both replies rendered); cutoff (T3) — 0 firings, exit 1. The
+2.1.281 run measured the same values (Arm T clean at 48.0 s / 60.0 s;
+probe-tui-second-turn 13.0 s / 9.1 s). Incomplete second turns — one per
+evening, no reply and no Stop after a long wait — occurred once per run and
+are re-runs, not findings, per §Re-run below.)*
+
 Conclusions:
 
 - Stop fires **once per completed turn**, not once per API round and not once
@@ -164,9 +194,9 @@ any Claude Code update" was unowned and unscheduled.
 `claude --version` against the **Measured against:** stamp at the top of this
 file: exit 0 = current, exit 1 = drift (re-run due), exit 2 = cannot
 determine. It runs `claude --version` only — no sandbox, no model turns — so
-it is safe to run on a schedule or from CI, where exit 1 is the R-2 "CI alert
-on version change" signal. Versions move in two ways; either should trigger
-the check:
+it is safe to run on a schedule or from CI, where exit 1 is the R-2 signal —
+and, since claudepr-3094ab2e, a **build-failing gate** (see **Wiring**).
+Versions move in two ways; either should trigger the check:
 
 - the dev host auto-updates the native install
   (`~/.local/share/claude/versions/`, repointing `~/.local/bin/claude`) —
@@ -197,18 +227,31 @@ actually ran). The `contract-status.txt` `alert:` line — `none`,
 release-notes stamp can explain a non-zero gate on its own; the release
 path stamps `contract-status.txt` into the
 release notes and uploads the refreshed version file as the release asset.
-Drift exits the gate non-zero but is an **alert, not a red build**: the full
-probes need model-turn auth CI does not have, so a hard gate there could
-never be cleared from CI — the follow-up issue is the owned hand-off. The
-`tests/contract_maintenance.rs` suite pins this wiring (template fragments,
-gate exit-code contract against a stubbed claude, and the doc/plan mentions)
-so the automation cannot silently detach from this page again.
+Drift exits the gate non-zero and, since claudepr-3094ab2e, that **fails the
+build**: the gate runs as the workflow's FIRST quality gate (before fmt), and
+its exit is fatal — exit 1 (drift) or 2 (cannot determine; fails closed)
+both go red. A Claude version change therefore *requires* rerunning the
+probes, recording updated evidence, and completing the re-pin (or, if a
+contract moved, the follow-up beads plus the code/doc changes they demand)
+before CI passes again; the re-pin commit itself is what turns the gate
+green. This is clearable even though the full probes need model-turn auth CI
+does not have, because the probes and the re-pin run host-side (authed dev
+host) — CI only enforces that the pinned evidence covers the version it
+sees. The follow-up issue survives the red (the gate files it before
+exiting), so the hand-off channel is unchanged. Note that CI installs the
+*latest* stable claude while the dev host auto-updates on its own schedule —
+the two can drift independently, and each is a valid drift signal against
+the same pinned stamp. The `tests/contract_maintenance.rs` suite pins this
+wiring (template fragments including the fatal wrapper, gate exit-code
+contract against a stubbed claude, and the doc/plan mentions) so the
+automation cannot silently detach from this page again.
 
 **Re-run.** No drift → nothing to do. The cheap live tests re-verify the
 merge and suppression contracts against the installed binary in ~35 s
 (`cargo test --test claude_contracts -- --ignored`) and are the fastest way
-to confirm "no drift within a version" (last verified 2026-09-14 against
-2.1.270: 2/2 passed). On drift, run all three scripts from §Reproducing —
+to confirm "no drift within a version" (last verified 2026-09-24 against
+2.1.282: 2/2 passed; previously 2026-09-14 against 2.1.270: 2/2 passed). On
+drift, run all three scripts from §Reproducing —
 each is self-contained (sandboxed mktemp `HOME`, scrubbed `CLAUDECODE*` env,
 trust pre-seeded for the probe cwd only, auth by inherited environment) and
 stamps the version it measured. Budget 1–6 min each. Note that
@@ -223,7 +266,9 @@ top of this file; copy `tests/fixtures/claude_contracts_v<old>.json` to
 repoint `FIXTURE` in `tests/claude_contracts.rs` together with its header
 comment and any version-citing assertion messages. Commit doc + fixture +
 test in one change so the always-on suite and this document keep claiming the
-same version.
+same version — that commit is also what turns the CI drift gate green again
+(§Wiring above; it is how the 2.1.270 → 2.1.282 re-pin of 2026-09-24 was
+landed, via a 2.1.281 pin the host's auto-updater superseded the same day).
 
 **File follow-ups** (a contract moved): one bead per moved contract,
 naming the downstream design that depends on it, and update this document and

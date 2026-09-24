@@ -33,9 +33,15 @@
 #   2  INDETERMINATE  version could not be determined (claude missing,
 #                     unparsable output, or a missing doc stamp)
 #
-# Drift is an alert, not a hard failure: the full probes cannot run without
-# model-turn auth, so CI runs the gate, captures this exit code, and lets the
-# follow-up issue carry the hand-off (claude-print-ci-workflowtemplate.yml).
+# Drift is a hard failure where CI runs this gate (claudepr-3094ab2e): the
+# claude-print-ci workflow invokes it as the FIRST quality gate and lets a
+# non-zero exit fail the run, so a Claude version change requires the
+# documented maintenance step — re-run the probes, record updated evidence,
+# land the re-pin commit (doc stamp + fixture + FIXTURE repoint) — before CI
+# goes green again. The full probes still cannot run inside CI (no
+# model-turn auth there), which is why the gate itself keeps running to
+# completion first: it writes the evidence bundle and files/updates the
+# follow-up issue, so the hand-off survives the red build it then raises.
 #
 # Outside of the steps above the gate is read-only: it runs `claude --version`,
 # the detector, (optionally) cargo test / the probe scripts, and — on drift

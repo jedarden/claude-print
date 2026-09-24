@@ -1,0 +1,33 @@
+{
+  "claude_version": "2.1.281",
+  "measured_at": "2026-09-24",
+  "probe_scripts": [
+    "scripts/probe-claude-contracts.sh",
+    "scripts/probe-stop-toolallowed.sh",
+    "scripts/probe-tui-second-turn.sh"
+  ],
+  "evidence": "docs/notes/claude-contract-probes.md",
+  "resolves": ["PO-1", "PO-2", "OQ-1", "OQ-2", "Stop-poller assumption (plan §7)"],
+  "contracts": {
+    "settings_flag_merges_not_replaces": true,
+    "all_loaded_sources_hooks_fire": true,
+    "cross_source_hook_order_guaranteed": false,
+    "setting_sources_empty_accepted": true,
+    "setting_sources_empty_suppresses_standard_sources": true,
+    "settings_file_loads_despite_setting_sources_empty": true,
+    "setting_sources_none_accepted": false,
+    "stop_firings_single_turn_completed_run_per_loaded_source": 1,
+    "stop_firings_multi_round_tool_use_completed_turn": 1,
+    "stop_firings_tui_per_turn": 1,
+    "stop_firings_max_turns_cutoff": 0,
+    "stop_firings_max_turns_cutoff_exit_code": 1
+  },
+  "notes": {
+    "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host's real ~/.claude files were never read or written. Auth traveled by inherited environment only.",
+    "cross_source_order_evidence": "2.1.281 re-run: every probe pair again fired standard-source-first 2-3 ms apart (P2 project SessionStart ...839.154 vs relay ...839.157; P6 user Stop ...870.244 vs relay ...870.246), and only the merge (all sources fire) is contractual. The 2.1.270 start/finish-timestamp experiment (project hook sleeping 300 ms) remains the evidence that the order can flip: relay STARTING before project in 1 of 4 runs, the two hooks running concurrently.",
+    "tui_per_turn_evidence": "Two turns in one TUI session (probe-tui-second-turn.sh): turn 1 fired 1 Stop with reply rendered (13.0 s), turn 2 fired 1 Stop with reply rendered SECOND-OK (9.1 s); TUI screen showed (running stop hook) on both. The tool-using TUI arm (probe-stop-toolallowed.sh Arm T) matched: 1 Stop after the multi-round prompt (48.0 s) and 1 Stop after the plain second prompt (60.0 s), both stop_hook_active false.",
+    "degraded_path_hazard": "On runs where the model's tool calls were permission-DENIED (no allowlist, headless), the 2.1.270 measurement observed one run out of two producing an extra Stop firing. Mechanism unexplained; not reachable in the NEEDLE fleet (claude-print.yaml passes --dangerously-skip-permissions). The single-fire poller tolerates it: first payload -> transcript retry/fallback, watchdog bounds the session.",
+    "print_mode_tool_use_evidence": "Two sequential permitted Bash rounds in one -p run (Arm P): exactly 1 Stop at the turn's true end (payload last_assistant_message: DONE, stop_hook_active: false, single session id), claude exit 0.",
+    "cutoff_evidence": "A -p run cut off by --max-turns (2.1.281: T3 with --max-turns 2, exit 1) fires no Stop of its own; the same shape recurred on the T1 arm when its task outgrew --max-turns 6 (exit 1, zero own firings) - cutoffs belong to the --stop-hook-timeout watchdog, not the Stop poller."
+  }
+}

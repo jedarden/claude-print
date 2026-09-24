@@ -85,6 +85,41 @@ spec:
             VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*= *"\(.*\)".*/\1/')
             echo "Building claude-print v${VERSION} (commit: ${COMMIT})"
 
+            # === Contract-maintenance gate (docs/notes/claude-contract-probes.md
+            # §Maintenance, R-2) — the FIRST quality gate, runs in BOTH modes =
+            # Install the claude binary first (native installer; `claude
+            # --version` needs no auth) so drift detection compares the real
+            # installed version against the doc's **Measured against:** stamp
+            # instead of recording "unknown". Then run the gate:
+            # detect -> cheap live contract tests -> evidence bundle ->
+            # follow-up. Probes with model turns skip here (no API auth in
+            # this pod) and are recorded as SKIPPED, never silent.
+            #
+            # Drift is a RED BUILD, not just an alert (claudepr-3094ab2e): a
+            # Claude version change must be answered by re-running the probes,
+            # recording updated evidence, and landing the re-pin commit (doc
+            # stamp + fixture + FIXTURE repoint) — that commit is what turns
+            # this gate green again. The gate still files/updates the
+            # follow-up issue and writes the evidence bundle before exiting,
+            # so the hand-off survives the red. Exit 2 (cannot determine)
+            # fails closed for the same reason: unevidenced contracts must
+            # not ride a green build.
+            if curl -fsSL https://claude.ai/install.sh | bash >/tmp/claude-install.log 2>&1; then
+              export PATH="${HOME}/.local/bin:${PATH}"
+              claude --version || true
+            else
+              echo "WARNING: claude native install failed — gate will fail INDETERMINATE" >&2
+              cat /tmp/claude-install.log >&2 || true
+            fi
+
+            if ! bash scripts/contract-maintenance-gate.sh \
+              --evidence-dir target/contract-maintenance \
+              --file-follow-up; then
+              echo "ERROR (contract-maintenance gate): Claude contract evidence does not cover the installed claude — re-run the probes and land the re-pin (docs/notes/claude-contract-probes.md §Maintenance). Evidence bundle: target/contract-maintenance/" >&2
+              exit 1
+            fi
+            echo "contract-maintenance gate OK — pinned evidence covers the installed claude"
+
             # === Quality gates — run on EVERY CI invocation; fail fast on error ===
             # Per plan "Definition of Done" / all-gates policy: every commit that
             # reaches the CI step MUST pass fmt + clippy + test + audit simultaneously.
@@ -105,39 +140,6 @@ spec:
             echo "Running cargo audit..."
             cargo audit
             echo "audit OK (no known vulnerabilities)"
-
-            # === Contract-maintenance gate (docs/notes/claude-contract-probes.md
-            # §Maintenance, R-2) — runs in BOTH modes ========================
-            # Install the claude binary first (native installer; `claude
-            # --version` needs no auth) so drift detection compares the real
-            # installed version against the doc's **Measured against:** stamp
-            # instead of recording "unknown". Then run the gate:
-            # detect -> cheap live contract tests -> evidence bundle ->
-            # follow-up. Probes with model turns skip here (no API auth in
-            # this pod) and are recorded as SKIPPED, never silent.
-            #
-            # Drift is an ALERT, not a red build: the full probes cannot run
-            # in CI (no model auth), so a hard gate could not be cleared from
-            # CI — the gate files/updates the follow-up issue instead, and the
-            # exit code is captured below.
-            if curl -fsSL https://claude.ai/install.sh | bash >/tmp/claude-install.log 2>&1; then
-              export PATH="${HOME}/.local/bin:${PATH}"
-              claude --version || true
-            else
-              echo "WARNING: claude native install failed — gate will report INDETERMINATE" >&2
-              cat /tmp/claude-install.log >&2 || true
-            fi
-
-            set +e
-            bash scripts/contract-maintenance-gate.sh \
-              --evidence-dir target/contract-maintenance \
-              --file-follow-up
-            GATE_EXIT=$?
-            set -e
-            echo "contract-maintenance gate exit: ${GATE_EXIT} (0=CURRENT, 1=DRIFT re-run due, 2=INDETERMINATE)"
-            if [ "${GATE_EXIT}" -ne 0 ]; then
-              echo "ALERT (contract-maintenance gate exit ${GATE_EXIT}): Claude contract evidence needs re-verification — follow-up issue + evidence bundle above (docs/notes/claude-contract-probes.md §Maintenance)"
-            fi
 
             # In verify-only mode (TAG empty), skip release creation after quality gates
             if [ -z "$TAG" ]; then

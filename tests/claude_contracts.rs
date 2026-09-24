@@ -3,10 +3,13 @@
 //! The plan pinned three runtime assumptions as unverified — PO-1/OQ-1
 //! (`--settings` merge + firing order), PO-2/OQ-2 (`--setting-sources=`
 //! suppression), and the Stop-poller's once-per-turn assumption. They were
-//! measured against claude 2.1.270 on 2026-09-13 with the live probe scripts
-//! (`scripts/probe-claude-contracts.sh`, `scripts/probe-stop-toolallowed.sh`);
-//! the observed values are pinned in
-//! `tests/fixtures/claude_contracts_v2.1.270.json` and documented in
+//! measured against claude 2.1.282 on 2026-09-24 (re-pinned from the 2.1.270
+//! measurement of 2026-09-13, via a 2.1.281 run the same day that the host's
+//! auto-updater superseded; re-run procedure in
+//! docs/notes/claude-contract-probes.md §Maintenance) with the live probe
+//! scripts (`scripts/probe-claude-contracts.sh`,
+//! `scripts/probe-stop-toolallowed.sh`); the observed values are pinned in
+//! `tests/fixtures/claude_contracts_v2.1.282.json` and documented in
 //! `docs/notes/claude-contract-probes.md`.
 //!
 //! The always-on tests below assert that what claude-print *does* (child argv,
@@ -37,7 +40,7 @@ use claude_print::hook::HookInstaller;
 use claude_print::session::{LaunchOptions, Session};
 use serde::Deserialize;
 
-const FIXTURE: &str = include_str!("fixtures/claude_contracts_v2.1.270.json");
+const FIXTURE: &str = include_str!("fixtures/claude_contracts_v2.1.282.json");
 
 /// The measured contracts, as recorded by the probe run.
 #[derive(Debug, Deserialize)]
@@ -119,7 +122,7 @@ fn fixture_pins_measured_contracts() {
     );
     assert!(
         !f.contracts.setting_sources_none_accepted,
-        "PO-2 fallback spelling rejected by claude 2.1.270"
+        "PO-2 fallback spelling rejected by claude 2.1.282"
     );
     assert_eq!(
         f.contracts
@@ -207,7 +210,7 @@ fn child_argv_matches_verified_spelling_no_inherit_hooks() {
         args.iter().any(|a| a == VERIFIED_SUPPRESS_SPELLING),
         "isolation mode must forward the verified empty spelling {VERIFIED_SUPPRESS_SPELLING:?}: {args:?}"
     );
-    // The `=none` fallback is REJECTED by claude 2.1.270 (P5: exit 1 before
+    // The `=none` fallback is REJECTED by claude 2.1.282 (P5: exit 1 before
     // session start) — it must never be emitted.
     assert!(
         !args.iter().any(|a| a.starts_with("--setting-sources=none")),
@@ -229,7 +232,7 @@ fn relay_settings_schema_matches_live_verified_structure() {
     let val: serde_json::Value = serde_json::from_str(&content).unwrap();
 
     // Double-nested hooks.Stop[ { hooks: [ {type: "command", ...} ] } ] —
-    // accepted and fired by claude 2.1.270 (Hook Installer §2 schema note).
+    // accepted and fired by claude 2.1.282 (Hook Installer §2 schema note).
     let stop = val
         .pointer("/hooks/Stop")
         .and_then(|v| v.as_array())

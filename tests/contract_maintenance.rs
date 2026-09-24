@@ -581,8 +581,11 @@ fn ci_workflowtemplate_wires_the_gate_on_every_push() {
         "bash scripts/contract-maintenance-gate.sh",
         "--evidence-dir target/contract-maintenance",
         "--file-follow-up",
-        // drift is an alert, not a red build: the exit is captured, not fatal
-        "GATE_EXIT",
+        // drift is a red build (claudepr-3094ab2e): a non-zero gate exit
+        // fails the run inside a fatal wrapper that names the re-pin as the
+        // way back to green
+        "ERROR (contract-maintenance gate): Claude contract evidence does not cover",
+        "land the re-pin (docs/notes/claude-contract-probes.md §Maintenance)",
         // claude is installed first so detection compares a real version
         "https://claude.ai/install.sh",
         // release path stamps the status and refreshes the version asset
@@ -594,15 +597,31 @@ fn ci_workflowtemplate_wires_the_gate_on_every_push() {
             "WorkflowTemplate lost wiring fragment: {fragment}"
         );
     }
-    // The gate runs before the verify-only early exit, so every push hits it
-    // (anchored to the exit's own message — "Verify-only mode" alone first
-    // appears in the clone-branch echo higher up the template).
+    // The alert-era capture is gone for good: the exit must be fatal, not
+    // buffered into GATE_EXIT and swallowed.
+    for absent in ["GATE_EXIT", "set +e"] {
+        assert!(
+            !template.contains(absent),
+            "WorkflowTemplate regained the alert-era fragment {absent} — the gate exit must fail the run"
+        );
+    }
+    // The gate is the FIRST quality gate (before fmt) and runs before the
+    // verify-only early exit, so every push hits it before any other gate
+    // can pass (anchored to the exit's own message — "Verify-only mode"
+    // alone first appears in the clone-branch echo higher up the template).
     let gate_at = template
         .find("bash scripts/contract-maintenance-gate.sh")
         .unwrap();
+    let fmt_at = template
+        .find("cargo fmt --check")
+        .expect("fmt gate must exist");
     let verify_at = template
         .find("Verify-only mode: all quality gates passed")
         .expect("verify-only early exit must exist");
+    assert!(
+        gate_at < fmt_at,
+        "the contract gate must run before the fmt gate — a version change requires the re-pin first"
+    );
     assert!(
         gate_at < verify_at,
         "the gate must run before the verify-only exit"

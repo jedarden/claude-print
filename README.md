@@ -614,7 +614,7 @@ Before cutting a release tag:
 - `scripts/billing-canary.sh` — daily credential-backed AS-4 canary (`CLAUDE_PRINT_POOL=1` runs the pooled leg)
 - `scripts/claude-print-billing-canary.{service,timer}` — systemd user units for the canary
 - `scripts/bench_startup_overhead.py` — ADR-005 startup-overhead benchmark harness (`--self-check` for a deterministic no-subprocess pin)
-- `scripts/contract-maintenance-gate.sh` — Claude contract-evidence maintenance gate (detect version drift → re-run probes → evidence bundle → re-pin follow-up; exits 0 = current, 1 = re-run due, 2 = indeterminate; CI runs it on every push, see `docs/notes/claude-contract-probes.md` §Maintenance)
+- `scripts/contract-maintenance-gate.sh` — Claude contract-evidence maintenance gate (detect version drift → re-run probes → evidence bundle → re-pin follow-up; exits 0 = current, 1 = re-run due, 2 = indeterminate; CI runs it on every push as a mandatory first gate — drift fails the build until the re-pin lands, see `docs/notes/claude-contract-probes.md` §Maintenance)
 - `scripts/` — integration test scripts
 
 ---
