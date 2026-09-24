@@ -35,6 +35,22 @@ static musl build) against the tagged commit before publishing.
 
 ### Changed
 
+- **Forgejo/GitHub roles and the canonical release publication path stated
+  explicitly.** The README's Repository & contributions and Install sections
+  now pin down the division of labor: GitHub is read-only for source and refs
+  (a one-way Forgejo → GitHub mirror), while release artifacts live only on
+  GitHub Releases — Forgejo hosts no release assets. The canonical
+  publication path is named end to end: the `vX.Y.Z` tag is pushed to Forgejo
+  first, the `claude-print-ci` Argo Workflow builds the tagged commit from
+  Forgejo, and the workflow publishes the artifacts to GitHub Releases, from
+  which nothing flows back. Installation guidance now holds when the mirror
+  is unavailable: `CLAUDE_PRINT_RELEASE_URL` redirects `install.sh` to any
+  host serving the same assets under the same checksum verification, and
+  build-from-source from Forgejo never touches GitHub. The repo-root
+  `claude-print-ci-workflowtemplate.yml` clone source is synced to the
+  deployed template (Forgejo, per declarative-config `01783ba9`), removing
+  the last GitHub-clone instruction in the repository.
+
 - **README identifies Forgejo as the canonical repository.** Clone, install,
   and release references now state that
   `git.ardenone.com/jedarden/claude-print` (Forgejo) is the source of truth

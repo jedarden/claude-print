@@ -29,9 +29,19 @@ Every downloaded artifact is verified against the release's published `sha256sum
 
 Set `SKIP_MOCK_CLAUDE=1` to skip the `mock_claude` test fixture download.
 
+Release artifacts are published only to GitHub Releases — Forgejo hosts no
+release assets — so the default download URL is a GitHub URL. If GitHub is
+unreachable from the installing host, set `CLAUDE_PRINT_RELEASE_URL` to a
+base URL serving that release's assets (`sha256sums.txt`,
+`claude-print-x86_64-linux`, and the rest); `install.sh` runs the identical
+checksum verification against whichever host serves them, so a mirror can
+redistribute the artifacts but cannot bypass verification. With no mirror
+reachable, [build from source](#build-from-source) from the canonical Forgejo
+repository — source availability never depends on the mirror.
+
 ### Repository & contributions
 
-`git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository and the destination for all pushes. The GitHub repo (`jedarden/claude-print`) is a read-only push mirror — do not treat it as authoritative, and expect it to always reflect Forgejo rather than the reverse. Release artifacts are published only to GitHub Releases; that is the supported download path for `install.sh`. Contribute by pushing to Forgejo directly, or by opening an issue or PR on either host — mirror-side PRs are applied on Forgejo before merge.
+`git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository and the destination for all pushes. The GitHub repo (`jedarden/claude-print`) is a read-only push mirror — do not treat it as authoritative, and expect it to always reflect Forgejo rather than the reverse. "Read-only" describes source and refs: mirror syncs carry Forgejo → GitHub and never the reverse. Release artifacts run the other way conceptually — they are published only to GitHub Releases, and Forgejo hosts no release assets. The canonical publication path is one-directional: a `vX.Y.Z` tag is pushed to Forgejo first, the `claude-print-ci` Argo Workflow builds the tagged commit from Forgejo, and the workflow publishes the artifacts to GitHub Releases, from which nothing flows back. That makes GitHub Releases the supported download path for `install.sh`, with `CLAUDE_PRINT_RELEASE_URL` redirecting the installer to any host serving the same assets when GitHub is unreachable (see [Install](#install)). Contribute by pushing to Forgejo directly, or by opening an issue or PR on either host — mirror-side PRs are applied on Forgejo before merge.
 
 ### Build from source
 
@@ -43,6 +53,9 @@ cargo build --release
 # fully static binary (recommended for deployment):
 cargo build --target x86_64-unknown-linux-musl --release
 ```
+
+Building from source is also the install fallback whenever GitHub Releases is
+unreachable — nothing in this path touches the GitHub mirror.
 
 The binaries land under Cargo's target directory, which is not always
 `./target` — so don't assume that path when you go to run them:

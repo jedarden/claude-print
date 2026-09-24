@@ -64,16 +64,18 @@ spec:
             # cargo audit gate (RustSec advisory DB check)
             cargo install cargo-audit
 
-            # Clone from trusted hardcoded source (ignore webhook payload)
+            # Clone from Forgejo (git.ardenone.com) — the canonical repository
+            # and source of truth. The GitHub mirror is never a clone source;
+            # the GitHub side hosts only the release artifacts published below.
             # Use --no-tags to avoid fetching all tags; fetch specific tag if needed
             if [ -n "$TAG" ]; then
               echo "Release mode: building from tag $TAG"
               git clone --depth 1 --branch "$TAG" --single-branch \
-                "https://github.com/jedarden/claude-print.git" /workspace
+                "https://git.ardenone.com/jedarden/claude-print.git" /workspace
             else
               echo "Verify-only mode: building from main"
               git clone --depth 1 \
-                "https://github.com/jedarden/claude-print.git" /workspace
+                "https://git.ardenone.com/jedarden/claude-print.git" /workspace
             fi
             cd /workspace
 
