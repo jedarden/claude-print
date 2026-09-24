@@ -5,6 +5,20 @@ are tagged `vX.Y.Z` and published as GitHub Releases by the `claude-print-ci`
 Argo workflow, which runs the full gate set (fmt, clippy, test, cargo audit,
 static musl build) against the tagged commit before publishing.
 
+## [Unreleased]
+
+### Added
+
+- **Release artifact integrity verification in `install.sh`.** The CI release
+  build now publishes a `sha256sums.txt` manifest alongside the binaries, and
+  `install.sh` verifies every artifact against it before installing or
+  executing anything. A missing manifest, an asset with no checksum entry, or
+  a digest mismatch aborts the install with nothing placed. The
+  `mock_claude` fixture keeps its documented skip behavior when the manifest
+  does not list it; a listed fixture that fails to download or mismatches is
+  fatal. Covered by `tests/install_sh.rs` (valid, missing-manifest,
+  missing-entry, tampered-binary, tampered-fixture, fixture-skip).
+
 ## [0.2.2] - 2026-09-20
 
 First tagged release since v0.2.0. The 0.2.1 version number was consumed by a

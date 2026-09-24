@@ -188,6 +188,15 @@ spec:
               echo "unknown" > last-claude-version.txt
             fi
 
+            # Publish sha256 checksums so install.sh (and auditors) can verify
+            # every artifact before executing it — install.sh fails closed on
+            # a missing manifest, a missing entry, or a digest mismatch.
+            # Filenames are recorded bare so manifest entries match the
+            # release asset names exactly.
+            sha256sum "${CLAUDE_PRINT_ASSET}" "${MOCK_ASSET}" last-claude-version.txt > sha256sums.txt
+            echo "Release checksums:"
+            cat sha256sums.txt
+
             # Create GitHub release with both binaries and the version artifact
             gh release create "v${VERSION}" \
               --repo jedarden/claude-print \
@@ -207,11 +216,13 @@ spec:
             - \`claude-print-${TARGET}\` — main binary
             - \`mock_claude-${TARGET}\` — test fixture binary
             - \`last-claude-version.txt\` — Claude version this release was built and tested against
+            - \`sha256sums.txt\` — sha256 checksums of every asset; install.sh verifies against this before installing
             " \
               --target main \
               "./${CLAUDE_PRINT_ASSET}" \
               "./${MOCK_ASSET}" \
-              "./last-claude-version.txt"
+              "./last-claude-version.txt" \
+              "./sha256sums.txt"
 
             echo "Release v${VERSION} created successfully"
         env:

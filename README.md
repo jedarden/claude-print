@@ -25,6 +25,8 @@ sh install.sh
 
 `install.sh` downloads a pre-built static musl binary from GitHub Releases (`jedarden/claude-print`), runs `--check` to verify the setup, and copies `claude-print.yaml` to `~/.needle/agents/` if NEEDLE is present.
 
+Every downloaded artifact is verified against the release's published `sha256sums.txt` before it is installed or executed. A missing manifest, an asset with no checksum entry, or any digest mismatch aborts the install with nothing placed — the check fails closed. The `mock_claude` fixture remains optional: a release whose manifest does not list it skips the fixture instead of failing.
+
 Set `SKIP_MOCK_CLAUDE=1` to skip the `mock_claude` test fixture download.
 
 ### Build from source
