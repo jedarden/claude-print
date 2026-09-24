@@ -43,6 +43,21 @@ atty = "0.2"
 which = "7.0"
 uuid = { version = "1.18", features = ["v4"] }
 
+# Dev/test builds carry line-tables-only debuginfo, not full DWARF
+# (claudepr-1a49ba70). Measured 2026-09-24, cold build with a fresh target
+# dir: 35 integration-test binaries each link the whole crate, and before
+# this setting ~79% of every test binary was .debug_* sections —
+# target/debug/deps alone was ~1.14 GiB per build generation. Line tables
+# keep panic/backtrace file:line frames; what is dropped is variable- and
+# type-level DWARF. A lane that genuinely needs full DWARF can opt back in
+# for that invocation only: CARGO_PROFILE_DEV_DEBUG=2 (verified: no
+# gdb/lldb/valgrind/llvm-cov/perf/heaptrack use anywhere in this repo's
+# scripts, docs, or CI as of 2026-09-24). [profile.test] has no `debug` of
+# its own and inherits this; [profile.release] / [profile.release-musl] are
+# untouched.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = true
