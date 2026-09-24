@@ -74,6 +74,13 @@ up to six hours of random delay, and catches up after downtime because it is
 persistent. The user's systemd manager must have lingering enabled on a server
 where that user may log out (`loginctl show-user "$USER" -p Linger`).
 
+The installer itself is pinned hermetically by
+`tests/install_billing_canary.rs`: a redirected `HOME`/`XDG_CONFIG_HOME` and
+a PATH of fakes (no real systemd involved) prove the four files land
+byte-identical at the documented paths with the documented modes, that a
+second run is idempotent, and that every failed prerequisite — no
+`systemctl`, no `claude-print` on PATH — aborts before anything is written.
+
 ## Result and logs
 
 Every attempt atomically replaces:
