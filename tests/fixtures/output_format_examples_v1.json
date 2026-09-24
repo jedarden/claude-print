@@ -1,0 +1,287 @@
+{
+  "contract": "claude-print output-format contracts (text / json / stream-json)",
+  "contract_version": "v1",
+  "document": "docs/notes/output-format-contracts.md",
+  "pinned_by": "tests/output_format_contracts.rs",
+  "error_subtypes": [
+    {
+      "variant": "setup",
+      "subtype": "internal_error",
+      "exit_code": 2,
+      "message": "claude binary not found in PATH"
+    },
+    {
+      "variant": "config",
+      "subtype": "internal_error",
+      "exit_code": 2,
+      "message": "invalid config: malformed.toml: unsupported key `frobnicate`"
+    },
+    {
+      "variant": "timeout",
+      "subtype": "timeout",
+      "exit_code": 124,
+      "message": "operation timed out"
+    },
+    {
+      "variant": "interrupted",
+      "subtype": "interrupted",
+      "exit_code": 130,
+      "message": "interrupted by signal"
+    },
+    {
+      "variant": "assistant_error",
+      "subtype": "assistant_error",
+      "exit_code": 1,
+      "message": "Credit balance too low"
+    }
+  ],
+  "cases": [
+    {
+      "id": "text-success",
+      "documented": true,
+      "op": {
+        "kind": "emit_success",
+        "format": "text",
+        "result": {
+          "text": "The capital of France is Paris.",
+          "num_turns": 3,
+          "session_id": "3f2b8c64-9d1e-4a7b-b2c3-1e5f9a8d6c04",
+          "is_error": false,
+          "used_fallback": false,
+          "usage": {
+            "input_tokens": 5200,
+            "output_tokens": 42,
+            "cache_creation_input_tokens": 650,
+            "cache_read_input_tokens": 21000
+          }
+        },
+        "claude_version": "2.1.270 (Claude Code)",
+        "duration_ms": 45213
+      },
+      "expected_stdout": "The capital of France is Paris.\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "text-success-multiline",
+      "documented": false,
+      "op": {
+        "kind": "emit_success",
+        "format": "text",
+        "result": {
+          "text": "first line\n\nsecond paragraph",
+          "num_turns": 1,
+          "session_id": "3f2b8c64-9d1e-4a7b-b2c3-1e5f9a8d6c04",
+          "is_error": false,
+          "used_fallback": false,
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 4,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+          }
+        },
+        "claude_version": "2.1.270 (Claude Code)",
+        "duration_ms": 100
+      },
+      "expected_stdout": "first line\n\nsecond paragraph\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "text-success-fallback-ansi-stripped",
+      "documented": false,
+      "op": {
+        "kind": "emit_success",
+        "format": "text",
+        "result": {
+          "text": "\u001b[32mgreen\u001b[0m fallback text",
+          "num_turns": 1,
+          "session_id": null,
+          "is_error": false,
+          "used_fallback": true,
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+          }
+        },
+        "claude_version": "2.1.270 (Claude Code)",
+        "duration_ms": 0
+      },
+      "expected_stdout": "green fallback text\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "text-error-timeout",
+      "documented": true,
+      "op": {
+        "kind": "emit_error",
+        "format": "text",
+        "variant": "timeout",
+        "claude_version": "2.1.270 (Claude Code)",
+        "after_inject": true
+      },
+      "expected_stdout": "",
+      "expected_stderr": "error: operation timed out\n"
+    },
+    {
+      "id": "json-success",
+      "documented": true,
+      "op": {
+        "kind": "emit_success",
+        "format": "json",
+        "result": {
+          "text": "The capital of France is Paris.",
+          "num_turns": 3,
+          "session_id": "3f2b8c64-9d1e-4a7b-b2c3-1e5f9a8d6c04",
+          "is_error": false,
+          "used_fallback": false,
+          "usage": {
+            "input_tokens": 5200,
+            "output_tokens": 42,
+            "cache_creation_input_tokens": 650,
+            "cache_read_input_tokens": 21000
+          }
+        },
+        "claude_version": "2.1.270 (Claude Code)",
+        "duration_ms": 45213
+      },
+      "expected_stdout": "{\"claude_version\":\"2.1.270 (Claude Code)\",\"cost_usd\":0,\"duration_ms\":45213,\"is_error\":false,\"num_turns\":3,\"result\":\"The capital of France is Paris.\",\"session_id\":\"3f2b8c64-9d1e-4a7b-b2c3-1e5f9a8d6c04\",\"subtype\":\"success\",\"type\":\"result\",\"usage\":{\"cache_creation_input_tokens\":650,\"cache_read_input_tokens\":21000,\"input_tokens\":5200,\"output_tokens\":42}}\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "json-success-null-session",
+      "documented": true,
+      "op": {
+        "kind": "emit_success",
+        "format": "json",
+        "result": {
+          "text": "ok",
+          "num_turns": 1,
+          "session_id": null,
+          "is_error": false,
+          "used_fallback": false,
+          "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+          }
+        },
+        "claude_version": "2.1.270 (Claude Code)",
+        "duration_ms": 0
+      },
+      "expected_stdout": "{\"claude_version\":\"2.1.270 (Claude Code)\",\"cost_usd\":0,\"duration_ms\":0,\"is_error\":false,\"num_turns\":1,\"result\":\"ok\",\"session_id\":null,\"subtype\":\"success\",\"type\":\"result\",\"usage\":{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":0,\"output_tokens\":0}}\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "json-error-timeout",
+      "documented": true,
+      "op": {
+        "kind": "emit_error",
+        "format": "json",
+        "variant": "timeout",
+        "claude_version": "2.1.270 (Claude Code)",
+        "after_inject": true
+      },
+      "expected_stdout": "{\"claude_version\":\"2.1.270 (Claude Code)\",\"error_message\":\"operation timed out\",\"is_error\":true,\"subtype\":\"timeout\",\"type\":\"result\"}\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "json-error-assistant",
+      "documented": true,
+      "op": {
+        "kind": "emit_error",
+        "format": "json",
+        "variant": "assistant_error",
+        "message": "Credit balance too low",
+        "claude_version": "2.1.270 (Claude Code)",
+        "after_inject": true
+      },
+      "expected_stdout": "{\"claude_version\":\"2.1.270 (Claude Code)\",\"error_message\":\"Credit balance too low\",\"is_error\":true,\"subtype\":\"assistant_error\",\"type\":\"result\"}\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "json-error-config-on-stderr",
+      "documented": true,
+      "op": {
+        "kind": "emit_error",
+        "format": "json",
+        "variant": "config",
+        "message": "invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n",
+        "claude_version": "2.1.276 (Claude Code)",
+        "after_inject": true
+      },
+      "expected_stdout": "",
+      "expected_stderr": "{\"claude_version\":\"2.1.276 (Claude Code)\",\"error_message\":\"invalid config: malformed.toml: TOML parse error at line 1, column 3\\n  |\\n1 | [[\\n  |   ^\\ninvalid key\\n\",\"is_error\":true,\"subtype\":\"internal_error\",\"type\":\"result\"}\n"
+    },
+    {
+      "id": "stream-json-success-emits-nothing",
+      "documented": true,
+      "op": {
+        "kind": "emit_success",
+        "format": "stream-json",
+        "result": {
+          "text": "The reader thread owns stdout in this mode",
+          "num_turns": 1,
+          "session_id": "3f2b8c64-9d1e-4a7b-b2c3-1e5f9a8d6c04",
+          "is_error": false,
+          "used_fallback": false,
+          "usage": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+          }
+        },
+        "claude_version": "2.1.270 (Claude Code)",
+        "duration_ms": 5
+      },
+      "expected_stdout": "",
+      "expected_stderr": ""
+    },
+    {
+      "id": "stream-json-error-after-inject",
+      "documented": true,
+      "op": {
+        "kind": "emit_error",
+        "format": "stream-json",
+        "variant": "assistant_error",
+        "message": "Credit balance too low",
+        "claude_version": "2.1.270 (Claude Code)",
+        "after_inject": true
+      },
+      "expected_stdout": "{\"claude_version\":\"2.1.270 (Claude Code)\",\"error_message\":\"Credit balance too low\",\"is_error\":true,\"subtype\":\"assistant_error\",\"type\":\"result\"}\n",
+      "expected_stderr": ""
+    },
+    {
+      "id": "stream-json-error-before-inject",
+      "documented": true,
+      "op": {
+        "kind": "emit_error",
+        "format": "stream-json",
+        "variant": "timeout",
+        "claude_version": "2.1.270 (Claude Code)",
+        "after_inject": false
+      },
+      "expected_stdout": "",
+      "expected_stderr": "error: operation timed out\n"
+    },
+    {
+      "id": "stream-json-replay",
+      "documented": true,
+      "op": {
+        "kind": "stream_replay",
+        "transcript_lines": [
+          "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"sessionId\":\"s-270\",\"uuid\":\"u-1\"}",
+          "",
+          "{\"type\":\"assistant\",\"message\":{\"id\":\"m-1\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"sessionId\":\"s-270\",\"uuid\":\"a-1\"}",
+          "{ \"type\": \"assistant\", \"message\": { \"id\": \"m-2\", \"content\": [{ \"type\": \"text\", \"text\": \"spaced JSON stays byte-for-byte\" }] }, \"sessionId\": \"s-270\", \"uuid\": \"a-2\" }",
+          "{\"type\":\"assistant\",\"message\":{\"id\":\"m-3\",\"content\":[{\"type\":\"text\",\"text\":\"trailing CR trimmed\"}]},\"sessionId\":\"s-270\",\"uuid\":\"a-3\"}\r"
+        ]
+      },
+      "expected_stdout": "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"sessionId\":\"s-270\",\"uuid\":\"u-1\"}\n{\"type\":\"assistant\",\"message\":{\"id\":\"m-1\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"sessionId\":\"s-270\",\"uuid\":\"a-1\"}\n{ \"type\": \"assistant\", \"message\": { \"id\": \"m-2\", \"content\": [{ \"type\": \"text\", \"text\": \"spaced JSON stays byte-for-byte\" }] }, \"sessionId\": \"s-270\", \"uuid\": \"a-2\" }\n{\"type\":\"assistant\",\"message\":{\"id\":\"m-3\",\"content\":[{\"type\":\"text\",\"text\":\"trailing CR trimmed\"}]},\"sessionId\":\"s-270\",\"uuid\":\"a-3\"}\n",
+      "expected_stderr": ""
+    }
+  ]
+}
