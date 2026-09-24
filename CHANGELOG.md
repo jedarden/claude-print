@@ -9,6 +9,21 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Billing-canary installation and operations documented.** The "Install on
+  each host" section of `scripts/billing-canary.md` is now the complete
+  operator workflow for `install-billing-canary.sh`: prerequisites (including
+  the unit-PATH trap — the installer checks the shell's PATH, the service
+  runs the unit's pinned one), the installed-path/mode table, the installer's
+  steps in order, the timer's schedule and catch-up semantics, the linger
+  requirement (check, admin remedy, warning-not-block), post-install
+  verification commands, how `CLAUDE_PRINT_POOL` relates to the installed
+  timer (stateless by design; the pooled leg runs manually from the libexec
+  copy, with `CLAUDE_PRINT_BIN` for fresh builds), and a `reason=`-keyed
+  failure-recovery table covering every `FAIL` shape the canary can write
+  plus the installer's own failure modes. Stale `ex44` host references in
+  the README, the plan, and the canary doc corrected to `codinghome`
+  (ex44 was decommissioned 2026-08-30).
+
 - **`inherit_hooks` semantics documented and pinned end-to-end.** The README
   gains a "Hook inheritance" section defining what the config key controls
   (the standard settings sources — user/project/local — so your hooks fire or

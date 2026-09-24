@@ -611,7 +611,7 @@ Before deploying to production, verify that sessions are billing against the sub
 This script inspects the latest transcript JSONL under `~/.claude/projects/` and asserts the `entrypoint` field is `"cli"` (subscription), not `"sdk-cli"` (credit pool). Exit 0 means correct billing; exit 1 means a billing regression. Run this after every release or Claude Code upgrade.
 
 Production hosts also run a daily credential-backed canary. Install its
-systemd user timer on ex44 and lab with:
+systemd user timer on codinghome and lab with:
 
 ```bash
 ./scripts/install-billing-canary.sh
@@ -620,8 +620,10 @@ systemd user timer on ex44 and lab with:
 The canary makes a single one-turn Haiku invocation, checks that invocation's exact
 transcript with `check-billing.sh`, and atomically writes `PASS` or `FAIL` to
 `~/.local/state/claude-print/billing-canary/last-result`. See
-[`scripts/billing-canary.md`](scripts/billing-canary.md) for timer and alerting
-details. The manual release check remains required as a second layer.
+[`scripts/billing-canary.md`](scripts/billing-canary.md) for the full
+installation and operations workflow — installed paths, timer schedule, the
+linger requirement, verification, and failure recovery. The manual release
+check remains required as a second layer.
 
 ### Common issues
 

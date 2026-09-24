@@ -1415,7 +1415,7 @@ The `claude_version` field is additive (minor) and will not be removed in a majo
 
 ### Monitoring and Alerting
 
-`claude-print` emits no metrics itself. A daily systemd user timer on ex44 and lab runs one cheap Haiku session, checks its exact transcript with `scripts/check-billing.sh`, and writes an atomic result to `~/.local/state/claude-print/billing-canary/last-result`. Every run also emits a `CLAUDE_PRINT_BILLING_CANARY status=PASS|FAIL` journal line and exits non-zero on failure. Operators or a heartbeat monitor alert when the result is `FAIL`, missing, or older than 48 hours.
+`claude-print` emits no metrics itself. A daily systemd user timer on codinghome and lab runs one cheap Haiku session, checks its exact transcript with `scripts/check-billing.sh`, and writes an atomic result to `~/.local/state/claude-print/billing-canary/last-result`. Every run also emits a `CLAUDE_PRINT_BILLING_CANARY status=PASS|FAIL` journal line and exits non-zero on failure. Operators or a heartbeat monitor alert when the result is `FAIL`, missing, or older than 48 hours.
 
 The manual `scripts/check-billing.sh` release gate remains required as a belt-and-suspenders second layer. Reviewing NEEDLE transcripts for unexpected `entrypoint: sdk-cli` remains useful corroboration.
 
