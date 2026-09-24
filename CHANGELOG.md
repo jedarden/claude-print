@@ -33,6 +33,20 @@ static musl build) against the tagged commit before publishing.
   fatal. Covered by `tests/install_sh.rs` (valid, missing-manifest,
   missing-entry, tampered-binary, tampered-fixture, fixture-skip).
 
+- **Installer rollback (`claude-print.prev`) documented and pinned.** The
+  rollback copy `install.sh` has always preserved now has a stated contract
+  and workflow: `docs/notes/installer-rollback.md` is the authoritative
+  semantics (created only on upgrade, always holding the *immediately*
+  previous binary — no chain; mode 755 preserved; verify-before-backup
+  ordering so a failed install disturbs nothing; only the main binary is
+  covered, never `mock_claude` or the NEEDLE yaml), and the README gains an
+  "Upgrades and rollback" section with the one-step `mv` workflow. Four new
+  `tests/install_sh.rs` cases pin the semantics hermetically against fake
+  releases whose binary bodies differ per generation: backup-on-upgrade
+  (verbatim content, mode, stdout note, mock scope), single-generation
+  replacement across two upgrades, no copy on a fresh install, and the
+  failed-install no-touch ordering.
+
 ### Changed
 
 - **Startup-overhead benchmark evidence made machine-independent and

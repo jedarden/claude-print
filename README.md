@@ -39,6 +39,31 @@ redistribute the artifacts but cannot bypass verification. With no mirror
 reachable, [build from source](#build-from-source) from the canonical Forgejo
 repository — source availability never depends on the mirror.
 
+### Upgrades and rollback
+
+Re-running `sh install.sh` upgrades in place. Once the new binary has passed
+checksum verification, the previous binary is preserved as
+`~/.local/bin/claude-print.prev`; each upgrade replaces that copy, so it
+always holds the immediately previous version — there is no chain of older
+copies. A fresh install (no existing binary) creates no `.prev`, and a
+failed install (missing manifest, unlisted asset, digest mismatch) never
+touches the live binary or an existing copy, because verification precedes
+the backup.
+
+Roll back one version in one step:
+
+```bash
+mv ~/.local/bin/claude-print.prev ~/.local/bin/claude-print
+claude-print --check
+```
+
+The move consumes the copy — after rolling back there is no `.prev` until
+the next upgrade, so two-versions-back requires installing that release
+explicitly. Only the main binary is covered: `mock_claude` and
+`~/.needle/agents/claude-print.yaml` are overwritten in place with no
+backup. Full semantics — including the mid-install failure window — are
+documented in [`docs/notes/installer-rollback.md`](docs/notes/installer-rollback.md).
+
 ### Repository & contributions
 
 `git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository and the destination for all pushes. The GitHub repo (`jedarden/claude-print`) is a read-only push mirror — do not treat it as authoritative, and expect it to always reflect Forgejo rather than the reverse. "Read-only" describes source and refs: mirror syncs carry Forgejo → GitHub and never the reverse. Release artifacts run the other way conceptually — they are published only to GitHub Releases, and Forgejo hosts no release assets. The canonical publication path is one-directional: a `vX.Y.Z` tag is pushed to Forgejo first, the `claude-print-ci` Argo Workflow builds the tagged commit from Forgejo, and the workflow publishes the artifacts to GitHub Releases, from which nothing flows back. That makes GitHub Releases the supported download path for `install.sh`, with `CLAUDE_PRINT_RELEASE_URL` redirecting the installer to any host serving the same assets when GitHub is unreachable (see [Install](#install)). Contribute by pushing to Forgejo directly, or by opening an issue or PR on either host — mirror-side PRs are applied on Forgejo before merge.
@@ -478,7 +503,7 @@ The pool is opt-in, so rollback is removing the opt-in — no binary revert requ
 2. Stop the daemon: send `SIGINT`/`SIGTERM` to the `claude-print serve` process. It exits 0, tears down every worker, and removes its socket file.
 3. Removing a stale socket file by hand (`rm /tmp/claude-print-pool.sock`) is always safe — a client that finds a socket nobody is listening on falls back statelessly anyway.
 
-Even out of order (clients still pointing at a dead daemon), behavior stays correct: those clients fall back statelessly (INV-10). A binary-level rollback follows the general release procedure — `install.sh` preserves the previous binary as `claude-print.prev`.
+Even out of order (clients still pointing at a dead daemon), behavior stays correct: those clients fall back statelessly (INV-10). A binary-level rollback follows the general release procedure — `install.sh` preserves the previous binary as `claude-print.prev` (see [Upgrades and rollback](#upgrades-and-rollback)).
 
 The full invariant set (INV-9 through INV-15) is specified in `docs/plan/plan.md` (Invariants); the end-to-end pins live in `tests/pool_socket_e2e.rs`, `tests/pool_adversarial_e2e.rs`, `tests/pool_failure_e2e.rs`, and `tests/serve.rs`.
 
