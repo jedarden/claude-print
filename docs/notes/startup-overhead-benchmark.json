@@ -1,5 +1,5 @@
 {
-  "schema": "claude-print/startup-overhead-benchmark/1",
+  "schema": "claude-print/startup-overhead-benchmark/2",
   "measured_at_utc": "2026-09-19T20:22:18+00:00",
   "scope": "startup/prompt-injection overhead only (process start -> 'prompt injected' verbose trace); does NOT establish model-latency savings",
   "environment": {
@@ -18,7 +18,7 @@
     "argv": [
       "scripts/bench_startup_overhead.py",
       "--bin-dir",
-      "/build/target-workers/release",
+      "<redacted: host-specific absolute path>",
       "--samples",
       "10",
       "--warmup",
@@ -28,9 +28,7 @@
       "--output",
       "docs/notes/startup-overhead-benchmark.json"
     ],
-    "bin_dir": "/build/target-workers/release",
-    "claude_print_path": "/build/target-workers/release/claude-print",
-    "mock_claude_path": "/build/target-workers/release/mock-claude"
+    "bin_dir_source": "schema-1 recording (2026-09-19) passed --bin-dir explicitly, pointing at this host's then-current redirected cargo target dir (value redacted here; machine-specific, and no longer this host's redirect either). Schema 2 harnesses omit --bin-dir and derive the bin dir from cargo metadata --no-deps --format-version 1 plus --profile — see docs/notes/startup-overhead-benchmark.md (claudepr-70a60152)."
   },
   "config": {
     "prompt": "Reply with exactly one word: pong",

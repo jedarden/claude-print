@@ -28,16 +28,30 @@ full scope statement.
 Prerequisite (deliberately NOT run by this script — `cargo` on some hosts is
 a CI-submitting wrapper):
 
-    cargo build          # produces target/debug/claude-print and mock-claude
+    cargo build [--release]   # produces claude-print and mock-claude
+
+The build output is located through `cargo metadata`, never a hardcoded
+path: on fleet hosts the shared `cargo` wrapper redirects the target dir
+(e.g. /build/claude-print), on a stock checkout it is ./target, and
+`cargo metadata` reports whichever applies on the host it runs on (AGENTS.md,
+"Where the build output lands"). `--bin-dir DIR` still overrides for ad-hoc
+layouts.
 
 Usage:
 
-    scripts/bench_startup_overhead.py [--bin-dir DIR] [--samples N]
-        [--warmup N] [--pool-size N] [--timeout SECS] [--mode cold|warm|both]
-        [--output FILE] [--self-check]
+    scripts/bench_startup_overhead.py [--bin-dir DIR]
+        [--profile debug|release] [--samples N] [--warmup N] [--pool-size N]
+        [--timeout SECS] [--mode cold|warm|both] [--output FILE] [--self-check]
 
-Defaults: bin-dir=target/debug, samples=10, warmup=3, pool-size=1,
-timeout=60, mode=both, output=- (stdout).
+Defaults: bin-dir=$(cargo metadata target_directory)/<profile>, profile=debug,
+samples=10, warmup=3, pool-size=1, timeout=60, mode=both, output=- (stdout).
+If `cargo metadata` is unavailable, the stock-checkout layout
+target/<profile> is used instead.
+
+Recorded evidence stays machine-independent (schema 2): the JSON artifact's
+harness block records how the bin dir was resolved (bin_dir_source) and
+redacts any explicit --bin-dir value from the recorded argv, so committed
+artifacts carry no host-specific absolute paths.
 """
 
 from __future__ import annotations
@@ -58,6 +72,13 @@ from datetime import datetime, timezone
 
 # The ADR-005 canonical trivial prompt.
 PROMPT = "Reply with exactly one word: pong"
+
+# Artifact schema. Version 2 changed only the `harness` block: it records the
+# bin-dir *derivation* (`bin_dir_source`) instead of absolute paths, and an
+# explicit `--bin-dir` is redacted from the recorded argv. Schema 1 recorded
+# `bin_dir`/`claude_print_path`/`mock_claude_path` as absolute host paths,
+# which made committed evidence machine-specific (claudepr-70a60152).
+ARTIFACT_SCHEMA = "claude-print/startup-overhead-benchmark/2"
 
 # A client sample must finish well inside this budget; the harness kills and
 # fails the run otherwise (a wedged sample is evidence of a bug, not an
@@ -313,6 +334,46 @@ def git_commit():
         return None
 
 
+def cargo_target_directory():
+    """The workspace `target_directory` per `cargo metadata`, or None.
+
+    This is the one source that knows where the build output really lives on
+    any host: the fleet's shared `cargo` wrapper redirects it (AGENTS.md,
+    "Where the build output lands"), a stock checkout does not, and
+    `cargo metadata` reports whichever applies. It compiles nothing and
+    submits nothing to CI (the wrapper only offloads build/test-class
+    commands), and `--offline` keeps the harness's no-network property —
+    `--no-deps` resolves no dependencies, so nothing needs the registry.
+    """
+    try:
+        proc = subprocess.run(
+            ["cargo", "metadata", "--no-deps", "--format-version", "1",
+             "--offline"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout).get("target_directory")
+    except json.JSONDecodeError:
+        return None
+
+
+def redact_bin_dir(argv):
+    """argv with any `--bin-dir` value redacted (`--bin-dir DIR` and
+    `--bin-dir=DIR` both handled), so recorded evidence never carries a
+    host-specific absolute path."""
+    out = list(argv)
+    for i, arg in enumerate(out):
+        if arg == "--bin-dir" and i + 1 < len(out):
+            out[i + 1] = "<redacted: host-specific absolute path>"
+        elif arg.startswith("--bin-dir="):
+            out[i] = "--bin-dir=<redacted: host-specific absolute path>"
+    return out
+
+
 def self_check():
     """Deterministic sanity pins for the helpers (no subprocesses)."""
     assert percentile([1.0], 95) == 1.0
@@ -325,14 +386,32 @@ def self_check():
     assert parse_trace_line("[claude-print 0ms] fifo opened") == (0, "fifo opened")
     assert parse_trace_line("claude-print: something") is None
     assert parse_trace_line("[claude-print abc] x") is None
+    # Recorded evidence stays machine-independent (schema 2): an explicitly
+    # passed --bin-dir is redacted from the recorded argv in both spellings.
+    # The schema-1 artifact of the 2026-09-19 run committed this host's
+    # redirected /build/... path instead (claudepr-70a60152).
+    assert redact_bin_dir(
+        ["scripts/bench_startup_overhead.py", "--bin-dir",
+         "/build/target-workers/release", "--samples", "10"]
+    ) == ["scripts/bench_startup_overhead.py", "--bin-dir",
+          "<redacted: host-specific absolute path>", "--samples", "10"]
+    assert redact_bin_dir(["p", "--bin-dir=/an/abs/path"]) == [
+        "p", "--bin-dir=<redacted: host-specific absolute path>"]
+    assert redact_bin_dir(["p", "--samples", "10", "--profile", "release"]) == [
+        "p", "--samples", "10", "--profile", "release"]
     print("self-check ok")
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--bin-dir", default="target/debug",
-                    help="directory holding claude-print and mock-claude")
+    ap.add_argument("--bin-dir", default=None,
+                    help="directory holding claude-print and mock-claude "
+                         "(default: <cargo metadata target_directory>/"
+                         "<profile>; overrides --profile)")
+    ap.add_argument("--profile", choices=["debug", "release"], default="debug",
+                    help="cargo build profile whose output dir to benchmark "
+                         "(used only when --bin-dir is omitted)")
     ap.add_argument("--samples", type=int, default=10,
                     help="recorded samples per mode (default 10)")
     ap.add_argument("--warmup", type=int, default=3,
@@ -349,11 +428,34 @@ def main():
     if args.self_check:
         return self_check()
 
-    claude_print = os.path.join(args.bin_dir, "claude-print")
-    mock = os.path.join(args.bin_dir, "mock-claude")
+    # Resolve the build output the way AGENTS.md mandates ("Where the build
+    # output lands"): through cargo itself, so the same command line works on
+    # fleet hosts (redirected target dir) and stock checkouts alike. An
+    # explicit --bin-dir still wins for ad-hoc layouts.
+    if args.bin_dir is not None:
+        bin_dir = args.bin_dir
+        bin_dir_source = ("--bin-dir flag (host-specific; value redacted "
+                          "from the recorded artifact)")
+    else:
+        target_dir = cargo_target_directory()
+        if target_dir is not None:
+            bin_dir = os.path.join(target_dir, args.profile)
+            bin_dir_source = (
+                "cargo metadata --no-deps --format-version 1 -> "
+                f"target_directory + --profile {args.profile} (see AGENTS.md "
+                "'Where the build output lands')")
+        else:
+            bin_dir = os.path.join("target", args.profile)
+            bin_dir_source = (
+                f"fallback target/{args.profile} (cargo metadata unavailable; "
+                "stock-checkout layout)")
+
+    claude_print = os.path.join(bin_dir, "claude-print")
+    mock = os.path.join(bin_dir, "mock-claude")
     for path in (claude_print, mock):
         if not os.path.exists(path):
-            sys.exit(f"missing {path}; run `cargo build` first (see module docstring)")
+            sys.exit(f"missing {path}; run `cargo build` first "
+                     f"(bin dir resolved via: {bin_dir_source})")
 
     version = subprocess.run(
         [claude_print, "--version"], capture_output=True, text=True, timeout=30
@@ -372,7 +474,7 @@ def main():
     env = build_env(tmp_home, tmp_config)
 
     result = {
-        "schema": "claude-print/startup-overhead-benchmark/1",
+        "schema": ARTIFACT_SCHEMA,
         "measured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "scope": (
             "startup/prompt-injection overhead only (process start -> "
@@ -392,10 +494,11 @@ def main():
             "claude_backend_note": "mock-claude test fixture, not real Claude Code",
         },
         "harness": {
-            "argv": sys.argv,
-            "bin_dir": args.bin_dir,
-            "claude_print_path": claude_print,
-            "mock_claude_path": mock,
+            # Machine-independent recording (schema 2): the derivation, not
+            # the resolved host path — committed evidence must reproduce on
+            # any box (claudepr-70a60152).
+            "argv": redact_bin_dir(sys.argv),
+            "bin_dir_source": bin_dir_source,
         },
         "config": {
             "prompt": PROMPT,

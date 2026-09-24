@@ -6,7 +6,15 @@
 6.18.46). Harness: `scripts/bench_startup_overhead.py`. Raw
 machine-readable samples and summary statistics:
 `docs/notes/startup-overhead-benchmark.json` (schema
-`claude-print/startup-overhead-benchmark/1`, committed alongside this note).
+`claude-print/startup-overhead-benchmark/2`, committed alongside this note).
+Schema 2 differs from the schema-1 recording of this same run only in the
+`harness` block: the original recorded the bin dir as this host's
+machine-specific absolute path (`/build/target-workers/release` — the cargo
+redirect in effect here at measurement time, since superseded by the
+per-repo `/build/claude-print` redirect), which no other box could resolve
+and which no longer even matches this one. The re-recorded block states the
+derivation instead; every measurement, sample, and environment field is
+byte-identical (claudepr-70a60152).
 
 **Scope — read this first.** This measurement covers **startup/prompt-injection
 overhead only**: wall-clock from client process start to the arrival of the
@@ -24,17 +32,23 @@ the ADR-005 decision or the pool's design.
 ```
 cargo build --release
 python3 scripts/bench_startup_overhead.py \
-  --bin-dir /build/target-workers/release \
-  --samples 10 --warmup 3 --mode both \
+  --profile release --samples 10 --warmup 3 --mode both \
   --output docs/notes/startup-overhead-benchmark.json
 ```
 
-(The `--bin-dir` above is this box's redirected cargo target dir; on a stock
-checkout it is `target/release`. `cargo build --release` produces both
-`claude-print` and `mock-claude` there.) The harness re-records its own argv
-into the JSON artifact's `harness.argv`, so the committed results file is
-self-describing. A deterministic sanity harness exists for CI-adjacent use
-(no subprocesses, no binaries needed):
+No `--bin-dir` is needed: the harness locates the build output through
+`cargo metadata --no-deps --format-version 1` and appends `--profile`
+(`release` above; the default is `debug`), which resolves to
+`/build/claude-print/release` on fleet hosts with the shared `cargo`
+wrapper and `target/release` on a stock checkout — the resolution AGENTS.md
+mandates in "Where the build output lands", so the same command line
+reproduces on either. `cargo build --release` produces both `claude-print`
+and `mock-claude` there. (`--bin-dir DIR` still overrides for ad-hoc
+layouts.) The harness re-records its own argv and the bin-dir *derivation*
+(`harness.bin_dir_source`) into the JSON artifact, redacting any explicit
+`--bin-dir` value, so the committed results file is self-describing
+without carrying machine-specific paths. A deterministic sanity harness
+exists for CI-adjacent use (no subprocesses, no binaries needed):
 `python3 scripts/bench_startup_overhead.py --self-check`.
 
 ## Method
@@ -123,7 +137,12 @@ is the mirror-image cost it amortizes away.
   dirs; nothing outside the benchmark's own temp output is read or written.
   The committed JSON contains host/kernel/CPU/versions and timings only.
 - **Deterministic harness check:** `--self-check` pins the percentile
-  math and the trace-line parser without spawning anything.
+  math, the trace-line parser, and the argv redaction without spawning
+  anything.
+- **Reproducibility guard:** `tests/benchmark_reproducibility.rs` runs in
+  every `cargo test` and fails if the committed artifact (or this note)
+  ever again hardcodes a machine-specific bin-dir path — the artifact must
+  record the derivation (schema 2), not the path.
 - **To reproduce:** build (`cargo build --release`), run the command line
   above on an idle machine, and compare against the committed JSON. The
   absolute numbers are box-specific (they price two sleep-bounded quiet

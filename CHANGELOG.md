@@ -35,6 +35,22 @@ static musl build) against the tagged commit before publishing.
 
 ### Changed
 
+- **Startup-overhead benchmark evidence made machine-independent and
+  guarded.** `scripts/bench_startup_overhead.py` no longer needs
+  `--bin-dir`: it derives the build directory from `cargo metadata` (the
+  resolution AGENTS.md mandates in "Where the build output lands") plus a
+  new `--profile debug|release` flag, records only the derivation
+  (`harness.bin_dir_source`), and redacts an explicit `--bin-dir` from the
+  recorded argv. The committed artifact
+  (`docs/notes/startup-overhead-benchmark.json`) moves to schema
+  `claude-print/startup-overhead-benchmark/2` — same measurements, harness
+  block stripped of the stale `/build/target-workers/release` absolute
+  paths that no other host could resolve and that no longer match even
+  this host's redirect — and the note's reproduce command derives the
+  path instead of hardcoding it. `tests/benchmark_reproducibility.rs`
+  fails the suite if a machine-specific bin-dir path ever returns to the
+  artifact or the note.
+
 - **Forgejo/GitHub roles and the canonical release publication path stated
   explicitly.** The README's Repository & contributions and Install sections
   now pin down the division of labor: GitHub is read-only for source and refs
