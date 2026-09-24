@@ -98,6 +98,13 @@ fn build_release_with_binary_body(names: &[&str], binary_body: &str) -> TempDir 
 }
 
 fn run_install(home: &Path, release_dir: &Path) -> Output {
+    run_install_with_env(home, release_dir, &[])
+}
+
+/// [`run_install`] with extra environment variables layered over the standard
+/// isolation set — the path install.sh's documented toggles (e.g.
+/// `SKIP_MOCK_CLAUDE=1`) reach the script through.
+fn run_install_with_env(home: &Path, release_dir: &Path, envs: &[(&str, &str)]) -> Output {
     let bin_dir = home.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     // Satisfies install.sh's `command -v claude` preflight without a real
@@ -106,7 +113,8 @@ fn run_install(home: &Path, release_dir: &Path) -> Output {
     fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
 
-    Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg(repo_path("install.sh"))
         .env("HOME", home)
         .env(
@@ -120,9 +128,11 @@ fn run_install(home: &Path, release_dir: &Path) -> Output {
         .env(
             "CLAUDE_PRINT_RELEASE_URL",
             format!("file://{}", release_dir.display()),
-        )
-        .output()
-        .unwrap()
+        );
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().unwrap()
 }
 
 fn installed_path(home: &Path, install_name: &str) -> PathBuf {
@@ -308,6 +318,51 @@ fn install_skips_mock_claude_when_it_is_absent_from_the_release() {
         stdout.contains("skipping mock_claude"),
         "stdout must note the skip: {stdout}"
     );
+}
+
+#[test]
+fn skip_mock_claude_env_skips_a_shipped_fixture_while_the_binary_stays_verified_and_installed() {
+    // SKIP_MOCK_CLAUDE=1 is the documented opt-out (install.sh header,
+    // README "Set SKIP_MOCK_CLAUDE=1 to skip the mock_claude test fixture
+    // download"). The release here ships AND lists the fixture, so without
+    // the env the fixture leg would run in full (download, verify, install —
+    // the mirror image of install_succeeds_when_artifacts_match_...): the
+    // skip can only be the env branch, not a missing-asset skip. It must
+    // bypass the fixture alone — the binary is still verified against the
+    // manifest and installed, and the post-install --check smoke still runs.
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    let home = tempfile::tempdir().unwrap();
+
+    let output = run_install_with_env(home.path(), release.path(), &[("SKIP_MOCK_CLAUDE", "1")]);
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    // The fixture is never placed, and its leg never starts: no download,
+    // no verification, no install line for it.
+    assert!(
+        !installed_path(home.path(), MOCK_INSTALL_NAME).exists(),
+        "SKIP_MOCK_CLAUDE=1 must leave the fixture uninstalled"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(&format!("Downloading {MOCK_ASSET}")),
+        "the fixture download must never start: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("Verified {MOCK_ASSET}")),
+        "the fixture must not be verified: {stdout}"
+    );
+    // The main binary keeps its full treatment.
+    assert!(
+        stdout.contains(&format!("Verified {BINARY_ASSET}")),
+        "the binary must still be verified: {stdout}"
+    );
+    let binary = installed_path(home.path(), BINARY_INSTALL_NAME);
+    assert_eq!(
+        fs::read_to_string(&binary).unwrap(),
+        BINARY_BODY,
+        "the verified binary must be installed verbatim"
+    );
+    assert_eq!(mode_of(&binary), 0o755, "the binary stays executable");
 }
 
 // ---------------------------------------------------------------------------
