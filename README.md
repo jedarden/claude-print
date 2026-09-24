@@ -23,16 +23,20 @@ The billing path is determined by an `isatty` check inside the `claude` binary: 
 sh install.sh
 ```
 
-`install.sh` downloads a pre-built static musl binary from GitHub Releases (`jedarden/claude-print`), runs `--check` to verify the setup, and copies `claude-print.yaml` to `~/.needle/agents/` if NEEDLE is present.
+`install.sh` downloads a pre-built static musl binary from GitHub Releases (`jedarden/claude-print`) — the supported distribution channel for release artifacts — runs `--check` to verify the setup, and copies `claude-print.yaml` to `~/.needle/agents/` if NEEDLE is present. Note that GitHub Releases is the artifact host, not the source of truth for the code; see [Repository & contributions](#repository--contributions).
 
 Every downloaded artifact is verified against the release's published `sha256sums.txt` before it is installed or executed. A missing manifest, an asset with no checksum entry, or any digest mismatch aborts the install with nothing placed — the check fails closed. The `mock_claude` fixture remains optional: a release whose manifest does not list it skips the fixture instead of failing.
 
 Set `SKIP_MOCK_CLAUDE=1` to skip the `mock_claude` test fixture download.
 
+### Repository & contributions
+
+`git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository and the destination for all pushes. The GitHub repo (`jedarden/claude-print`) is a read-only push mirror — do not treat it as authoritative, and expect it to always reflect Forgejo rather than the reverse. Release artifacts are published only to GitHub Releases; that is the supported download path for `install.sh`. Contribute by pushing to Forgejo directly, or by opening an issue or PR on either host — mirror-side PRs are applied on Forgejo before merge.
+
 ### Build from source
 
 ```bash
-git clone https://github.com/jedarden/claude-print
+git clone https://git.ardenone.com/jedarden/claude-print  # canonical (Forgejo); the GitHub repo is a read-only mirror
 cd claude-print
 cargo build --release
 # binary at target/release/claude-print
@@ -498,8 +502,8 @@ Before cutting a release tag:
 3. Run `claude-print --check` to verify PTY and Stop hook mechanics
 4. **Check Claude Code version currency**: if the installed Claude Code version (`claude --version`) has changed since the last release, capture a real session transcript and add it as `tests/fixtures/transcript_vX.Y.Z.jsonl` with corresponding regression tests in `tests/version_compat.rs`
 5. Update version in `Cargo.toml`
-6. Commit and push: `git tag v0.x.y && git push origin v0.x.y`
-7. Monitor the `claude-print-ci` Argo Workflow for successful build and GitHub release
+6. Commit and push: `git tag v0.x.y && git push origin v0.x.y` (origin is Forgejo, the canonical host — the tag must land there first; see the workflow's tag-to-Forgejo note)
+7. Monitor the `claude-print-ci` Argo Workflow for a successful build and publish — release artifacts land on GitHub Releases, the supported download channel (see [Repository & contributions](#repository--contributions))
 
 ## Structure
 

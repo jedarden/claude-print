@@ -19,6 +19,15 @@ static musl build) against the tagged commit before publishing.
   fatal. Covered by `tests/install_sh.rs` (valid, missing-manifest,
   missing-entry, tampered-binary, tampered-fixture, fixture-skip).
 
+### Changed
+
+- **README identifies Forgejo as the canonical repository.** Clone, install,
+  and release references now state that
+  `git.ardenone.com/jedarden/claude-print` (Forgejo) is the source of truth
+  and the destination for pushes, that the GitHub repo is a read-only push
+  mirror, and that GitHub Releases remains the supported channel for
+  downloading release artifacts.
+
 ## [0.2.2] - 2026-09-20
 
 First tagged release since v0.2.0. The 0.2.1 version number was consumed by a
