@@ -12,6 +12,14 @@ Protocol version: **v1** — the version described here is the only version
 that has ever shipped. See [Versioning and compatibility](#versioning-and-compatibility)
 for what that means when the two ends of the socket are not the same build.
 
+This note is the internals document. The operator-facing workflow — starting
+`serve`, choosing the socket and pool size, invoking `--pool-socket`,
+shutdown, permissions, and the fallback-vs-hard-failure policy in operator
+terms — lives in the README's
+[Warm PTY pool (ADR-005)](../../README.md#warm-pty-pool-adr-005) section;
+`AGENTS.md` §"Pool operations" carries the same quick reference for repo
+agents.
+
 ## Transport
 
 * **Socket:** `AF_UNIX` / `SOCK_STREAM`. Path is chosen by whoever starts the

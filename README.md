@@ -449,6 +449,23 @@ rm "$bad_config" config-error.json
 
 Pooled workers are warmed through trust-dismiss and idle-settle but never past prompt injection, and every request still gets its own `claude` process and session: one prompt per worker, no multi-turn reuse. A released worker is destroyed and replaced, never handed to a second prompt (INV-9).
 
+### Operator workflow
+
+The whole lifecycle is three commands, in order — start the daemon, point invocations at it, stop the daemon:
+
+```bash
+# 1) Start the daemon: N workers kept warm, on a socket you choose
+claude-print serve --pool-size 2 --socket /tmp/claude-print-pool.sock
+
+# 2) Run clients: any output format, repeated freely, concurrent or sequential
+claude-print --pool-socket /tmp/claude-print-pool.sock "prompt"
+
+# 3) Stop the daemon: SIGINT or SIGTERM — a supervisor stop is not a failure
+pkill -TERM -f 'claude-print serve'
+```
+
+Between 1 and 3 there is nothing to coordinate. Each client acquires one warmed worker, drives exactly one prompt on it, and releases it (the daemon destroys the worker and spawns a replacement — a released worker is never reused). Clients that find no live daemon fall back to the ordinary stateless session, and a client whose daemon dies mid-session finishes anyway (the session is daemon-independent once assigned) — so the daemon can be started, restarted, or removed at any time without stranding or blocking anyone.
+
 ### `serve` — the pool daemon
 
 ```
@@ -466,6 +483,7 @@ Operating behavior:
 - The daemon warms `--pool-size` workers and tops the pool back up after every handout. Warmup is bounded (120 s per worker); a worker that fails or times out warmup is destroyed and replaced, never handed out half-warmed.
 - `SIGINT` or `SIGTERM` stops the daemon cleanly: every worker's process group is torn down (SIGTERM → 2 s grace → SIGKILL, exit observed and reaped — no survivors, no zombies), the socket file is removed, and the exit code is 0. A supervisor stopping the service is not a failure. Setup failures (bad `--pool-size`, unusable socket path) exit 2 before any worker is spawned.
 - Socket cleanup is ownership-checked: at shutdown the daemon removes only the socket node it created at bind time, so a daemon that lost its path to a replacement never unlinks the winner's socket.
+- The socket node **is** the access control. It is created owner-only (`0600`, held regardless of `umask`), so clients must run as the same user as the daemon — and anyone who can connect acquires a warmed `claude` worker running as that user, billing its subscription. Run the daemon under exactly the account pooled invocations should bill as; the default path under a world-writable `/tmp` is safe because the node's own mode, not the directory, gates `connect(2)`.
 - The worker runs `claude` with the daemon's launch decisions (hook settings for the Stop-FIFO relay, `--setting-sources=` so user hooks do not fire inside pooled workers). Per-invocation client flags cannot reach an already-running worker — see below.
 - `serve` never reads the config file and never falls through to prompt validation. Like every entry point it requires a valid `HOME` and a resolvable `claude` binary (`--claude-binary`).
 
@@ -487,13 +505,15 @@ All three output formats (`text`, `json`, `stream-json`) work over an acquired w
 | Daemon dies while a client is driving | The session is daemon-independent once assigned: the client finishes inside its `--timeout`; the best-effort release against the dead daemon is bounded (10 s) and non-fatal |
 | Client killed without cleanup (SIGKILL) | Its worker is never reassigned to a second prompt; the daemon holds it `InUse` and reclaims it only at its own shutdown |
 
+The two outcomes are observably distinct. A fallback prints nothing unless `--verbose` is on (then exactly one stderr line, `pool: <reason>; falling back to the ordinary stateless session`) and produces output and an exit code identical to a no-flag run. A hard failure exits 2 with `error: pool protocol failure: <detail>` on stderr in `text` mode — the same message rides the structured error payload in `json`/`stream-json`, like every setup failure — and the `<detail>` names what broke: `malformed response` for an unparseable frame, `timed out waiting for the pool` for silence past the acquire budget, `worker_assigned carried no stop_fifo …` for a daemon too old to speak the current handoff. Which side of the table a failure lands on never depends on the wording, only on the failure's class.
+
 ### Operating limits
 
 - `--pool-size`: 1–256 (hard cap — each worker is a full `claude` PTY process).
 - Acquire budget: `min(60 s, --timeout)`, bounding the whole connect + request + response + fd-transfer exchange; every protocol stage inside it is deadline-bounded.
 - Worker warmup: bounded at 120 s per worker.
 - Release exchange: bounded at 10 s, best-effort.
-- One client per worker at a time; concurrent acquirers get distinct workers with distinct sessions.
+- One client per worker at a time; concurrent acquirers get distinct workers with distinct sessions. There is no wait queue: an acquire that finds no Ready worker is answered `pool_full` immediately and that client falls back statelessly — size `--pool-size` for steady-state concurrency (clients beyond it are never blocked, just not pooled).
 
 ### Measured startup overhead
 
@@ -517,7 +537,7 @@ The pool is opt-in, so rollback is removing the opt-in — no binary revert requ
 
 Even out of order (clients still pointing at a dead daemon), behavior stays correct: those clients fall back statelessly (INV-10). A binary-level rollback follows the general release procedure — `install.sh` preserves the previous binary as `claude-print.prev` (see [Upgrades and rollback](#upgrades-and-rollback)).
 
-The full invariant set (INV-9 through INV-15) is specified in `docs/plan/plan.md` (Invariants); the end-to-end pins live in `tests/pool_socket_e2e.rs`, `tests/pool_adversarial_e2e.rs`, `tests/pool_failure_e2e.rs`, and `tests/serve.rs`.
+The byte-level contract underneath this section — frame formats, the `SCM_RIGHTS` fd transfer, the timeout table, and the versioning rules that decide which failures fall back — is specified in [`docs/notes/pool-socket-protocol.md`](docs/notes/pool-socket-protocol.md). The full invariant set (INV-9 through INV-15) is specified in `docs/plan/plan.md` (Invariants); the end-to-end pins live in `tests/pool_socket_e2e.rs`, `tests/pool_adversarial_e2e.rs`, `tests/pool_failure_e2e.rs`, and `tests/serve.rs`.
 
 ## NEEDLE integration
 
