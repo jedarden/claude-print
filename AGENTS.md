@@ -23,12 +23,27 @@ cargo test
 # Unit tests only (no binary compilation required)
 cargo test --lib
 
-# Integration tests (requires compiled binary)
-cargo test --test '*'
+# All test targets — unit + integration (requires compiled binaries)
+cargo test --tests
 
 # Smoke check (verifies PTY, FIFO, and billing env prerequisites; credential-free)
 cargo run --bin claude-print -- --check
 ```
+
+**Never use `cargo test --test '*'`** — use `cargo test --tests`. Quoted, the
+wildcard does resolve on stock Cargo (glob target selection), but it cannot
+survive the fleet path: `~/.local/bin/cargo-remote` flattens the invocation
+into one string (`TEST_ARGS="${*:2}"` drops the quoting), and the
+`rust-verify` verify pod re-expands that string unquoted
+(`cargo test $TEST_ARGS`), so the literal `*` glob-expands to the clone's
+top-level files — `error: unexpected argument 'Cargo.toml' found` (verified
+2026-09-24, claudepr-07a82368). A clean checkout is precisely the case that
+offloads to iad-ci, so the wildcard fails exactly where a fleet agent
+following this doc would run it. `cargo test --tests` selects every test
+target (unit + integration, no doctests) with nothing to quote, identically
+under stock and wrapped Cargo; a single target remains
+`cargo test --test <name>` — a named selector carries no metacharacters
+either way.
 
 ### Where the build output lands
 
