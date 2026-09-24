@@ -39,11 +39,35 @@ Set `SKIP_MOCK_CLAUDE=1` to skip the `mock_claude` test fixture download.
 git clone https://git.ardenone.com/jedarden/claude-print  # canonical (Forgejo); the GitHub repo is a read-only mirror
 cd claude-print
 cargo build --release
-# binary at target/release/claude-print
 
 # fully static binary (recommended for deployment):
 cargo build --target x86_64-unknown-linux-musl --release
 ```
+
+The binaries land under Cargo's target directory, which is not always
+`./target` — so don't assume that path when you go to run them:
+
+- **Stock Cargo checkout:** `target/release/claude-print` and
+  `target/x86_64-unknown-linux-musl/release/claude-print`.
+- **Hosts with the shared `cargo` wrapper** (`~/.local/bin/cargo` on this
+  fleet's codinghome and lab boxes): the wrapper force-sets
+  `CARGO_TARGET_DIR=/build/<repo>` for every invocation — here
+  `/build/claude-print/release/claude-print` and
+  `/build/claude-print/x86_64-unknown-linux-musl/release/claude-print` — and
+  refuses a `--target-dir` outside that directory. `./target/` is never
+  created.
+
+Resolve the directory through cargo instead of hardcoding either location —
+`cargo metadata` goes through the same wrapper, so it reports the redirected
+directory where one is enforced and the checkout's `target` dir elsewhere:
+
+```bash
+TARGET="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)"
+"$TARGET/release/claude-print" --version
+```
+
+`cargo run --bin claude-print -- --check` runs the smoke check directly from
+the build and works under both layouts.
 
 Architectures: `x86_64` only (static musl binary). aarch64 / ARM Linux is out of scope for v1.0 — see `docs/plan/plan.md` Non-Goals. CI builds only for the x86_64 runner; an `install.sh` aarch64 branch would 404 because no such release asset is produced.
 
@@ -418,7 +442,7 @@ All three output formats (`text`, `json`, `stream-json`) work over an acquired w
 
 ### Measured startup overhead
 
-Startup overhead (process start → prompt injection, the plan's Benchmark Contract) was measured with the `mock-claude` fixture backend: **1443.6 ms stateless vs 1050.6 ms pooled on average (Δ 393.0 ms, 27.2%)**, release build, 2026-09-19 — see [`docs/notes/startup-overhead-benchmark.md`](docs/notes/startup-overhead-benchmark.md) for method and phase decomposition, and reproduce with `scripts/bench_startup_overhead.py`. This measures `claude-print`'s own overhead only. It does **not** measure model latency: what a real dispatch saves in wall-clock depends on real Claude Code startup and inference, which the mock deliberately removes — no model-latency savings are claimed or established here.
+Startup overhead (process start → prompt injection, the plan's Benchmark Contract) was measured with the `mock-claude` fixture backend: **1443.6 ms stateless vs 1050.6 ms pooled on average (Δ 393.0 ms, 27.2%)**, release build, 2026-09-19 — see [`docs/notes/startup-overhead-benchmark.md`](docs/notes/startup-overhead-benchmark.md) for method and phase decomposition, and reproduce with `scripts/bench_startup_overhead.py` (build first with `cargo build`; the script's `--bin-dir` defaults to `target/debug`, so on hosts with the shared `cargo` wrapper pass it explicitly: `--bin-dir "$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)/debug"`). This measures `claude-print`'s own overhead only. It does **not** measure model latency: what a real dispatch saves in wall-clock depends on real Claude Code startup and inference, which the mock deliberately removes — no model-latency savings are claimed or established here.
 
 ### Billing
 
@@ -545,7 +569,7 @@ Before cutting a release tag:
 
 1. Run `./scripts/check-billing.sh` to verify billing conformance (requires credentials)
 2. Run `cargo test` to ensure all mocked tests pass
-3. Run `claude-print --check` to verify PTY and Stop hook mechanics
+3. Run `cargo run --bin claude-print -- --check` to verify PTY and Stop hook mechanics on the build you are about to release
 4. **Check Claude Code version currency**: if the installed Claude Code version (`claude --version`) has changed since the last release, capture a real session transcript and add it as `tests/fixtures/transcript_vX.Y.Z.jsonl` with corresponding regression tests in `tests/version_compat.rs`
 5. Update version in `Cargo.toml`
 6. Commit and push: `git tag v0.x.y && git push origin v0.x.y` (origin is Forgejo, the canonical host — the tag must land there first; see the workflow's tag-to-Forgejo note)

@@ -27,8 +27,41 @@ cargo test --lib
 cargo test --test '*'
 
 # Smoke check (verifies PTY, hooks, and environment prerequisites)
-./target/debug/claude-print --check
+cargo run --bin claude-print -- --check
 ```
+
+### Where the build output lands
+
+`./target/…` is correct on a stock Cargo checkout and wrong on fleet hosts
+(codinghome, lab): there the `cargo` wrapper at `~/.local/bin/cargo` exports
+`CARGO_TARGET_DIR=/build/claude-print` for every invocation, so build output
+lands under `/build/claude-print/…` and `./target/` is never created. The
+wrapper also refuses a `--target-dir` outside `/build/claude-print/` (one
+shared target dir per repo; needle-d6b685b4). The same command therefore has
+two possible output locations:
+
+| Artifact | Stock checkout | Fleet hosts (wrapper) |
+|----------|----------------|----------------------|
+| Debug binary | `target/debug/claude-print` | `/build/claude-print/debug/claude-print` |
+| Host release binary | `target/release/claude-print` | `/build/claude-print/release/claude-print` |
+| Musl release binary | `target/x86_64-unknown-linux-musl/release/claude-print` | `/build/claude-print/x86_64-unknown-linux-musl/release/claude-print` |
+| mock-claude fixture | `target/debug/mock-claude` | `/build/claude-print/debug/mock-claude` |
+
+Don't hardcode either column. Resolve the target directory through cargo
+itself — `cargo metadata` runs through the same wrapper, so it reports
+`/build/claude-print` on fleet hosts and the checkout's `target` dir on a
+stock one:
+
+```bash
+TARGET="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)"
+"$TARGET/debug/claude-print" --check
+```
+
+`cargo run --bin claude-print -- --check` sidesteps path resolution entirely
+and works under both layouts. Tests need no path pinning either: the
+integration and e2e suites locate `mock-claude` and the crate binary relative
+to their own on-disk location (`current_exe()` in `tests/pty_integration.rs`,
+`CARGO_BIN_EXE_*` elsewhere), so they pass wherever cargo puts the build.
 
 The `cargo` wrapper at `~/.local/bin/cargo` auto-submits to the `rust-verify`
 WorkflowTemplate on `iad-ci` when there are no uncommitted changes and the repo has
