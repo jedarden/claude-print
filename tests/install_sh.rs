@@ -166,6 +166,47 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Absolute path of the real `install`(1), for the placement-failure shim to
+/// delegate its non-target invocations to: the first executable `install` on
+/// this process's PATH. The shim's directory is prepended to the child's PATH
+/// only, so it can never match here — and the resolved path is interpolated
+/// into the shim precisely because the shim itself must not `command -v
+/// install`: the child's PATH points at the shim first, so that would recurse.
+fn real_install_path() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH must be set to locate install(1)");
+    for dir in path.to_string_lossy().split(':') {
+        let candidate = Path::new(dir).join("install");
+        if let Ok(metadata) = fs::metadata(&candidate) {
+            if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+                return candidate;
+            }
+        }
+    }
+    panic!("no executable `install` on PATH — cannot build the placement-failure shim");
+}
+
+/// Shell body of the placement-failure `install` shim (`__REAL_INSTALL__` is
+/// replaced by [`real_install_path`]): fails exactly the invocation whose
+/// destination is the main binary — matched by basename, so `claude-print.prev`
+/// (the rollback copy), `mock_claude`, and `~/.needle/agents/claude-print.yaml`
+/// keep the real tool — and execs the real `install` for everything else.
+const PLACEMENT_FAILURE_SHIM: &str = concat!(
+    "#!/bin/sh\n",
+    "last=\n",
+    "for arg in \"$@\"; do\n",
+    "  last=$arg\n",
+    "done\n",
+    "case \"$last\" in\n",
+    "  */claude-print)\n",
+    "    echo \"install: cannot create regular file '$last': No space left on device (simulated placement failure)\" >&2\n",
+    "    exit 1\n",
+    "    ;;\n",
+    "  *)\n",
+    "    exec '__REAL_INSTALL__' \"$@\"\n",
+    "    ;;\n",
+    "esac\n",
+);
+
 #[test]
 fn install_succeeds_when_artifacts_match_the_published_checksums() {
     let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
@@ -369,9 +410,9 @@ fn skip_mock_claude_env_skips_a_shipped_fixture_while_the_binary_stays_verified_
 // Rollback-copy semantics (docs/notes/installer-rollback.md): install.sh
 // moves an existing ~/.local/bin/claude-print to claude-print.prev before
 // installing the newly verified binary. Creation, single-generation
-// replacement, scope, and the verify-before-backup ordering are each pinned
-// below with per-generation binary bodies, so a content assert identifies
-// which install a file came from.
+// replacement, scope, the verify-before-backup ordering, and the mid-install
+// failure window are each pinned below with per-generation binary bodies, so
+// a content assert identifies which install a file came from.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -509,5 +550,127 @@ fn a_failed_install_disturbs_neither_the_live_binary_nor_the_existing_rollback_c
         fs::read_to_string(installed_path(home.path(), PREV_INSTALL_NAME)).unwrap(),
         generation_body("v0"),
         "an existing rollback copy must not be replaced by a failed install"
+    );
+}
+
+#[test]
+fn mid_install_placement_failure_leaves_the_previous_binary_recoverable_and_reports_the_failure() {
+    // The mid-install failure window (docs/notes/installer-rollback.md
+    // "The mid-install failure window"): an upgrade whose downloaded artifact
+    // has PASSED checksum verification and whose rollback copy has already
+    // been created, but whose final `install` of the new binary fails — the
+    // canonical disk-filling-up-between-the-two-steps shape. The failure is
+    // injected with an `install` shim first on PATH (the same PATH-stub
+    // technique run_install uses for the fake `claude`) that fails only the
+    // main binary's placement, so verification and the backup `mv` both run
+    // for real before the failure strikes.
+    let release = build_release_with_binary_body(
+        &[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET],
+        &generation_body("v2"),
+    );
+    let home = tempfile::tempdir().unwrap();
+    preplace_prior_install(home.path(), &generation_body("v1"), None);
+
+    let bin_dir = home.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let shim = bin_dir.join("install");
+    fs::write(
+        &shim,
+        PLACEMENT_FAILURE_SHIM.replace(
+            "__REAL_INSTALL__",
+            &real_install_path().display().to_string(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = run_install(home.path(), release.path());
+
+    // The failure is reported: nonzero exit, with the placement tool's error
+    // (naming its target) surfacing on stderr rather than being swallowed.
+    assert!(
+        !output.status.success(),
+        "a failed final placement must fail the install"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("claude-print"),
+        "stderr must carry the placement failure: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The failure struck inside the window: the artifact had passed
+    // verification and the backup had already been taken.
+    assert!(
+        stdout.contains(&format!("Verified {BINARY_ASSET}")),
+        "the binary must have been verified before the failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("Backing up existing binary"),
+        "the rollback copy must have been created before the failure: {stdout}"
+    );
+    // No false success: nothing that runs after the placement may appear —
+    // no per-artifact Installed line, no --check smoke, no completion banner.
+    assert!(
+        !stdout.contains(&format!(
+            "Installed {}",
+            installed_path(home.path(), BINARY_INSTALL_NAME).display()
+        )),
+        "a failed placement must not claim the binary was installed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Running claude-print --check"),
+        "the post-install smoke must not run after a failed placement: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Installation complete"),
+        "a failed placement must never print the completion banner: {stdout}"
+    );
+    // Nor may anything further be placed: the fixture leg and everything
+    // after it never ran.
+    assert!(
+        !installed_path(home.path(), MOCK_INSTALL_NAME).exists(),
+        "nothing after the failed placement may be installed"
+    );
+    // The live path was consumed by the backup `mv` and never refilled, so
+    // recovery must come from the rollback copy.
+    assert!(
+        !installed_path(home.path(), BINARY_INSTALL_NAME).exists(),
+        "the live path stays vacant when the placement fails: {stdout}"
+    );
+    // The previous binary remains recoverable at .prev: verbatim content,
+    // executable mode, and actually runnable.
+    let prev = installed_path(home.path(), PREV_INSTALL_NAME);
+    assert_eq!(
+        fs::read_to_string(&prev).unwrap(),
+        generation_body("v1"),
+        "the rollback copy must hold the previous binary verbatim"
+    );
+    assert_eq!(mode_of(&prev), 0o755, "the rollback copy stays executable");
+    let run_prev = Command::new(&prev).output().unwrap();
+    assert!(
+        run_prev.status.success(),
+        "the rollback copy must still run: {}",
+        stderr_of(&run_prev)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_prev.stdout).contains("v1"),
+        "the rollback copy must identify as the previous generation: {}",
+        String::from_utf8_lossy(&run_prev.stdout)
+    );
+    // The documented one-step rollback (docs/notes/installer-rollback.md
+    // "Rollback workflow") then restores a working binary.
+    fs::rename(&prev, installed_path(home.path(), BINARY_INSTALL_NAME)).unwrap();
+    let restored = Command::new(installed_path(home.path(), BINARY_INSTALL_NAME))
+        .output()
+        .unwrap();
+    assert!(
+        restored.status.success(),
+        "the rolled-back binary must run: {}",
+        stderr_of(&restored)
+    );
+    assert!(
+        String::from_utf8_lossy(&restored.stdout).contains("v1"),
+        "the rolled-back binary must be the previous generation: {}",
+        String::from_utf8_lossy(&restored.stdout)
     );
 }

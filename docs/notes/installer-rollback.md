@@ -47,7 +47,10 @@ Properties of that step:
 Between the backup `mv` and the new binary's `install`, a failure (disk
 full, permissions) leaves the previous binary safe at `.prev` and nothing at
 `claude-print`. The recovery is the same rollback `mv` above — that is why
-the backup is taken before the new binary lands rather than after.
+the backup is taken before the new binary lands rather than after. The whole
+window is pinned hermetically by
+`mid_install_placement_failure_leaves_the_previous_binary_recoverable_and_reports_the_failure`
+in the coverage table below.
 
 ## Hermetic coverage
 
@@ -60,3 +63,4 @@ fake `file://` releases (per-generation binary bodies):
 | `each_upgrade_replaces_the_rollback_copy_with_the_immediately_previous_binary` | Replacement: after two upgrades the copy holds the middle generation, and exactly one `*prev*` file exists (no chain) |
 | `fresh_install_creates_no_rollback_copy` | No existing binary means no `.prev` |
 | `a_failed_install_disturbs_neither_the_live_binary_nor_the_existing_rollback_copy` | Ordering: a digest mismatch aborts before the backup, leaving the live binary and an existing `.prev` byte-identical |
+| `mid_install_placement_failure_leaves_the_previous_binary_recoverable_and_reports_the_failure` | The mid-install failure window: with verification passed and the backup taken, a failing final placement (an `install` shim on `PATH` matching only the main binary's destination, simulating the disk-full shape) exits nonzero with the tool's error on stderr, prints no success line (`Installed …`, `--check`, `Installation complete`), places nothing further, and leaves the live path vacant — while `.prev` holds the previous binary verbatim at mode 755, still runnable, and the documented rollback `mv` restores a working binary from it |
