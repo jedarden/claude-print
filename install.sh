@@ -10,6 +10,10 @@
 # Every artifact is verified against the release's published sha256sums.txt
 # manifest before it is installed or executed. A missing manifest, a missing
 # checksum entry, or a digest mismatch aborts the install with nothing placed.
+#
+# Supported platforms: x86_64 Linux only. Anything else exits 1 before any
+# download begins (see the platform gate below and README "Supported
+# platforms" for the full matrix).
 set -e
 
 REPO="jedarden/claude-print"
@@ -18,14 +22,27 @@ NEEDLE_AGENTS_DIR="${HOME}/.needle/agents"
 RELEASE_URL="${CLAUDE_PRINT_RELEASE_URL:-https://github.com/${REPO}/releases/latest/download}"
 CHECKSUMS_ASSET="sha256sums.txt"
 
-# Detect OS and architecture
+# Detect OS and architecture against the supported release matrix.
+#
+# CI publishes static musl artifacts for x86_64 Linux ONLY (README
+# "Supported platforms"): the release toolchain installs just
+# x86_64-unknown-linux-musl, so no other asset name is ever produced.
+# Every other combination is refused here — before anything is downloaded,
+# verified, or placed — with the supported matrix and a way forward, so an
+# unsupported architecture never surfaces as a download failure for an
+# asset that was never published.
 OS=$(uname -s)
 ARCH=$(uname -m)
 case "${OS}-${ARCH}" in
-  Linux-x86_64)  TARGET="x86_64-linux" ;;
-  Linux-aarch64) TARGET="aarch64-linux" ;;
+  Linux-x86_64) TARGET="x86_64-linux" ;;
   *)
-    echo "Unsupported platform: ${OS}-${ARCH}" >&2
+    echo "Error: ${OS}-${ARCH} is not a supported platform." >&2
+    echo "Release artifacts are published for x86_64 Linux only (README \"Supported platforms\")." >&2
+    if [ "${OS}" = "Linux" ]; then
+      echo "No prebuilt binary is released for ${ARCH} Linux — build from source instead (README \"Build from source\")." >&2
+    else
+      echo "${OS} is not supported: claude-print is Linux-only (docs/plan/plan.md Non-Goals; Windows has no POSIX PTY path)." >&2
+    fi
     exit 1
     ;;
 esac

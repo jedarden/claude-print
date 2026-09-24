@@ -15,7 +15,7 @@ The billing path is determined by an `isatty` check inside the `claude` binary: 
 - **Claude Code** must be installed and authenticated. See [claude.ai/code](https://claude.ai/code).
 - An active **Claude subscription** (Pro or Max plan) is required. The whole point is to bill against subscription, not credits.
 - **`HOME` must be set to a non-empty value** for the user running `claude-print`. Claude Code configuration, trust state, and transcripts are resolved beneath this directory.
-- Linux only. PTY support requires POSIX — no Windows ConPTY.
+- Linux on x86_64 only — see [Supported platforms](#supported-platforms) for the full release matrix. PTY support requires POSIX — no Windows ConPTY.
 
 ## Install
 
@@ -107,7 +107,19 @@ TARGET="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)
 `cargo run --bin claude-print -- --check` runs the smoke check directly from
 the build and works under both layouts.
 
-Architectures: `x86_64` only (static musl binary). aarch64 / ARM Linux is out of scope for v1.0 — see `docs/plan/plan.md` Non-Goals. CI builds only for the x86_64 runner; an `install.sh` aarch64 branch would 404 because no such release asset is produced.
+### Supported platforms
+
+The release matrix is explicit, and `install.sh` enforces it before anything is downloaded: an unsupported combination fails up front with a message naming the supported matrix and the way forward, never a download error for an asset that was never published.
+
+| `uname -s` | `uname -m` | Result |
+|---|---|---|
+| `Linux` | `x86_64` | Installs the prebuilt static musl binary (`claude-print-x86_64-linux`) — the only combination CI builds and publishes |
+| `Linux` | anything else (`aarch64`, `armv7l`, …) | Refused before any download: no prebuilt artifact is released for other Linux architectures; the error points at [Build from source](#build-from-source) |
+| any other OS | any | Refused before any download: claude-print is Linux-only (Windows would need ConPTY — a POSIX PTY does not exist there) |
+
+aarch64 / ARM Linux is out of scope for v1.0 — see `docs/plan/plan.md` Non-Goals; it can be added in a future release if needed. CI builds only on the x86_64 runner and installs only the `x86_64-unknown-linux-musl` toolchain, so `x86_64-linux` is the only asset name a release ever carries — an installer mapping for any other architecture would request a nonexistent asset and fail as a download error instead of a supported-platform statement.
+
+`tests/install_sh_arch.rs` pins this matrix row by row by faking `uname -s`/`uname -m` per case, independent of the machine running the tests: the supported row must fetch the `x86_64-linux` assets, and every unsupported row must exit 1 with the actionable message before any download starts and with nothing placed.
 
 ## Self-check
 
