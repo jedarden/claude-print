@@ -106,6 +106,39 @@ spec:
             cargo audit
             echo "audit OK (no known vulnerabilities)"
 
+            # === Contract-maintenance gate (docs/notes/claude-contract-probes.md
+            # §Maintenance, R-2) — runs in BOTH modes ========================
+            # Install the claude binary first (native installer; `claude
+            # --version` needs no auth) so drift detection compares the real
+            # installed version against the doc's **Measured against:** stamp
+            # instead of recording "unknown". Then run the gate:
+            # detect -> cheap live contract tests -> evidence bundle ->
+            # follow-up. Probes with model turns skip here (no API auth in
+            # this pod) and are recorded as SKIPPED, never silent.
+            #
+            # Drift is an ALERT, not a red build: the full probes cannot run
+            # in CI (no model auth), so a hard gate could not be cleared from
+            # CI — the gate files/updates the follow-up issue instead, and the
+            # exit code is captured below.
+            if curl -fsSL https://claude.ai/install.sh | bash >/tmp/claude-install.log 2>&1; then
+              export PATH="${HOME}/.local/bin:${PATH}"
+              claude --version || true
+            else
+              echo "WARNING: claude native install failed — gate will report INDETERMINATE" >&2
+              cat /tmp/claude-install.log >&2 || true
+            fi
+
+            set +e
+            bash scripts/contract-maintenance-gate.sh \
+              --evidence-dir target/contract-maintenance \
+              --file-follow-up
+            GATE_EXIT=$?
+            set -e
+            echo "contract-maintenance gate exit: ${GATE_EXIT} (0=CURRENT, 1=DRIFT re-run due, 2=INDETERMINATE)"
+            if [ "${GATE_EXIT}" -ne 0 ]; then
+              echo "ALERT (contract-maintenance gate exit ${GATE_EXIT}): Claude contract evidence needs re-verification — follow-up issue + evidence bundle above (docs/notes/claude-contract-probes.md §Maintenance)"
+            fi
+
             # In verify-only mode (TAG empty), skip release creation after quality gates
             if [ -z "$TAG" ]; then
               echo "Verify-only mode: all quality gates passed, exiting without release"
@@ -178,15 +211,19 @@ spec:
               exit 1
             fi
 
-            # Record the wrapped Claude version when available. The release
-            # image does not currently install Claude, so retain an explicit
-            # unknown marker rather than omitting the artifact.
-            if CLAUDE_BIN=$(command -v claude 2>/dev/null); then
-              CLAUDE_VERSION_OUTPUT=$("$CLAUDE_BIN" --version 2>&1)
-              echo "$CLAUDE_VERSION_OUTPUT" > last-claude-version.txt
-              echo "Recorded Claude version: $CLAUDE_VERSION_OUTPUT"
+            # The contract-maintenance gate recorded the claude version it
+            # detected into target/last-claude-version.txt (the same file
+            # tests/version_compat.rs writes locally). "unknown" only if the
+            # gate could not determine it (claude install failed).
+            CONTRACT_STATUS_TEXT="(contract-maintenance gate did not record status)"
+            if [ -f target/contract-maintenance/contract-status.txt ]; then
+              CONTRACT_STATUS_TEXT="$(cat target/contract-maintenance/contract-status.txt)"
+            fi
+            if [ -s target/last-claude-version.txt ]; then
+              cp target/last-claude-version.txt last-claude-version.txt
+              echo "Recorded Claude version: $(cat last-claude-version.txt)"
             else
-              echo "WARNING: claude binary not found on PATH; recording unknown" >&2
+              echo "WARNING: gate recorded no claude version; recording unknown" >&2
               echo "unknown" > last-claude-version.txt
             fi
 
@@ -206,6 +243,14 @@ spec:
               --notes "Release v${VERSION}
 
             Built from commit: ${COMMIT}
+
+            ## Contract evidence
+
+            ${CONTRACT_STATUS_TEXT}
+
+            (docs/notes/claude-contract-probes.md §Maintenance — drift means
+            the probed Claude Code contracts need re-measurement before the
+            evidence can be trusted for this line.)
 
             ## Installation
 

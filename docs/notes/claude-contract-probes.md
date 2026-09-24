@@ -7,7 +7,9 @@ Stop contract, print mode), and `scripts/probe-tui-second-turn.sh` (TUI
 once-per-turn contract). Re-run them after any Claude Code update; results are
 version-pinned — the maintenance workflow (drift detection, re-run procedure,
 re-pin checklist, follow-up rule) is defined in §Maintenance at the bottom of
-this file, with `scripts/check-claude-version-bump.sh` as its detection step.
+this file and made executable by `scripts/contract-maintenance-gate.sh`
+(detection step: `scripts/check-claude-version-bump.sh`), which CI runs on
+every push.
 Resolves plan PO-1, PO-2, OQ-1, OQ-2 and the Stop-poller
 assumption (plan §7 Stop Poller and the glossary Stop-hook note).
 
@@ -152,8 +154,11 @@ driver run before this was caught).
 The evidence above is pinned to one claude version and carries to a new one
 only by re-measurement. The maintenance step has four parts: detect, re-run,
 re-pin, and (only if a contract moved) file follow-ups. This section is the
-definition of that step — the doc-level instruction "re-run them after any
-Claude Code update" is otherwise unowned and unscheduled.
+definition of that step, and since 2026-09-24 it has an executable owner:
+`scripts/contract-maintenance-gate.sh` performs all four parts (detect →
+re-run → evidence → follow-up) and is invoked by CI on every push — see
+**Wiring** below. Before that, the doc-level instruction "re-run them after
+any Claude Code update" was unowned and unscheduled.
 
 **Detect.** `bash scripts/check-claude-version-bump.sh` compares the live
 `claude --version` against the **Measured against:** stamp at the top of this
@@ -169,7 +174,35 @@ the check:
 - CI records the version it saw into `target/last-claude-version.txt` via
   `test_claude_version_recorded` (`tests/version_compat.rs`), and the release
   WorkflowTemplate uploads it as a release asset — diffing consecutive
-  artifacts is the fleet-visible drift signal (claudepr-777d3056).
+  artifacts is the fleet-visible drift signal (claudepr-777d3056). The gate
+  refreshes the same file on every run, in the same full-line format
+  `test_claude_version_recorded` writes, so the release asset stays real and
+  consistently formatted even when cargo did not run first.
+
+**Wiring.** The `claude-print-ci` WorkflowTemplate (this repo's
+`claude-print-ci-workflowtemplate.yml`; the live copy is applied through
+`declarative-config`) runs the gate on every push, in verify-only and release
+mode alike: it installs the claude binary first (native installer —
+`claude --version` needs no auth) so detection compares the *installed*
+version instead of recording `unknown`, then invokes
+`scripts/contract-maintenance-gate.sh --file-follow-up`. On drift the gate
+re-anchors `target/last-claude-version.txt`, files or updates a GitHub
+follow-up issue (idempotent per installed version — searched by a
+`claude-contract-drift live=<version>` marker before create), and leaves the
+evidence bundle under `target/contract-maintenance/` (`detection.txt`,
+`live-contract-tests.txt`, `probes/*.txt`, `contract-status.txt`,
+`next-steps.txt`; `live-contract-tests.txt` exists only when the tests
+actually ran). The `contract-status.txt` `alert:` line — `none`,
+`re-run-due`, or `indeterminate` — mirrors the gate's exit code, so a
+release-notes stamp can explain a non-zero gate on its own; the release
+path stamps `contract-status.txt` into the
+release notes and uploads the refreshed version file as the release asset.
+Drift exits the gate non-zero but is an **alert, not a red build**: the full
+probes need model-turn auth CI does not have, so a hard gate there could
+never be cleared from CI — the follow-up issue is the owned hand-off. The
+`tests/contract_maintenance.rs` suite pins this wiring (template fragments,
+gate exit-code contract against a stubbed claude, and the doc/plan mentions)
+so the automation cannot silently detach from this page again.
 
 **Re-run.** No drift → nothing to do. The cheap live tests re-verify the
 merge and suppression contracts against the installed binary in ~35 s
