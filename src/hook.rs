@@ -148,8 +148,16 @@ pub struct HookInstaller {
 
 impl HookInstaller {
     pub fn new() -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Owner-only from the first instant (plan T-1, docs/notes/hook-design.md):
+        // a default tempdir() is created `0o777 & ~umask` — typically 0755 —
+        // handing the Stop payload (session id, prompt text) to every local
+        // user. Requesting 0700 up front means the umask can only tighten the
+        // mode, never loosen it.
         let dir = tempfile::Builder::new()
             .prefix(&format!("claude-print-{}-", std::process::id()))
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .map_err(|e| Error::Internal(anyhow::anyhow!("failed to create temp dir: {e}")))?;
 
@@ -165,6 +173,18 @@ impl HookInstaller {
 
         mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)
             .map_err(|e| Error::Internal(anyhow::anyhow!("mkfifo failed: {e}")))?;
+
+        // Pin the relay-artifact modes exactly (0700 dir / 0600 FIFO,
+        // docs/notes/hook-design.md): creation-time modes are
+        // `requested & ~umask`, so a restrictive umask could land the FIFO
+        // below 0600 and break hook.sh's write. chmod is unconditional, so
+        // both modes hold verbatim whatever umask the invoking shell carried.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| Error::Internal(anyhow::anyhow!("failed to pin temp dir mode 0700: {e}")),
+        )?;
+        std::fs::set_permissions(&fifo_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| Error::Internal(anyhow::anyhow!("failed to pin stop.fifo mode 0600: {e}")),
+        )?;
 
         Ok(HookInstaller {
             dir,
@@ -423,6 +443,129 @@ mod tests {
             use std::os::unix::fs::FileTypeExt;
             assert!(meta.file_type().is_fifo(), "stop.fifo must be a named pipe");
         }
+    }
+
+    // ── relay artifact permissions (docs/notes/hook-design.md) ───────────────
+
+    /// hook-design.md promises the temp dir at mode 0700: the Stop payload
+    /// (session id, transcript path, prompt text) is written here, and a
+    /// world-readable dir hands it to every local user (plan T-1).
+    #[test]
+    fn temp_dir_mode_is_owner_only() {
+        let installer = HookInstaller::new().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(installer.dir_path())
+            .expect("temp dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "temp dir must be owner-only 0700, got {mode:o}"
+        );
+    }
+
+    /// hook-design.md promises the FIFO is created with `mkfifo(path, 0600)` —
+    /// owner rw only, so only the invoking user can read the payload in flight.
+    #[test]
+    fn fifo_mode_is_owner_rw() {
+        let installer = HookInstaller::new().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&installer.fifo_path)
+            .expect("FIFO metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "stop.fifo must be owner-rw 0600, got {mode:o}"
+        );
+    }
+
+    /// The promised modes must survive the artifacts being *used*, not just
+    /// created: the identity relay writes `session-identity.json` into the dir
+    /// and Stop relays write through the FIFO mid-session, and neither may
+    /// loosen the dir's 0700 or the FIFO's 0600.
+    #[test]
+    fn relay_artifact_modes_survive_usage() {
+        let installer = HookInstaller::new().unwrap();
+
+        // Simulate the UserPromptSubmit relay writing its payload into the dir.
+        std::fs::write(&installer.identity_path, br#"{"session_id":"x"}"#)
+            .expect("write identity payload");
+
+        // Round-trip the FIFO the way a Stop relay + poller would.
+        let fifo = installer.fifo_path.clone();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut f = std::fs::File::open(&fifo).expect("open FIFO for reading");
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).expect("read FIFO");
+            buf
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&installer.fifo_path, b"payload").expect("write FIFO");
+        assert_eq!(reader.join().unwrap(), b"payload");
+
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(installer.dir_path())
+            .expect("temp dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "temp dir 0700 must survive relay usage, got {dir_mode:o}"
+        );
+        let meta = std::fs::metadata(&installer.fifo_path).expect("FIFO metadata");
+        let fifo_mode = meta.permissions().mode();
+        assert_eq!(
+            fifo_mode & 0o777,
+            0o600,
+            "stop.fifo 0600 must survive relay usage, got {fifo_mode:o}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            assert!(
+                meta.file_type().is_fifo(),
+                "stop.fifo must still be a named pipe"
+            );
+        }
+    }
+
+    /// Neither mode may lean on a restrictive umask: under a hostile umask 000,
+    /// an unpinned mkdir would land the dir world-writable. Mirrors
+    /// `serve_socket_is_owner_only_regardless_of_umask` in tests/serve.rs. The
+    /// flip is process-wide but held only across `HookInstaller::new`; the
+    /// pinned modes keep every concurrent hook test umask-tolerant in that
+    /// window (no other test in this binary asserts a mode it doesn't set
+    /// explicitly).
+    #[test]
+    fn artifact_modes_hold_under_hostile_umask() {
+        let previous_mask = unsafe { libc::umask(0o000) };
+        let installer = HookInstaller::new().unwrap();
+        unsafe { libc::umask(previous_mask) };
+
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(installer.dir_path())
+            .expect("temp dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "temp dir must be owner-only even under umask 000, got {dir_mode:o}"
+        );
+        let fifo_mode = std::fs::metadata(&installer.fifo_path)
+            .expect("FIFO metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            fifo_mode & 0o777,
+            0o600,
+            "stop.fifo must be owner-rw even under umask 000, got {fifo_mode:o}"
+        );
     }
 
     #[test]
