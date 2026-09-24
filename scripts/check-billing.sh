@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# check-billing.sh - AS-4 billing conformance check
+# check-billing.sh - AS-4 billing conformance check (JSON-evidence half)
+#
+# Asserts the transcript's `entrypoint` field is `cli`. This field is the JSON
+# evidence of the billing classification: the wire-level `cc_entrypoint`
+# request header is set by Claude Code at startup and is never directly
+# observable. (The env-input half — `CLAUDE_CODE_ENTRYPOINT=cli` forced into
+# the child — is verified credential-free by `claude-print --check`.)
 #
 # With no argument, inspect the newest Claude transcript (the manual release
 # gate). With a transcript path, inspect exactly that file (used by the
@@ -55,24 +61,35 @@ fi
 
 log_info "Inspecting transcript: $TRANSCRIPT"
 
-# The entrypoint is carried on one JSONL event. Isolating that line first keeps
-# jq from rejecting an otherwise useful transcript if a later line is partial.
-ENTRYPOINT_LINE=$(grep -m1 '"entrypoint"' "$TRANSCRIPT" 2>/dev/null || true)
-ENTRYPOINT=
-
-if [ -n "$ENTRYPOINT_LINE" ]; then
+# The JSON evidence of the billing contract is a top-level `entrypoint` field
+# on a transcript event — the only observable proxy for the wire-level
+# `cc_entrypoint` request header, which no transcript ever carries directly.
+# The substring `"entrypoint"` can also appear nested (e.g. inside quoted
+# message text), so scan every candidate line until one carries the field at
+# the top level. Isolating lines keeps jq from rejecting an otherwise useful
+# transcript if a later line is partial.
+extract_entrypoint() {
+    line=$1
     if command -v jq >/dev/null 2>&1; then
-        ENTRYPOINT=$(printf '%s\n' "$ENTRYPOINT_LINE" \
-            | jq -r '.entrypoint // empty' 2>/dev/null || true)
+        printf '%s\n' "$line" | jq -r '.entrypoint // empty' 2>/dev/null || true
     else
-        ENTRYPOINT=$(printf '%s\n' "$ENTRYPOINT_LINE" \
-            | sed -n 's/.*"entrypoint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        printf '%s\n' "$line" \
+            | sed -n 's/.*"entrypoint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
     fi
-fi
+}
+
+ENTRYPOINT=
+while IFS= read -r line; do
+    ENTRYPOINT=$(extract_entrypoint "$line")
+    if [ -n "$ENTRYPOINT" ]; then
+        break
+    fi
+done < <(grep '"entrypoint"' "$TRANSCRIPT" 2>/dev/null || true)
 
 if [ -z "$ENTRYPOINT" ]; then
-    log_error "No entrypoint field found in transcript: $TRANSCRIPT"
-    log_error "The transcript may be from an incompatible Claude Code version."
+    log_error "No top-level entrypoint field found in transcript: $TRANSCRIPT"
+    log_error "The transcript carries no billing evidence; it may be from an"
+    log_error "incompatible Claude Code version."
     exit 1
 fi
 

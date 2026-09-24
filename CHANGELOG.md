@@ -58,6 +58,28 @@ static musl build) against the tagged commit before publishing.
   mirror, and that GitHub Releases remains the supported channel for
   downloading release artifacts.
 
+### Fixed
+
+- **Billing-entrypoint contract defined and aligned.** The three names are now
+  distinguished in one place (`docs/notes/billing-context.md`): `cc_entrypoint`
+  is the wire-level billing header (never an environment variable, never
+  directly observable); `CLAUDE_CODE_ENTRYPOINT=cli` is the authoritative
+  environment input, forced into the child by `FORCED_ENV` (`src/pty.rs`);
+  the transcript JSONL's `entrypoint` field is the JSON evidence, asserted by
+  `scripts/check-billing.sh`. `CLAUDE_CC_ENTRYPOINT` — the phantom variable
+  AGENTS.md invariant 5 told operators to verify — is gone from every
+  operational surface, and a guard test
+  (`tests/billing_entrypoint_contract.rs`) keeps it out. Alignments:
+  `--check` gained a credential-free billing row that re-runs the binary's
+  own child-env construction over an inherited `sdk-cli` and asserts a single
+  forced `cli` (and no longer claims, in any doc, to read the session JSONL —
+  that is check-billing.sh's job); `check-billing.sh` now extracts the
+  `entrypoint` evidence from the first event carrying it as a *top-level*
+  field, so the substring appearing nested in quoted message text no longer
+  false-fails the manual newest-transcript release gate; README, AGENTS.md,
+  `scripts/billing-canary.md`, and the plan's `--check` descriptions state the
+  two halves accurately.
+
 ## [0.2.2] - 2026-09-20
 
 First tagged release since v0.2.0. The 0.2.1 version number was consumed by a

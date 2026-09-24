@@ -26,7 +26,7 @@ cargo test --lib
 # Integration tests (requires compiled binary)
 cargo test --test '*'
 
-# Smoke check (verifies PTY, hooks, and environment prerequisites)
+# Smoke check (verifies PTY, FIFO, and billing env prerequisites; credential-free)
 cargo run --bin claude-print -- --check
 ```
 
@@ -202,7 +202,7 @@ cargo build -p mock-claude
 | `src/pool.rs` | ADR-005 warm PTY pool: `PoolManager`/`PoolServer` (the `serve` daemon — worker spawn, bounded warmup, SCM_RIGHTS fd handoff, SIGTERM→SIGKILL group teardown, ownership-checked socket cleanup) and the `--pool-socket` client (`AcquiredWorker` release-on-drop, acquire classification into fallback vs hard protocol failure, stateless-fallback contract). `MAX_POOL_SIZE` 256; acquire budget `min(60s, --timeout)`. |
 | `src/prompt.rs` | Prompt input validation: NUL byte rejection, file size/type checks for `--input-file` (Security T-2, EC-4) |
 | `src/verbose.rs` | `--verbose` timing traces: emits `[claude-print <ms>ms] <message>` to stderr across session lifecycle |
-| `src/pty.rs` | Forks child, opens PTY pair, calls `login_tty`, unsets `CLAUDE_CODE_SESSION_ID` in child, forwards SIGWINCH/SIGINT |
+| `src/pty.rs` | Forks child, opens PTY pair, calls `login_tty`; builds the child env pre-fork via `scrub_env` (drops session markers) + `FORCED_ENV` (forces `CLAUDE_CODE_ENTRYPOINT=cli`), passes it to `execvpe`; forwards SIGWINCH/SIGINT |
 | `src/startup.rs` | State machine: reads PTY output until trust dialog or idle; auto-dismisses (sends CR), injects prompt via bracketed paste; hard timeout after 45s with <200 bytes |
 | `src/event_loop.rs` | Single-threaded `poll(2)` loop (50ms timeout for timer ticks) over PTY master + self-pipe + stop FIFO; calls callback on each chunk |
 | `src/hook.rs` | Installs Stop hook via temp dir settings.json; creates FIFO; cleans up on drop |
@@ -212,7 +212,7 @@ cargo build -p mock-claude
 | `src/terminal.rs` | Absorbs and discards terminal probe sequences (DA1/DA2/DSR/xtversion) from Ink TUI |
 | `src/watchdog.rs` | Watchdog: monitors four deadlines (PTY first-output, stream-json first-output, overall session, Stop-hook) in a background thread; signals timeout via the event-loop self-pipe |
 | `src/error.rs` | `Error` enum and `Result` alias |
-| `src/check.rs` | `--check` mode: verifies PTY, FIFO, hooks, and `cc_entrypoint` env |
+| `src/check.rs` | `--check` mode: verifies claude binary, openpty, mkfifo, optional mock_claude PTY round-trip, and the billing env-input force (`CLAUDE_CODE_ENTRYPOINT=cli`); warns on orphaned temp dirs |
 
 ## Key invariants
 
@@ -232,14 +232,27 @@ These must hold across all changes:
 4. **Never pass `--print` or `--output-format` to the child** — those flags
    activate the API billing path. The entire point is to stay on the PTY/TUI path.
 
-5. **`cc_entrypoint=cli` is the correctness invariant** — verify that
-   `CLAUDE_CC_ENTRYPOINT` (or equivalent) is `cli` via `--check` before each
-   release. AS-4 in the plan documents the acceptance criterion.
+5. **`cc_entrypoint=cli` is the correctness invariant** — the wire-level
+   billing header is not an environment variable and is never directly
+   observable. The env input claude-print controls is
+   `CLAUDE_CODE_ENTRYPOINT`, forced to `cli` in the child (`FORCED_ENV`,
+   `src/pty.rs`) regardless of inheritance; verify that half credential-free
+   via `--check`. The JSON evidence is the transcript's `entrypoint` field;
+   verify it with `scripts/check-billing.sh` (daily canary, plus the manual
+   newest-transcript run before each release). AS-4 in the plan documents the
+   acceptance criterion. `CLAUDE_CC_ENTRYPOINT` does not exist — no such
+   variable is read or set anywhere.
 
-6. **Unset `CLAUDE_CODE_SESSION_ID` in child** — the child must not inherit the
-   parent's session ID or it will write events into the parent's transcript and may
-   skip Stop hook dispatch. Only `CLAUDE_CODE_SESSION_ID` is unset;
-   `CLAUDECODE=1` and `CLAUDE_CODE_ENTRYPOINT=cli` must be preserved.
+6. **Scrub the parent's session markers from the child env** — an inherited
+   session ID makes the child write events into the parent's transcript and
+   may skip Stop hook dispatch; an inherited `CLAUDECODE=1` flips it into
+   nested-session mode. `scrub_env` drops all four markers
+   (`CLAUDE_CODE_SESSION_ID`, `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`,
+   `CLAUDE_CODE_SKIP_PROMPT_HISTORY`) and then `FORCED_ENV` appends
+   `CLAUDE_CODE_ENTRYPOINT=cli` and `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`,
+   overriding any inherited values. The environment is built in the parent
+   before `fork()` and passed to `execvpe` — never `setenv`/`unsetenv`
+   post-fork (async-signal-safety).
 
 7. **Keep both FIFO ends alive for the full event loop** — `open_fifo_nonblock()`
    returns `(read_fd, keeper_write_fd)`. Both must be stored until after the event

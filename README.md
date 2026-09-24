@@ -86,13 +86,18 @@ Architectures: `x86_64` only (static musl binary). aarch64 / ARM Linux is out of
 
 ## Self-check
 
-After install, verify the PTY, Stop hook, and billing entrypoint:
+After install, verify the PTY, FIFO, and billing env-input mechanics:
 
 ```bash
 claude-print --check
 ```
 
-This confirms `cc_entrypoint=cli` appears in the session JSONL. `install.sh` runs this automatically, but it's worth running manually after upgrades.
+This is credential-free and runs no session. Its billing row confirms the
+binary still forces `CLAUDE_CODE_ENTRYPOINT=cli` into the child environment
+(env input) even when the parent inherited `sdk-cli`. It does **not** read a
+session transcript — confirming `entrypoint: cli` in the JSONL (the billing
+evidence) is `./scripts/check-billing.sh`, below. `install.sh` runs `--check`
+automatically, but it's worth running manually after upgrades.
 
 ## Usage
 
@@ -546,6 +551,19 @@ Argument-parser help (`--help`) is still rendered before runtime HOME validation
 
 ### Billing classification verification
 
+Three names are involved here and they are not the same thing — see
+[`docs/notes/billing-context.md`](docs/notes/billing-context.md) for the full
+contract:
+
+- `cc_entrypoint` — Anthropic's wire-level billing header, chosen by Claude
+  Code at startup. Never an environment variable, never directly observable.
+- `CLAUDE_CODE_ENTRYPOINT` — the environment input claude-print controls:
+  forced to `cli` in the child regardless of inheritance (`FORCED_ENV`,
+  `src/pty.rs`), verified credential-free by `claude-print --check`.
+- `entrypoint` (transcript JSONL field) — the observable evidence of the
+  classification Claude Code actually chose. This is what the checks below
+  assert on.
+
 Before deploying to production, verify that sessions are billing against the subscription pool (`cc_entrypoint=cli`):
 
 ```bash
@@ -582,7 +600,7 @@ Before cutting a release tag:
 
 1. Run `./scripts/check-billing.sh` to verify billing conformance (requires credentials)
 2. Run `cargo test` to ensure all mocked tests pass
-3. Run `cargo run --bin claude-print -- --check` to verify PTY and Stop hook mechanics on the build you are about to release
+3. Run `cargo run --bin claude-print -- --check` to verify PTY, FIFO, and the billing env-input force (credential-free) on the build you are about to release
 4. **Check Claude Code version currency**: if the installed Claude Code version (`claude --version`) has changed since the last release, capture a real session transcript and add it as `tests/fixtures/transcript_vX.Y.Z.jsonl` with corresponding regression tests in `tests/version_compat.rs`
 5. Update version in `Cargo.toml`
 6. Commit and push: `git tag v0.x.y && git push origin v0.x.y` (origin is Forgejo, the canonical host — the tag must land there first; see the workflow's tag-to-Forgejo note)

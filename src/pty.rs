@@ -134,6 +134,40 @@ where
     env
 }
 
+/// `--check` probe for the billing env-input half of the entrypoint contract.
+///
+/// Re-runs this binary's own child-env construction over an environment that
+/// inherited the SDK path (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`, as a `claude -p`
+/// parent would leak down) plus every scrubbed session marker, and asserts the
+/// child would receive exactly one `CLAUDE_CODE_ENTRYPOINT=cli` and none of
+/// the markers. This is the credential-free half of the contract: it proves
+/// the shipped binary still forces the subscription entrypoint, while the
+/// JSON-evidence half (`entrypoint` field in the session JSONL) stays with
+/// `scripts/check-billing.sh` and the AS-4 canary.
+pub fn child_env_forces_cli_entrypoint() -> bool {
+    let inherited = [
+        ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_SESSION_ID", "parent-session"),
+        ("CLAUDE_CODE_CHILD_SESSION", "parent-child-marker"),
+        ("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1"),
+        ("PATH", "/usr/bin"),
+    ];
+    let env = scrub_env(inherited);
+
+    let mut entrypoints = env
+        .iter()
+        .filter(|e| e.to_bytes().starts_with(b"CLAUDE_CODE_ENTRYPOINT="));
+    match (entrypoints.next(), entrypoints.next()) {
+        (Some(only), None) if only.to_bytes() == b"CLAUDE_CODE_ENTRYPOINT=cli" => {}
+        _ => return false,
+    }
+    SCRUBBED_ENV.iter().all(|marker| {
+        !env.iter()
+            .any(|e| e.to_bytes().starts_with(marker.as_bytes()))
+    })
+}
+
 impl PtySpawner {
     /// Open a PTY pair, fork, set the PTY window size, call `login_tty` in the
     /// child to make the slave the controlling terminal, then `execvp` `cmd`.

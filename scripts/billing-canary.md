@@ -11,6 +11,14 @@ a dedicated working directory and selects the one transcript created there by
 the current run. This matters on ex44 and lab because concurrent NEEDLE sessions
 can otherwise make an unrelated transcript appear newest.
 
+The canary covers the JSON-evidence half of the billing-entrypoint contract:
+the transcript's `entrypoint` field, the only observable proxy for the
+wire-level `cc_entrypoint` header. The other half — the environment input,
+`CLAUDE_CODE_ENTRYPOINT=cli` forced into the child by `FORCED_ENV`
+(`src/pty.rs`) — is credential-free and is verified by `claude-print --check`
+and pinned by `tests/nested_session.rs` / `tests/billing_entrypoint_contract.rs`.
+See `docs/notes/billing-context.md` for the full contract.
+
 ## Pooled leg (`CLAUDE_PRINT_POOL=1`)
 
 By default the canary runs a stateless session (its own `claude` spawn) — that

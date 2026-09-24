@@ -333,6 +333,28 @@ fn probe_mock_claude_pty(mock_path: &Path) -> Row {
     }
 }
 
+/// Billing env-input contract: the shipped binary must still force
+/// `CLAUDE_CODE_ENTRYPOINT=cli` in the child environment regardless of what
+/// the parent inherited. Credential-free — the JSON-evidence half of the
+/// contract (`entrypoint` in the session JSONL) is `scripts/check-billing.sh`.
+fn probe_billing_entrypoint() -> Row {
+    if crate::pty::child_env_forces_cli_entrypoint() {
+        Row {
+            name: "billing entrypoint",
+            pass: true,
+            detail: "child env forces CLAUDE_CODE_ENTRYPOINT=cli over any inherited value".into(),
+        }
+    } else {
+        Row {
+            name: "billing entrypoint",
+            pass: false,
+            detail: "child env does not force CLAUDE_CODE_ENTRYPOINT=cli — sessions would \
+                     fall back to the sdk-cli credit pool"
+                .into(),
+        }
+    }
+}
+
 pub fn run(claude_binary: Option<&Path>) -> i32 {
     run_with_clean(claude_binary, false)
 }
@@ -371,6 +393,13 @@ pub fn run_with_clean(claude_binary: Option<&Path>, clean: bool) -> i32 {
         rows.push(r);
     }
 
+    // Step 5: the billing env-input contract (FORCED_ENV still wins).
+    let r = probe_billing_entrypoint();
+    if !r.pass {
+        all_pass = false;
+    }
+    rows.push(r);
+
     let name_w = 20usize;
     let res_w = 6usize;
     println!(
@@ -392,7 +421,7 @@ pub fn run_with_clean(claude_binary: Option<&Path>, clean: bool) -> i32 {
         );
     }
 
-    // Step 5: warn about old temp dirs, or remove them when explicitly asked.
+    // Step 6: warn about old temp dirs, or remove them when explicitly asked.
     // Warn-only findings never fail the check; a requested removal failure does.
     let orphan_report = process_orphans(clean);
     if clean && !orphan_report.all_removed {
@@ -403,7 +432,7 @@ pub fn run_with_clean(claude_binary: Option<&Path>, clean: bool) -> i32 {
         println!("{message}");
     }
 
-    // Step 6: final verdict.
+    // Step 7: final verdict.
     if all_pass {
         println!("All checks passed.");
         0
@@ -558,5 +587,19 @@ mod tests {
         // A path that neither exists nor is on PATH → FAIL.
         let row = probe_claude_binary(Some(Path::new("/nonexistent/claude-bf44b9-zzz")));
         assert!(!row.pass, "missing binary should FAIL: {}", row.detail);
+    }
+
+    #[test]
+    fn billing_entrypoint_probe_passes_on_the_shipped_env_logic() {
+        // The --check row must pass against this binary's own FORCED_ENV/
+        // scrub_env logic: it is the credential-free half of the entrypoint
+        // contract (AGENTS.md invariant 5). A regression there fails here,
+        // install.sh, and tests/nested_session.rs together.
+        let row = probe_billing_entrypoint();
+        assert!(
+            row.pass,
+            "billing env-input probe must pass: {}",
+            row.detail
+        );
     }
 }
