@@ -75,15 +75,27 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/integration.rs` | High-level integration; uses `mock_claude` |
 | `tests/integration/` | Sub-module helpers for integration tests |
 | `tests/cli.rs` | CLI argument parsing and flag validation |
+| `tests/config_parse_errors.rs` | Malformed config → exit 2 (not 0) + structured JSON error on stderr in json/stream-json modes, human-readable stderr in text mode; no silent fallback to defaults (bead claudepr-ea80e6b2) |
+| `tests/config_startup_errors.rs` | End-to-end config failures during CLI startup in all three output modes, via the shared `config_error_helpers` module |
+| `tests/config_error_helpers.rs` | Shared helper module for the config-error suites (`ConfigFixture`, `run_with_config*`, structured-error assertions); also compiled as a standalone integration target, but contains no tests of its own |
 | `tests/emitter.rs` | Output formatting (text / json / stream-json) |
 | `tests/startup.rs` | Trust-dialog detection and prompt injection |
 | `tests/terminal.rs` | Terminal probe parsing |
 | `tests/transcript.rs` | JSONL transcript parsing |
+| `tests/tui_transcript.rs` | TUI-shaped transcript parsing (claudepr-26e7a0b6): `sessionId` spelled on every ordinary record and no print-mode `type: "result"` event — the two reasons `session_id` came back null for every real PTY run |
+| `tests/docs_slug_consistency.rs` | Documentation-drift guard for the transcript-slug algorithm (bead claudepr-3243f25c): `tests/fixtures/slug_vectors_v2.1.263.json` pins `cwd_to_slug` against live-verified vectors, every `<path> → <slug>` example in the markdown docs is re-derived with the implementation, and stale prose patterns are linted |
 | `tests/hooks.rs` | Stop hook FIFO install / read |
 | `tests/stop_poller.rs` | Stop payload polling logic |
 | `tests/pty_integration.rs` | PTY spawn + round-trip (requires PTY capability) |
+| `tests/nested_session.rs` | `CLAUDECODE`/session-marker scrub regression (claudepr-26e7a0b6): the child env is built in the *parent* (`build_child_env`/`scrub_env`, `SCRUBBED_ENV`/`FORCED_ENV` in `src/pty.rs`), so a claude-print run inside another Claude session still creates a fresh top-level session instead of a subagent-style transcript with null `session_id`. Also pins that the removed `unsetenv`-between-fork-and-exec mechanism (not async-signal-safe; pool mode is multithreaded) stays dead |
+| `tests/home_unset.rs` | Strict `HOME` contract end-to-end (`src/util.rs::get_home`): unset/empty/missing/non-directory/non-writable HOME yield path-specific setup errors and never an implicit `/root` fallback — across config path resolution, transcript path derivation, the live projects dir, direct session startup, and binary error output. Env-mutating cases serialize on one lock; binary cases override the child env only (`docs/test-coverage-home-unset.md`) |
 | `tests/sigint_forwarding_e2e.rs` | Single-session SIGINT forwarding through `PtySpawner::relay` (HR-8): mock child receives the forwarded signal AS SIGINT (trap marker + default-disposition kill), relay returns 130, child reaped, SIGINT/SIGWINCH dispositions restored (bead claudepr-1472789b) |
-| `tests/version_compat.rs` | `--version` output parsing |
+| `tests/version_compat.rs` | `--version` output parsing (print/TUI transcript shape fixtures). `test_claude_version_recorded` shells out to the installed `claude --version` — silent skip when `claude` is absent — and writes the `target/last-claude-version.txt` CI artifact that `scripts/check-claude-version-bump.sh` diffs against |
+| `tests/flag_compat.rs` | Child-argv compatibility with the *installed* `claude`: every flag claude-print forwards is still accepted by the child's argument parser — the check that was missing when `--timeout` was forwarded to a binary without that option and broke every invocation against claude 2.1.263 — with a deliberately-unknown-flag inverse so the probe cannot silently stop detecting. Credential-free: an unknown *option* is rejected before any model request; silently skips when `claude` is not on PATH |
+| `tests/claude_contracts.rs` | Measured Claude Code runtime contracts (bead claudepr-6ef2541c), pinned in `tests/fixtures/claude_contracts_v2.1.270.json`: `--settings` merges (not replaces), `--setting-sources=` suppresses standard sources while the settings file still loads, Stop fires once per turn. Always-on tests keep claude-print's child argv and relay-settings schema aligned with the *measured* spelling; two `#[ignore]`'d tests re-measure against the real claude (API auth required — they skip silently without it; sandboxed HOME). Maintenance workflow: `docs/notes/claude-contract-probes.md` |
+| `tests/install_sh.rs` | `install.sh` release-artifact integrity verification end-to-end: a fake release directory (assets + `sha256sums.txt`) served via `CLAUDE_PRINT_RELEASE_URL=file://…`, temp `HOME`, fake `claude` on `PATH` so the post-install `--check` smoke passes; missing manifest, unlisted asset, and digest mismatch each abort with nothing placed. Hermetic — no network, no real download (asset names pinned to x86_64, the only architecture CI publishes) |
+| `tests/billing_canary.rs` | Pins `scripts/billing-canary.sh`'s flag contract through a fake `claude-print` (bash fixtures, hermetic): the pooled leg adds exactly `--pool-socket <path>`, neither leg ever carries a print/API-path flag, and the die-during-warmup / never-ready daemon shapes plus the stateless fallback produce the scripted outcomes |
+| `tests/stdin_limit.rs` | stdin prompt-size limit (T-2): stdin enforces the same 10 MB `PROMPT_MAX_BYTES` ceiling as `--input-file`; oversize, empty, and NUL-byte input are rejected before the child is spawned (reaching the session error against an inline mock proves the prompt passed validation) |
 | `tests/watchdog.rs` | Watchdog timeout for silent children (no output + no Stop hook) |
 | `tests/binary_e2e.rs` | Binary-level end-to-end via the *compiled* binary + mock-claude (exit codes, stdout/stderr contract, child-argv forwarding: hook-inheritance modes across CLI flag and `inherit_hooks` config, `--dangerously-skip-permissions`) |
 | `tests/stream_json_incremental.rs` | Incremental stream-json forwarding through the real binary (events emitted mid-session, not post-burst) |
@@ -96,7 +108,76 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/pool_socket_e2e.rs` | `--pool-socket` client matrix end-to-end through the compiled CLI (bead claudepr-c7824b71): text/json/stream-json over an acquired worker, stateless fallback for absent and stale sockets, three sequential clients with teardown/replace and zero cross-caller leakage, and three malformed-daemon acquire shapes (close mid-exchange, wrong-shape response, assignment without fd) failing safely within the caller timeout |
 | `tests/pool_adversarial_e2e.rs` | Pool concurrency proofs (ADR-005 umbrella claudepr-a03e32d7): concurrent clients each drive a distinct worker with proven session↔worker binding (INV-9, INV-11), and three same-cwd stream-json clients under pool concurrency forward only their own session's events — the end-to-end proof the transcript-guessing defect is dead (claudepr-a927ec0c) |
 | `tests/pool_failure_e2e.rs` | Pool failure paths end-to-end against REAL daemons/clients (bead claudepr-c470b8aa): daemon SIGKILLed mid-handoff (protocol failure, not fallback) and SIGSTOPped silent (budget expiry, no leak, recovery), daemon crash mid-drive (client still finishes inside `--timeout`), SIGKILLed client's worker orphaned but never reassigned (INV-9, INV-13), manager restart recovering on the same socket path with ownership-checked cleanup, and stateless-fallback output parity vs no-flag baselines across absent/stale/unavailable sockets in all three formats |
-| `tests/fixtures/` | Shared fixture helpers |
+| `tests/serve.rs` | `serve` subcommand end-to-end (bead claudepr-7f088327), same hermetic strategy as `binary_e2e` (`--claude-binary` pinned to mock-claude): serve enters the server path and never falls through to prompt validation; `--pool-size 0`/over-max/non-numeric/negative exit 2 before any spawn; unbindable socket paths fail fast naming the exact path; the socket node is 0600 under any umask; SIGINT/SIGTERM teardown is bounded, reaps every worker, and repeated/second signals neither wedge nor respawn; a foreign file at the socket path survives shutdown, while the daemon's own node is removed even when a foreign file preceded the bind; a non-serve invocation is behaviorally unchanged |
+| `tests/fixtures/` | Version-pinned hermetic fixtures: `claude_contracts_v2.1.270.json` (measured hook contracts, bead claudepr-6ef2541c), `terminal_probes_v2.1.270.json` (DEC probe traffic, via `scripts/probe-tui-terminal-probes.py`), `slug_vectors_v2.1.263.json` (live-verified `cwd_to_slug` vectors), `startup_trust_dialog_v2.1.263.txt` (trust-dialog shape), `transcript_v2.1.{168,233}.jsonl` (print-mode transcript shapes). Re-pin through the probe scripts after a Claude Code update; never hand-edit a version-stamped fixture |
+
+### Execution requirements
+
+Which targets run under a plain `cargo test`, and what each additionally
+needs.
+
+**Compiled binaries.** A default `cargo test` builds `claude-print` and
+`mock-claude` first, so nothing extra is needed. `cargo test --lib` runs only
+the `src/` inline unit tests — no `tests/` target at all. Targets that spawn
+a binary at runtime (and therefore mean nothing under `--lib`, and need the
+binaries present under a selective `--test <name>` run):
+`integration.rs` (+ `integration/scenarios.rs`), `pty_integration`,
+`binary_e2e`, `serve`,
+`pool_socket_e2e`, `pool_adversarial_e2e`, `pool_failure_e2e`,
+`stream_json_incremental`, `transcript_race_e2e`,
+`stop_duplicate_firings_e2e`, `stop_sparse_payloads_e2e`,
+`stop_delayed_payload_e2e`, `sigint_forwarding_e2e`, `watchdog`,
+`home_unset` (binary cases; the rest is lib-level), `stdin_limit`,
+`config_parse_errors`, `config_startup_errors` (through the helpers).
+The remaining `tests/` targets are library-level and spawn no process:
+`cli`, `emitter`, `startup`, `terminal`, `transcript`, `tui_transcript`,
+`hooks`, `stop_poller`, `transcript_flush_window`, `stream_json_cleanup`,
+`docs_slug_consistency`, `nested_session`, and the always-on half of
+`claude_contracts`.
+
+**Real `claude` on PATH** (silent skip when absent — never a failure):
+`version_compat::test_claude_version_recorded` (`--version` only) and
+`flag_compat` (argv-parse probe). Both are credential-free.
+
+**Credentials (API auth).** Required only by the two `#[ignore]`'d
+`claude_contracts` live re-measurements — which *check* for
+`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` and
+skip silently without one — and by the live probe/canary scripts in the next
+section. Everything under `cargo test` runs without credentials.
+
+**Ignored (`#[ignore]`)** — excluded from default runs; execute explicitly
+with `cargo test -- --ignored`:
+
+| Test | Why it is ignored |
+|------|-------------------|
+| `claude_contracts::live_settings_flag_merges_across_sources` | live probe: real claude + API auth, sandboxed HOME (PO-1/OQ-1 re-measurement) |
+| `claude_contracts::live_empty_setting_sources_suppresses_but_settings_file_loads` | live probe: real claude + API auth, sandboxed HOME (OQ-2 re-measurement) |
+| `startup::test_hard_timeout_fires_after_45s_with_few_bytes` | slow by design: sleeps 45 s (EC-8 hard-timeout pin) |
+| `transcript_race_e2e::as6_transcript_race_delayed_jsonl_write` | timing-sensitive race window (AS-6): run deliberately, not incidentally |
+
+### Probes, drift checks, and release verification (`scripts/` + `install.sh`)
+
+The live probes and gates the plan and `docs/notes/` reference. These are the
+maintenance surface for the version-pinned fixtures above — not part of
+`cargo test`, and (except where noted) requiring the real `claude` with API
+auth. All live-probe isolation follows the same contract: `HOME` redirected
+into a throwaway sandbox, `CLAUDECODE*` session markers scrubbed,
+`CLAUDE_CODE_ENTRYPOINT=cli` forced — the child-env contract of `src/pty.rs`.
+
+| Script | What it does | Requires |
+|--------|--------------|----------|
+| `scripts/check-claude-version-bump.sh` | Claude-version drift detection: compares live `claude --version` against the **Measured against:** stamp in `docs/notes/claude-contract-probes.md`. Exit 0 = evidence current, 1 = drift (re-run due), 2 = cannot determine. The detection step of the probe maintenance workflow (plan R-2 CI alert) | `claude` on PATH; read-only, credential-free |
+| `scripts/probe-claude-contracts.sh` | Measures the hook contracts pinned as PO-1/PO-2/OQ-1/OQ-2 (`--settings` merge, `--setting-sources=` suppression) plus the Stop-per-turn baseline; feeds the `claude_contracts` fixture | real claude + auth (model turns) |
+| `scripts/probe-stop-toolallowed.sh` | Authoritative Stop-count probes with tool use actually permitted (`--allowedTools Bash`); the earlier un-permitted probes measured degraded runs. Print + TUI arms with per-firing payload detail | real claude + auth (multi-round tool use) |
+| `scripts/probe-tui-second-turn.sh` | Decisive TUI once-per-turn Stop probe: watches both the hook firing log and the TUI screen text so a failed prompt injection is distinguishable from a second turn that fires no Stop | real claude + auth; TUI/PTY |
+| `scripts/probe-tui-stop.py` | PTY driver for `probe-tui-second-turn.sh` (standalone-capable): drives the real TUI under claude-print's child-env contract, counts Stop firings from the hook log | real claude + auth |
+| `scripts/probe-tui-terminal-probes.py` | Captures the DEC probe bytes the TUI writes at startup and records them as `tests/fixtures/terminal_probes_v<version>.json` (companion to `docs/notes/terminal-probes.md`); `--answer` replies via the `src/terminal.rs` responder. No model turn | real claude; sandboxed HOME |
+| `scripts/check-billing.sh` | AS-4 billing conformance: no argument inspects the newest real transcript (manual release gate); a path argument inspects exactly that file (used by the automated canary so concurrent sessions cannot false-positive) | a transcript to inspect; parsing itself is credential-free |
+| `scripts/billing-canary.sh` | Automated AS-4 canary: one-turn Haiku session through claude-print, transcript matched by session id; `CLAUDE_PRINT_POOL=1` proves pooled sessions also bill `cli` (INV-15). Installed as a systemd user timer by `install-billing-canary.sh` (+ `.service`/`.timer` units). Flag contract pinned by `tests/billing_canary.rs` | real claude + auth |
+| `scripts/bench_startup_overhead.py` | Startup-overhead benchmark (process start → prompt injection) against `mock-claude` only; measures claude-print's own overhead, no model latency. Results in `docs/notes/startup-overhead-benchmark.{md,json}` | compiled `claude-print` + `mock-claude`; hermetic, no credentials |
+| `scripts/test_startup_wedge.sh`, `scripts/test_sessionstart_hook.sh`, `scripts/test_exact_claude_print_scenario.sh` | Historical repros from the startup-wedge investigation (untrusted-dir hang, SessionStart-hook interference, exact relay scenario) | real claude + auth; diagnostic provenance, kept in `docs/plan/plan.md`'s tree |
+| `scripts/verify_fix.sh`, `scripts/verify-startup-wedge-fix.sh` | Historical verifications of the `--setting-sources=` wedge fix (bf-2u1) | real claude + auth; diagnostic provenance |
+| `install.sh` (repo root) | Release installer: verifies every artifact against the published `sha256sums.txt` before installing or executing anything; preserves a `claude-print.prev` rollback copy | network + release URL at install time; its verification logic is tested hermetically by `tests/install_sh.rs` |
 
 ### mock_claude
 
