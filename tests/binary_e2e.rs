@@ -757,6 +757,161 @@ fn no_inherit_hooks_forwards_setting_sources_in_child_argv() {
     );
 }
 
+// ── inherit_hooks config key (claudepr-41ba7be2) ─────────────────────────────
+//
+// The `[defaults]` table's `inherit_hooks` key is the config-file route to the
+// same decision the `--no-inherit-hooks` flag makes. These tests prove the
+// precedence chain end-to-end through the compiled binary:
+//
+//   CLI --no-inherit-hooks  >  [defaults] inherit_hooks  >  built-in true
+//
+// and that in EVERY mode the relay `--settings=` file stays forwarded —
+// isolation suppresses the standard settings sources (user/project/local, so
+// the user's hooks never fire) but never the relay hook claude-print's own
+// Stop detection depends on. The mock simulates a user-settings hook with a
+// filesystem side effect via MOCK_USER_HOOK_MARKER: the marker exists iff the
+// child could load standard sources (no `--setting-sources` spelling in argv).
+
+/// Set up a temporary config directory whose config.toml holds `content`.
+/// Identical to [`setup_malformed_config`] but named for valid content; the
+/// caller must keep the TempDir alive for the test duration.
+fn setup_config_content(content: &str) -> TempDir {
+    setup_malformed_config(content)
+}
+
+/// `inherit_hooks = false` in the config file, no CLI flag → isolated run:
+/// `--setting-sources=` IS forwarded (so the simulated user-settings hook must
+/// NOT fire), while the relay `--settings=` is STILL forwarded — isolation
+/// never suppresses the relay hook, or Stop would never arrive.
+#[test]
+fn inherit_hooks_config_false_isolates_hooks() {
+    let _config = setup_config_content("[defaults]\ninherit_hooks = false\n");
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let marker = dir.path().join("user_hook_fired");
+
+    let mut cmd = claude_print();
+    cmd.arg("test prompt");
+    cmd.env("XDG_CONFIG_HOME", _config.path());
+    cmd.env("MOCK_RECORD_ARGS", &record);
+    cmd.env("MOCK_USER_HOOK_MARKER", &marker);
+
+    let out = run(&mut cmd, BUDGET);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "config inherit_hooks=false: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    let args = read_recorded_argv(&record);
+    assert!(
+        args.iter().any(|a| a == "--setting-sources="),
+        "config inherit_hooks=false: --setting-sources= must be forwarded, got: {:?}",
+        args
+    );
+    assert!(
+        args.iter().any(|a| a.starts_with("--settings=")),
+        "config inherit_hooks=false: relay --settings= must STILL be forwarded \
+         (isolation never suppresses the relay hook), got: {:?}",
+        args
+    );
+    assert!(
+        !marker.exists(),
+        "config inherit_hooks=false: the simulated user-settings hook must NOT \
+         fire (standard sources are suppressed), but the marker was written to {}",
+        marker.display()
+    );
+}
+
+/// `inherit_hooks = true` in the config file, no CLI flag → inherited run:
+/// no `--setting-sources` in the child argv (the flag is OMITTED, matching
+/// `claude -p`), so the simulated user-settings hook DOES fire alongside the
+/// relay hook.
+#[test]
+fn inherit_hooks_config_true_inherits_hooks() {
+    let _config = setup_config_content("[defaults]\ninherit_hooks = true\n");
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let marker = dir.path().join("user_hook_fired");
+
+    let mut cmd = claude_print();
+    cmd.arg("test prompt");
+    cmd.env("XDG_CONFIG_HOME", _config.path());
+    cmd.env("MOCK_RECORD_ARGS", &record);
+    cmd.env("MOCK_USER_HOOK_MARKER", &marker);
+
+    let out = run(&mut cmd, BUDGET);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "config inherit_hooks=true: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    let args = read_recorded_argv(&record);
+    assert!(
+        !args.iter().any(|a| a.starts_with("--setting-sources")),
+        "config inherit_hooks=true: --setting-sources must be OMITTED from the \
+         child argv, got: {:?}",
+        args
+    );
+    assert!(
+        args.iter().any(|a| a.starts_with("--settings=")),
+        "config inherit_hooks=true: relay --settings= must still be forwarded, \
+         got: {:?}",
+        args
+    );
+    assert!(
+        marker.exists(),
+        "config inherit_hooks=true: the simulated user-settings hook must fire \
+         (standard sources load alongside the relay hook)"
+    );
+}
+
+/// Config says `inherit_hooks = true`, CLI passes `--no-inherit-hooks` → the
+/// CLI wins: `--setting-sources=` IS forwarded and the simulated user hook
+/// does NOT fire. Pins the first tier of the precedence chain (the two tests
+/// above pin the config tier and the built-in default is covered by the
+/// plain-default-mode argv test).
+#[test]
+fn no_inherit_hooks_flag_overrides_config_inherit_hooks_true() {
+    let _config = setup_config_content("[defaults]\ninherit_hooks = true\n");
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let marker = dir.path().join("user_hook_fired");
+
+    let mut cmd = claude_print();
+    cmd.arg("--no-inherit-hooks").arg("test prompt");
+    cmd.env("XDG_CONFIG_HOME", _config.path());
+    cmd.env("MOCK_RECORD_ARGS", &record);
+    cmd.env("MOCK_USER_HOOK_MARKER", &marker);
+
+    let out = run(&mut cmd, BUDGET);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "CLI flag over config inherit_hooks=true: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+
+    let args = read_recorded_argv(&record);
+    assert!(
+        args.iter().any(|a| a == "--setting-sources="),
+        "CLI --no-inherit-hooks must override config inherit_hooks=true: \
+         --setting-sources= must be forwarded, got: {:?}",
+        args
+    );
+    assert!(
+        !marker.exists(),
+        "CLI --no-inherit-hooks must override config inherit_hooks=true: the \
+         simulated user-settings hook must NOT fire"
+    );
+}
+
 // ── --dangerously-skip-permissions flag (bf-2v7m) ─────────────────────────────────
 //
 // Implements the acceptance criteria for bead bf-2v7m: when the flag is NOT

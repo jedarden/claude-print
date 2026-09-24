@@ -1234,7 +1234,7 @@ These tests verify that `--settings` relay hook merges correctly and that `--no-
 **`--no-inherit-hooks` flag:**
 - The `--setting-sources` argument is present in child argv when flag is set and is exactly `--setting-sources=` (empty value). OQ-2 is resolved: the empty form is the verified one (claude 2.1.270), and the `=none` fallback was measured as rejected (exit 1 before session start) — the test pins the single verified form instead of parameterizing over both. `tests/claude_contracts.rs::child_argv_matches_verified_spelling_no_inherit_hooks` asserts this against the measured-contract fixture.
 - `--setting-sources` is absent from child argv when flag is not set
-- Mock that tracks whether a "user hook" fires: with `--no-inherit-hooks`, user hook does not fire; without, it does
+- Mock that tracks whether a "user hook" fires: with `--no-inherit-hooks`, user hook does not fire; without, it does — implemented as `mock_claude`'s `MOCK_USER_HOOK_MARKER` (claudepr-41ba7be2): the marker file is written iff the child argv carries no `--setting-sources` spelling; the `tests/binary_e2e.rs` inherit-hooks cases pin fired/not-fired for the CLI flag, for both `defaults.inherit_hooks` values, and for the CLI-over-config precedence
 
 **Temp dir lifecycle:**
 - After a successful run, `$TMPDIR` contains no leftover `claude-print-*` directories

@@ -9,6 +9,20 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **`inherit_hooks` semantics documented and pinned end-to-end.** The README
+  gains a "Hook inheritance" section defining what the config key controls
+  (the standard settings sources — user/project/local — so your hooks fire or
+  don't), what it never controls (the relay `--settings` hooks, which stay
+  active in both modes because Stop detection depends on them), the
+  `--no-inherit-hooks` → `defaults.inherit_hooks` → `true` precedence chain,
+  and the one-directional CLI flag. `mock_claude` gains
+  `MOCK_USER_HOOK_MARKER` — a user-settings hook with a filesystem side
+  effect that fires only when the child argv carries no `--setting-sources`
+  spelling — and three new `tests/binary_e2e.rs` cases pin the config-file
+  route and CLI precedence: `inherit_hooks = false` isolates the child,
+  `inherit_hooks = true` inherits, and `--no-inherit-hooks` overrides a
+  config `true`.
+
 - **Release artifact integrity verification in `install.sh`.** The CI release
   build now publishes a `sha256sums.txt` manifest alongside the binaries, and
   `install.sh` verifies every artifact against it before installing or

@@ -15,7 +15,10 @@ const CONFIG_DIR: &str = "claude-print";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
-    /// Whether to inherit user hooks (default: true)
+    /// Whether the child inherits user hooks (default: true). `false` forwards
+    /// `--setting-sources=` to the child so only claude-print's relay settings
+    /// load; the CLI `--no-inherit-hooks` flag overrides this value. See the
+    /// README "Hook inheritance" section for the user-facing semantics.
     pub inherit_hooks: Option<bool>,
     /// Default model to use
     pub model: Option<String>,

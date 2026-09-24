@@ -30,6 +30,33 @@ fn main() {
         }
     }
 
+    // MOCK_USER_HOOK_MARKER=<path> (claudepr-41ba7be2): simulate a hook defined
+    // in the user's `~/.claude/settings.json` with a filesystem side effect.
+    // Real Claude Code loads the standard settings sources (user/project/local)
+    // only when `--setting-sources` is NOT constrained, so a hook defined there
+    // fires in default (inherited) mode and does not fire in isolation mode
+    // (`--setting-sources=`, the verified OQ-2 spelling). mock-claude models
+    // that measured contract directly: when the knob is set and the argv does
+    // NOT carry any `--setting-sources` spelling, write the marker file — the
+    // binary_e2e tests then assert fired/not-fired per mode. Written FIRST so
+    // it fires even under MOCK_SILENT / MOCK_EXIT_BEFORE_STOP (a SessionStart-
+    // shaped hook runs at startup regardless of what happens later). Skipped
+    // for the `--version` probe for the same reason MOCK_RECORD_ARGS is: the
+    // probe is not a session.
+    //
+    // NB: the always-forwarded relay `--settings=` does not match the
+    // `--setting-sources` prefix (next char is `=` vs `-s`), so the relay
+    // settings never count as source suppression.
+    if !is_version_probe {
+        if let Ok(marker) = std::env::var("MOCK_USER_HOOK_MARKER") {
+            let setting_sources_constrained =
+                std::env::args().any(|a| a.starts_with("--setting-sources"));
+            if !setting_sources_constrained {
+                let _ = std::fs::write(&marker, b"user hook fired");
+            }
+        }
+    }
+
     // Discover the stop FIFO path. mock-claude simulates the Stop hook that real
     // claude fires — it does not execute hooks, so it writes the Stop payload to
     // the fifo directly. claude-print never passes the fifo path in the child

@@ -113,7 +113,7 @@ claude-print --timeout 30 "quick question"
 | `--claude-binary <PATH>` | | PATH lookup | Path to claude binary |
 | `--pool-socket <PATH>` | | | Acquire a prewarmed worker from the pool daemon at this Unix socket instead of spawning a fresh `claude`; falls back to the ordinary stateless session when the pool can't serve — see [Warm PTY pool](#warm-pty-pool-adr-005) |
 | `--config <FILE>` | | XDG or user config | Read configuration from an explicit TOML file |
-| `--no-inherit-hooks` | | | Disable user hook inheritance |
+| `--no-inherit-hooks` | | off | Isolate this run from your `~/.claude/settings.json` hooks by forwarding `--setting-sources=` to the child; the relay hooks claude-print needs always stay active — see [Hook inheritance](#hook-inheritance-inherit_hooks) |
 | `--mcp-config <MCP_CONFIG>` | | | MCP config (path or inline JSON) to load; may be repeated or comma-separated for multiple files. Headless runs always pass `--strict-mcp-config` to the child, so only configs named here load — inherited/project/global MCP servers cannot wedge startup |
 | `--pretrust-cwd` | | off | Pre-grant folder trust for the working dir by writing `hasTrustDialogAccepted: true` into `~/.claude.json` before spawning the child — the only way to keep the one-time trust dialog from stalling an untrusted cwd without relying on the PTY keyword scanner. Off by default to avoid mutating the shared user config under fleet concurrency; enable it when you have seen trust-dialog stalls |
 | `--show-child-stderr` | | off | Surface the child's captured PTY output to stderr when startup is slow or stalls (watchdog first-output timeout, or the prompt was never injected) — useful for diagnosing MCP/init wedges |
@@ -163,7 +163,7 @@ configurations are fine. The four keys are:
 | Key | Type | Built-in default | CLI counterpart | Meaning |
 |-----|------|------------------|-----------------|---------|
 | `model` | string | `claude-sonnet-4-6` (`DEFAULT_MODEL` in `src/config.rs`) | `--model`, `-m` | Model forwarded to the child `claude` process |
-| `inherit_hooks` | bool | `true` | `--no-inherit-hooks` | `false` isolates the run from your `~/.claude/settings.json` hooks by forwarding `--setting-sources=` to the child |
+| `inherit_hooks` | bool | `true` | `--no-inherit-hooks` | `false` isolates the run from your `~/.claude/settings.json` hooks by forwarding `--setting-sources=` to the child — see [Hook inheritance](#hook-inheritance-inherit_hooks) |
 | `max_turns` | integer (`u32`) | `30` | `--max-turns` | Maximum agentic turns, forwarded to the child |
 | `timeout_secs` | integer (`u64`) | `3600` | `--timeout` | claude-print's own wall-clock watchdog (never forwarded to the child) |
 
@@ -204,6 +204,52 @@ these two with the CLI flags (or, for NEEDLE, the `invoke` template in
 them without a format change. `--model` and `--no-inherit-hooks` have no
 parser default, so their absence is detectable and their config values apply
 whenever the flag is absent.
+
+### Hook inheritance (`inherit_hooks`)
+
+The child `claude` process loads its settings from two independent channels,
+and this key controls only the first:
+
+1. **Standard settings sources** — your user `~/.claude/settings.json`, the
+   project's `.claude/settings.json`, and `.claude/settings.local.json`. Every
+   hook defined there (`SessionStart`, `PreToolUse`, `Stop`, …) fires when its
+   event happens.
+2. **claude-print's relay settings** — a private settings file in a per-run
+   temp dir, forwarded to the child as `--settings`. It carries only the
+   `Stop` and `UserPromptSubmit` relay hooks claude-print itself needs (Stop
+   detection and transcript binding); none of your settings are in it.
+
+With `inherit_hooks = true` (the default), claude-print forwards no
+`--setting-sources` flag, so the child loads both channels exactly as
+`claude -p` does: your hooks fire alongside the relay hooks.
+
+With `inherit_hooks = false` — equivalent to passing `--no-inherit-hooks` —
+claude-print forwards `--setting-sources=` (empty value). That suppresses the
+standard sources, so **your hooks never fire**, while the relay settings stay
+active: the empty spelling is measured to suppress the standard sources and
+still load the `--settings` file (claude 2.1.270, re-confirmed on 2.1.281 —
+`docs/notes/claude-contract-probes.md`, OQ-2). The relay hooks therefore
+outrank isolation in every mode, and deliberately so: claude-print's Stop
+detection depends on them, which is why no setting can turn them off.
+Isolation is for runs whose surroundings make your hooks a liability — a
+collector that shouldn't see headless sessions, hooks that prompt or chatter,
+NEEDLE workers suppressing hook noise.
+
+Precedence for this key, first match wins:
+
+1. `--no-inherit-hooks` on the command line
+2. `defaults.inherit_hooks` in the config file
+3. built-in default: `true`
+
+The CLI flag is one-directional — it can only suppress. When the config file
+says `inherit_hooks = false` there is no flag that re-enables inheritance for
+a single run; point `--config` at a file that omits the key (or sets it
+`true`) for that invocation instead.
+
+One caveat: pooled workers (the `serve` daemon, ADR-005) are always launched
+isolated regardless of this key — per-invocation flags cannot reach an
+already-running worker, and the daemon launches every worker with
+`--setting-sources=`. See [Warm PTY pool](#warm-pty-pool-adr-005).
 
 ### Missing file
 
