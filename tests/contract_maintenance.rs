@@ -594,9 +594,15 @@ fn ci_workflowtemplate_wires_the_gate_on_every_push() {
             "WorkflowTemplate lost wiring fragment: {fragment}"
         );
     }
-    // The gate runs before the verify-only early exit, so every push hits it.
-    let gate_at = template.find("contract-maintenance-gate.sh").unwrap();
-    let verify_at = template.find("Verify-only mode").unwrap();
+    // The gate runs before the verify-only early exit, so every push hits it
+    // (anchored to the exit's own message — "Verify-only mode" alone first
+    // appears in the clone-branch echo higher up the template).
+    let gate_at = template
+        .find("bash scripts/contract-maintenance-gate.sh")
+        .unwrap();
+    let verify_at = template
+        .find("Verify-only mode: all quality gates passed")
+        .expect("verify-only early exit must exist");
     assert!(
         gate_at < verify_at,
         "the gate must run before the verify-only exit"
