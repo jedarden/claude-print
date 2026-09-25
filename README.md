@@ -121,7 +121,7 @@ The release matrix is explicit, and `install.sh` enforces it before anything is 
 
 aarch64 / ARM Linux is out of scope for v1.0 — see `docs/plan/plan.md` Non-Goals; it can be added in a future release if needed. CI builds only on the x86_64 runner and installs only the `x86_64-unknown-linux-musl` toolchain, so `x86_64-linux` is the only asset name a release ever carries — an installer mapping for any other architecture would request a nonexistent asset and fail as a download error instead of a supported-platform statement.
 
-`tests/install_sh_arch.rs` pins this matrix row by row by faking `uname -s`/`uname -m` per case, independent of the machine running the tests: the supported row must fetch the `x86_64-linux` assets, and every unsupported row must exit 1 with the actionable message before any download starts and with nothing placed.
+`tests/install_sh_arch.rs` pins this matrix row by row by faking `uname -s`/`uname -m` per case, independent of the machine running the tests: the supported row must fetch the `x86_64-linux` assets, and every unsupported row must exit 1 with the actionable message before any download starts and with nothing placed. `tests/platform_matrix_docs.rs` pins the documented matrix to the artifacts themselves: it re-derives the published asset names from the `claude-print-ci` WorkflowTemplate's toolchain set and asserts this table, `install.sh`'s arch→asset mapping and refusal message, and the installer suites' fake-release names against them — so widening the release in CI, renaming an asset, or reintroducing an installer mapping for an unpublished architecture fails the build until the docs, the publisher, and the installer agree.
 
 ## Self-check
 
