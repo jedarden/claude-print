@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude Print contract-drift watch (scheduled §Maintenance detection step)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/claude-print/contract-drift-watch.sh
+Environment=CLAUDE_PRINT_CONTRACT_REPO=%h/claude-print
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+TimeoutStartSec=5min

@@ -218,7 +218,9 @@ re-pin, and (only if a contract moved) file follow-ups. This section is the
 definition of that step, and since 2026-09-24 it has an executable owner:
 `scripts/contract-maintenance-gate.sh` performs all four parts (detect →
 re-run → evidence → follow-up) and is invoked by CI on every push — see
-**Wiring** below. Before that, the doc-level instruction "re-run them after
+**Wiring** below — while its detection step additionally runs on a daily
+dev-host timer independent of pushes (**Scheduled watch** below). Before
+that, the doc-level instruction "re-run them after
 any Claude Code update" was unowned and unscheduled.
 
 **Detect.** `bash scripts/check-claude-version-bump.sh` compares the live
@@ -289,6 +291,38 @@ the same pinned stamp. The `tests/contract_maintenance.rs` suite pins this
 wiring (template fragments including the fatal wrapper, gate exit-code
 contract against a stubbed claude, and the doc/plan mentions) so the
 automation cannot silently detach from this page again.
+
+**Scheduled watch.** CI fires only on a push, and Claude Code auto-updates
+on its own schedule — the 2026-09-24 re-pin was itself superseded hours
+later by the host auto-updater (a 2.1.281 pin, 2.1.282 installed the same
+day) with nothing pushed in between. Between pushes, then, the
+**Measured against:** stamp and the active fixture pins can be stale with
+nothing red. Since 2026-09-25 (claudepr-e6e54313) the detection step
+therefore also runs on a schedule independent of repo activity:
+`claude-print-contract-drift-watch.timer`, a systemd user timer on the dev
+host (`OnCalendar=daily`, `Persistent=true`, so a missed window fires after
+the next boot), runs `scripts/contract-drift-watch.sh` — the
+credential-free detector and nothing heavier. On drift (detector exit 1)
+the watcher files exactly one bead in this repo's bead workspace via
+`bead create --unique-ref claude-contract-drift:live-<version>` (the CLI's
+atomic idempotent create: daily repeats while the drift persists return
+`EXISTING <id>` instead of duplicating), carrying the same
+`claude-contract-drift live=<version>` marker as the gate's gh issue — the
+hand-off lands in the same queue the re-pin work is dispatched from. Exit 2
+(cannot determine) files nothing and fails the unit loudly. Install or
+refresh it (after editing the watcher) with
+`./scripts/install-contract-drift-watch.sh`: the watcher goes to
+`~/.local/libexec/claude-print/`, the units to `~/.config/systemd/user/`,
+and the service pins `CLAUDE_PRINT_CONTRACT_REPO=%h/claude-print` — the
+shared checkout whose pins the detector reads and whose `.beads/` the
+follow-up lands in (the detector itself always runs from that checkout, so
+detection logic never goes stale; only the watcher is installed). Result
+line: `~/.local/state/claude-print/contract-drift-watch/last-result`
+(PASS/DRIFT/INDETERMINATE, the billing-canary state shape); logs:
+`journalctl --user -u claude-print-contract-drift-watch.service`.
+`tests/contract_drift_watch.rs` and `tests/install_contract_drift_watch.rs`
+pin the watcher's exit/filing contract and the installer, so the schedule
+cannot silently detach from this page either.
 
 **Re-run.** No drift → nothing to do. The cheap live tests re-verify the
 merge and suppression contracts against the installed binary in ~35 s

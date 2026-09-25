@@ -714,6 +714,7 @@ Before cutting a release tag:
 - `scripts/claude-print-billing-canary.{service,timer}` — systemd user units for the canary
 - `scripts/bench_startup_overhead.py` — ADR-005 startup-overhead benchmark harness (`--self-check` for a deterministic no-subprocess pin)
 - `scripts/contract-maintenance-gate.sh` — Claude contract-evidence maintenance gate (detect version drift → re-run probes → evidence bundle → re-pin follow-up; exits 0 = current, 1 = re-run due, 2 = indeterminate; CI runs it on every push as a mandatory first gate — drift fails the build until the re-pin lands, see `docs/notes/claude-contract-probes.md` §Maintenance)
+- `scripts/contract-drift-watch.sh` — scheduled contract-drift watch: the gate's credential-free detection step on a daily systemd user timer (`claude-print-contract-drift-watch.{service,timer}`, installed by `install-contract-drift-watch.sh`) so a Claude Code auto-update between pushes still alerts — on drift it files one idempotent bead (`--unique-ref claude-contract-drift:live-<version>`), see `docs/notes/claude-contract-probes.md` §Maintenance → Scheduled watch
 - `scripts/` — integration test scripts
 
 ---

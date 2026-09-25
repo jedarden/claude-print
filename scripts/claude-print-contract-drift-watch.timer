@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Claude Print contract-drift watch daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+AccuracySec=15m
+Persistent=true
+Unit=claude-print-contract-drift-watch.service
+
+[Install]
+WantedBy=timers.target
