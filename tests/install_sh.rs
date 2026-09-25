@@ -378,6 +378,40 @@ fn install_skips_mock_claude_when_it_is_absent_from_the_release() {
 }
 
 #[test]
+fn a_manifest_that_omits_a_shipped_fixture_skips_it_rather_than_failing() {
+    // The sharp shape of the optional-asset rule (README Install: "a release
+    // whose manifest does not list it skips the fixture instead of
+    // failing"): the fixture's bytes ship in the release, but the manifest —
+    // already written over the other assets — does not list it. The skip
+    // decision reads only the manifest, so the same omission that is fatal
+    // for the main binary
+    // (install_fails_closed_when_an_asset_has_no_checksum_entry) leaves the
+    // fixture undownloaded and unplaced while the listed binary installs
+    // normally.
+    let release = build_release(&[BINARY_ASSET, VERSION_ASSET]);
+    fs::write(release.path().join(MOCK_ASSET), MOCK_BODY).unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let output = run_install(home.path(), release.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    assert!(
+        !installed_path(home.path(), MOCK_INSTALL_NAME).exists(),
+        "an unlisted fixture must never be installed, however available its bytes are"
+    );
+    assert!(installed_path(home.path(), BINARY_INSTALL_NAME).exists());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(&format!("Downloading {MOCK_ASSET}")),
+        "the unlisted fixture must not even be downloaded: {stdout}"
+    );
+    assert!(
+        stdout.contains("skipping mock_claude"),
+        "stdout must note the skip: {stdout}"
+    );
+}
+
+#[test]
 fn skip_mock_claude_env_skips_a_shipped_fixture_while_the_binary_stays_verified_and_installed() {
     // SKIP_MOCK_CLAUDE=1 is the documented opt-out (install.sh header,
     // README "Set SKIP_MOCK_CLAUDE=1 to skip the mock_claude test fixture
@@ -1022,5 +1056,137 @@ fn a_failed_install_places_no_needle_adapter() {
     assert!(
         !stdout.contains(".needle"),
         "no adapter line may print on a failed install: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// README Install-section alignment — the layer-6 pattern of
+// tests/config_contract.rs applied to the supply-chain paragraph. The README's
+// `## Install` section is the user-facing statement of the guarantees the
+// tests in this file enforce against real `install.sh` runs, so the two are
+// pinned together: every documented clause is matched verbatim against the
+// section, every clause is mapped to the adversarial test that enforces it
+// (renaming, deleting, or gutting that test breaks the pin), and the two
+// identifiers the README names are cross-checked against install.sh's own
+// source. Rewording the guarantee on one side only fails here.
+// ---------------------------------------------------------------------------
+
+const README_MD: &str = include_str!("../README.md");
+const INSTALL_SH_SOURCE: &str = include_str!("../install.sh");
+const THIS_TEST_SOURCE: &str = include_str!("install_sh.rs");
+
+/// The README's `## Install` section — from its heading up to the next
+/// level-2 heading (`## Self-check`). Every README-side pin below is scoped
+/// to this slice, so a guarantee sentence that merely survives elsewhere in
+/// the README cannot satisfy an Install-section check.
+fn readme_install_section() -> &'static str {
+    let start = README_MD
+        .find("\n## Install\n")
+        .unwrap_or_else(|| panic!("README.md must carry an `## Install` heading"))
+        + 1; // keep the heading line itself in the slice
+    let rest = &README_MD[start..];
+    // `\n## ` (with the trailing space) matches only level-2 headings, not
+    // the `###` subsections inside Install.
+    let end = rest.find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// A documented Install-section guarantee clause and the test in this file
+/// that enforces it against a real `install.sh` run over a forged release.
+/// The clause must appear verbatim in the section; the test must exist under
+/// exactly this name — a guarantee whose enforcing test disappears degrades
+/// into documentation-only, which is what this pin exists to prevent.
+const INSTALL_GUARANTEES: &[(&str, &str)] = &[
+    // The verification sentence's positive half: a release whose artifacts
+    // all match the published manifest installs, with each verification
+    // recorded.
+    (
+        "Every downloaded artifact is verified against the release's published \
+         `sha256sums.txt` before it is installed or executed",
+        "install_succeeds_when_artifacts_match_the_published_checksums",
+    ),
+    // The fail-closed triad, clause by clause: each documented abort has its
+    // own adversarial test asserting the abort and that nothing was placed.
+    (
+        "A missing manifest",
+        "install_fails_closed_when_the_checksum_manifest_is_missing",
+    ),
+    (
+        "an asset with no checksum entry",
+        "install_fails_closed_when_an_asset_has_no_checksum_entry",
+    ),
+    (
+        "any digest mismatch aborts the install with nothing placed",
+        "install_fails_closed_on_a_tampered_binary",
+    ),
+    // The fixture is the sole optional asset: its manifest entry is the skip
+    // decision, so the same omission that is fatal for the binary is a skip
+    // for the fixture — even when the fixture's bytes ship in the release.
+    // (install_skips_mock_claude_when_it_is_absent_from_the_release pins the
+    // asset-absent variant of the same skip.)
+    (
+        "The `mock_claude` fixture remains optional: a release whose manifest \
+         does not list it skips the fixture instead of failing",
+        "a_manifest_that_omits_a_shipped_fixture_skips_it_rather_than_failing",
+    ),
+    // The documented opt-out, against a release that ships AND lists the
+    // fixture — so the skip can only be the env branch.
+    (
+        "Set `SKIP_MOCK_CLAUDE=1` to skip the `mock_claude` test fixture download",
+        "skip_mock_claude_env_skips_a_shipped_fixture_while_the_binary_stays_verified_and_installed",
+    ),
+];
+
+#[test]
+fn readme_install_documents_each_guarantee_against_the_adversarial_test_that_pins_it() {
+    let section = readme_install_section();
+    assert!(
+        !section.is_empty(),
+        "README.md must carry a non-empty `## Install` section"
+    );
+    for (clause, test_name) in INSTALL_GUARANTEES {
+        assert!(
+            section.contains(clause),
+            "the README Install section must carry the guarantee verbatim: \
+             {clause:?} — update README and tests together"
+        );
+        assert!(
+            THIS_TEST_SOURCE.contains(&format!("fn {test_name}()")),
+            "the guarantee {clause:?} is pinned to `{test_name}`, which no longer \
+             exists in tests/install_sh.rs — restore the test or re-point the pin"
+        );
+    }
+    // The section must also point readers at this file — the same
+    // test-suite cross-reference the Supported-platforms section carries for
+    // tests/install_sh_arch.rs.
+    assert!(
+        section.contains("`tests/install_sh.rs`"),
+        "the README Install section must point at tests/install_sh.rs, the file \
+         that pins the supply-chain guarantees"
+    );
+}
+
+#[test]
+fn readme_install_names_the_installer_s_own_manifest_asset_and_opt_out_var() {
+    let section = readme_install_section();
+    // The manifest filename the README names must be the one install.sh
+    // fetches and verifies against — defined once in the installer.
+    assert!(
+        INSTALL_SH_SOURCE.contains("CHECKSUMS_ASSET=\"sha256sums.txt\""),
+        "install.sh must define CHECKSUMS_ASSET=\"sha256sums.txt\" — the manifest \
+         identifier the README section pins"
+    );
+    assert!(
+        section.contains("`sha256sums.txt`"),
+        "the README Install section must name the manifest asset `sha256sums.txt`"
+    );
+    // The opt-out the README documents must be the one install.sh reads.
+    assert!(
+        INSTALL_SH_SOURCE.contains("\"${SKIP_MOCK_CLAUDE:-0}\""),
+        "install.sh must read the opt-out as ${{SKIP_MOCK_CLAUDE:-0}}"
+    );
+    assert!(
+        section.contains("`SKIP_MOCK_CLAUDE=1`"),
+        "the README Install section must spell the opt-out `SKIP_MOCK_CLAUDE=1`"
     );
 }
