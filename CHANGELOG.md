@@ -101,6 +101,23 @@ static musl build) against the tagged commit before publishing.
   replacement across two upgrades, no copy on a fresh install, and the
   failed-install no-touch ordering.
 
+- **README HOME provisioning recipes exercised and pinned.** The
+  "HOME in containers and chroots" recipes are no longer documentation
+  only (bead claudepr-ab982704): `tests/home_provisioning_recipes.rs`
+  extracts the section's fenced blocks (the `text` unset-HOME error, the
+  Dockerfile `ENV HOME=/home/claude`, the Kubernetes `env:` stanza) and
+  the Prerequisites not-writable quote from README.md at runtime and
+  matches them against the compiled binary's actual output, so the quoted
+  lines cannot fork from `get_home()`'s messages. Each recipe is executed
+  as its reader would — a provisioned HOME takes `--version` (the
+  documented health-check form) and a full mock-claude prompt run to
+  success with no probe residue, `--help` renders without HOME (the one
+  documented exception), and the documented failure shapes are driven for
+  real: missing mount, read-only permissions, and HOME-as-file on the
+  host, plus a genuine `chroot(2)` jail running the whole matrix with the
+  literal documented paths (`/home/service` provisioned, chmod-0555, a
+  read-only tmpfs mount, and the never-provisioned `/home/claude`).
+
 ### Changed
 
 - **Startup-overhead benchmark evidence made machine-independent and
