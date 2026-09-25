@@ -452,7 +452,7 @@ rm "$bad_config" config-error.json
 
 - `text` (default): plain text response, printed to stdout.
 - `json`: one-line JSON object with `type`, `subtype`, `is_error`, `result`, `session_id`, `num_turns`, `duration_ms`, `cost_usd`, `claude_version`, and `usage` fields. `result` holds the response text (there is no `text` or `model` field); `usage` is an object with `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens`.
-- `stream-json`: JSONL replay of the raw transcript events in real time, one event per line.
+- `stream-json`: JSONL replay of the raw transcript events in real time, one event per line. The byte-level contract — framing, ordering, incremental delivery, completion, transcript binding under same-cwd concurrency, and error objects — is specified in [`docs/notes/stream-json-contract.md`](docs/notes/stream-json-contract.md).
 
 ## Exit codes
 
