@@ -7,7 +7,8 @@
 # owned and scheduled instead of being an unowned doc-level instruction:
 #
 #   detect      scripts/check-claude-version-bump.sh (live `claude --version`
-#               vs the doc's **Measured against:** stamp)
+#               vs the doc stamp and every active version-pinned fixture
+#               family: claude_contracts and stream_json_golden)
 #   re-run      cargo test --test claude_contracts -- --ignored (cheap live
 #               contracts; the tests self-skip without claude/auth) unless
 #               --skip-live-tests; the three model-turn probe scripts run only
@@ -37,8 +38,9 @@
 # claude-print-ci workflow invokes it as the FIRST quality gate and lets a
 # non-zero exit fail the run, so a Claude version change requires the
 # documented maintenance step — re-run the probes, record updated evidence,
-# land the re-pin commit (doc stamp + fixture + FIXTURE repoint) — before CI
-# goes green again. The full probes still cannot run inside CI (no
+# land the re-pin commit (doc stamp + every active fixture family + test
+# references) — before CI goes green again. The full probes still cannot run
+# inside CI (no
 # model-turn auth there), which is why the gate itself keeps running to
 # completion first: it writes the evidence bundle and files/updates the
 # follow-up issue, so the hand-off survives the red build it then raises.
@@ -131,6 +133,7 @@ fi
 [ -n "$LIVE_LINE" ] || LIVE_LINE="unknown"
 LIVE_VERSION="$(version_token "$LIVE_LINE")"
 [ -n "$LIVE_VERSION" ] || LIVE_VERSION="unknown"
+FIXTURE_PINS="$(printf '%s\n' "$DET_OUT" | grep '^fixture (' || true)"
 
 mkdir -p "$(dirname "$VERSION_FILE")"
 printf '%s\n' "$LIVE_LINE" > "$VERSION_FILE"
@@ -186,7 +189,8 @@ installed: ${LIVE_VERSION}
 pinned:    ${PIN_VERSION} (docs/notes/claude-contract-probes.md **Measured against:**)
 
 The measured contracts (merge, suppression, once-per-turn Stop, max-turns
-cutoff) are unverified for ${LIVE_VERSION}. Re-run due — procedure:
+cutoff, and the stream-json golden wire format) plus the active
+version-pinned fixture families are unverified for ${LIVE_VERSION}. Re-run due — procedure:
 docs/notes/claude-contract-probes.md §Maintenance (detect, re-run, re-pin,
 file follow-ups). Evidence bundle: target/contract-maintenance/ (CI artifact).
 "
@@ -233,6 +237,8 @@ contract-maintenance: ${VERDICT}
 alert: ${ALERT}
 pinned: ${PIN_VERSION}
 installed: ${LIVE_VERSION}
+fixture-pins:
+${FIXTURE_PINS:-unknown}
 live-tests: ${LIVE_SUMMARY}
 probes: ${PROBES_SUMMARY}
 follow-up: ${FOLLOW_UP}
@@ -249,13 +255,15 @@ EOF
         ;;
     DRIFT)
         cat > "$EVIDENCE_DIR/next-steps.txt" <<EOF
-Re-run due — evidence is pinned to ${PIN_VERSION} but ${LIVE_VERSION} is installed.
+Re-run due — one or more active evidence or fixture pins do not cover
+installed ${LIVE_VERSION} (documentation stamp: ${PIN_VERSION}).
   1. cargo test --test claude_contracts -- --ignored   # cheap pre-check (~35 s)
   2. bash scripts/probe-claude-contracts.sh            # merge/suppression/Stop
   3. bash scripts/probe-stop-toolallowed.sh            # multi-round Stop (print)
   4. bash scripts/probe-tui-second-turn.sh             # TUI once-per-turn
-  5. Re-pin per §Re-pin (doc stamp + fixture + FIXTURE repoint in one change),
-     or file one bead per moved contract per §File follow-ups.
+  5. Re-pin per §Re-pin (doc stamp + claude_contracts_v*.json +
+     stream_json_golden_v* family + active test references in one change), or
+     file one bead per moved contract per §File follow-ups.
 Procedure: docs/notes/claude-contract-probes.md §Maintenance
 Follow-up: ${FOLLOW_UP}
 EOF

@@ -9,8 +9,8 @@
 //!
 //! - detector parse — `scripts/check-claude-version-bump.sh` exits 0/1/2
 //!   against a stubbed `claude`, with the stub's version derived from the
-//!   doc's live **Measured against:** stamp (re-pin-proof: re-stamping the
-//!   doc moves both sides together, so nothing here goes stale);
+//!   doc's live **Measured against:** stamp; the active fixture references are
+//!   checked too, so a stale stream-json golden pin is visible;
 //! - the gate's contract against a stubbed `claude`/`gh`/`cargo` (hermetic —
 //!   a single stub-bin PATH, so unstubbed binaries are genuinely absent):
 //!   exit code, evidence-bundle shape, the refreshed
@@ -212,7 +212,7 @@ fn stderr_of(out: &Output) -> String {
 // ── Detector parse (scripts/check-claude-version-bump.sh) ────────────────────
 
 #[test]
-fn detector_current_when_installed_matches_pin() {
+fn detector_doc_pin_matches_but_stale_golden_keeps_drift_red() {
     let pin = doc_pin();
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -220,9 +220,34 @@ fn detector_current_when_installed_matches_pin() {
 
     let out = run_script("scripts/check-claude-version-bump.sh", Some(&bin), &[], &[]);
 
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    // The documentation pin is current, but the active stream-json golden
+    // family is intentionally still pinned to 2.1.270. The detector must not
+    // call this current merely because the doc stamp matches.
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("CURRENT"), "{stdout}");
+    assert!(stdout.contains("DRIFT"), "{stdout}");
+    assert!(stdout.contains("fixture (stream_json_golden)"), "{stdout}");
+}
+
+#[test]
+fn detector_drift_names_the_golden_repin_step() {
+    let pin = doc_pin();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    stub_claude(&bin, &format!("{pin} (Claude Code)"));
+
+    let out = run_script("scripts/check-claude-version-bump.sh", Some(&bin), &[], &[]);
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Re-measure and re-pin every active version-pinned fixture family"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("stream_json_golden_v<version>.*.jsonl"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -265,7 +290,7 @@ fn detector_indeterminate_on_unparsable_version() {
 // ── Gate contract, hermetic (stubbed claude / gh / cargo) ────────────────────
 
 #[test]
-fn gate_current_records_evidence_and_refreshes_version_file() {
+fn gate_stale_golden_records_evidence_and_refreshes_version_file() {
     let pin = doc_pin();
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -278,9 +303,9 @@ fn gate_current_records_evidence_and_refreshes_version_file() {
         &[],
     );
 
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
     let evidence = dir.path().join("evidence");
-    assert_eq!(status_value(&evidence, "alert"), "none");
+    assert_eq!(status_value(&evidence, "alert"), "re-run-due");
     assert_eq!(status_value(&evidence, "pinned"), pin);
     assert_eq!(status_value(&evidence, "installed"), pin);
     // Version artifact: the full first line, the same shape
@@ -291,7 +316,9 @@ fn gate_current_records_evidence_and_refreshes_version_file() {
     );
     // Evidence bundle shape per §Wiring: detection + probes (SKIPPED) +
     // status + next-steps; live-contract-tests.txt only when tests ran.
-    assert!(read_text(&evidence.join("detection.txt")).contains("detector-exit: 0"));
+    let detection = read_text(&evidence.join("detection.txt"));
+    assert!(detection.contains("detector-exit: 1"));
+    assert!(detection.contains("fixture (stream_json_golden)"));
     for probe in [
         "probe-claude-contracts.sh",
         "probe-stop-toolallowed.sh",
@@ -302,7 +329,10 @@ fn gate_current_records_evidence_and_refreshes_version_file() {
     }
     assert!(!evidence.join("live-contract-tests.txt").exists());
     assert!(evidence.join("next-steps.txt").exists());
-    assert_eq!(status_value(&evidence, "follow-up"), "n/a (no drift)");
+    assert_eq!(
+        status_value(&evidence, "follow-up"),
+        "not-requested (pass --file-follow-up)"
+    );
 }
 
 #[test]
@@ -403,7 +433,7 @@ fn gate_drift_without_follow_up_flag_never_calls_gh() {
 }
 
 #[test]
-fn gate_current_never_files_a_follow_up() {
+fn gate_stale_golden_without_follow_up_never_calls_gh() {
     let pin = doc_pin();
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -414,12 +444,19 @@ fn gate_current_never_files_a_follow_up() {
     let out = run_script(
         "scripts/contract-maintenance-gate.sh",
         Some(&bin),
-        &gate_args(dir.path(), true, &["--file-follow-up"]),
+        &gate_args(dir.path(), true, &[]),
         &[("GH_ARGS_FILE", gh_args.display().to_string())],
     );
 
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
-    assert!(!gh_args.exists(), "no drift means no follow-up work");
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    assert!(
+        !gh_args.exists(),
+        "without --file-follow-up, gh is not called"
+    );
+    assert_eq!(
+        status_value(&dir.path().join("evidence"), "follow-up"),
+        "not-requested (pass --file-follow-up)"
+    );
 }
 
 #[test]
@@ -487,7 +524,7 @@ fn gate_runs_cheap_live_contracts_when_not_skipped() {
         &[("CARGO_ARGS_FILE", cargo_args.display().to_string())],
     );
 
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
     let evidence = dir.path().join("evidence");
     let live = read_text(&evidence.join("live-contract-tests.txt"));
     assert!(live.contains("live-tests-exit: 0"), "{live}");
@@ -514,7 +551,7 @@ fn gate_live_tests_skip_flag_leaves_no_transcript() {
         &[],
     );
 
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
     let evidence = dir.path().join("evidence");
     assert!(!evidence.join("live-contract-tests.txt").exists());
     assert_eq!(
@@ -640,6 +677,8 @@ fn maintenance_docs_still_name_the_gate() {
         "§Maintenance must name the gate as the executable owner"
     );
     assert!(maintenance.contains("--file-follow-up"));
+    assert!(maintenance.contains("claude_contracts_v*.json"));
+    assert!(maintenance.contains("stream_json_golden_v*"));
 
     let plan = fs::read_to_string(repo_path("docs/plan/plan.md")).unwrap();
     let r2 = plan

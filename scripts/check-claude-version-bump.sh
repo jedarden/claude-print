@@ -2,16 +2,18 @@
 # check-claude-version-bump.sh — detection step of the contract-probe
 # maintenance workflow (docs/notes/claude-contract-probes.md §Maintenance).
 #
-# Compares the live `claude --version` against the version this repo's
-# contract evidence is pinned to (the **Measured against:** stamp in
-# docs/notes/claude-contract-probes.md). Drift means the measured contracts
-# (merge, --setting-sources suppression, once-per-turn Stop,
-# max-turns-fires-no-Stop) are unverified for the installed version and the
-# probe scripts must be re-run.
+# Compares the live `claude --version` against every active version pin this
+# repo's contract evidence carries: the **Measured against:** stamp in
+# docs/notes/claude-contract-probes.md, the active claude_contracts fixture,
+# and the active stream-json golden fixture family. Drift means the measured
+# contracts (merge, --setting-sources suppression, once-per-turn Stop,
+# max-turns-fires-no-Stop, and the stream-json wire-format goldens) are
+# unverified for the installed version and the probe/capture paths must be
+# re-run.
 #
 # Exit codes:
 #   0  versions match — evidence is current, nothing to do
-#   1  DRIFT — the installed version differs from the pinned one; re-run due
+#   1  DRIFT — the installed version differs from any active pin; re-run due
 #   2  cannot determine (claude missing, or a version string unparseable)
 #
 # Read-only: runs `claude --version` only — no sandbox, no HOME writes, no
@@ -29,6 +31,55 @@ version_token() {
     # First x.y.z-looking token in the given text, empty if none.
     printf '%s' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
 }
+
+# Only the fixture references wired into the contract tests are active pins.
+# Older claude_contracts_v*.json captures remain in tests/fixtures/ as useful
+# measurement history, but must not keep the gate red after a newer fixture is
+# selected by tests/claude_contracts.rs. The stream-json contract has three
+# files in one family; all three references must carry the same version.
+FIXTURE_SOURCES=(
+    "$REPO_ROOT/tests/claude_contracts.rs"
+    "$REPO_ROOT/tests/stream_json_contract.rs"
+)
+FIXTURE_CLASSES=(claude_contracts stream_json_golden)
+declare -A FIXTURE_PINS=()
+FIXTURE_PARSE_ERROR=0
+
+for source in "${FIXTURE_SOURCES[@]}"; do
+    if [ ! -f "$source" ]; then
+        echo "ERROR: active fixture source is missing: $source" >&2
+        FIXTURE_PARSE_ERROR=1
+        continue
+    fi
+    while IFS= read -r fixture; do
+        [ -n "$fixture" ] || continue
+        fixture_class="${fixture#fixtures/}"
+        fixture_class="${fixture_class%%_v*}"
+        fixture_version="${fixture##*_v}"
+        previous="${FIXTURE_PINS[$fixture_class]-}"
+        if [ -n "$previous" ] && [ "$previous" != "$fixture_version" ]; then
+            echo "ERROR: active $fixture_class fixture references disagree: $previous and $fixture_version" >&2
+            FIXTURE_PARSE_ERROR=1
+        else
+            FIXTURE_PINS["$fixture_class"]="$fixture_version"
+        fi
+        if ! compgen -G "$REPO_ROOT/tests/$fixture*" >/dev/null; then
+            echo "ERROR: active fixture family is missing for $fixture" >&2
+            FIXTURE_PARSE_ERROR=1
+        fi
+    done < <(grep -hEo 'fixtures/(claude_contracts|stream_json_golden)_v[0-9]+\.[0-9]+\.[0-9]+' "$source" || true)
+done
+
+for fixture_class in "${FIXTURE_CLASSES[@]}"; do
+    if [ -z "${FIXTURE_PINS[$fixture_class]-}" ]; then
+        echo "ERROR: no active $fixture_class fixture reference found" >&2
+        FIXTURE_PARSE_ERROR=1
+    fi
+done
+
+if [ "$FIXTURE_PARSE_ERROR" -ne 0 ]; then
+    exit 2
+fi
 
 PIN_LINE="$(grep -m1 '^\*\*Measured against:\*\*' "$DOC" || true)"
 PIN_VERSION="$(version_token "${PIN_LINE:-}")"
@@ -50,17 +101,29 @@ fi
 
 echo "pinned (docs/notes/claude-contract-probes.md): $PIN_VERSION"
 echo "live   (claude --version):                    $LIVE_VERSION"
+for fixture_class in "${FIXTURE_CLASSES[@]}"; do
+    echo "fixture ($fixture_class):                    ${FIXTURE_PINS[$fixture_class]}"
+done
 
-if [ "$PIN_VERSION" = "$LIVE_VERSION" ]; then
+DRIFT=0
+[ "$PIN_VERSION" = "$LIVE_VERSION" ] || DRIFT=1
+for fixture_class in "${FIXTURE_CLASSES[@]}"; do
+    [ "${FIXTURE_PINS[$fixture_class]}" = "$LIVE_VERSION" ] || DRIFT=1
+done
+
+if [ "$DRIFT" -eq 0 ]; then
     echo "CURRENT — contract evidence matches the installed version."
     exit 0
 fi
 
-echo "DRIFT — evidence is pinned to $PIN_VERSION but $LIVE_VERSION is installed."
+echo "DRIFT — contract evidence does not cover the installed version $LIVE_VERSION."
+echo "Re-measure and re-pin every active version-pinned fixture family before CI can pass."
 echo "Re-run due (docs/notes/claude-contract-probes.md §Maintenance):"
 echo "  1. cargo test --test claude_contracts -- --ignored   # cheap pre-check (~35 s)"
 echo "  2. bash scripts/probe-claude-contracts.sh            # merge/suppression/Stop"
 echo "  3. bash scripts/probe-stop-toolallowed.sh            # multi-round Stop (print)"
 echo "  4. bash scripts/probe-tui-second-turn.sh             # TUI once-per-turn"
-echo "  5. Re-pin doc stamp + fixture, or file follow-up beads if a contract moved."
+echo "  5. Re-pin claude_contracts_v<version>.json and stream_json_golden_v<version>.*.jsonl"
+echo "     (update each active test reference and the documented stamp), or file"
+echo "     follow-up beads if a contract moved."
 exit 1

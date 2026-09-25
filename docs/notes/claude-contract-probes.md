@@ -30,6 +30,17 @@ in §Stop firing contract below). Evidence tables below retain the original
 `tests/fixtures/claude_contracts_v2.1.281.json` (the earlier same-day run)
 and `tests/fixtures/claude_contracts_v2.1.282.json` (the pinned one).
 
+The maintenance gate covers both active version-pinned fixture families:
+`tests/fixtures/claude_contracts_v*.json` (the active reference is the
+fixture selected by `tests/claude_contracts.rs`) and
+`tests/fixtures/stream_json_golden_v*` (the active
+`.{input,expected,errors}.jsonl` triple selected by
+`tests/stream_json_contract.rs`). Historical captures may remain beside the
+active files, but every active reference must be re-measured and re-pinned
+with the same Claude version. The currently committed stream-json golden
+family is still stamped 2.1.270 while the runtime pin is 2.1.282, so the gate
+intentionally remains red until that family is re-measured and re-pinned.
+
 **Isolation:** every probe ran with `HOME` redirected into a throwaway
 `mktemp` sandbox (fresh `.claude.json`, trust pre-seeded for the probe cwd
 only). The host's real `~/.claude/settings.json`, `~/.claude.json`, and
@@ -196,6 +207,13 @@ file: exit 0 = current, exit 1 = drift (re-run due), exit 2 = cannot
 determine. It runs `claude --version` only — no sandbox, no model turns — so
 it is safe to run on a schedule or from CI, where exit 1 is the R-2 signal —
 and, since claudepr-3094ab2e, a **build-failing gate** (see **Wiring**).
+It also checks the active references for both version-pinned fixture classes,
+`tests/fixtures/claude_contracts_v*.json` and
+`tests/fixtures/stream_json_golden_v*`'s
+`.{input,expected,errors}.jsonl` family; historical fixture files that are no
+longer selected by a contract test do not hold the gate back. A version bump
+therefore stays red until the runtime evidence and the stream-json goldens
+are re-measured and their active references are re-pinned together.
 Versions move in two ways; either should trigger the check:
 
 - the dev host auto-updates the native install
@@ -265,8 +283,14 @@ top of this file; copy `tests/fixtures/claude_contracts_v<old>.json` to
 `claude_contracts_v<new>.json`, updating `claude_version`/`measured_at`; and
 repoint `FIXTURE` in `tests/claude_contracts.rs` together with its header
 comment and any version-citing assertion messages. Commit doc + fixture +
-test in one change so the always-on suite and this document keep claiming the
-same version — that commit is also what turns the CI drift gate green again
+same version. Re-measure the stream-json capture path and regenerate the
+complete `tests/fixtures/stream_json_golden_v<new>.{input,expected,errors}.jsonl`
+family, then update all three `include_str!` references, the header comment,
+and the stamped `GOLDEN_CLAUDE_VERSION` in `tests/stream_json_contract.rs`.
+Do not hand-edit golden bytes or merely rename their files. Commit the doc,
+both active fixture families, and their test references in one change so the
+always-on suites and this document keep claiming the same version — that
+commit is also what turns the CI drift gate green again
 (§Wiring above; it is how the 2.1.270 → 2.1.282 re-pin of 2026-09-24 was
 landed, via a 2.1.281 pin the host's auto-updater superseded the same day).
 
