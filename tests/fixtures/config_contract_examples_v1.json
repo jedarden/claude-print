@@ -1,0 +1,482 @@
+{
+  "contract_version": "v1",
+  "document": "docs/notes/config-file-contract.md",
+  "pinned_by": "tests/config_contract.rs",
+  "readme": "README.md",
+  "keys": [
+    {
+      "name": "model",
+      "toml_type": "string",
+      "builtin_default": "claude-sonnet-4-6",
+      "cli_flag": "--model, -m"
+    },
+    {
+      "name": "inherit_hooks",
+      "toml_type": "boolean",
+      "builtin_default": true,
+      "cli_flag": "--no-inherit-hooks"
+    },
+    {
+      "name": "max_turns",
+      "toml_type": "integer (`u32`)",
+      "builtin_default": 30,
+      "cli_flag": "--max-turns"
+    },
+    {
+      "name": "timeout_secs",
+      "toml_type": "integer (`u64`)",
+      "builtin_default": 3600,
+      "cli_flag": "--timeout"
+    }
+  ],
+  "default_path": [
+    {
+      "id": "xdg-wins-over-home",
+      "xdg": "set",
+      "home": "set",
+      "expect_path": "{xdg}/claude-print/config.toml"
+    },
+    {
+      "id": "home-fallback-when-xdg-unset",
+      "xdg": "unset",
+      "home": "set",
+      "expect_path": "{home}/.config/claude-print/config.toml"
+    },
+    {
+      "id": "xdg-empty-used-as-set",
+      "xdg": "empty",
+      "home": "set",
+      "expect_path": "claude-print/config.toml"
+    },
+    {
+      "id": "xdg-non-utf8-falls-back-to-home",
+      "xdg": "non-utf8",
+      "home": "set",
+      "expect_path": "{home}/.config/claude-print/config.toml"
+    },
+    {
+      "id": "unset-home-errors",
+      "xdg": "unset",
+      "home": "unset",
+      "documented": true,
+      "also_in_readme": true,
+      "expect_error": "invalid config: HOME environment variable not set or empty; set HOME to the user's home directory"
+    }
+  ],
+  "cases": [
+    {
+      "id": "shipped-defaults-block",
+      "documented": true,
+      "also_in_readme": true,
+      "file": "shipped-defaults.toml",
+      "toml": "[defaults]\nmodel = \"claude-sonnet-4-6\" # string\ninherit_hooks = true        # bool\nmax_turns = 30              # integer (u32)\ntimeout_secs = 3600         # integer (u64)\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      },
+      "toml_in_readme": true
+    },
+    {
+      "id": "bare-defaults-table",
+      "documented": true,
+      "file": "bare.toml",
+      "toml": "[defaults]\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "empty-file",
+      "documented": true,
+      "file": "empty.toml",
+      "toml": "",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "missing-file",
+      "documented": true,
+      "file": "absent.toml",
+      "missing": true,
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "root-key-outside-defaults-ignored",
+      "documented": true,
+      "file": "root-extra-key.toml",
+      "toml": "extra = 1\n[defaults]\nmodel = \"claude-opus-4-8\"\n",
+      "expect": {
+        "model": "claude-opus-4-8",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "root-table-outside-defaults-ignored",
+      "documented": true,
+      "file": "root-other-table.toml",
+      "toml": "[other]\nx = 1\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "model-config-applies",
+      "file": "model-only.toml",
+      "toml": "[defaults]\nmodel = \"claude-opus-4-8\"\n",
+      "expect": {
+        "model": "claude-opus-4-8",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "model-cli-overrides-config",
+      "file": "model-only.toml",
+      "toml": "[defaults]\nmodel = \"claude-opus-4-8\"\n",
+      "cli": {
+        "model": "claude-haiku-4-5"
+      },
+      "expect": {
+        "model": "claude-haiku-4-5",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "inherit-hooks-false-applies",
+      "file": "inherit-false.toml",
+      "toml": "[defaults]\ninherit_hooks = false\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": false,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "inherit-hooks-cli-overrides-config",
+      "file": "inherit-false.toml",
+      "toml": "[defaults]\ninherit_hooks = false\n",
+      "cli": {
+        "inherit_hooks": true
+      },
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "max-turns-config-tier",
+      "file": "max-turns.toml",
+      "toml": "[defaults]\nmax_turns = 20\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 20,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "max-turns-cli-overrides-config",
+      "file": "max-turns.toml",
+      "toml": "[defaults]\nmax_turns = 20\n",
+      "cli": {
+        "max_turns": 50
+      },
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 50,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "timeout-config-tier",
+      "file": "timeout.toml",
+      "toml": "[defaults]\ntimeout_secs = 1800\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 1800
+      }
+    },
+    {
+      "id": "timeout-cli-overrides-config",
+      "file": "timeout.toml",
+      "toml": "[defaults]\ntimeout_secs = 1800\n",
+      "cli": {
+        "timeout_secs": 7200
+      },
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 7200
+      }
+    },
+    {
+      "id": "max-turns-lower-bound",
+      "file": "bounds.toml",
+      "toml": "[defaults]\nmax_turns = 1\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 1,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "max-turns-upper-bound",
+      "file": "bounds.toml",
+      "toml": "[defaults]\nmax_turns = 1000\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 1000,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "timeout-lower-bound",
+      "file": "bounds.toml",
+      "toml": "[defaults]\ntimeout_secs = 1\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 1
+      }
+    },
+    {
+      "id": "timeout-upper-bound",
+      "file": "bounds.toml",
+      "toml": "[defaults]\ntimeout_secs = 86400\n",
+      "expect": {
+        "model": "claude-sonnet-4-6",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 86400
+      }
+    },
+    {
+      "id": "model-underscores-accepted",
+      "file": "model-chars.toml",
+      "toml": "[defaults]\nmodel = \"claude-opus_4_8_testing\"\n",
+      "expect": {
+        "model": "claude-opus_4_8_testing",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "model-dots-accepted",
+      "file": "model-chars.toml",
+      "toml": "[defaults]\nmodel = \"claude-opus.4.8.testing\"\n",
+      "expect": {
+        "model": "claude-opus.4.8.testing",
+        "inherit_hooks": true,
+        "max_turns": 30,
+        "timeout_secs": 3600
+      }
+    },
+    {
+      "id": "bad-model-prefix",
+      "documented": true,
+      "also_in_readme": true,
+      "toml_in_readme": true,
+      "file": "bad-model.toml",
+      "toml": "[defaults]\nmodel = \"gpt-4\"\n",
+      "error": "invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'"
+    },
+    {
+      "id": "model-empty",
+      "file": "model-empty.toml",
+      "toml": "[defaults]\nmodel = \"\"\n",
+      "error": "invalid config: config validation failed at model-empty.toml: invalid config: model name cannot be empty"
+    },
+    {
+      "id": "model-too-long",
+      "file": "model-too-long.toml",
+      "toml": "[defaults]\nmodel = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+      "error": "invalid config: config validation failed at model-too-long.toml: invalid config: model name 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' is too long (max 100 characters)"
+    },
+    {
+      "id": "model-invalid-chars",
+      "file": "model-chars-bad.toml",
+      "toml": "[defaults]\nmodel = \"model@bad\"\n",
+      "error": "invalid config: config validation failed at model-chars-bad.toml: invalid config: model name 'model@bad' contains invalid characters (allowed: alphanumeric, '-', '_', '.')"
+    },
+    {
+      "id": "max-turns-zero",
+      "file": "max-turns-zero.toml",
+      "toml": "[defaults]\nmax_turns = 0\n",
+      "error": "invalid config: config validation failed at max-turns-zero.toml: invalid config: max_turns value 0 is invalid: must be at least 1"
+    },
+    {
+      "id": "max-turns-over-1000",
+      "file": "max-turns-over.toml",
+      "toml": "[defaults]\nmax_turns = 1001\n",
+      "error": "invalid config: config validation failed at max-turns-over.toml: invalid config: max_turns value 1001 is invalid: must be at most 1000"
+    },
+    {
+      "id": "timeout-zero",
+      "file": "timeout-zero.toml",
+      "toml": "[defaults]\ntimeout_secs = 0\n",
+      "error": "invalid config: config validation failed at timeout-zero.toml: invalid config: timeout_secs value 0 is invalid: must be at least 1"
+    },
+    {
+      "id": "timeout-over-86400",
+      "file": "timeout-over.toml",
+      "toml": "[defaults]\ntimeout_secs = 86401\n",
+      "error": "invalid config: config validation failed at timeout-over.toml: invalid config: timeout_secs value 86401 is invalid: must be at most 86400 (24 hours)"
+    },
+    {
+      "id": "validation-order-model-first",
+      "file": "order-model.toml",
+      "toml": "[defaults]\nmodel = \"\"\nmax_turns = 0\n",
+      "error": "invalid config: config validation failed at order-model.toml: invalid config: model name cannot be empty"
+    },
+    {
+      "id": "validation-order-max-turns-before-timeout",
+      "file": "order-turns.toml",
+      "toml": "[defaults]\nmax_turns = 0\ntimeout_secs = 0\n",
+      "error": "invalid config: config validation failed at order-turns.toml: invalid config: max_turns value 0 is invalid: must be at least 1"
+    },
+    {
+      "id": "unknown-key-in-defaults",
+      "documented": true,
+      "also_in_readme": true,
+      "toml_in_readme": true,
+      "file": "unknown-key.toml",
+      "toml": "[defaults]\nfrobnicate = 1\n",
+      "error": "invalid config: unknown-key.toml: TOML parse error at line 2, column 1\n  |\n2 | frobnicate = 1\n  | ^^^^^^^^^^\nunknown field `frobnicate`, expected one of `inherit_hooks`, `model`, `max_turns`, `timeout_secs`\n"
+    },
+    {
+      "id": "malformed-toml",
+      "documented": true,
+      "also_in_readme": true,
+      "toml_in_readme": true,
+      "file": "malformed.toml",
+      "toml": "[[\n",
+      "error": "invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n"
+    },
+    {
+      "id": "unclosed-string",
+      "file": "unclosed.toml",
+      "toml": "[defaults]\nmodel = \"claude-opus-4-8\n",
+      "error": "invalid config: unclosed.toml: TOML parse error at line 2, column 25\n  |\n2 | model = \"claude-opus-4-8\n  |                         ^\ninvalid basic string\n"
+    },
+    {
+      "id": "duplicate-key",
+      "file": "dup-key.toml",
+      "toml": "[defaults]\nmodel = \"claude-opus-4-8\"\nmodel = \"claude-haiku-4-5\"\n",
+      "error": "invalid config: dup-key.toml: TOML parse error at line 3, column 1\n  |\n3 | model = \"claude-haiku-4-5\"\n  | ^\nduplicate key `model` in table `defaults`\n"
+    },
+    {
+      "id": "duplicate-defaults-table",
+      "file": "dup-table.toml",
+      "toml": "[defaults]\nmodel = \"claude-opus-4-8\"\n[defaults]\nmax_turns = 5\n",
+      "error": "invalid config: dup-table.toml: TOML parse error at line 3, column 1\n  |\n3 | [defaults]\n  | ^\ninvalid table header\nduplicate key `defaults` in document root\n"
+    },
+    {
+      "id": "model-as-integer",
+      "file": "model-integer.toml",
+      "toml": "[defaults]\nmodel = 123\n",
+      "error": "invalid config: model-integer.toml: TOML parse error at line 2, column 9\n  |\n2 | model = 123\n  |         ^^^\ninvalid type: integer `123`, expected a string\n"
+    },
+    {
+      "id": "max-turns-as-string",
+      "documented": true,
+      "file": "max-turns-string.toml",
+      "toml": "[defaults]\nmax_turns = \"50\"\n",
+      "error": "invalid config: max-turns-string.toml: TOML parse error at line 2, column 13\n  |\n2 | max_turns = \"50\"\n  |             ^^^^\ninvalid type: string \"50\", expected u32\n"
+    },
+    {
+      "id": "max-turns-as-float",
+      "file": "max-turns-float.toml",
+      "toml": "[defaults]\nmax_turns = 50.5\n",
+      "error": "invalid config: max-turns-float.toml: TOML parse error at line 2, column 13\n  |\n2 | max_turns = 50.5\n  |             ^^^^\ninvalid type: floating point `50.5`, expected u32\n"
+    },
+    {
+      "id": "max-turns-negative",
+      "file": "max-turns-negative.toml",
+      "toml": "[defaults]\nmax_turns = -10\n",
+      "error": "invalid config: max-turns-negative.toml: TOML parse error at line 2, column 13\n  |\n2 | max_turns = -10\n  |             ^^^\ninvalid value: integer `-10`, expected u32\n"
+    },
+    {
+      "id": "inherit-hooks-as-string",
+      "file": "inherit-string.toml",
+      "toml": "[defaults]\ninherit_hooks = \"true\"\n",
+      "error": "invalid config: inherit-string.toml: TOML parse error at line 2, column 17\n  |\n2 | inherit_hooks = \"true\"\n  |                 ^^^^^^\ninvalid type: string \"true\", expected a boolean\n"
+    },
+    {
+      "id": "timeout-as-boolean",
+      "file": "timeout-bool.toml",
+      "toml": "[defaults]\ntimeout_secs = true\n",
+      "error": "invalid config: timeout-bool.toml: TOML parse error at line 2, column 16\n  |\n2 | timeout_secs = true\n  |                ^^^^\ninvalid type: boolean `true`, expected u64\n"
+    },
+    {
+      "id": "unreadable-directory",
+      "documented": true,
+      "file": "config-dir",
+      "directory": true,
+      "error": "invalid config: cannot read config at config-dir: Is a directory (os error 21)"
+    }
+  ],
+  "emitted": [
+    {
+      "id": "text-validation-error",
+      "documented": true,
+      "also_in_readme": true,
+      "format": "text",
+      "claude_version": "2.1.276 (Claude Code)",
+      "message": "invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'",
+      "expected_stdout": "",
+      "expected_stderr": "error: invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'\n"
+    },
+    {
+      "id": "json-parse-error",
+      "documented": true,
+      "also_in_readme": true,
+      "format": "json",
+      "claude_version": "2.1.276 (Claude Code)",
+      "message": "invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n",
+      "expected_stdout": "",
+      "expected_stderr": "{\"claude_version\":\"2.1.276 (Claude Code)\",\"error_message\":\"invalid config: malformed.toml: TOML parse error at line 1, column 3\\n  |\\n1 | [[\\n  |   ^\\ninvalid key\\n\",\"is_error\":true,\"subtype\":\"internal_error\",\"type\":\"result\"}\n"
+    },
+    {
+      "id": "stream-json-parse-error",
+      "documented": true,
+      "format": "stream-json",
+      "claude_version": "2.1.276 (Claude Code)",
+      "message": "invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n",
+      "expected_stdout": "",
+      "expected_stderr": "{\"claude_version\":\"2.1.276 (Claude Code)\",\"error_message\":\"invalid config: malformed.toml: TOML parse error at line 1, column 3\\n  |\\n1 | [[\\n  |   ^\\ninvalid key\\n\",\"is_error\":true,\"subtype\":\"internal_error\",\"type\":\"result\"}\n"
+    }
+  ]
+}

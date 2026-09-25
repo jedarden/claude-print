@@ -218,9 +218,16 @@ this order — the first rule that matches wins:
 An explicit `--config` replaces the default path entirely; it does not merge
 with it. A valid `HOME` is required in every case, even when `XDG_CONFIG_HOME`
 or `--config` supplies the path (see
-[Troubleshooting](#home-in-containers-and-chroots) for why). The config file is
-read only by normal prompt runs — `--version`, `--check`, and `serve` never
-load it.
+[Troubleshooting](#home-in-containers-and-chroots) for why). When
+`XDG_CONFIG_HOME` is unset and `HOME` is missing or empty, path resolution
+itself fails — exit 2, this stderr line (text mode):
+
+```text
+error: invalid config: HOME environment variable not set or empty; set HOME to the user's home directory
+```
+
+The config file is read only by normal prompt runs — `--version`, `--check`,
+and `serve` never load it.
 
 `claude-print` never creates or writes the file; you own it.
 
@@ -362,7 +369,14 @@ parse time with `invalid type: string "50", expected u32`, before validation
 runs.
 
 Unknown keys are rejected at parse time (`deny_unknown_fields` on `Defaults`)
-with an error naming the four expected fields:
+with an error naming the four expected fields. For this file:
+
+```toml
+[defaults]
+frobnicate = 1
+```
+
+the error is:
 
 ```text
 error: invalid config: unknown-key.toml: TOML parse error at line 2, column 1
@@ -379,6 +393,13 @@ If an existing config file cannot be read, parsed, or validated,
 fall back to defaults with a warning. Stdout is empty in every mode; the error
 goes to stderr, shaped by the output format.
 
+For a constraint violation — a `model` that fails validation:
+
+```toml
+[defaults]
+model = "gpt-4"
+```
+
 - **`text` mode:** one line on stderr (stdout empty):
 
   ```text
@@ -387,6 +408,12 @@ goes to stderr, shaped by the output format.
 
   The doubled `invalid config:` is not a typo — the per-field reason carries
   its own prefix, and the path wrapper adds another.
+
+For a parse failure — a file whose entire content is `[[` (malformed TOML):
+
+```toml
+[[
+```
 
 - **`json` / `stream-json` mode:** stdout stays empty and a structured `result`
   object (exit code still 2, subtype `internal_error` for every config
