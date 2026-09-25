@@ -99,6 +99,7 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/transcript.rs` | JSONL transcript parsing |
 | `tests/tui_transcript.rs` | TUI-shaped transcript parsing (claudepr-26e7a0b6): `sessionId` spelled on every ordinary record and no print-mode `type: "result"` event — the two reasons `session_id` came back null for every real PTY run |
 | `tests/docs_slug_consistency.rs` | Documentation-drift guard for the transcript-slug algorithm (bead claudepr-3243f25c): `tests/fixtures/slug_vectors_v2.1.263.json` pins `cwd_to_slug` against live-verified vectors, every `<path> → <slug>` example in the markdown docs is re-derived with the implementation, and stale prose patterns are linted |
+| `tests/docs_pool_contract.rs` | Documentation-contract test for the published serve / `--pool-socket` API (bead claudepr-e4e94485): every `claude-print ...` example line in README §"Warm PTY pool (ADR-005)" and AGENTS.md §"Pool operations" parses through the real `Cli` parser with the documented flag values, the documented default socket path / pool-size default and cap / acquire budget equal `DEFAULT_SOCKET_PATH`, clap's `default_value`, `MAX_POOL_SIZE` + `validate_pool_size`, and `DEFAULT_ACQUIRE_TIMEOUT_SECS`, the serve usage line and flag table list exactly the long flags the subcommand accepts (cross-checked against the rendered `serve --help`), the `0600` permission claim is re-derived through a real `bind_socket`, and the fallback-vs-protocol-failure split matches `is_stateless_fallback` plus `AcquireFailure`'s Display |
 | `tests/hooks.rs` | Stop hook FIFO install / read |
 | `tests/stop_poller.rs` | Stop payload polling logic |
 | `tests/pty_integration.rs` | PTY spawn + round-trip (requires PTY capability) |
@@ -151,8 +152,8 @@ binaries present under a selective `--test <name>` run):
 The remaining `tests/` targets are library-level and spawn no process:
 `cli`, `emitter`, `startup`, `terminal`, `transcript`, `tui_transcript`,
 `hooks`, `stop_poller`, `transcript_flush_window`, `stream_json_cleanup`,
-`docs_slug_consistency`, `nested_session`, and the always-on half of
-`claude_contracts`.
+`docs_slug_consistency`, `docs_pool_contract`, `nested_session`, and the
+always-on half of `claude_contracts`.
 
 **Real `claude` on PATH** (silent skip when absent — never a failure):
 `version_compat::test_claude_version_recorded` (`--version` only) and

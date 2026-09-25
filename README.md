@@ -507,6 +507,14 @@ All three output formats (`text`, `json`, `stream-json`) work over an acquired w
 
 The two outcomes are observably distinct. A fallback prints nothing unless `--verbose` is on (then exactly one stderr line, `pool: <reason>; falling back to the ordinary stateless session`) and produces output and an exit code identical to a no-flag run. A hard failure exits 2 with `error: pool protocol failure: <detail>` on stderr in `text` mode — the same message rides the structured error payload in `json`/`stream-json`, like every setup failure — and the `<detail>` names what broke: `malformed response` for an unparseable frame, `timed out waiting for the pool` for silence past the acquire budget, `worker_assigned carried no stop_fifo …` for a daemon too old to speak the current handoff. Which side of the table a failure lands on never depends on the wording, only on the failure's class.
 
+### Restarting the daemon
+
+Restart is stop + start, with nothing to coordinate in between — no drain, no quiesce, no client notification:
+
+- A clean stop (`SIGINT`/`SIGTERM`) removes the daemon's own socket node, so an immediate restart binds a fresh one.
+- A crash (`SIGKILL`, OOM-kill) leaves the stale node behind, and the next `serve` **replaces it at bind** — a leftover node never blocks a restart, and hand-removing one (`rm /tmp/claude-print-pool.sock`) is always safe too.
+- In the window before the new daemon binds, arriving clients find a socket nobody answers and fall back statelessly; clients mid-session finish regardless — the session is daemon-independent once assigned (see the table above).
+
 ### Operating limits
 
 - `--pool-size`: 1–256 (hard cap — each worker is a full `claude` PTY process).
