@@ -48,7 +48,31 @@ always holds the immediately previous version — there is no chain of older
 copies. A fresh install (no existing binary) creates no `.prev`, and a
 failed install (missing manifest, unlisted asset, digest mismatch) never
 touches the live binary or an existing copy, because verification precedes
-the backup.
+the backup. The output tells the runs apart: an upgrade prints `Backing up
+existing binary to ~/.local/bin/claude-print.prev` before placing the new
+binary, a fresh install prints no backup line — and no failed run prints
+`Installation complete.`
+
+**If an upgrade fails** (nonzero exit, reason on stderr), inspect what it
+left before touching anything:
+
+```bash
+ls -l ~/.local/bin/claude-print ~/.local/bin/claude-print.prev
+```
+
+- **Live binary still present** — the failure struck during verification,
+  before the backup: nothing was moved or replaced. Fix the cause and re-run
+  `sh install.sh`.
+- **Live path vacant, `claude-print.prev` present** — the failure struck
+  between the backup and the placement (disk full, permissions at
+  `~/.local/bin`): this is the mid-install failure window. Roll back (below)
+  to restore the previous binary, then fix the cause before retrying.
+- **New binary live** — the placement succeeded and a later leg failed
+  (`mock_claude` or the `--check` smoke); the binary is installed, the run
+  just stopped short of `Installation complete.`
+
+A fresh install has no `.prev` to lose, so the vacant shape on a first
+install simply means: fix the cause and re-run.
 
 Roll back one version in one step:
 
@@ -57,12 +81,17 @@ mv ~/.local/bin/claude-print.prev ~/.local/bin/claude-print
 claude-print --check
 ```
 
+`--check` is the post-rollback gate — credential-free, runs no session (see
+[Self-check](#self-check)), and it must exit 0; follow it with
+`claude-print --version` to confirm the restored generation.
+
 The move consumes the copy — after rolling back there is no `.prev` until
 the next upgrade, so two-versions-back requires installing that release
 explicitly. Only the main binary is covered: `mock_claude` and
 `~/.needle/agents/claude-print.yaml` are overwritten in place with no
-backup. Full semantics — including the mid-install failure window — are
-documented in [`docs/notes/installer-rollback.md`](docs/notes/installer-rollback.md);
+backup. Full semantics — including the mid-install failure window and the
+complete failure triage table — are documented in
+[`docs/notes/installer-rollback.md`](docs/notes/installer-rollback.md);
 the adapter copy's own contract (detection, source, mode, overwrite) in
 [`docs/notes/installer-needle-adapter.md`](docs/notes/installer-needle-adapter.md).
 
