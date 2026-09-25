@@ -3,6 +3,7 @@
   "document": "docs/notes/config-file-contract.md",
   "pinned_by": "tests/config_contract.rs",
   "readme": "README.md",
+  "analysis": "docs/config-error-analysis.md",
   "keys": [
     {
       "name": "model",
@@ -60,6 +61,7 @@
       "home": "unset",
       "documented": true,
       "also_in_readme": true,
+      "also_in_analysis": true,
       "expect_error": "invalid config: HOME environment variable not set or empty; set HOME to the user's home directory"
     }
   ],
@@ -309,6 +311,7 @@
       "documented": true,
       "also_in_readme": true,
       "toml_in_readme": true,
+      "also_in_analysis": true,
       "file": "bad-model.toml",
       "toml": "[defaults]\nmodel = \"gpt-4\"\n",
       "error": "invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'"
@@ -381,6 +384,7 @@
       "documented": true,
       "also_in_readme": true,
       "toml_in_readme": true,
+      "also_in_analysis": true,
       "file": "malformed.toml",
       "toml": "[[\n",
       "error": "invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n"
@@ -453,6 +457,7 @@
       "id": "text-validation-error",
       "documented": true,
       "also_in_readme": true,
+      "also_in_analysis": true,
       "format": "text",
       "claude_version": "2.1.276 (Claude Code)",
       "message": "invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'",
@@ -463,6 +468,7 @@
       "id": "json-parse-error",
       "documented": true,
       "also_in_readme": true,
+      "also_in_analysis": true,
       "format": "json",
       "claude_version": "2.1.276 (Claude Code)",
       "message": "invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n",

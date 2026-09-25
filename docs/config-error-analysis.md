@@ -1,8 +1,8 @@
 # Config Error Handling Analysis
 
-**Date:** 2026-08-15 (original) · **Revised:** 2026-09-24 — reconciled with the
-current dispatch behavior (serve entry point, process-wide `HOME` preflight,
-missing-file-is-not-an-error semantics)
+**Date:** 2026-08-15 (original) · **Revised:** 2026-09-24 (dispatch behavior)
+· **2026-09-25** — reconciled with the config-file contract v1 (bead
+claudepr-227efdb1) and added to the drift-pinned set
 **Project:** claude-print
 **Purpose:** Document the actual current behavior of config parsing and error handling
 
@@ -10,7 +10,13 @@ missing-file-is-not-an-error semantics)
 > [`docs/notes/config-file-contract.md`](notes/config-file-contract.md)
 > (pinned by `tests/config_contract.rs`); the README's Configuration section
 > summarizes it. This document is the engineering analysis behind that
-> behavior — where the three disagree, the contract wins.
+> behavior — where the three disagree, the contract wins. The
+> contract-bearing excerpts of this document (the path-precedence statement
+> and its `XDG_CONFIG_HOME` edges, the quoted error lines and JSON result
+> object, the resolution-limitation vocabulary) are checked against the same
+> fixture by `tests/config_contract.rs` (bead claudepr-09637c58), so a
+> contract change that forgets this analysis fails the pin instead of
+> letting it silently rot.
 
 ## Executive Summary
 
@@ -77,9 +83,35 @@ level by `tests/config_contract.rs` — but from the CLI that arm is
 effectively shadowed: the preflight has just validated the same condition
 through the same `get_home()` call, so an invocation that reaches
 `default_path()` already has a usable `HOME`. The two failures also render
-differently: the preflight emits a `Setup` error whose message is the
-actionable `HOME …` guidance, while a config failure emits a
-`ClaudePrintError::Config` (see "Error reporting" below).
+differently in *variant*, though not in message: the preflight emits a
+`ClaudePrintError::Setup` while a config failure emits a
+`ClaudePrintError::Config` (see "Error reporting" below) — but because
+`get_home()` returns `Error::Config` and `Error`'s Display prepends
+`invalid config: `, both paths put the byte-identical actionable guidance in
+front of the user (exit 2, `subtype: "internal_error"` in JSON modes):
+
+```text
+error: invalid config: HOME environment variable not set or empty; set HOME to the user's home directory
+```
+
+### Path resolution: three rules, two sharp edges
+
+`default_path()` resolves in three rules, first match wins —
+`--config <FILE>` (which replaces discovery entirely; the discovered file is
+never read and nothing is merged), else
+`$XDG_CONFIG_HOME/claude-print/config.toml`, else
+`$HOME/.config/claude-print/config.toml` under `get_home()`'s strict policy.
+Two `XDG_CONFIG_HOME` edges are contract v1 substance, each pinned by the
+fixture's `default_path` rules:
+
+- **Empty-but-set counts as set.** `var()` succeeds on the empty string, the
+  value is used as given, and joining `claude-print/config.toml` onto an
+  empty base yields the cwd-relative path `claude-print/config.toml` — not
+  an error, and not a fall-through to `HOME`.
+- **Non-UTF-8 falls through to the HOME rule.** A value that is not valid
+  UTF-8 fails the `var()` read — the variable effectively disappears, so
+  resolution continues to `$HOME/.config/claude-print/config.toml`; it does
+  not error at the XDG step.
 
 ## Entry-point dispatch (current behavior)
 
@@ -201,7 +233,11 @@ if let Some(ref defaults) = config.defaults {
    directory): `cannot read config at …`.
 2. **Parse** — malformed TOML, an unknown key inside `[defaults]`
    (`deny_unknown_fields`), a duplicate key/table, or a wrong type: reports
-   the TOML line/column and a source excerpt.
+   the TOML line/column and a source excerpt. The closed world is
+   `[defaults]` only: keys and tables *outside* `[defaults]` are silently
+   ignored (the root schema accepts `defaults` and drops everything else),
+   so a typo outside the table is dead weight, not an error — the asymmetry
+   is deliberate and fixture-pinned.
 3. **Validate** (`Defaults::validate`, in order `model` → `max_turns` →
    `timeout_secs`, first failure wins): parses, then fails a constraint
    (e.g. `model name 'gpt-4' must start with 'claude-'`).
@@ -216,6 +252,23 @@ optional fields within a valid (or absent) file** — never a fallback when a
 file that exists is invalid. A separate `Config::load` exists for callers
 that want a missing file to be an error.
 
+### Resolution tiering and the `max_turns`/`timeout_secs` limitation
+
+Parsed values feed per-setting resolvers — CLI flag, then config value,
+then built-in default — but only two of the four keys can genuinely take
+the config tier on a real invocation. `--model` and `--no-inherit-hooks`
+carry no clap parser `default_value`, so an absent flag stays `None` and
+`defaults.model` / `defaults.inherit_hooks` apply whenever the flag is
+absent. `--max-turns` and `--timeout` carry clap `default_value`s equal to
+the built-in defaults (30 / 3600), which makes an absent flag
+indistinguishable from an explicitly passed one: `main.rs` always passes
+`Some(cli.max_turns)` / `Some(cli.timeout)` into the resolvers, so the
+`defaults.max_turns` / `defaults.timeout_secs` tiers parse and validate but
+never fire. This is the contract's documented "Known limitation" (control
+the two settings with the CLI flags); `tests/config_contract.rs` pins the
+mechanism against clap's own parser definitions, so removing a
+`default_value` without updating the contract fails the pin.
+
 ## Error reporting
 
 A config failure becomes `ClaudePrintError::Config` via
@@ -225,11 +278,19 @@ validation tier deliberately keeps a doubled prefix — the per-field reason
 carries its own). `emit_error` (`src/emitter.rs`) then renders:
 
 - **Text mode:** one `error: invalid config: …` line on **stderr**; stdout
-  empty; exit 2.
+  empty; exit 2. For a `[defaults]` table setting `model = "gpt-4"` in
+  `bad-model.toml` (the validation tier, showing the deliberate doubled
+  prefix):
+
+  ```text
+  error: invalid config: config validation failed at bad-model.toml: invalid config: model name 'gpt-4' must start with 'claude-'
+  ```
+
 - **`json` / `stream-json`:** a structured `result` object on **stderr**
   (`emit_error` routes `ClaudePrintError::Config` to stderr specifically —
   config errors fire before a session exists, so stdout, which carries the
-  response payload, stays clean); exit 2; `subtype: "internal_error"`.
+  response payload, stays clean); exit 2; `subtype: "internal_error"`. For
+  a file whose entire content is `[[` (the parse tier):
 
 ```json
 {"claude_version":"2.1.276 (Claude Code)","error_message":"invalid config: malformed.toml: TOML parse error at line 1, column 3\n  |\n1 | [[\n  |   ^\ninvalid key\n","is_error":true,"subtype":"internal_error","type":"result"}
@@ -279,7 +340,10 @@ that test.
    clap exits during parsing.
 5. **`Config::default_path` prefers `XDG_CONFIG_HOME`.** Path precedence is
    now `--config <FILE>` → `$XDG_CONFIG_HOME/claude-print/config.toml` →
-   `$HOME/.config/claude-print/config.toml`.
+   `$HOME/.config/claude-print/config.toml`, with two edges the contract
+   later pinned: an empty-but-set `XDG_CONFIG_HOME` counts as set and
+   yields the cwd-relative `claude-print/config.toml`, and a non-UTF-8
+   value fails the `var()` read and falls through to the HOME rule.
 6. **`--check` grew `--clean`** (`check::run_with_clean`) and skips the
    automatic orphan sweep.
 7. **`--version` is a custom flag** (clap's built-in disabled), still
@@ -288,12 +352,25 @@ that test.
 8. **Stale line numbers refreshed** — the original cited `main.rs:186-221`
    for config loading and `main.rs:47-58` for the early-exit flags, which no
    longer matched the file.
+9. **Contract v1 landed and this analysis joined the pinned set
+   (2026-09-25).** `docs/notes/config-file-contract.md` (bead
+   claudepr-227efdb1) is now the normative contract, replayed end-to-end by
+   `tests/config_contract.rs` against
+   `tests/fixtures/config_contract_examples_v1.json`. This reconciliation
+   verified the analysis against that fixture-pinned behavior — the claims
+   held; the gaps were the two `XDG_CONFIG_HOME` edges, the
+   inside/outside `[defaults]` parse asymmetry, and the
+   `max_turns`/`timeout_secs` `default_value` limitation, all now stated
+   above — and the analysis's contract-bearing excerpts are themselves
+   checked against the same fixture (bead claudepr-09637c58), so where the
+   documents disagree with the contract, the pin fails rather than the
+   analysis silently rotting.
 
 ## Regression tests
 
 | Test | Pins |
 |------|------|
-| `tests/config_contract.rs` | The normative contract end-to-end: path precedence (incl. empty-but-set and non-UTF-8 `XDG_CONFIG_HOME`, strict `HOME` failure), loader tiers through the real `Config::load_or_default`, and every documented error line byte-for-byte through `emit_error`; keeps `docs/notes/config-file-contract.md` and the README from drifting (bead claudepr-227efdb1) |
+| `tests/config_contract.rs` | The normative contract end-to-end: path precedence (incl. empty-but-set and non-UTF-8 `XDG_CONFIG_HOME`, strict `HOME` failure), loader tiers through the real `Config::load_or_default`, and every documented error line byte-for-byte through `emit_error`; keeps `docs/notes/config-file-contract.md`, the README, and this document's contract-bearing excerpts from drifting (bead claudepr-227efdb1; the analysis pin is claudepr-09637c58) |
 | `tests/config_startup_errors.rs` | Binary-level: a malformed config is visible in text mode and structured on **stderr** in `json`/`stream-json`, exit 2, stdout clean |
 | `tests/config_parse_errors.rs` | Parse-tier failures (unclosed bracket/string, …): exit 2, structured JSON error, no silent fallback to defaults (bead claudepr-ea80e6b2) |
 | `tests/home_unset.rs` | The `HOME` preflight: unset/empty/missing/read-only `HOME` all exit 2 with the same actionable message by every entry point (`env_u_home_version_fails_with_actionable_error`, `assert_cli_home_unset_error` callers), no `/root` fallback under a real `chroot`, and `XDG_CONFIG_HOME`/`--config` not exempting a run |

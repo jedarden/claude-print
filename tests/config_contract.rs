@@ -37,6 +37,17 @@
 //!    shipped-defaults TOML block, and File-location precedence list are
 //!    asserted against the fixture, so a contract change that updates the
 //!    note but forgets the README fails here too (bead claudepr-746dd1c4).
+//! 7. **Analysis alignment** — the engineering analysis
+//!    (`docs/config-error-analysis.md`, subordinate to the contract the same
+//!    way the README is) restates contract facts in prose. Its
+//!    contract-bearing excerpts are pinned against the same fixture: every
+//!    `also_in_analysis` example must appear verbatim (raw or JSON-escaped),
+//!    the path-precedence statement must carry the fixture-derived XDG and
+//!    HOME path strings, both `XDG_CONFIG_HOME` edges must be named with the
+//!    fixture's own cwd-relative outcome, and the documented
+//!    `max_turns`/`timeout_secs` `default_value` limitation must stay
+//!    stated — so a contract change that updates the note and README but
+//!    forgets the analysis fails here (bead claudepr-09637c58).
 //!
 //! A contract change therefore updates implementation, fixture, and document
 //! together in one commit — which is the point.
@@ -57,6 +68,7 @@ use claude_print::error::ClaudePrintError;
 const FIXTURE: &str = include_str!("fixtures/config_contract_examples_v1.json");
 const DOC: &str = include_str!("../docs/notes/config-file-contract.md");
 const README: &str = include_str!("../README.md");
+const ANALYSIS: &str = include_str!("../docs/config-error-analysis.md");
 
 /// Env and cwd are process-global; every test that touches them takes this
 /// lock so the panics of one replay cannot poison another's environment.
@@ -76,6 +88,7 @@ struct Fixture {
     document: String,
     pinned_by: String,
     readme: String,
+    analysis: String,
     keys: Vec<KeyRow>,
     default_path: Vec<PathRule>,
     cases: Vec<Case>,
@@ -97,6 +110,9 @@ struct PathRule {
     home: String,
     documented: Option<bool>,
     also_in_readme: Option<bool>,
+    /// The error also appears in the engineering analysis
+    /// (`docs/config-error-analysis.md`).
+    also_in_analysis: Option<bool>,
     expect_path: Option<String>,
     expect_error: Option<String>,
 }
@@ -107,6 +123,9 @@ struct Case {
     documented: Option<bool>,
     /// The error/emitted payload also appears in the README.
     also_in_readme: Option<bool>,
+    /// The error/emitted payload also appears in the engineering analysis
+    /// (`docs/config-error-analysis.md`).
+    also_in_analysis: Option<bool>,
     /// The TOML block itself also appears in the README (the README shows
     /// some errors without the file that produced them, and vice versa).
     toml_in_readme: Option<bool>,
@@ -140,6 +159,9 @@ struct Emitted {
     id: String,
     documented: Option<bool>,
     also_in_readme: Option<bool>,
+    /// The emitted line also appears in the engineering analysis
+    /// (`docs/config-error-analysis.md`).
+    also_in_analysis: Option<bool>,
     format: String,
     claude_version: String,
     message: String,
@@ -952,6 +974,158 @@ fn readme_shipped_defaults_block_lives_in_the_configuration_section() {
     }
 }
 
+// ── layer 7: analysis alignment ──────────────────────────────────────────────
+
+/// Examples the engineering analysis also quotes (`also_in_analysis`) are
+/// pinned in `docs/config-error-analysis.md` exactly like the README pins:
+/// error messages must appear raw or JSON-escaped (the analysis embeds the
+/// parse-tier message inside its JSON result-object example), and emitted
+/// lines verbatim. The analysis is prose, so it shows errors without the
+/// TOML files that produced them — only the payloads are pinned, never the
+/// blocks.
+#[test]
+fn analysis_examples_still_match() {
+    let fx = fixture();
+
+    for case in &fx.cases {
+        if case.also_in_analysis != Some(true) {
+            continue;
+        }
+        if let Some(err) = case.error.as_deref() {
+            assert!(
+                contains_message(ANALYSIS, err),
+                "case {} is also_in_analysis but its error message appears in neither raw \
+                 nor JSON-escaped form in docs/config-error-analysis.md — update the \
+                 analysis and fixture together",
+                case.id
+            );
+        }
+    }
+
+    for rule in &fx.default_path {
+        if rule.also_in_analysis != Some(true) {
+            continue;
+        }
+        if let Some(err) = rule.expect_error.as_deref() {
+            assert!(
+                contains_message(ANALYSIS, err),
+                "rule {} is also_in_analysis but its error appears in neither raw nor \
+                 JSON-escaped form in docs/config-error-analysis.md",
+                rule.id
+            );
+        }
+    }
+
+    for case in &fx.emitted {
+        if case.also_in_analysis != Some(true) {
+            continue;
+        }
+        let payload = if !case.expected_stdout.is_empty() {
+            &case.expected_stdout
+        } else {
+            &case.expected_stderr
+        };
+        let example = payload.strip_suffix('\n').unwrap_or(payload);
+        assert!(
+            !example.is_empty() && ANALYSIS.contains(example),
+            "case {} is also_in_analysis but its emitted line does not appear verbatim in \
+             docs/config-error-analysis.md — update the analysis and fixture together",
+            case.id
+        );
+    }
+}
+
+/// The analysis's own path-precedence discussion must restate the fixture's
+/// `default_path` rules: both discoverable path strings (derived from the
+/// fixture's templates, so renaming the file or moving the directory trips
+/// here), the empty-but-set edge with the fixture's cwd-relative outcome,
+/// and the non-UTF-8 fall-through to the HOME rule. These are the contract
+/// facts the analysis states in prose rather than quoting as example lines.
+#[test]
+fn analysis_path_precedence_and_xdg_edges_match_the_fixture_rules() {
+    let fx = fixture();
+
+    let xdg_path = fixture_display_path(&fx, "{xdg}", "$XDG_CONFIG_HOME");
+    let home_path = fixture_display_path(&fx, "{home}", "$HOME");
+    assert!(
+        ANALYSIS.contains(&xdg_path),
+        "the analysis must state the fixture's XDG path `{xdg_path}` in its precedence \
+         discussion — update the analysis and fixture together"
+    );
+    assert!(
+        ANALYSIS.contains(&home_path),
+        "the analysis must state the fixture's HOME path `{home_path}` in its precedence \
+         discussion — update the analysis and fixture together"
+    );
+
+    // The empty-but-set edge: the fixture pins the cwd-relative outcome
+    // (`claude-print/config.toml` with no directory part); the analysis must
+    // state that outcome, not just name the edge.
+    let empty_rule = fx
+        .default_path
+        .iter()
+        .find(|r| r.xdg == "empty")
+        .expect("fixture must carry the empty-XDG rule");
+    let cwd_relative = empty_rule
+        .expect_path
+        .as_deref()
+        .expect("the empty-XDG rule must pin an expect_path");
+    assert!(
+        !cwd_relative.contains('{'),
+        "the empty-XDG rule's expect_path must be the bare cwd-relative path, not a \
+         {{xdg}}/{{home}} template"
+    );
+    assert!(
+        ANALYSIS.contains("empty-but-set")
+            && ANALYSIS.contains(&format!("cwd-relative path `{cwd_relative}`")),
+        "the analysis must name the empty-but-set edge and state the fixture's \
+         cwd-relative outcome `{cwd_relative}` — update the analysis and fixture together"
+    );
+
+    // The non-UTF-8 edge: the analysis must name it and state the
+    // fall-through, matching the fixture's non-utf8 rule resolving to the
+    // HOME path.
+    assert!(
+        fx.default_path.iter().any(|r| r.xdg == "non-utf8"
+            && r.expect_path.as_deref() == Some("{home}/.config/claude-print/config.toml")),
+        "fixture must keep the non-UTF-8 rule falling back to the HOME path"
+    );
+    assert!(
+        ANALYSIS.contains("non-UTF-8") && ANALYSIS.contains("falls through to the HOME rule"),
+        "the analysis must name the non-UTF-8 edge and state that it falls through to \
+         the HOME rule"
+    );
+}
+
+/// The resolution-tiering limitation the contract documents (clap
+/// `default_value`s on `--max-turns`/`--timeout` neutralize the config tier)
+/// must stay stated in the analysis, and the analysis must reference every
+/// contract key by its `defaults.<name>` spelling — a key added to the
+/// contract without an analysis mention fails here.
+#[test]
+fn analysis_states_the_resolution_limitation_and_every_key() {
+    let fx = fixture();
+
+    assert!(
+        ANALYSIS.contains("default_value"),
+        "the analysis must state the documented default_value mechanism that \
+         neutralizes the max_turns/timeout_secs config tiers"
+    );
+    assert!(
+        ANALYSIS.contains("never fire") || ANALYSIS.contains("never fires"),
+        "the analysis must state that the neutralized config tiers never fire"
+    );
+    for key in &fx.keys {
+        let spelling = format!("defaults.{}", key.name);
+        assert!(
+            ANALYSIS.contains(&spelling),
+            "key {}: the analysis must reference `{spelling}` — update the analysis and \
+             fixture together",
+            key.name
+        );
+    }
+}
+
 // ── self-integrity ───────────────────────────────────────────────────────────
 
 /// The fixture's own header must still point at this test, this document, and
@@ -972,6 +1146,10 @@ fn fixture_header_points_at_this_test_and_doc() {
     assert_eq!(
         fx.readme, "README.md",
         "fixture readme must name the README"
+    );
+    assert_eq!(
+        fx.analysis, "docs/config-error-analysis.md",
+        "fixture analysis must name the engineering analysis"
     );
     assert_eq!(fx.contract_version, "v1");
     assert!(
