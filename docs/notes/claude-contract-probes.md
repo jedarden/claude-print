@@ -345,7 +345,10 @@ line: `~/.local/state/claude-print/contract-drift-watch/last-result`
 `journalctl --user -u claude-print-contract-drift-watch.service`.
 `tests/contract_drift_watch.rs` and `tests/install_contract_drift_watch.rs`
 pin the watcher's exit/filing contract and the installer, so the schedule
-cannot silently detach from this page either.
+cannot silently detach from this page either. The operator-facing sequence
+for this timer and the billing canary — prerequisites, installation,
+status/log inspection, restart/disable, removal, and failure behavior — is
+`docs/notes/scheduled-services-runbook.md`.
 
 **Re-run.** No drift → nothing to do. The cheap live tests re-verify the
 merge and suppression contracts against the installed binary in ~35 s

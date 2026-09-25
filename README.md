@@ -749,6 +749,13 @@ installation and operations workflow — installed paths, timer schedule, the
 linger requirement, verification, and failure recovery. The manual release
 check remains required as a second layer.
 
+The companion contract-drift watch installs the same way
+(`./scripts/install-contract-drift-watch.sh`) and alerts when a Claude Code
+auto-update leaves the repo's pinned contract evidence stale.
+[`docs/notes/scheduled-services-runbook.md`](docs/notes/scheduled-services-runbook.md)
+is the operator runbook for both services — prerequisites, installation,
+status/log inspection, restart/disable, removal, and failure behavior.
+
 ### Common issues
 
 **PTY open failed** — You may be in a container without `/dev/ptmx`. Run on a bare-metal host or a VM with full PTY support.

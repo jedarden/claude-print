@@ -74,6 +74,11 @@ systemctl --user start claude-print-billing-canary.service   # force the first r
 The checkout is only needed at install time: the timer runs the installed
 copies, never the repo.
 
+The cross-service operator sequence — install, status/log inspection,
+restart/disable, removal, and the contract-drift watch that installs the
+same way — is
+[`docs/notes/scheduled-services-runbook.md`](../docs/notes/scheduled-services-runbook.md).
+
 ### Prerequisites
 
 | Requirement | Enforced | On failure |
