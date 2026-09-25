@@ -483,11 +483,15 @@ impl Session {
         // 4. Stop hook watchdog timeout: if Stop hook doesn't fire within N seconds after prompt injection (default 120s)
         //
         // bf-lu1h: timeout #2 (stream-json first-output) only applies in
-        // stream-json mode. Outside it the child never writes
-        // <temp_dir>/transcript.jsonl (the real transcript lands in
-        // ~/.claude/projects/) and mark_stream_json_output is never called, so
-        // the deadline is unsatisfiable and would SIGTERM any turn >90s. Arm it
-        // (and tell the watchdog the mode) only for stream-json output.
+        // stream-json mode. Outside it no stream-json reader runs, so nothing
+        // could ever credit the deadline and it would SIGTERM any turn >90s.
+        //
+        // claudepr-33fdf4ed: in stream-json mode the deadline is credited by
+        // the live transcript reader — the flag from
+        // `stream_json_output_flag` is handed to the reader at
+        // PROMPT_INJECTED below, and the reader stores it when it forwards
+        // its first transcript line. A session that outlives the deadline
+        // with events flowing is therefore no longer killed.
         let is_stream_json = matches!(output_format, crate::cli::OutputFormat::StreamJson);
         let stream_json_first_output = if is_stream_json {
             stream_json_timeout_secs.or(first_output_timeout_secs)
@@ -502,21 +506,15 @@ impl Session {
             is_stream_json,
         );
 
-        // Get temp directory path for stream-json monitoring
-        // The watchdog will monitor <temp_dir>/transcript.jsonl for stream-json output
-        let temp_dir_path = installer.dir_path().to_path_buf();
-
         // Get the raw fd for the self-pipe write end for the watchdog to signal timeout
         let watchdog_self_pipe_fd = Some(self_pipe_write.as_raw_fd());
 
-        let watchdog = Watchdog::new(
-            watchdog_config,
-            spawner.child_pid,
-            Some(temp_dir_path),
-            watchdog_self_pipe_fd,
-        );
+        let watchdog = Watchdog::new(watchdog_config, spawner.child_pid, watchdog_self_pipe_fd);
 
         let watchdog_state = watchdog.state();
+        // Handed to the stream-json reader at PROMPT_INJECTED (stream-json
+        // mode only); see the comment above.
+        let stream_json_first_output_flag = watchdog_state.stream_json_output_flag();
 
         // Spawn the watchdog timeout thread
         let _timeout_thread = watchdog.spawn_timeout_thread();
@@ -686,11 +684,21 @@ impl Session {
                                 installer.identity_path.clone(),
                                 projects_dir,
                                 pre_existing,
+                                // claudepr-33fdf4ed: the reader credits the
+                                // watchdog's Phase-2 deadline on its first
+                                // forwarded line.
+                                Some(std::sync::Arc::clone(&stream_json_first_output_flag)),
                             ));
                             stream_json_spawned_clone
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         Err(e) => {
+                            // claudepr-33fdf4ed: with live tailing disabled
+                            // nothing can ever credit the Phase-2 deadline,
+                            // so credit it here — an unobservable stream must
+                            // not re-arm the unconditional kill the deadline
+                            // used to be.
+                            watchdog_state_clone.mark_stream_json_output();
                             eprintln!(
                                 "claude-print: warning: could not derive projects dir for the \
                                  stream-json reader: {}; live transcript tailing disabled",
@@ -1030,10 +1038,9 @@ impl Session {
         // 5a. Watchdog: the same four deadlines with the same arming formula,
         //     but child signaling suppressed — the worker is daemon-owned, so
         //     a deadline reroutes through worker release → daemon teardown
-        //     instead of a direct SIGTERM. No temp dir is passed, so the
-        //     Phase-2 transcript monitor is never spawned; in production
-        //     nothing writes <temp_dir>/transcript.jsonl anyway (bf-lu1h), so
-        //     this is observably identical to the stateless wiring.
+        //     instead of a direct SIGTERM. As on the stateless path
+        //     (claudepr-33fdf4ed), the Phase-2 stream-json deadline is credited
+        //     by the live transcript reader via the flag handed out below.
         let is_stream_json = matches!(output_format, crate::cli::OutputFormat::StreamJson);
         let stream_json_first_output = if is_stream_json {
             stream_json_timeout_secs.or(first_output_timeout_secs)
@@ -1050,12 +1057,14 @@ impl Session {
         let watchdog = Watchdog::new(
             watchdog_config,
             worker.pid(),
-            None,
             Some(self_pipe_write.as_raw_fd()),
         )
         .without_child_signals();
 
         let watchdog_state = watchdog.state();
+        // Handed to the stream-json reader at PROMPT_INJECTED (stream-json
+        // mode only); see the stateless wiring for the full rationale.
+        let stream_json_first_output_flag = watchdog_state.stream_json_output_flag();
         let _timeout_thread = watchdog.spawn_timeout_thread();
 
         // 6. Event loop over the worker's PTY master (no spawn — step 5 of the
@@ -1209,11 +1218,20 @@ impl Session {
                                 identity_path,
                                 projects_dir,
                                 pre_existing,
+                                // claudepr-33fdf4ed: the reader credits the
+                                // watchdog's Phase-2 deadline on its first
+                                // forwarded line.
+                                Some(std::sync::Arc::clone(&stream_json_first_output_flag)),
                             ));
                             stream_json_spawned_clone
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         Err(e) => {
+                            // claudepr-33fdf4ed: with live tailing disabled
+                            // nothing can ever credit the Phase-2 deadline —
+                            // credit it here so a degraded run isn't killed
+                            // by a deadline nothing can satisfy.
+                            watchdog_state_clone.mark_stream_json_output();
                             eprintln!(
                                 "claude-print: warning: could not derive the worker's projects \
                                  dir for the stream-json reader: {}; live transcript tailing \

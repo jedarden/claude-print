@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -307,16 +308,25 @@ pub fn spawn_stream_json_reader_to(
 /// [`spawn_stream_json_reader_bound_to`] for the full binding ladder; the only
 /// guess it still makes is a single transcript created after injection, which
 /// no sibling started before us can produce.
+///
+/// `first_output` is the watchdog's Phase-2 credit flag
+/// ([`crate::watchdog::WatchdogState::stream_json_output_flag`]): the reader
+/// stores it the moment it forwards its first transcript line, making the
+/// stream-json first-output deadline a true FIRST-OUTPUT deadline
+/// (claudepr-33fdf4ed) instead of the unconditional session cap it was when
+/// nothing could credit it.
 pub fn spawn_stream_json_reader_bound(
     identity_path: PathBuf,
     projects_dir: PathBuf,
     pre_existing: HashMap<PathBuf, u64>,
+    first_output: Option<Arc<AtomicBool>>,
 ) -> StreamJsonHandle {
     spawn_stream_json_reader_bound_to(
         identity_path,
         projects_dir,
         pre_existing,
         Box::new(std::io::stdout()),
+        first_output,
     )
 }
 
@@ -353,12 +363,14 @@ pub fn spawn_stream_json_reader_bound_to(
     projects_dir: PathBuf,
     pre_existing: HashMap<PathBuf, u64>,
     writer: Box<dyn Write + Send + 'static>,
+    first_output: Option<Arc<AtomicBool>>,
 ) -> StreamJsonHandle {
     spawn_reader(
         TranscriptSource::Bind {
             identity_path,
             projects_dir,
             pre_existing,
+            first_output,
         },
         writer,
     )
@@ -372,11 +384,13 @@ enum TranscriptSource {
     Exact { path: PathBuf, start_offset: u64 },
     /// Bind to this session's transcript at runtime (see
     /// [`spawn_stream_json_reader_bound_to`]). Used at `PROMPT_INJECTED`, where
-    /// the exact `<session_id>.jsonl` filename is unknown.
+    /// the exact `<session_id>.jsonl` filename is unknown. `first_output` is
+    /// the watchdog's Phase-2 credit flag, stored on the first forwarded line.
     Bind {
         identity_path: PathBuf,
         projects_dir: PathBuf,
         pre_existing: HashMap<PathBuf, u64>,
+        first_output: Option<Arc<AtomicBool>>,
     },
 }
 
@@ -402,14 +416,15 @@ fn stream_json_reader_loop(
     drain_rx: mpsc::Receiver<()>,
     retarget_rx: mpsc::Receiver<PathBuf>,
 ) {
-    let (initial_path, initial_offset, pre_existing, identity) = match source {
+    let (initial_path, initial_offset, pre_existing, identity, first_output) = match source {
         TranscriptSource::Exact { path, start_offset } => {
-            (path, start_offset, HashMap::new(), None)
+            (path, start_offset, HashMap::new(), None, None)
         }
         TranscriptSource::Bind {
             identity_path,
             projects_dir,
             pre_existing,
+            first_output,
         } => {
             // Resolve the transcript file and the byte offset to seek to.
             // Polls until a binding resolves; `None` → the reader was told to
@@ -428,6 +443,7 @@ fn stream_json_reader_loop(
                     offset,
                     pre_existing,
                     Some((identity_path, projects_dir)),
+                    first_output,
                 ),
                 None => return,
             }
@@ -442,6 +458,7 @@ fn stream_json_reader_loop(
         writer,
         &drain_rx,
         &retarget_rx,
+        first_output,
     );
 }
 
@@ -647,6 +664,12 @@ fn rebind(
 
 /// Open, seek, and forward transcript lines until drained — retargeting to a
 /// newly-bound path whenever the session asks.
+///
+/// `first_output` is the watchdog's Phase-2 credit flag; it is consumed (set
+/// once, then dropped) the moment the FIRST transcript line is forwarded, so
+/// the stream-json first-output deadline measures real forwarded output
+/// (claudepr-33fdf4ed).
+#[allow(clippy::too_many_arguments)] // tail state; grouping would obscure the loop's inputs
 fn tail_loop(
     initial_path: PathBuf,
     initial_offset: u64,
@@ -655,6 +678,7 @@ fn tail_loop(
     mut writer: Box<dyn Write + Send + 'static>,
     drain_rx: &mpsc::Receiver<()>,
     retarget_rx: &mpsc::Receiver<PathBuf>,
+    mut first_output: Option<Arc<AtomicBool>>,
 ) {
     use std::fs::File;
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -747,6 +771,14 @@ fn tail_loop(
             Ok(_) => {
                 let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
                 if !trimmed.is_empty() {
+                    // Credit the watchdog's first-output deadline before the
+                    // write: a forwarded line proves the child is producing
+                    // stream-json events, which is exactly what Phase 2
+                    // measures (claudepr-33fdf4ed). Consumed after the first
+                    // line so the hot path pays nothing afterwards.
+                    if let Some(flag) = first_output.take() {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     let _ = writeln!(writer, "{}", trimmed);
                 }
             }
@@ -845,6 +877,15 @@ mod tests {
     }
 
     fn spawn_bound(dir: &TempDir) -> (PathBuf, PathBuf, Arc<Mutex<Vec<u8>>>, StreamJsonHandle) {
+        spawn_bound_with_flag(dir, None)
+    }
+
+    /// `spawn_bound` with a watchdog Phase-2 credit flag — for the
+    /// claudepr-33fdf4ed first-output tests.
+    fn spawn_bound_with_flag(
+        dir: &TempDir,
+        first_output: Option<Arc<AtomicBool>>,
+    ) -> (PathBuf, PathBuf, Arc<Mutex<Vec<u8>>>, StreamJsonHandle) {
         let projects_dir = dir.path().join("projects").join("shared-cwd");
         std::fs::create_dir_all(&projects_dir).unwrap();
         let identity_path = dir.path().join("session-identity.json");
@@ -855,6 +896,7 @@ mod tests {
             projects_dir.clone(),
             pre_existing,
             writer,
+            first_output,
         );
         (identity_path, projects_dir, buf, handle)
     }
@@ -970,6 +1012,100 @@ mod tests {
             !text.contains("SIBLING-NEWEST"),
             "reader forwarded the newest-mtime candidate instead of the \
              identity payload's exact transcript_path; got:\n{text}"
+        );
+    }
+
+    // ── claudepr-33fdf4ed: Phase-2 first-output credit ─────────────────────────
+
+    /// The watchdog's first-output flag must be credited exactly when the
+    /// reader forwards its FIRST transcript line — that credit is what makes
+    /// the stream-json deadline a first-output deadline instead of the
+    /// unconditional session cap it was while nothing could set the flag.
+    #[test]
+    fn first_forwarded_line_credits_watchdog_flag() {
+        use std::sync::atomic::Ordering;
+
+        let dir = TempDir::new().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let (identity_path, projects_dir, buf, handle) =
+            spawn_bound_with_flag(&dir, Some(Arc::clone(&flag)));
+
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag must start unset before any output exists"
+        );
+
+        // Transcript content exists, but nothing is bound yet: nothing
+        // forwarded, so nothing credited.
+        let ours_path = projects_dir.join("ours-session.jsonl");
+        append_markers(&ours_path, &["CREDIT-ME"]);
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag was credited while the binding was still unresolved — \
+             the deadline would be satisfied by output nobody forwarded"
+        );
+
+        // Identity resolves → the reader binds, forwards the line, and only
+        // then credits the flag.
+        write_identity(
+            &identity_path,
+            &format!(
+                "{}\n",
+                serde_json::json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "ours-session",
+                    "transcript_path": ours_path.display().to_string(),
+                })
+            ),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "reader forwarded no first line within 5s of a resolved \
+                 binding — the watchdog deadline would fire on a healthy run"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.signal_drain();
+        drop(handle);
+        assert!(
+            forwarded(&buf).contains("CREDIT-ME"),
+            "the credit fired without the line actually being forwarded"
+        );
+    }
+
+    /// The flag must be handed over untouched: a reader that never forwards
+    /// (unresolved binding, no drain) must leave it unset, or the Phase-2
+    /// deadline would be disarmed for a run that produced nothing.
+    #[test]
+    fn first_output_flag_stays_unset_while_nothing_is_forwarded() {
+        use std::sync::atomic::Ordering;
+
+        let dir = TempDir::new().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let (_identity_path, projects_dir, buf, handle) =
+            spawn_bound_with_flag(&dir, Some(Arc::clone(&flag)));
+
+        // Two new candidates: attribution is refused, nothing is ever
+        // forwarded, so the flag must stay unset.
+        append_markers(&projects_dir.join("a.jsonl"), &["A"]);
+        append_markers(&projects_dir.join("b.jsonl"), &["B"]);
+        thread::sleep(IDENTITY_GRACE + Duration::from_millis(150));
+
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag credited with zero forwarded output"
+        );
+        assert!(
+            forwarded(&buf).trim().is_empty(),
+            "reader forwarded an ambiguous candidate"
+        );
+        drop(handle);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "flag credited on exit without any forwarded line"
         );
     }
 

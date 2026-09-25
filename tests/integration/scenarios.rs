@@ -551,11 +551,15 @@ fn stream_json_reader_binds_single_candidate_and_tails_projects_dir_jsonl() {
 
     // Spawn the BOUND reader. At this instant the new session's file does NOT
     // exist yet (session_id unknown) — exactly the PROMPT_INJECTED condition.
+    // The trailing None is the watchdog first-output flag (claudepr-33fdf4ed):
+    // these binding tests don't exercise the Phase-2 deadline, so the reader
+    // gets no flag to credit.
     let handle = spawn_stream_json_reader_bound_to(
         identity_path,
         projects_dir.clone(),
         pre_existing,
         writer,
+        None,
     );
 
     // claude now creates THIS session's transcript and writes the first event.
@@ -653,6 +657,7 @@ fn stream_json_reader_identity_binding_wins_over_newest_sibling() {
         projects_dir.clone(),
         pre_existing,
         writer,
+        None,
     );
 
     // The SIBLING session creates its transcript first (so it is older) — and
@@ -732,6 +737,7 @@ fn stream_json_reader_refuses_ambiguous_candidates_until_retarget() {
         projects_dir.clone(),
         pre_existing,
         writer,
+        None,
     );
 
     // Two concurrent sessions create transcripts — neither ours.
@@ -819,6 +825,7 @@ fn stream_json_reader_binds_when_identity_arrives_late() {
         projects_dir.clone(),
         pre_existing,
         writer,
+        None,
     );
 
     // Ambiguous window: two candidates, no identity yet.
@@ -913,6 +920,7 @@ fn stream_json_reader_late_identity_rebinds_after_fallback_bind_matured() {
         projects_dir.clone(),
         pre_existing,
         writer,
+        None,
     );
 
     // Sole new candidate: the fallback matures after IDENTITY_GRACE and binds
@@ -1019,6 +1027,7 @@ fn stream_json_reader_retarget_same_path_does_not_duplicate() {
         projects_dir.clone(),
         pre_existing,
         writer,
+        None,
     );
 
     // Identity binds us to our transcript; it gets a first event.
@@ -1094,6 +1103,7 @@ fn stream_json_reader_retarget_binds_from_snapshot_offset() {
         projects_dir.clone(),
         pre_existing,
         writer,
+        None,
     );
 
     // No identity ever lands. Two sibling sessions start after the injection:

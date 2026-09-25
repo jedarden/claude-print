@@ -469,7 +469,7 @@ Drop-in for `claude -p`:
 | `--dangerously-skip-permissions` | Forwarded |
 | `--timeout SECS` | Wall-clock timeout (default: 3600) |
 | `--first-output-timeout SECS` | PTY first-output timeout in seconds (default: 90). If child produces no PTY output within this deadline, watchdog terminates with timeout error. |
-| `--stream-json-timeout SECS` | Stream-json first-output timeout in seconds (default: 90). If child produces no stream-json events within this deadline, watchdog terminates with timeout error. |
+| `--stream-json-timeout SECS` | Stream-json first-output timeout in seconds (default: 90). If the live transcript reader forwards no transcript line within this deadline (stream-json mode only), watchdog terminates with timeout error. A session that outlives the deadline with events flowing is NOT terminated. `0` disables the deadline. |
 | `--stop-hook-timeout SECS` | Stop hook watchdog timeout in seconds (default: 120). If Stop hook doesn't fire within this deadline after prompt injection, watchdog assumes child is hung and terminates. |
 | `--claude-binary PATH` | Override claude binary path (default: resolves `claude` from PATH) |
 | `--no-inherit-hooks` | Disable user hook inheritance; passes `--setting-sources=` to claude (verified per OQ-2 resolution) |
@@ -797,12 +797,14 @@ The watchdog prevents indefinite hangs when the child `claude` process wedges. W
 
 **Timeout types:**
 
-| Timeout Type | Default | Purpose | Error Subtype |
-|--------------|---------|---------|---------------|
-| PTY first-output timeout | 90 s | Child produces no PTY output within deadline (process may be hung at startup) | `pty_first_output_timeout` |
-| Stream-json first-output timeout | 90 s | Child produces no stream-json events within deadline (process may be hung during session initialization) | `stream_json_first_output_timeout` |
-| Overall timeout | 3600 s | Session exceeded overall max-turn deadline (max-turn timeout applies throughout entire session) | `overall_timeout` |
-| Stop hook timeout | 120 s | Stop hook didn't fire within deadline after prompt injection (child may have hung during tool use or model inference) | `stop_hook_timeout` |
+| Timeout Type | Default | Purpose | Wire subtype |
+|--------------|---------|---------|--------------|
+| PTY first-output timeout | 90 s | Child produces no PTY output within deadline (process may be hung at startup) | `timeout` |
+| Stream-json first-output timeout | 90 s | Live transcript reader forwards no transcript line within deadline (process may be hung during session initialization) | `timeout` |
+| Overall timeout | 3600 s | Session exceeded overall max-turn deadline (max-turn timeout applies throughout entire session) | `timeout` |
+| Stop hook timeout | 120 s | Stop hook didn't fire within deadline after prompt injection (child may have hung during tool use or model inference) | `timeout` |
+
+Every deadline funnels into the single `Timeout` error variant, so the JSON/stream-json wire subtype is always `timeout`; the fine-grained reason (which deadline fired) travels only in the human-readable stderr message (`TimeoutType::description`). Per-timeout subtype strings were never emitted and are deliberately absent — do not reintroduce them without changing the documented wire contract (claudepr-33fdf4ed).
 
 **Implementation:** `src/watchdog.rs` runs timeout checks on separate deadlines tracked via `Instant::now()`. Each timeout is independent — if any deadline expires, the watchdog triggers cleanup: SIGTERM child → 2 s grace → SIGKILL → waitpid → emit timeout result and exit.
 
@@ -810,7 +812,7 @@ The watchdog operates through a multi-phase timeout thread that monitors four di
 
 1. **PTY first-output detection**: If the child produces no PTY output within the deadline, the watchdog assumes the process is hung at startup and terminates it.
 
-2. **Stream-json first-output monitoring**: A background monitor thread watches `<temp_dir>/transcript.jsonl` for valid JSON lines. This monitor only runs in `stream-json` output mode (guarded by `stream_json_mode` flag). In text/json modes, this timeout is disabled because the transcript is written directly to `~/.claude/projects/` rather than the temp directory. The monitor wakes every 100ms to check if the file exists and contains valid JSON.
+2. **Stream-json first-output monitoring**: In `stream-json` output mode (guarded by the `stream_json_mode` flag), the deadline is credited through the live transcript reader spawned at `PROMPT_INJECTED`: the session hands the reader the watchdog's shared first-output flag (`WatchdogState::stream_json_output_flag`), and the reader stores it the moment it forwards its first transcript line — so the deadline measures real forwarded output, not wall-clock session age (claudepr-33fdf4ed; the pre-fix file poller watched `<temp_dir>/transcript.jsonl`, a location nothing writes, which made this deadline an unconditional session cap). If the reader cannot be spawned (projects dir underivable, live tailing degraded), the session credits the deadline itself: nothing else could ever observe output, so an unobservable stream must not re-arm an unconditional kill. In text/json modes no reader runs and this timeout is disabled entirely.
 
 3. **Overall session timeout**: Enforced throughout the entire session duration, regardless of current phase. This prevents indefinite polling of `stop.fifo` if the child wedges during any stage of execution.
 
@@ -818,11 +820,11 @@ The watchdog operates through a multi-phase timeout thread that monitors four di
 
 **State tracking**: The watchdog uses atomic flags for thread-safe state coordination:
 - `pty_output_received`: Set when PTY output is detected
-- `stream_json_output_received`: Set when stream-json events are detected  
+- `stream_json_output_received`: Set by the live transcript reader when it forwards its first line (or by the session when the reader could not be spawned)
 - `prompt_injected_at`: Captures the timestamp when prompt injection occurs
 - `timeout_fired` and `timeout_type`: Indicate which timeout triggered
 
-**Integration with event loop:** The watchdog is consulted on each `poll()` iteration. When a timeout fires, the event loop breaks, cleanup runs, and a timeout result is emitted with the appropriate `subtype` field. The watchdog signals the event loop via a self-pipe mechanism — the timeout thread writes a byte to a pipe fd that's included in the `poll()` set, waking the main loop immediately when a timeout occurs.
+**Integration with event loop:** The watchdog is consulted on each `poll()` iteration. When a timeout fires, the event loop breaks, cleanup runs, and a timeout result is emitted with the `timeout` subtype (see the table above). The watchdog signals the event loop via a self-pipe mechanism — the timeout thread writes a byte to a pipe fd that's included in the `poll()` set, waking the main loop immediately when a timeout occurs.
 
 ### 11. NEEDLE Agent Config
 

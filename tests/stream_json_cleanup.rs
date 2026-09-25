@@ -117,11 +117,14 @@ fn test_stream_json_bound_reader_drop_joins_thread_while_unbound() {
     // Create a pre-existing snapshot (empty in this case)
     let pre_existing = claude_print::emitter::snapshot_jsonl_sizes(&projects_path);
 
-    // Spawn the bound reader; no identity file, no candidates
+    // Spawn the bound reader; no identity file, no candidates. The trailing
+    // None is the watchdog first-output flag (claudepr-33fdf4ed) — not under
+    // test here, so the reader gets none.
     let handle = claude_print::emitter::spawn_stream_json_reader_bound(
         identity_path,
         projects_path,
         pre_existing,
+        None,
     );
 
     // Give it time to start polling

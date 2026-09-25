@@ -33,6 +33,15 @@ impl EnvGuard {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    /// Capture the current value, then unset `key` (defensive — clears any
+    /// stale flag, e.g. MOCK_SILENT leaked from a shell env, that would
+    /// derail the run).
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -216,4 +225,97 @@ fn watchdog_one_second_timeout_fires_cleanly() {
         after_count, before_count,
         "temp dir cleanup must happen even with very short timeout"
     );
+}
+
+/// claudepr-33fdf4ed: the stream-json first-output deadline must be a
+/// FIRST-OUTPUT deadline, not an unconditional session cap.
+///
+/// MOCK_EARLY_JSONL=1 makes mock-claude write the transcript the moment the
+/// prompt arrives — while the turn is still running — and MOCK_DELAY_STOP=12000
+/// then holds the session open well past the 6 s stream-json first-output
+/// deadline configured here. The live reader binds on the identity payload,
+/// forwards that early line, and thereby credits the watchdog's shared
+/// first-output flag, so the deadline is satisfied even though the session
+/// outlives it. Before the fix the flag was credited by a poller watching
+/// `<temp_dir>/transcript.jsonl` — a file nothing writes in production — so
+/// this exact session was killed at ~6 s with `Error::Timeout` while events
+/// were actively flowing.
+#[test]
+fn stream_json_session_outliving_first_output_deadline_survives() {
+    let _lock = env_lock();
+
+    let mock_bin = mock_claude_bin();
+    if !mock_bin.exists() {
+        eprintln!(
+            "Skipping test: mock-claude binary not found at {}",
+            mock_bin.display()
+        );
+        return;
+    }
+
+    // Defensive: MOCK_SILENT would make the child block forever and never
+    // fire Stop, turning this into a timeout.
+    let _silent_guard = EnvGuard::remove("MOCK_SILENT");
+
+    // Hermetic HOME so the mock's transcript lands under a throwaway
+    // ~/.claude/projects/<cwd-slug>/ rather than the real one.
+    let home = tempfile::TempDir::new().expect("temp HOME");
+    let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+
+    // The shape under test: transcript events land EARLY (after identity,
+    // before Stop), and Stop is held back 12 s — twice the deadline below.
+    // The deadline clock starts at session start, and the fixture's startup
+    // scan (trust-dialog settle 2 s + post-dismiss idle 1 s) means
+    // PROMPT_INJECTED — and with it the reader and its first forwarded line —
+    // cannot land before ~3 s, so the deadline must exceed that too.
+    let _early_guard = EnvGuard::set("MOCK_EARLY_JSONL", "1");
+    let _delay_guard = EnvGuard::set("MOCK_DELAY_STOP", "12000");
+
+    const RESPONSE: &str = "watchdog-first-output-response";
+    let _resp_guard = EnvGuard::set("MOCK_RESPONSE", RESPONSE);
+
+    let result = Session::run(
+        &mock_bin,
+        // No child args needed: mock_claude derives its FIFO path from the
+        // `--settings` claude-print injects and fires Stop unconditionally.
+        &[],
+        b"hold the session open past the deadline".to_vec(),
+        Some(30), // overall wall-clock timeout (s) — must exceed the 12 s hold
+        Some(20), // PTY first-output timeout (s)
+        Some(6),  // stream-json first-output timeout (s) — the deadline under test
+        Some(20), // stop-hook timeout (s)
+        OutputFormat::StreamJson,
+        &Default::default(), // bf-uj0: headless-launch knobs (all off)
+    );
+
+    let session = result.unwrap_or_else(|e| {
+        panic!(
+            "a stream-json session with events flowing must survive the \
+             first-output deadline, got: {e:?}"
+        )
+    });
+
+    // Survival is only meaningful if the session really outlived the
+    // deadline: the mock held Stop back a full 12 s against a 6 s deadline.
+    assert!(
+        session.duration_ms >= 12000,
+        "session must outlive the 6 s deadline (mock holds Stop 12 s), \
+         duration_ms={}",
+        session.duration_ms
+    );
+
+    // The success is the real end-to-end path: the transcript the mock wrote
+    // early was read back (no last_assistant_message fallback needed — the
+    // file existed before Stop).
+    assert_eq!(
+        session.transcript.text, RESPONSE,
+        "response text must come from the transcript the mock wrote"
+    );
+
+    // Join the reader (drain + drop) so the test leaves no live reader
+    // thread writing to stdout after it returns.
+    if let Some(handle) = session.stream_json_handle {
+        handle.signal_drain();
+        drop(handle);
+    }
 }

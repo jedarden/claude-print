@@ -113,6 +113,19 @@ fn main() {
     let mock_silent = env_flag("MOCK_SILENT");
     let mock_exit_before_stop = env_flag("MOCK_EXIT_BEFORE_STOP");
     let mock_delay_stop_ms: u64 = env_u64("MOCK_DELAY_STOP", 0);
+    // claudepr-33fdf4ed: MOCK_EARLY_JSONL=1 writes the transcript JSONL the
+    // moment the prompt arrives, BEFORE the Stop payload — as real claude
+    // does (events land in the transcript while the turn is still running;
+    // the default fixture order writes everything at Stop). Paired with
+    // MOCK_DELAY_STOP — re-applied between the early write and the Stop
+    // write, see below — the session is held open past claude-print's
+    // stream-json first-output deadline WITH transcript events already
+    // flowing: exactly the shape that deadline must tolerate, and exactly
+    // the shape its old unconditional firing got wrong. Not combined with
+    // MOCK_DELAY_JSONL (that delays the write PAST Stop, the opposite
+    // ordering) or MOCK_APPEND_ON_TERM (whose arming site is the skipped
+    // late write).
+    let mock_early_jsonl = env_flag("MOCK_EARLY_JSONL");
     // bf-5206: the trust dialog is ON by default in claude-print-driven mode —
     // real Claude Code shows a first-run trust prompt, and claude-print's startup
     // scanner needs those keywords to reach PROMPT_INJECTED. MOCK_TRUST_DIALOG=0
@@ -326,8 +339,11 @@ fn main() {
     }
 
     // Delay Stop if requested. Skipped under MOCK_STOP_BEFORE_INJECT so the Stop
-    // fires immediately (see comment above the trust-dialog emission).
-    if mock_delay_stop_ms > 0 && !mock_stop_before_inject {
+    // fires immediately (see comment above the trust-dialog emission), and
+    // under MOCK_EARLY_JSONL — there the delay is re-applied AFTER the early
+    // transcript write instead, so the JSONL really lands before the deadline
+    // the held-open session must survive.
+    if mock_delay_stop_ms > 0 && !mock_stop_before_inject && !mock_early_jsonl {
         thread::sleep(Duration::from_millis(mock_delay_stop_ms));
     }
 
@@ -498,7 +514,8 @@ fn main() {
     // Timed just before the Stop write: the reader must never see transcript
     // content before identity, and the transcript JSONL below lands after Stop
     // (later still with MOCK_DELAY_JSONL), so this ordering preserves that
-    // invariant on every scenario.
+    // invariant on every scenario. (MOCK_EARLY_JSONL writes the JSONL between
+    // this identity write and the Stop write — still after identity.)
     if driven_by_claude_print && !mock_stop_before_inject {
         let identity_payload = format!(
             "{{\"hook_event_name\":\"UserPromptSubmit\"{session_id_part}{transcript_path_part}{cwd_part}}}\n"
@@ -518,36 +535,12 @@ fn main() {
         }
     }
 
-    // O_WRONLY on a FIFO blocks until a reader opens the other end.
-    if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&fifo_path) {
-        let _ = file.write_all(payload.as_bytes());
-    }
-
-    // bf-3isy: write the transcript JSONL to the path advertised above. With
-    // MOCK_DELAY_JSONL the write lands <ms> AFTER the Stop payload, so the
-    // Stop-before-JSONL race window is real (the retry loop must absorb it).
-    // Skipped when transcript_path was omitted — there is no advertised path
-    // to honor, and MOCK_OMIT_TRANSCRIPT_PATH's own scenario relies on the
-    // last_assistant_message fallback.
-    //
-    // claudepr-26e7a0b6: the write is ALSO skipped when claude's transcript
-    // persistence gate says saving is off — mirroring real claude 2.1.263,
-    // which still reports `transcript_path` in the Stop payload but never
-    // creates the file when it considers itself a child session. The gate
-    // (verified in the claude bundle) is:
-    //   * CLAUDE_CODE_FORCE_SESSION_PERSISTENCE set → always save;
-    //   * else CLAUDE_CODE_CHILD_SESSION or CLAUDE_CODE_SKIP_PROMPT_HISTORY
-    //     set → "Transcript saving is off", no transcript file.
-    // claude-print's pty.rs scrubs both markers and sets the force flag before
-    // execvp, so a claude-print-driven mock always writes. A harness that
-    // forgets the scrub (or a future claude gating on something new) fails
-    // these tests loudly — stream-json emits nothing and json reports zero
-    // usage — instead of silently passing.
-    // claudepr-f3ed858a: under MOCK_WRITE_DERIVED_JSONL a transcript_path-less
-    // payload still gets a transcript file — at the path claude-print must
-    // DERIVE from session_id + cwd (the whole point of the derivation fallback:
-    // real claude writes the JSONL there even when it omits transcript_path).
-    // Requires session_id + cwd advertised; without them there is no filename.
+    // The derived-transcript fallback path (claudepr-f3ed858a): at the path
+    // claude-print must DERIVE from session_id + cwd (the whole point of the
+    // derivation fallback: real claude writes the JSONL there even when it
+    // omits transcript_path). Requires session_id + cwd advertised; without
+    // them there is no filename. Computed before the Stop write so the
+    // MOCK_EARLY_JSONL early write below can use it too.
     let derived_transcript_path: Option<String> =
         if transcript_path.is_none() && write_derived_jsonl && !omit_session_id && !omit_cwd {
             Some(
@@ -562,61 +555,108 @@ fn main() {
             None
         };
 
-    if let Some(path) = transcript_path.or(derived_transcript_path) {
-        let force_persistence = std::env::var_os("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE")
-            .is_some_and(|v| !v.is_empty());
-        let saving_disabled = !force_persistence
-            && (std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_some()
-                || std::env::var_os("CLAUDE_CODE_SKIP_PROMPT_HISTORY").is_some());
-        if saving_disabled {
-            eprintln!(
-                "mock-claude: Transcript saving is off — child-session marker inherited; \
-                 not writing {path}"
-            );
-        } else {
-            if mock_delay_jsonl_ms > 0 {
-                thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
-            }
-            write_transcript_jsonl(&path, &mock_response, &session_id, mock_is_error);
-
-            // MOCK_APPEND_ON_TERM=1 (claudepr-61cb0f95): arm the teardown
-            // window. On SIGTERM (pool teardown's group signal) or SIGHUP
-            // (what the master close delivers first), append one extra result
-            // line to the transcript just written, then _exit — the last
-            // thing the worker does before the daemon observes its exit and
-            // replies to the release. The stream-json reader of a caller
-            // whose release reached the daemon BEFORE the drain signal must
-            // therefore forward this line; a caller that drained first joins
-            // its reader before the release can trigger the append, and the
-            // line never surfaces. That asymmetry is the release-before-drain
-            // pin. Arming happens here — after the transcript exists — so
-            // only a teardown of a fully-served worker can fire it; the
-            // hold-alive at the end of main keeps the worker from exiting on
-            // its own, so the client's release (not an early exit) is what
-            // triggers the append.
-            if env_flag("MOCK_APPEND_ON_TERM") {
-                let file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .unwrap_or_else(|e| panic!("mock-claude: cannot append-open {path}: {e}"));
-                APPEND_ON_TERM_FD.store(file.into_raw_fd(), Ordering::Relaxed);
-                // SAFETY: signal(2) installs the handlers above; nothing else
-                // runs first. Raw libc rather than nix for the same reason as
-                // the SIGINT trap: this workspace member's only dependency is
-                // libc.
-                unsafe {
-                    libc::signal(
-                        libc::SIGTERM,
-                        append_on_term_handler as *const () as libc::sighandler_t,
-                    );
-                    libc::signal(
-                        libc::SIGHUP,
-                        append_on_term_handler as *const () as libc::sighandler_t,
-                    );
+    // claudepr-33fdf4ed: MOCK_EARLY_JSONL=1 — write the transcript NOW (the
+    // prompt has arrived; the session is mid-turn) and hold the Stop payload
+    // back for MOCK_DELAY_STOP, so the session stays alive past
+    // claude-print's stream-json first-output deadline with transcript
+    // events already flowing. The persistence gate mirrors the late write
+    // below; the transcript still lands AFTER the identity write, preserving
+    // the reader's binding invariant.
+    if mock_early_jsonl && !mock_stop_before_inject {
+        if let Some(path) = transcript_path.clone().or(derived_transcript_path.clone()) {
+            if transcript_saving_disabled() {
+                eprintln!(
+                    "mock-claude: Transcript saving is off — child-session marker inherited; \
+                     not writing {path}"
+                );
+            } else {
+                write_transcript_jsonl(&path, &mock_response, &session_id, mock_is_error);
+                // The pre-prompt MOCK_DELAY_STOP was skipped; hold the
+                // session open HERE instead — after the transcript exists,
+                // before Stop.
+                if mock_delay_stop_ms > 0 {
+                    thread::sleep(Duration::from_millis(mock_delay_stop_ms));
                 }
             }
         }
     }
+
+    // O_WRONLY on a FIFO blocks until a reader opens the other end.
+    if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&fifo_path) {
+        let _ = file.write_all(payload.as_bytes());
+    }
+
+    // bf-3isy: write the transcript JSONL to the path advertised above. With
+    // MOCK_DELAY_JSONL the write lands <ms> AFTER the Stop payload, so the
+    // Stop-before-JSONL race window is real (the retry loop must absorb it).
+    // Skipped when transcript_path was omitted — there is no advertised path
+    // to honor, and MOCK_OMIT_TRANSCRIPT_PATH's own scenario relies on the
+    // last_assistant_message fallback. Skipped under MOCK_EARLY_JSONL too —
+    // that knob wrote the file BEFORE the Stop payload above, and a second
+    // write here would be a no-op rewrite at best.
+    //
+    // claudepr-26e7a0b6: the write is ALSO skipped when claude's transcript
+    // persistence gate says saving is off (`transcript_saving_disabled`,
+    // shared with the early write) — mirroring real claude 2.1.263, which
+    // still reports `transcript_path` in the Stop payload but never creates
+    // the file when it considers itself a child session. claude-print's
+    // pty.rs scrubs both markers and sets the force flag before execvp, so a
+    // claude-print-driven mock always writes. A harness that forgets the
+    // scrub (or a future claude gating on something new) fails these tests
+    // loudly — stream-json emits nothing and json reports zero usage —
+    // instead of silently passing.
+    if !mock_early_jsonl {
+        if let Some(path) = transcript_path.or(derived_transcript_path) {
+            if transcript_saving_disabled() {
+                eprintln!(
+                    "mock-claude: Transcript saving is off — child-session marker inherited; \
+                 not writing {path}"
+                );
+            } else {
+                if mock_delay_jsonl_ms > 0 {
+                    thread::sleep(Duration::from_millis(mock_delay_jsonl_ms));
+                }
+                write_transcript_jsonl(&path, &mock_response, &session_id, mock_is_error);
+
+                // MOCK_APPEND_ON_TERM=1 (claudepr-61cb0f95): arm the teardown
+                // window. On SIGTERM (pool teardown's group signal) or SIGHUP
+                // (what the master close delivers first), append one extra result
+                // line to the transcript just written, then _exit — the last
+                // thing the worker does before the daemon observes its exit and
+                // replies to the release. The stream-json reader of a caller
+                // whose release reached the daemon BEFORE the drain signal must
+                // therefore forward this line; a caller that drained first joins
+                // its reader before the release can trigger the append, and the
+                // line never surfaces. That asymmetry is the release-before-drain
+                // pin. Arming happens here — after the transcript exists — so
+                // only a teardown of a fully-served worker can fire it; the
+                // hold-alive at the end of main keeps the worker from exiting on
+                // its own, so the client's release (not an early exit) is what
+                // triggers the append.
+                if env_flag("MOCK_APPEND_ON_TERM") {
+                    let file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap_or_else(|e| panic!("mock-claude: cannot append-open {path}: {e}"));
+                    APPEND_ON_TERM_FD.store(file.into_raw_fd(), Ordering::Relaxed);
+                    // SAFETY: signal(2) installs the handlers above; nothing else
+                    // runs first. Raw libc rather than nix for the same reason as
+                    // the SIGINT trap: this workspace member's only dependency is
+                    // libc.
+                    unsafe {
+                        libc::signal(
+                            libc::SIGTERM,
+                            append_on_term_handler as *const () as libc::sighandler_t,
+                        );
+                        libc::signal(
+                            libc::SIGHUP,
+                            append_on_term_handler as *const () as libc::sighandler_t,
+                        );
+                    }
+                }
+            }
+        }
+    } // !mock_early_jsonl
 
     // claudepr-8dcf53ce: degraded-run Stop duplication (MOCK_EXTRA_STOPS, see
     // its parsing above). Each extra firing is its own write-end open + write
@@ -871,6 +911,24 @@ fn json_escape(s: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+/// claude's transcript persistence gate (claudepr-26e7a0b6, verified in the
+/// claude 2.1.263 bundle): `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` set →
+/// always save; else `CLAUDE_CODE_CHILD_SESSION` or
+/// `CLAUDE_CODE_SKIP_PROMPT_HISTORY` set → "Transcript saving is off", no
+/// transcript file. Shared by the Stop-time write and the MOCK_EARLY_JSONL
+/// early write (claudepr-33fdf4ed) so both honor the same gate. Real claude
+/// still reports `transcript_path` while gated off; claude-print's pty.rs
+/// scrubs the markers and sets the force flag before execvp, so a
+/// claude-print-driven mock always writes — a harness that forgets the scrub
+/// fails tests loudly instead of silently passing.
+fn transcript_saving_disabled() -> bool {
+    let force_persistence =
+        std::env::var_os("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE").is_some_and(|v| !v.is_empty());
+    !force_persistence
+        && (std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_some()
+            || std::env::var_os("CLAUDE_CODE_SKIP_PROMPT_HISTORY").is_some())
 }
 
 /// Write a well-formed Claude Code transcript JSONL file at `path`.
