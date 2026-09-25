@@ -300,12 +300,18 @@ fn derived_asset_names_match_readme_and_installer() {
 
 #[test]
 fn installer_suites_fake_up_releases_from_the_published_asset_names() {
-    // The behavioral suites hand-build their `file://` releases — if CI
-    // ever renames an asset, those fakes would keep passing against names
-    // no release carries. Pin their constants to the names derived from
-    // the WorkflowTemplate's toolchain set, so a rename fails here first.
+    // The behavioral suites hand-build their fake releases (via the
+    // `file://` override, or a recording `curl` for the default-source
+    // suite) — if CI ever renames an asset, those fakes would keep
+    // passing against names no release carries. Pin their constants to
+    // the names derived from the WorkflowTemplate's toolchain set, so a
+    // rename fails here first.
     let (binary_asset, mock_asset) = published_assets();
-    for suite in ["tests/install_sh.rs", "tests/install_sh_arch.rs"] {
+    for suite in [
+        "tests/install_sh.rs",
+        "tests/install_sh_arch.rs",
+        "tests/install_sh_release_source.rs",
+    ] {
         let source = repo_file(suite);
         assert!(
             source.contains(&format!("const BINARY_ASSET: &str = \"{binary_asset}\";")),

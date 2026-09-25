@@ -174,6 +174,7 @@ fn runbook_documents_the_release_provenance_contract() {
         "tests/platform_matrix_docs.rs",
         "tests/install_sh_arch.rs",
         "tests/install_sh.rs",
+        "tests/install_sh_release_source.rs",
         "tests/release_runbook_docs.rs",
     ] {
         assert!(

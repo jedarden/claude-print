@@ -38,6 +38,11 @@ checksum verification against whichever host serves them, so a mirror can
 redistribute the artifacts but cannot bypass verification. With no mirror
 reachable, [build from source](#build-from-source) from the canonical Forgejo
 repository — source availability never depends on the mirror.
+`tests/install_sh_release_source.rs` pins the default itself: with the
+variable unset the installer fetches `sha256sums.txt` first and then the
+`x86_64-linux` assets from the GitHub Releases base of the repo the
+`claude-print-ci` workflow publishes to — tag-less, so it always installs
+the latest release.
 
 ### Upgrades and rollback
 

@@ -206,4 +206,5 @@ unchanged because the manifest travels with the release.
 | WorkflowTemplate ↔ README matrix ↔ installer mapping agreement; asset names derived from the toolchain set | `tests/platform_matrix_docs.rs` |
 | Per-row installer behavior for the matrix (refusal before download, nothing placed) | `tests/install_sh_arch.rs` |
 | Fail-closed verification (missing manifest / unlisted asset / digest mismatch), rollback copy semantics | `tests/install_sh.rs` |
+| The default release source the override redirects: the tag-less `releases/latest/download` base over the publisher's repo slug (workflow `--repo` flags and Forgejo clone URL agree), manifest-first fetch order, and the x86_64 asset names requested from the default | `tests/install_sh_release_source.rs` |
 | This runbook ↔ the WorkflowTemplate: asset names and the toolchain claim, publication order (tag→Forgejo before `gh release create`, draft/publish idempotency before the build, manifest generation before upload), manifest coverage of exactly the uploaded assets, bare-name generation, mode/version wiring | `tests/release_runbook_docs.rs` |
