@@ -6,15 +6,18 @@
 //! sequencer's idle fallback (src/startup.rs: no dialog on screen, ≥ 200
 //! bytes received, quiet window elapsed → bare CR).
 //!
-//! The TUI side is version-pinned: `tests/fixtures/terminal_probes_v2.1.270.json`
-//! holds a startup capture of claude 2.1.270 (2026-09-14) taken with
+//! The TUI side is version-pinned: `tests/fixtures/terminal_probes_v2.1.282.json`
+//! holds a startup capture of claude 2.1.282 (2026-09-24) taken with
 //! `scripts/probe-tui-terminal-probes.py --answer` — the driver replies via a
 //! faithful port of this responder, so the capture is the production probe
-//! shape. On 2.1.270 the TUI sends XTVERSION once, DA1 twice (the retry must
+//! shape. On 2.1.282 the TUI sends XTVERSION once, DA1 twice (the retry must
 //! be dedup-suppressed), and several sequences the doc table does not list
-//! (`?u`, `?2026$p`, SGR, mode sets) that must stay silent. Re-run the script
-//! after any Claude Code update and re-pin fixture + tests + doc together,
-//! exactly like `tests/fixtures/claude_contracts_v2.1.270.json`
+//! (`?u`, `?2026$p`, `16t`, `?1016$p`, SGR, mode sets) that must stay silent.
+//! The previous 2.1.270 capture (2026-09-14) is retained as the compatibility
+//! baseline and its probe inventory is asserted identical to the pinned one
+//! (see `retained_prior_capture_probe_inventory_matches_the_pinned_shape`).
+//! Re-run the script after any Claude Code update and re-pin fixture + tests +
+//! doc together, exactly like `tests/fixtures/claude_contracts_v2.1.282.json`
 //! (docs/notes/claude-contract-probes.md §Maintenance).
 
 use std::collections::HashSet;
@@ -30,8 +33,16 @@ const COLS: u16 = 220;
 
 /// Version-pinned capture of the real claude TUI startup probe traffic. The
 /// `v<version>` filename stamp and [`FIXTURE_VERSION`] must move together.
-const FIXTURE: &str = include_str!("fixtures/terminal_probes_v2.1.270.json");
-const FIXTURE_VERSION: &str = "2.1.270";
+const FIXTURE: &str = include_str!("fixtures/terminal_probes_v2.1.282.json");
+const FIXTURE_VERSION: &str = "2.1.282";
+
+/// The prior 2.1.270 capture, retained as the compatibility baseline: its
+/// probe inventory is asserted identical to the pinned one by
+/// [`retained_prior_capture_probe_inventory_matches_the_pinned_shape`], so a
+/// future re-pin that changes the recognized probe shape cannot silently drop
+/// the only evidence the two versions agreed.
+const PRIOR_FIXTURE: &str = include_str!("fixtures/terminal_probes_v2.1.270.json");
+const PRIOR_FIXTURE_VERSION: &str = "2.1.270";
 
 /// One row of the doc's probe table: (name, probe bytes, alternate spelling
 /// answering the same dedup bit, documented response bytes).
@@ -56,8 +67,11 @@ const PROBE_TABLE: &[ProbeRow] = &[
     ("WinSize", b"\x1b[18t", None, b"\x1b[8;50;220t"),
 ];
 
-/// Sequences the responder must stay silent on — includes ones the real
-/// 2.1.270 TUI actually sent in the pinned capture.
+/// Sequences the responder must stay silent on — includes ones the real TUI
+/// actually sent in the pinned captures (`?u`, `?2026$p` in both 2.1.270 and
+/// 2.1.282; `16t` and `?1016$p` new in the 2.1.282 capture). `16t` is the
+/// XTWINOPS cell-size-in-pixels query — the sibling of the answered `18t`
+/// chars-size probe, deliberately unanswered.
 const UNKNOWN_SEQUENCES: &[&[u8]] = &[
     b"\x1b[99t",            // unknown mode
     b"\x1b[?25h",           // cursor show (capture)
@@ -67,6 +81,8 @@ const UNKNOWN_SEQUENCES: &[&[u8]] = &[
     b"\x1b[38;5;174m",      // SGR color (capture)
     b"\x1b[?u",             // kitty keyboard query (capture)
     b"\x1b[?2026$p",        // synchronized-output query (capture)
+    b"\x1b[16t",            // cell-size-in-pixels query — 2.1.282 capture
+    b"\x1b[?1016$p",        // synchronized-output pixel query — 2.1.282 capture
     b"\x1bP1;2|body\x1b\\", // DCS string — not '['-introduced, never answered
 ];
 
@@ -287,7 +303,7 @@ fn empty_chunk_no_panic() {
     assert_eq!(resp, b"");
 }
 
-// ── Version-pinned capture (claude 2.1.270) ─────────────────────────────────
+// ── Version-pinned capture (claude 2.1.282) ─────────────────────────────────
 
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).expect("terminal probe fixture must parse")
@@ -343,8 +359,9 @@ fn fixture_capture_is_answered_with_exactly_the_documented_responses() {
         "feeding the recorded capture must answer exactly the deduped documented probes — \
          a new TUI probe here means the responder contract moved; re-measure"
     );
-    // The pinned 2.1.270 shape, spelled out: XTVERSION's DCS string answered
-    // first, then DA1 once — the capture's second DA1 is dedup-suppressed.
+    // The pinned shape, spelled out (identical on 2.1.270 and 2.1.282):
+    // XTVERSION's DCS string answered first, then DA1 once — the capture's
+    // second DA1 is dedup-suppressed.
     assert_eq!(got, b"\x1bP>|claude-print\x1b\\\x1b[?6c");
 }
 
@@ -412,6 +429,65 @@ fn fixture_probe_inventory_is_a_subset_of_the_doc_table() {
     assert!(
         recognized > 0,
         "the pinned capture must contain recognized probes"
+    );
+}
+
+/// The retained 2.1.270 capture is the compatibility baseline: the recognized
+/// probe traffic (kind, spelling, and capture order) must be identical to the
+/// pinned 2.1.282 one, which is the executable form of the comparison evidence
+/// in docs/notes/terminal-probes.md §Version-Pinned Capture. A failure here
+/// means a re-pin changed the responder's real-traffic contract, not just its
+/// version stamp — re-measure and update the doc table before re-pinning.
+#[test]
+fn retained_prior_capture_probe_inventory_matches_the_pinned_shape() {
+    let prior: Value = serde_json::from_str(PRIOR_FIXTURE).expect("prior fixture must parse");
+    assert_eq!(
+        prior["claude_version"].as_str().unwrap_or(""),
+        PRIOR_FIXTURE_VERSION,
+        "prior fixture version stamp must match its v<version> filename"
+    );
+
+    let inventory = |f: &Value| -> Vec<(String, String)> {
+        f["probe_inventory"]
+            .as_array()
+            .expect("probe_inventory")
+            .iter()
+            .map(|inv| {
+                (
+                    inv["name"].as_str().expect("probe name").to_string(),
+                    inv["params"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        inventory(&prior),
+        inventory(&fixture()),
+        "the recognized probe inventory (kind, spelling, order) must be identical across the \
+         retained 2.1.270 and pinned {FIXTURE_VERSION} captures — XTVERSION once, then DA1 twice"
+    );
+
+    // The unknown-sequence set may grow between versions (2.1.282 adds 16t and
+    // ?1016$p), but every probe kind recognized in the prior capture must
+    // still be recognized — silence can be added, answers cannot be lost.
+    let recognized = |f: &Value| -> HashSet<String> {
+        f["csi_sequences"]
+            .as_array()
+            .expect("csi_sequences")
+            .iter()
+            .filter_map(|s| {
+                let name = s["probe"].as_str().unwrap_or_default();
+                (!name.is_empty())
+                    .then(|| format!("{}:{}", name, s["params"].as_str().unwrap_or_default()))
+            })
+            .collect()
+    };
+    let prior_recognized = recognized(&prior);
+    let pinned_recognized = recognized(&fixture());
+    assert_eq!(
+        prior_recognized, pinned_recognized,
+        "no recognized probe spelling may appear or disappear between retained and pinned captures"
     );
 }
 

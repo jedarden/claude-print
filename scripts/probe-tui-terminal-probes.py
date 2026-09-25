@@ -5,7 +5,7 @@ Code TUI writes at startup, and record them as a version-pinned fixture.
 Companion to docs/notes/terminal-probes.md and tests/terminal.rs: the fixture
 this script writes (tests/fixtures/terminal_probes_v<version>.json) pins the
 probe traffic claude-print's TerminalEmu must answer, exactly like
-tests/fixtures/claude_contracts_v2.1.270.json pins the hook contracts. Re-run
+tests/fixtures/claude_contracts_v2.1.282.json pins the hook contracts. Re-run
 it after any Claude Code update; if the TUI starts emitting a probe the doc's
 table does not list, the fixture test fails loudly and forces a re-measure.
 
@@ -307,8 +307,8 @@ def main() -> int:
     untrusted = "--untrusted" in flags
     answer = "--answer" in flags
 
-    # Normalize to the bare version number ("2.1.270"), matching the
-    # claude_version field style of tests/fixtures/claude_contracts_v2.1.270.json
+    # Normalize to the bare version number ("2.1.282"), matching the
+    # claude_version field style of tests/fixtures/claude_contracts_v2.1.282.json
     # and the v<version> filename stamp.
     version = subprocess.run(
         [claude_bin, "--version"], capture_output=True, text=True, timeout=30

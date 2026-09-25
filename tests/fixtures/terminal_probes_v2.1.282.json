@@ -1,0 +1,1099 @@
+{
+  "claude_version": "2.1.282",
+  "measured_at": "2026-09-24",
+  "capture_script": "scripts/probe-tui-terminal-probes.py",
+  "evidence": "docs/notes/terminal-probes.md",
+  "environment": {
+    "term": "xterm-256color",
+    "rows": 50,
+    "cols": 220,
+    "winsize_source": "driver TIOCSWINSZ set to claude-print's stty fallback"
+  },
+  "isolation": "HOME redirected into a throwaway sandbox; CLAUDECODE* scrubbed; auth by inherited environment. Driver answered probes via the src/terminal.rs responder port (--answer). Trust pre-seeded for the probe cwd.",
+  "chunk_count": 18,
+  "capture_bytes": 3452,
+  "truncated": false,
+  "chunks": [
+    "\\x1b[33m\\x22glm-5.3\\x22 isn't described by this version's model catalog; update Claude Code, or map it with behavesAs on a modelPicker row (or modelOverrides, if it is a provider id of a model this version knows). Until then auto-compact keeps this session within 200k tokens (the context window it assumes); if the model accepts more, append [1m] to the model name for 1M, or set CLAUDE_CODE_MAX_CONTEXT_TOKENS to its real window; CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 restores the previous wait-for-the-API behavior.\\x1b[39m\\x0d\\x0a",
+    "\\x1b7\\x1b[r\\x1b8\\x1b[?25h",
+    "\\x1b[?2004h\\x1b[?2031h\\x1b[?1004h",
+    "\\x1b]0;\\xe2\\x9c\\xb3 Claude Code\\x07",
+    "\\x1b[?1049h\\x1b[2J\\x1b[H\\x1b[?1000h\\x1b[?1002h\\x1b[?1003h\\x1b[?1006h\\x1b[?25l\\x1b[?25l\\x1b[H\\x0d\\x1b[11C\\x1b[1B\\x1b[1mClaude Code\\x1b[24G\\x1b[22m\\x1b[38;5;246mv2.1.282\\x0d\\x1b[11C\\x1b[1Bglm-5.3 \\xc2\\xb7 API Usage Billing\\x0d\\x1b[11C\\x1b[1B/tmp/claude-print-probe-caps.z6k23b2_/proj\\x0d\\x1b[202C\\x1b[42B\\xe2\\x97\\x8f high \\xc2\\xb7 /effort\\x0d\\x1b[1B\\x1b[38;5;244m\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\x0d\\x1b[1B\\x1b[39m\\xe2\\x9d\\xaf\\xc2\\xa0\\x1b[7m \\x0d\\x1b[1B\\x1b[27m\\x1b[38;5;244m\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x94\\x80\\x0d\\x1b[2C\\x1b[1B\\x1b[38;5;246m\\xe2\\x8f\\xb8 manual mode on \\xc2\\xb7 ? for shortcuts \\xc2\\xb7 \\xe2\\x86\\x90 for agents\\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[>0q\\x1b[?u\\x1b[c",
+    "\\x1b[?2026$p",
+    "\\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\\x1b\\x5c\\x1b[16t\\x1b[?1016$p\\x1b[c",
+    "\\x1b[H\\x0d\\x1b[1B\\x1b[48;5;16m\\x1b[38;5;174m\\xe2\\x96\\x9b\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x84\\x0d\\x1b[1B\\x1b[48;5;16m\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x88\\xe2\\x96\\x98\\x0d\\x1b[1B\\xe2\\x96\\x9d\\xe2\\x96\\x9d \\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[2C\\x1b[1B \\x0d\\x1b[2C\\x1b[1B\\x1b[38;5;174m\\xe2\\x96\\x80\\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[1B  \\x0d\\x1b[1B\\x1b[48;5;16m\\x1b[38;5;174m\\xe2\\x96\\x9b\\xe2\\x96\\x88\\x1b[39m\\x1b[49m \\x0d\\x1b[1B\\x1b[48;5;16m\\x1b[38;5;174m\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x88\\xe2\\x96\\x80\\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[1B\\x1b[48;5;16m\\x1b[38;5;174m\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x9b\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x84\\x0d\\x1b[1B\\x1b[48;5;16m\\xe2\\x96\\x88\\x1b[3G\\xe2\\x96\\x88\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x88\\xe2\\x96\\x98\\x0d\\x1b[1B   \\xe2\\x96\\x9d\\xe2\\x96\\x9d \\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[5C\\x1b[1B \\x0d\\x1b[5C\\x1b[1B\\x1b[38;5;174m\\xe2\\x96\\x80\\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[1B     \\x0d\\x1b[3C\\x1b[1B\\x1b[48;5;16m\\x1b[38;5;174m\\xe2\\x96\\x9b\\xe2\\x96\\x88\\x1b[39m\\x1b[49m \\x0d\\x1b[1B\\x1b[48;5;16m\\x1b[38;5;174m\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x88\\xe2\\x96\\x80\\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[1B\\x1b[38;5;174m\\xe2\\x96\\x97\\xe2\\x96\\x9f\\x1b[48;5;16m\\xe2\\x96\\x9b\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x9b\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x84\\x0d\\x1b[1B \\xe2\\x96\\x9c\\x1b[4G\\x1b[48;5;16m\\xe2\\x96\\x88\\x1b[6G\\xe2\\x96\\x88\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x88\\xe2\\x96\\x98\\x0d\\x1b[1B \\xe2\\x96\\x9d\\xe2\\x96\\x9d   \\xe2\\x96\\x9d\\xe2\\x96\\x9d \\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[1B         \\x0d\\x1b[1C\\x1b[1B\\x1b[38;5;174m\\xe2\\x96\\x90\\x1b[48;5;16m\\xe2\\x96\\x9b\\x1b[7G\\xe2\\x96\\x9b\\xe2\\x96\\x88\\x1b[39m\\x1b[49m \\x0d\\x1b[1B\\x1b[38;5;246m\\xc2\\xb7\\x1b[38;5;174m\\xe2\\x96\\x9c\\x1b[48;5;16m\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x88\\x1b[38;5;246m\\xc2\\xb7\\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[3B\\x1b[38;5;246m~\\x1b[9G~\\x1b[39m\\x1b[50;1H\\x1b[48;3H",
+    "\\x1b[H\\x0d\\x1b[1B\\x1b[38;5;174m \\xe2\\x96\\x90\\x1b[48;5;16m\\xe2\\x96\\x9b\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x88\\xe2\\x96\\x9b\\xe2\\x96\\x88\\x0d\\x1b[1B\\x1b[49m\\xe2\\x96\\x9d\\xe2\\x96\\x9c\\x1b[48;5;16m\\xe2\\x96\\x88\\x1b[7G\\xe2\\x96\\x88\\x1b[49m\\xe2\\x96\\x88\\xe2\\x96\\x80\\x0d\\x1b[1B \\xe2\\x96\\x9d\\xe2\\x96\\x9d   \\xe2\\x96\\x9d\\xe2\\x96\\x9d \\x1b[39m\\x1b[50;1H\\x1b[48;3H"
+  ],
+  "csi_sequences": [
+    {
+      "offset": 0,
+      "params": "33",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 526,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 535,
+      "params": "",
+      "final": "r",
+      "probe": null
+    },
+    {
+      "offset": 540,
+      "params": "?25",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 546,
+      "params": "?2004",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 554,
+      "params": "?2031",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 562,
+      "params": "?1004",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 590,
+      "params": "?1049",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 598,
+      "params": "2",
+      "final": "J",
+      "probe": null
+    },
+    {
+      "offset": 602,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 605,
+      "params": "?1000",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 613,
+      "params": "?1002",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 621,
+      "params": "?1003",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 629,
+      "params": "?1006",
+      "final": "h",
+      "probe": null
+    },
+    {
+      "offset": 637,
+      "params": "?25",
+      "final": "l",
+      "probe": null
+    },
+    {
+      "offset": 643,
+      "params": "?25",
+      "final": "l",
+      "probe": null
+    },
+    {
+      "offset": 649,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 653,
+      "params": "11",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 658,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 662,
+      "params": "1",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 677,
+      "params": "24",
+      "final": "G",
+      "probe": null
+    },
+    {
+      "offset": 682,
+      "params": "22",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 687,
+      "params": "38;5;246",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 707,
+      "params": "11",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 712,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 745,
+      "params": "11",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 750,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 797,
+      "params": "202",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 803,
+      "params": "42",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 828,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 832,
+      "params": "38;5;244",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 1504,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 1508,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 1518,
+      "params": "7",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 1524,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 1528,
+      "params": "27",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 1533,
+      "params": "38;5;244",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2205,
+      "params": "2",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 2209,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2213,
+      "params": "38;5;246",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2279,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2284,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2291,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2298,
+      "params": ">0",
+      "final": "q",
+      "probe": "XTVERSION"
+    },
+    {
+      "offset": 2303,
+      "params": "?",
+      "final": "u",
+      "probe": null
+    },
+    {
+      "offset": 2307,
+      "params": "",
+      "final": "c",
+      "probe": "DA1"
+    },
+    {
+      "offset": 2310,
+      "params": "?2026$",
+      "final": "p",
+      "probe": null
+    },
+    {
+      "offset": 2354,
+      "params": "16",
+      "final": "t",
+      "probe": null
+    },
+    {
+      "offset": 2359,
+      "params": "?1016$",
+      "final": "p",
+      "probe": null
+    },
+    {
+      "offset": 2368,
+      "params": "",
+      "final": "c",
+      "probe": "DA1"
+    },
+    {
+      "offset": 2371,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2375,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2379,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2389,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2406,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2415,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2419,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2432,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2444,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2455,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2460,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2467,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2474,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2478,
+      "params": "2",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 2482,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2488,
+      "params": "2",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 2492,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2496,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2510,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2515,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2522,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2529,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2533,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2540,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2544,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2554,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2571,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2576,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2583,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2587,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2597,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2611,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2622,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2627,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2634,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2641,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2645,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2649,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2659,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2685,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2694,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2698,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2711,
+      "params": "3",
+      "final": "G",
+      "probe": null
+    },
+    {
+      "offset": 2721,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2733,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2747,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2752,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2759,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2766,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2770,
+      "params": "5",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 2774,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2780,
+      "params": "5",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 2784,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2788,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2802,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2807,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2814,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2821,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2825,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2835,
+      "params": "3",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 2839,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2843,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2853,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2870,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2875,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2882,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2886,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2896,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2919,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2930,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2935,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2942,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2949,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 2953,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 2957,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 2974,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3002,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3011,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3019,
+      "params": "4",
+      "final": "G",
+      "probe": null
+    },
+    {
+      "offset": 3023,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3036,
+      "params": "6",
+      "final": "G",
+      "probe": null
+    },
+    {
+      "offset": 3046,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3058,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3079,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3084,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3091,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3098,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3102,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3116,
+      "params": "1",
+      "final": "C",
+      "probe": null
+    },
+    {
+      "offset": 3120,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3124,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3138,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3151,
+      "params": "7",
+      "final": "G",
+      "probe": null
+    },
+    {
+      "offset": 3161,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3166,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3173,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3177,
+      "params": "38;5;246",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3190,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3204,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3229,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3237,
+      "params": "38;5;246",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3250,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3255,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3262,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3269,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3273,
+      "params": "3",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3277,
+      "params": "38;5;246",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3289,
+      "params": "9",
+      "final": "G",
+      "probe": null
+    },
+    {
+      "offset": 3294,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3299,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3306,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3313,
+      "params": "",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3317,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3321,
+      "params": "38;5;174",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3336,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3365,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3369,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3380,
+      "params": "48;5;16",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3393,
+      "params": "7",
+      "final": "G",
+      "probe": null
+    },
+    {
+      "offset": 3400,
+      "params": "49",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3412,
+      "params": "1",
+      "final": "B",
+      "probe": null
+    },
+    {
+      "offset": 3433,
+      "params": "39",
+      "final": "m",
+      "probe": null
+    },
+    {
+      "offset": 3438,
+      "params": "50;1",
+      "final": "H",
+      "probe": null
+    },
+    {
+      "offset": 3445,
+      "params": "48;3",
+      "final": "H",
+      "probe": null
+    }
+  ],
+  "probe_inventory": [
+    {
+      "name": "XTVERSION",
+      "params": ">0",
+      "offset": 2298
+    },
+    {
+      "name": "DA1",
+      "params": "",
+      "offset": 2307
+    },
+    {
+      "name": "DA1",
+      "params": "",
+      "offset": 2368
+    }
+  ]
+}
