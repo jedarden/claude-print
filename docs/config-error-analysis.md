@@ -115,6 +115,17 @@ main()
 | `serve` | Yes | `which` check up front; workers are spawned with this binary | **Never** — dispatched before prompt/config state | 0 clean signal shutdown, 2 setup or accept failure |
 | prompt run | Yes | `which` check; then the session child | Yes — after prompt resolution | 0 / 1 / 2 / 4 / 124 / 130 |
 
+The "Never" column for `--version`, `--check`, and `serve` is pinned at the
+binary level by `tests/config_entry_point_scope.rs` (bead claudepr-58e1a4b0):
+each entry point runs with a poisoned config — a directory at the path
+(unreadable tier) or garbage TOML (parse tier) — at the discovered path (both
+the `$XDG_CONFIG_HOME` and `$HOME/.config` rules) and via `--config`, and its
+output and exit status must be byte-identical to a run with no config file
+present; a control run proves each poison is lethal on the prompt path, so
+the identity cannot hold vacuously. A live-daemon leg poisons both channels
+at once and pins the full serve lifecycle, covering a config load placed
+inside `run_serve` as well as before the dispatch.
+
 ### `--help`
 
 Handled entirely inside `Cli::parse()`: clap prints the full help text to
@@ -163,7 +174,8 @@ service is not a failure). Pinned by
 `tests/serve.rs::serve_dispatch_enters_the_server_path_and_never_validates_a_prompt`,
 `serve_rejects_missing_claude_binary_before_binding`, and
 `default_non_serve_invocation_is_unchanged`, plus the parse-level pins in
-`src/main.rs`'s unit tests (claudepr-1feb2d1b).
+`src/main.rs`'s unit tests (claudepr-1feb2d1b) and the never-loads-config
+pins in `tests/config_entry_point_scope.rs` (claudepr-58e1a4b0).
 
 ## Config loading on the prompt path
 

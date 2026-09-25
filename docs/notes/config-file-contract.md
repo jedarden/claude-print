@@ -27,6 +27,12 @@ it entirely. Nothing else is configurable through this file: relay-hook
 internals, watchdog budgets other than `timeout_secs`, output formats, and
 pool behavior are CLI-only.
 
+That dispatch scope is pinned at the binary level by
+`tests/config_entry_point_scope.rs` (bead claudepr-58e1a4b0): each of those
+entry points runs with a poisoned config — unreadable, or garbage TOML — at
+the discovered path and via `--config`, and must produce byte-identical
+output and exit status to a run with no config file present at all.
+
 ## File location and path precedence
 
 The path is resolved in this order — the first rule that matches wins:
