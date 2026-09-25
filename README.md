@@ -23,7 +23,7 @@ The billing path is determined by an `isatty` check inside the `claude` binary: 
 sh install.sh
 ```
 
-`install.sh` downloads a pre-built static musl binary from GitHub Releases (`jedarden/claude-print`) — the supported distribution channel for release artifacts — runs `--check` to verify the setup, and copies `claude-print.yaml` to `~/.needle/agents/` if NEEDLE is present. Note that GitHub Releases is the artifact host, not the source of truth for the code; see [Repository & contributions](#repository--contributions).
+`install.sh` downloads a pre-built static musl binary from GitHub Releases (`jedarden/claude-print`) — the supported distribution channel for release artifacts — runs `--check` to verify the setup, and copies `claude-print.yaml` to `~/.needle/agents/` if NEEDLE is present (detected via `needle` on `PATH` or an existing `~/.needle/agents/`; the template is copied from the checkout beside the script, installed mode 0644, overwriting any existing copy — full semantics in [`docs/notes/installer-needle-adapter.md`](docs/notes/installer-needle-adapter.md)). Note that GitHub Releases is the artifact host, not the source of truth for the code; see [Repository & contributions](#repository--contributions).
 
 Every downloaded artifact is verified against the release's published `sha256sums.txt` before it is installed or executed. A missing manifest, an asset with no checksum entry, or any digest mismatch aborts the install with nothing placed — the check fails closed. The `mock_claude` fixture remains optional: a release whose manifest does not list it skips the fixture instead of failing.
 
@@ -62,7 +62,9 @@ the next upgrade, so two-versions-back requires installing that release
 explicitly. Only the main binary is covered: `mock_claude` and
 `~/.needle/agents/claude-print.yaml` are overwritten in place with no
 backup. Full semantics — including the mid-install failure window — are
-documented in [`docs/notes/installer-rollback.md`](docs/notes/installer-rollback.md).
+documented in [`docs/notes/installer-rollback.md`](docs/notes/installer-rollback.md);
+the adapter copy's own contract (detection, source, mode, overwrite) in
+[`docs/notes/installer-needle-adapter.md`](docs/notes/installer-needle-adapter.md).
 
 ### Repository & contributions
 
@@ -551,6 +553,8 @@ The byte-level contract underneath this section — frame formats, the `SCM_RIGH
 ## NEEDLE integration
 
 If you use NEEDLE for LLM fleet dispatch, `install.sh` automatically copies `claude-print.yaml` to `~/.needle/agents/`. This registers `claude-print` as the adapter for Anthropic subscription models (sonnet/opus/haiku) so NEEDLE workers bill against the subscription rather than the Agent SDK credit pool. See `claude-print.yaml` in the repo root for the full adapter config, including `--no-inherit-hooks` isolation mode and the `use_or_lose` cost type.
+
+The copy is conditional and pinned: the leg runs when `needle` is on `PATH` or `~/.needle/agents/` already exists, takes the template from the checkout beside `install.sh` (never a release download), installs it mode 0644, and overwrites any existing copy in place — so edits made to the installed adapter (such as adding `--pool-socket` to the `invoke` template for the warm pool) are reverted to the shipped template by the next `install.sh` run. Without NEEDLE the leg is skipped entirely and `~/.needle` is left untouched. Full contract: [`docs/notes/installer-needle-adapter.md`](docs/notes/installer-needle-adapter.md).
 
 ## Limitations
 

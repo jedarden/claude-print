@@ -9,6 +9,26 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **NEEDLE adapter installation contract defined and pinned.**
+  `docs/notes/installer-needle-adapter.md` is now the authoritative statement
+  of `install.sh`'s conditional NEEDLE leg (previously promised only in the
+  README's one-liner): detection (`needle` on `PATH` or an existing
+  `~/.needle/agents`), source (the checkout's `claude-print.yaml` beside the
+  script — never a release artifact, hence the one installed file without a
+  checksum entry), destination (`~/.needle/agents/claude-print.yaml`, dir
+  created even when the source is absent), permissions (`install -m 644`,
+  forcing 0644 over the repo copy's 0664 and over drifted destination modes),
+  in-place overwrite with no backup (hand edits revert on the next install
+  run — the pool `--pool-socket` opt-in is the affected workflow), the
+  silent no-NEEDLE skip (`~/.needle` is never created), the missing-source
+  skip note for the `curl install.sh | sh` shape, and the ordering that any
+  earlier install failure places no adapter. `tests/install_sh.rs` pins all
+  of it hermetically with the child `PATH` fully controlled (host tool dirs
+  resolved at test time, so `command -v needle` never depends on the host —
+  the fleet's coding boxes carry a real `needle`), plus a builder that
+  panics if a real `needle` sneaks into the pinned `PATH` so the no-NEEDLE
+  cases cannot pass vacuously.
+
 - **Billing-canary installation and operations documented.** The "Install on
   each host" section of `scripts/billing-canary.md` is now the complete
   operator workflow for `install-billing-canary.sh`: prerequisites (including

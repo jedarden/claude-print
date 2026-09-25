@@ -18,7 +18,7 @@ content assert identifies which install a file came from).
 | Replacement | Every upgrade overwrites the copy (`mv` onto the existing name). It always holds the *immediately previous* binary: there is no chain of older copies, and a version installed two upgrades ago is gone. |
 | Mode | `mv` preserves the installed binary's mode, so the copy stays executable (755) — the rollback step needs no `chmod`. |
 | Ordering | The backup runs *after* the downloaded artifact has passed `sha256sums.txt` verification and *before* the new binary is placed. A failed verification (missing manifest, missing checksum entry, digest mismatch) therefore leaves the live binary and any existing `.prev` untouched. |
-| Scope | Only the main binary is backed up. `mock_claude` and `~/.needle/agents/claude-print.yaml` are overwritten in place with no rollback copy, so rolling the binary back does not revert them. |
+| Scope | Only the main binary is backed up. `mock_claude` and `~/.needle/agents/claude-print.yaml` are overwritten in place with no rollback copy, so rolling the binary back does not revert them. The adapter copy's own contract (detection, source, mode, overwrite) is [`installer-needle-adapter.md`](installer-needle-adapter.md). |
 
 ## Rollback workflow
 

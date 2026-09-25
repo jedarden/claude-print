@@ -10,6 +10,11 @@
 //!
 //! Asset names are pinned to the x86_64 layout, the only one CI publishes
 //! (README "Architectures: x86_64 only").
+//!
+//! The NEEDLE-adapter leg (docs/notes/installer-needle-adapter.md) is pinned
+//! with the child `PATH` fully controlled — `command -v needle` must depend
+//! only on what a test planted, never on whether the machine running the
+//! suite has NEEDLE installed (the fleet's coding boxes do).
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -166,23 +171,34 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// Absolute path of the real `install`(1), for the placement-failure shim to
-/// delegate its non-target invocations to: the first executable `install` on
-/// this process's PATH. The shim's directory is prepended to the child's PATH
-/// only, so it can never match here — and the resolved path is interpolated
-/// into the shim precisely because the shim itself must not `command -v
-/// install`: the child's PATH points at the shim first, so that would recurse.
-fn real_install_path() -> PathBuf {
-    let path = std::env::var_os("PATH").expect("PATH must be set to locate install(1)");
+/// First executable `tool` on this process's PATH. The placement-failure
+/// shim uses it for the real `install`(1), and the NEEDLE-leg tests use it
+/// to locate the host tools `install.sh` calls — where a host keeps those is
+/// not universal (the fleet's coding boxes are NixOS: coreutils live in
+/// /run/current-system/sw/bin, not /usr/bin), so a hardcoded prefix would
+/// not resolve.
+fn which(tool: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH must be set to locate host tools");
     for dir in path.to_string_lossy().split(':') {
-        let candidate = Path::new(dir).join("install");
+        let candidate = Path::new(dir).join(tool);
         if let Ok(metadata) = fs::metadata(&candidate) {
             if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
                 return candidate;
             }
         }
     }
-    panic!("no executable `install` on PATH — cannot build the placement-failure shim");
+    panic!("no executable `{tool}` on PATH — cannot build the hermetic install environment");
+}
+
+/// Absolute path of the real `install`(1), for the placement-failure shim to
+/// delegate its non-target invocations to: the first executable `install` on
+/// this process's PATH ([`which`]). The shim's directory is prepended to the
+/// child's PATH only, so it can never match here — and the resolved path is
+/// interpolated into the shim precisely because the shim itself must not
+/// `command -v install`: the child's PATH points at the shim first, so that
+/// would recurse.
+fn real_install_path() -> PathBuf {
+    which("install")
 }
 
 /// Shell body of the placement-failure `install` shim (`__REAL_INSTALL__` is
@@ -672,5 +688,339 @@ fn mid_install_placement_failure_leaves_the_previous_binary_recoverable_and_repo
         String::from_utf8_lossy(&restored.stdout).contains("v1"),
         "the rolled-back binary must be the previous generation: {}",
         String::from_utf8_lossy(&restored.stdout)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// NEEDLE adapter installation (docs/notes/installer-needle-adapter.md):
+// when install.sh detects NEEDLE it copies the repo-root claude-print.yaml
+// template into ~/.needle/agents — from the checkout beside the script, not
+// from the release. Detection (needle on PATH, or an existing agents dir),
+// source and destination paths, the forced 0644 mode, in-place overwrite
+// with no backup, the no-NEEDLE skip, the missing-source skip, and the
+// ordering against failed installs are each pinned below with the child
+// PATH pinned (see pinned_path) so detection never depends on the host.
+// ---------------------------------------------------------------------------
+
+/// What install.sh names the NEEDLE adapter at both ends of its copy: the
+/// repo-root template beside the script, and the file inside
+/// `~/.needle/agents/`.
+const ADAPTER_NAME: &str = "claude-print.yaml";
+
+/// The documented skip note for a script with no template beside it (the
+/// `curl install.sh | sh` shape) — pinned verbatim so the wording cannot
+/// drift away from the documented contract.
+const ADAPTER_SKIP_NOTE: &str =
+    "Note: claude-print.yaml not found alongside install.sh — skipping NEEDLE config";
+
+fn needle_agents_dir(home: &Path) -> PathBuf {
+    home.join(".needle/agents")
+}
+
+fn adapter_dest(home: &Path) -> PathBuf {
+    needle_agents_dir(home).join(ADAPTER_NAME)
+}
+
+/// The checkout's adapter template — install.sh's source for the copy. Read
+/// from the manifest dir rather than inlined so the assert compares the two
+/// ends of the actual copy (checkout template vs installed file) instead of
+/// a third transcription of the bytes.
+fn repo_adapter_bytes() -> Vec<u8> {
+    fs::read(repo_path(ADAPTER_NAME)).unwrap()
+}
+
+/// Every host tool `install.sh` invokes by name besides its own stubs, whose
+/// directories make up the NEEDLE-leg PATH. `sh` itself is resolved by the
+/// test process (not the child), `echo`/`command`/`pwd` are shell builtins,
+/// and the stub scripts' `#!/bin/sh` is absolute — so this list is complete.
+const HOST_TOOLS: &[&str] = &[
+    "curl",
+    "install",
+    "uname",
+    "awk",
+    "sha256sum",
+    "mktemp",
+    "dirname",
+    "mv",
+    "mkdir",
+    "rm",
+];
+
+/// A PATH for the NEEDLE-leg tests: the stub bin dir plus exactly the host
+/// tool directories ([`which`] resolves them per host — NixOS keeps
+/// coreutils outside /usr/bin), and never the host PATH itself, which on the
+/// fleet's coding boxes carries the real `needle` at ~/.local/bin and would
+/// flip install.sh's detection arm from machine to machine. Panics if any
+/// included directory holds a `needle` binary, so the no-NEEDLE cases can
+/// never pass vacuously on a NEEDLE-equipped host.
+fn pinned_path(bin_dir: &Path) -> String {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for tool in HOST_TOOLS {
+        let dir = which(tool).parent().unwrap().to_path_buf();
+        let needle = dir.join("needle");
+        let real_needle = fs::metadata(&needle)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        assert!(
+            !real_needle,
+            "cannot pin a needle-free PATH: {needle:?} is a real NEEDLE install inside a host tool dir"
+        );
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    let mut path = bin_dir.display().to_string();
+    for dir in &dirs {
+        path.push(':');
+        path.push_str(&dir.display().to_string());
+    }
+    path
+}
+
+/// [`run_install_with_env`] with the two knobs the NEEDLE leg needs: the
+/// child PATH is pinned (see [`pinned_path`]) so `command -v needle` sees
+/// only the stub this test planted (`needle_on_path` — the command arm of
+/// the detection), and the script under test is a parameter so the
+/// directory beside install.sh — the adapter's source — is under the test's
+/// control too. The `~/.needle/agents` half of the detection is driven by
+/// what the test pre-creates under `home`.
+fn run_install_needle_leg(
+    script: &Path,
+    home: &Path,
+    release_dir: &Path,
+    needle_on_path: bool,
+) -> Output {
+    let bin_dir = home.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    // Same preflight stub as every other run, plus the detection stub.
+    let mut stub_names = vec!["claude"];
+    if needle_on_path {
+        stub_names.push("needle");
+    }
+    for name in stub_names {
+        let stub = bin_dir.join(name);
+        fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    Command::new("sh")
+        .arg(script)
+        .env("HOME", home)
+        .env("PATH", pinned_path(&bin_dir))
+        .env(
+            "CLAUDE_PRINT_RELEASE_URL",
+            format!("file://{}", release_dir.display()),
+        )
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn needle_on_the_path_installs_the_repo_adapter_template_into_the_agents_dir() {
+    // The command arm of the detection, against a fresh HOME with no
+    // ~/.needle at all: the agents dir is created and the checkout's
+    // template lands in it.
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    let home = tempfile::tempdir().unwrap();
+
+    let output =
+        run_install_needle_leg(&repo_path("install.sh"), home.path(), release.path(), true);
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let dest = adapter_dest(home.path());
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        repo_adapter_bytes(),
+        "the adapter must be the checkout's template verbatim (never a release artifact)"
+    );
+    assert_eq!(
+        mode_of(&dest),
+        0o644,
+        "install -m forces 0644 (the repo copy is 0664)"
+    );
+    assert!(
+        needle_agents_dir(home.path()).is_dir(),
+        "the agents dir is created under a fresh HOME"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Installed {}", dest.display())),
+        "stdout must record the adapter placement: {stdout}"
+    );
+    // The leg runs after the artifact legs, so its success line implies the
+    // binary made it too.
+    assert!(installed_path(home.path(), BINARY_INSTALL_NAME).is_file());
+}
+
+#[test]
+fn an_existing_agents_dir_alone_triggers_the_adapter_leg() {
+    // The second detection arm: ~/.needle/agents exists but no `needle`
+    // binary is reachable (a NEEDLE install whose bin dir is off this
+    // shell's PATH). The pre-existing dir is preserved, not recreated.
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(needle_agents_dir(home.path())).unwrap();
+    let marker = needle_agents_dir(home.path()).join("other-agent.yaml");
+    fs::write(&marker, "# an unrelated NEEDLE agent\n").unwrap();
+
+    let output =
+        run_install_needle_leg(&repo_path("install.sh"), home.path(), release.path(), false);
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let dest = adapter_dest(home.path());
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        repo_adapter_bytes(),
+        "the dir arm must install the template exactly like the command arm"
+    );
+    assert_eq!(mode_of(&dest), 0o644, "the adapter lands at 0644");
+    assert!(
+        marker.is_file(),
+        "a pre-existing agents dir keeps its contents — mkdir -p must not clear it"
+    );
+}
+
+#[test]
+fn without_needle_the_agents_dir_is_not_created_and_nothing_needle_related_is_printed() {
+    // The no-NEEDLE case: neither detection arm holds (no command, no dir).
+    // The skip must be total — not even ~/.needle may appear, because the
+    // mkdir lives inside the detection branch — and the rest of the install
+    // proceeds untouched.
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    let home = tempfile::tempdir().unwrap();
+
+    let output =
+        run_install_needle_leg(&repo_path("install.sh"), home.path(), release.path(), false);
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    assert!(
+        !home.path().join(".needle").exists(),
+        "without NEEDLE the leg must not even create ~/.needle"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(".needle") && !stdout.contains("NEEDLE"),
+        "nothing NEEDLE-related may print when undetected: {stdout}"
+    );
+    assert!(installed_path(home.path(), BINARY_INSTALL_NAME).is_file());
+    assert!(installed_path(home.path(), MOCK_INSTALL_NAME).is_file());
+}
+
+#[test]
+fn an_existing_adapter_is_overwritten_in_place_at_0644_with_no_backup_copy() {
+    // Overwrite + permissions: a hand-edited, mode-0600 adapter at the
+    // destination is replaced byte-for-byte with the checkout template and
+    // forced back to 0644 — and gains no backup copy (contrast the main
+    // binary's claude-print.prev; docs/notes/installer-rollback.md "Scope").
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    let home = tempfile::tempdir().unwrap();
+    let dest = adapter_dest(home.path());
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fs::write(&dest, "# a stale hand-edited adapter\n").unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output =
+        run_install_needle_leg(&repo_path("install.sh"), home.path(), release.path(), true);
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        repo_adapter_bytes(),
+        "a stale adapter must be replaced by the checkout template"
+    );
+    assert_eq!(
+        mode_of(&dest),
+        0o644,
+        "the mode is forced back to 0644 from the drifted 0600"
+    );
+    let entries: Vec<_> = fs::read_dir(dest.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![ADAPTER_NAME.to_string()],
+        "exactly the adapter may remain in the agents dir — no backup copy, got {entries:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Installed {}", dest.display())),
+        "stdout must record the overwrite as an ordinary placement: {stdout}"
+    );
+}
+
+#[test]
+fn no_adapter_beside_the_script_skips_the_needle_leg_with_a_note() {
+    // The missing-source case — the `curl install.sh | sh` shape, reproduced
+    // by running a staging copy of the script with no claude-print.yaml
+    // beside it. The skip is a note, not a failure, and per the documented
+    // ordering the agents dir is still created (the mkdir precedes the
+    // source check).
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    let staging = tempfile::tempdir().unwrap();
+    fs::copy(repo_path("install.sh"), staging.path().join("install.sh")).unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let output = run_install_needle_leg(
+        &staging.path().join("install.sh"),
+        home.path(),
+        release.path(),
+        true,
+    );
+
+    assert!(
+        output.status.success(),
+        "a missing adapter source is a skip, not a failure: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        !adapter_dest(home.path()).exists(),
+        "no adapter may be placed without a source"
+    );
+    assert!(
+        needle_agents_dir(home.path()).is_dir(),
+        "the agents dir is still created — mkdir precedes the source check"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(ADAPTER_SKIP_NOTE),
+        "stdout must carry the documented skip note verbatim: {stdout}"
+    );
+    assert!(
+        installed_path(home.path(), BINARY_INSTALL_NAME).is_file(),
+        "the binary still installs — the skip costs nothing else"
+    );
+}
+
+#[test]
+fn a_failed_install_places_no_needle_adapter() {
+    // Ordering: the adapter leg runs after the artifact legs, so an earlier
+    // failure — here a tampered binary, the same mutation as
+    // install_fails_closed_on_a_tampered_binary — must leave the NEEDLE side
+    // untouched even though detection succeeds: no adapter, no ~/.needle at
+    // all, and no adapter line on stdout.
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    fs::write(
+        release.path().join(BINARY_ASSET),
+        format!("{BINARY_BODY}\n# tampered\n"),
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let output =
+        run_install_needle_leg(&repo_path("install.sh"), home.path(), release.path(), true);
+
+    assert!(
+        !output.status.success(),
+        "the tampered release must abort the install"
+    );
+    assert!(
+        !home.path().join(".needle").exists(),
+        "a failed install must not create the NEEDLE agents dir"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(".needle"),
+        "no adapter line may print on a failed install: {stdout}"
     );
 }
