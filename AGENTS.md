@@ -92,7 +92,7 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/cli.rs` | CLI argument parsing and flag validation |
 | `tests/config_parse_errors.rs` | Malformed config → exit 2 (not 0) + structured JSON error on stderr in json/stream-json modes, human-readable stderr in text mode; no silent fallback to defaults (bead claudepr-ea80e6b2) |
 | `tests/config_startup_errors.rs` | End-to-end config failures during CLI startup in all three output modes, via the shared `config_error_helpers` module |
-| `tests/config_error_helpers.rs` | Shared helper module for the config-error suites (`ConfigFixture`, `run_with_config*`, structured-error assertions); also compiled as a standalone integration target, but contains no tests of its own |
+| `tests/config_error_helpers.rs` | Shared helper module for the config-error suites (`ConfigFixture`, `run_with_config*`, structured-error assertions); also compiled as a standalone integration target, where its `cfg(test)` unit tests of the fixture helpers themselves run — a helper module, not a suite, and the one `helper`-group carve-out in the §"Execution requirements" classification table |
 | `tests/config_contract.rs` | Config-file contract pin (bead claudepr-227efdb1): loads `tests/fixtures/config_contract_examples_v1.json` and replays it through the real implementation so `docs/notes/config-file-contract.md` (and the README's Configuration section) cannot drift — loader alignment (fixture TOML through `Config::load_or_default` from a temp cwd: successes resolve through the real CLI-over-config tiering, failures byte-match the user-facing message), path alignment (every `default_path` rule, incl. the empty-but-set and non-UTF-8 `XDG_CONFIG_HOME` edges and the strict `HOME` failure), table alignment (the four `[defaults]` keys against the resolvers' built-ins and clap's actual `default_value`s — the mechanism behind the documented `max_turns`/`timeout_secs` limitation), emitter alignment (documented text/json/stream-json error lines byte-for-byte through `emit_error`), and doc alignment (every `documented: true` example verbatim in the doc, `also_in_readme` ones in the README). Env/cwd-mutating replays serialize on one process lock |
 | `tests/emitter.rs` | Output formatting (text / json / stream-json) |
 | `tests/startup.rs` | Trust-dialog detection and prompt injection |
@@ -101,6 +101,7 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/tui_transcript.rs` | TUI-shaped transcript parsing (claudepr-26e7a0b6): `sessionId` spelled on every ordinary record and no print-mode `type: "result"` event — the two reasons `session_id` came back null for every real PTY run |
 | `tests/docs_slug_consistency.rs` | Documentation-drift guard for the transcript-slug algorithm (bead claudepr-3243f25c): `tests/fixtures/slug_vectors_v2.1.263.json` pins `cwd_to_slug` against live-verified vectors, every `<path> → <slug>` example in the markdown docs is re-derived with the implementation, and stale prose patterns are linted |
 | `tests/docs_pool_contract.rs` | Documentation-contract test for the published serve / `--pool-socket` API (bead claudepr-e4e94485): every `claude-print ...` example line in README §"Warm PTY pool (ADR-005)" and AGENTS.md §"Pool operations" parses through the real `Cli` parser with the documented flag values, the documented default socket path / pool-size default and cap / acquire budget equal `DEFAULT_SOCKET_PATH`, clap's `default_value`, `MAX_POOL_SIZE` + `validate_pool_size`, and `DEFAULT_ACQUIRE_TIMEOUT_SECS`, the serve usage line and flag table list exactly the long flags the subcommand accepts (cross-checked against the rendered `serve --help`), the `0600` permission claim is re-derived through a real `bind_socket`, and the fallback-vs-protocol-failure split matches `is_stateless_fallback` plus `AcquireFailure`'s Display |
+| `tests/docs_test_classification.rs` | Documentation-drift guard for the exhaustive test-target classification (bead claudepr-26cf624a): re-derives the AGENTS.md §"Execution requirements" classification table from the `tests/` tree and fails CI on any unclassified, stale, or duplicated row; verifies each execution group's dependency claim against the target's compilation unit (target + `mod`-included helpers — compiled-binary rows reference `CARGO_BIN_EXE_*`/`current_exe()`, repo-script rows spawn with no binary locator, real-claude rows probe the installed `claude`, library-level rows contain no `std::process::Command` outside the `#[ignore]`d live-probe carve-out); pins the Cargo.toml autodiscovery assumptions behind the enumeration; and cross-checks the Ignored table against the `#[ignore]`d tests in the tree plus the §"Test structure" table against the target list. Library-level; spawns nothing |
 | `tests/benchmark_reproducibility.rs` | Reproducibility guard for the committed startup-overhead evidence (bead claudepr-70a60152): the schema-1 recording carried machine-specific paths (`/build/target-workers/release`) no other box could resolve; schema 2 derives the bin dir from `cargo metadata`, records only the derivation (`harness.bin_dir_source`), and redacts an explicit `--bin-dir` from the recorded argv — this test pins that shape (against `docs/notes/startup-overhead-benchmark.{json,md}` and the script) so the drift cannot silently return. Library-level; spawns nothing |
 | `tests/hooks.rs` | Stop hook FIFO install / read |
 | `tests/stop_poller.rs` | Stop payload polling logic |
@@ -142,65 +143,105 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 ### Execution requirements
 
 Which targets run under a plain `cargo test`, and what each additionally
-needs. The four groups below — compiled binaries, repo scripts/stubs, real
-`claude`, library-level — account for every `tests/*.rs` target
-(`tests/integration/` is a module of `integration.rs`;
-`config_error_helpers.rs` is a compiled helper with no tests of its own). A
-new target that fits none of them is documentation drift: classify it here
-in the commit that adds it.
+needs. The classification table is exhaustive: every `tests/*.rs` target
+appears in exactly one row, in exactly one execution group
+(`config_error_helpers` is the helper carve-out — a shared `mod`-included
+module, not an execution group; `tests/integration/` is a module directory
+of `integration`, not a target). A new target that fits none of the groups
+is documentation drift: classify it here in the commit that adds it.
+`tests/docs_test_classification.rs` guards the table in CI (bead
+claudepr-26cf624a): it re-derives the target set from `tests/`, fails on
+any unclassified, stale, or duplicated row, and verifies each group's
+dependency claim against the target's actual compilation unit (the target
+file plus everything it pulls in via `mod …;`) — `CARGO_BIN_EXE_*` /
+`current_exe()` for compiled binaries, spawning with no binary locator for
+repo scripts, a `"claude"` subprocess probe for real-claude, and no
+`std::process::Command` for library-level. It also cross-checks the
+Ignored table below against the `#[ignore]`d tests actually present in the
+tree, and the §"Test structure" table against the target list.
+
+| Target | Group | Execution notes |
+|--------|-------|-----------------|
+| `integration` | compiled-binaries | + `integration/scenarios.rs`; high-level scenarios through `mock_claude` and the shared helpers |
+| `pty_integration` | compiled-binaries | mock-claude under a real PTY; PTY capability required |
+| `binary_e2e` | compiled-binaries | compiled `claude-print` + mock-claude |
+| `help_version_e2e` | compiled-binaries | compiled `claude-print`; mock-claude and exec-sentinel backends |
+| `serve` | compiled-binaries | compiled CLI through the `serve` subcommand, mock-claude backend |
+| `pool_socket_e2e` | compiled-binaries | compiled CLI; client matrix across three output formats |
+| `pool_adversarial_e2e` | compiled-binaries | compiled CLI; concurrent clients |
+| `pool_failure_e2e` | compiled-binaries | compiled CLI + real daemons/clients |
+| `stream_json_incremental` | compiled-binaries | compiled binary; mid-session event forwarding |
+| `transcript_race_e2e` | compiled-binaries | mock-claude; one `#[ignore]`d timing race test (Ignored table) |
+| `stop_duplicate_firings_e2e` | compiled-binaries | mock-claude (`MOCK_EXTRA_STOPS`) |
+| `stop_sparse_payloads_e2e` | compiled-binaries | mock-claude (`MOCK_OMIT_*`) |
+| `stop_delayed_payload_e2e` | compiled-binaries | mock-claude (`MOCK_DELAY_STOP`) |
+| `sigint_forwarding_e2e` | compiled-binaries | mock-claude child under a real PTY |
+| `watchdog` | compiled-binaries | mock child with silent output |
+| `home_unset` | compiled-binaries | binary cases; the rest is lib-level |
+| `claude_config_dir_contract` | compiled-binaries | real child through the public `PtySpawner`, plus a binary e2e leg against mock-claude |
+| `stdin_limit` | compiled-binaries | compiled binary; inline mock child |
+| `config_parse_errors` | compiled-binaries | compiled binary through the shared helpers |
+| `config_startup_errors` | compiled-binaries | compiled binary through the shared helpers |
+| `billing_entrypoint_contract` | compiled-binaries | `CARGO_BIN_EXE_claude-print` for the `--check` half; the check-billing half is a `bash` subprocess (repo-scripts work, but the binary half owns the row) |
+| `contract_maintenance` | repo-scripts | gate + detector under `bash` with `claude`/`gh`/`cargo` stubbed on a single-entry PATH of real-coreutils symlinks; the real-environment leg degrades to `unknown` when `claude` is absent rather than skipping |
+| `install_sh` | repo-scripts | `install.sh` under `sh` against a `file://` fake release with a fake `claude` |
+| `install_sh_arch` | repo-scripts | same, with `uname` stubbed so outcomes never depend on the host |
+| `billing_canary` | repo-scripts | `scripts/billing-canary.sh` under `bash` behind a fake `claude-print` |
+| `install_billing_canary` | repo-scripts | `scripts/install-billing-canary.sh` with fake `systemctl`/`claude-print`/`loginctl` plus real coreutils — panics if those are missing |
+| `sigwinch_forwarding_e2e` | repo-scripts | an `sh` trap child under a real PTY via the library's `PtySpawner` — PTY capability required, like `pty_integration` |
+| `version_compat` | real-claude | only `test_claude_version_recorded` (`--version` probe, writes the CI version artifact); the rest is library-level |
+| `flag_compat` | real-claude | argv-parse probe with a deliberately-unknown-flag inverse |
+| `cli` | library-level | |
+| `emitter` | library-level | |
+| `startup` | library-level | one `#[ignore]`d slow test (Ignored table) |
+| `terminal` | library-level | |
+| `transcript` | library-level | |
+| `tui_transcript` | library-level | |
+| `hooks` | library-level | |
+| `stop_poller` | library-level | |
+| `transcript_flush_window` | library-level | |
+| `stream_json_cleanup` | library-level | |
+| `docs_slug_consistency` | library-level | |
+| `docs_pool_contract` | library-level | |
+| `nested_session` | library-level | |
+| `output_format_contracts` | library-level | |
+| `benchmark_reproducibility` | library-level | |
+| `config_contract` | library-level | mutates process-global cwd/`HOME`/`XDG_CONFIG_HOME`, serialized on one lock |
+| `pool_protocol_compat` | library-level | real Unix sockets in-process, no workers |
+| `stream_json_contract` | library-level | golden replay through the real stream-json reader thread |
+| `claude_contracts` | library-level | always-on half only; the spawning half is the two `#[ignore]`d live probes (credentials-gated — next section) |
+| `docs_test_classification` | library-level | this guard — reads AGENTS.md and the `tests/` tree; spawns nothing |
+| `config_error_helpers` | helper | shared module `mod`-included by `integration`, `config_parse_errors`, `config_startup_errors`; compiled standalone too, where its `cfg(test)` fixture unit tests run |
 
 **Compiled binaries.** A default `cargo test` builds `claude-print` and
 `mock-claude` first, so nothing extra is needed. `cargo test --lib` runs only
-the `src/` inline unit tests — no `tests/` target at all. Targets that spawn
-a compiled binary at runtime (and therefore mean nothing under `--lib`, and
-need the binaries present under a selective `--test <name>` run):
-`integration.rs` (+ `integration/scenarios.rs`), `pty_integration`,
-`binary_e2e`, `help_version_e2e`, `serve`,
-`pool_socket_e2e`, `pool_adversarial_e2e`, `pool_failure_e2e`,
-`stream_json_incremental`, `transcript_race_e2e`,
-`stop_duplicate_firings_e2e`, `stop_sparse_payloads_e2e`,
-`stop_delayed_payload_e2e`, `sigint_forwarding_e2e` (mock-claude child under
-a real PTY), `watchdog`, `home_unset` (binary cases; the rest is lib-level),
-`claude_config_dir_contract` (real child through the public `PtySpawner`,
-plus a binary e2e leg against mock-claude), `stdin_limit`,
-`config_parse_errors`, `config_startup_errors` (through the helpers), and
-`billing_entrypoint_contract` (`CARGO_BIN_EXE_claude-print`
-for the `--check` half; the check-billing half is a `bash` subprocess — next
-group).
+the `src/` inline unit tests — no `tests/` target at all. The rows above
+spawn a compiled binary at runtime (and therefore mean nothing under
+`--lib`, and need the binaries present under a selective `--test <name>`
+run) — the guard pins that each row's compilation unit references
+`CARGO_BIN_EXE_*` or `current_exe()`, the two locators the suites use (see
+"Where the build output lands").
 
 **Repo scripts, stubs, and host-tool children.** These spawn subprocesses
 but need neither the compiled binaries nor the real `claude`: they drive the
 repo's shell scripts or stub/fake children against redirected
 `HOME`/`PATH`, so their only host requirements are a POSIX `sh`/`bash` and
-coreutils — no network, no credentials, no skip conditions; they always run.
-`contract_maintenance` (the gate and detector under `bash` with
-`claude`/`gh`/`cargo` stubbed on a single-entry PATH of real-coreutils
-symlinks; the real-environment leg degrades to `unknown` when `claude` is
-absent rather than skipping), `install_sh` and `install_sh_arch`
-(`install.sh` under `sh` against a `file://` fake release with a fake
-`claude`; the arch matrix stubs `uname` so outcomes never depend on the
-host), `billing_canary` (`scripts/billing-canary.sh` under `bash` behind a
-fake `claude-print`), `install_billing_canary`
-(`scripts/install-billing-canary.sh` with fake
-`systemctl`/`claude-print`/`loginctl` plus real coreutils — it panics if
-those are missing), and `sigwinch_forwarding_e2e` (an `sh` trap child under
-a real PTY via the library's `PtySpawner` — PTY capability required, like
-`pty_integration`).
+coreutils — no network, no credentials, no skip conditions; they always
+run. The guard pins the split: each row's unit spawns something
+(`std::process::Command` or the library's `PtySpawner`) while referencing
+neither binary locator.
 
 **Real `claude` on PATH** (silent skip when absent — never a failure):
-`version_compat::test_claude_version_recorded` (`--version` only) and
-`flag_compat` (argv-parse probe). Both are credential-free. The rest of
-`version_compat` is library-level.
+both rows are credential-free — an unknown *option* is rejected by the
+child's argument parser before any model request, which is exactly what
+they probe.
 
-**Library-level — spawn no process:** `cli`, `emitter`, `startup`,
-`terminal`, `transcript`, `tui_transcript`, `hooks`, `stop_poller`,
-`transcript_flush_window`, `stream_json_cleanup`, `docs_slug_consistency`,
-`docs_pool_contract`, `nested_session`, `output_format_contracts`,
-`benchmark_reproducibility`, `config_contract` (mutates process-global
-cwd/`HOME`/`XDG_CONFIG_HOME`, serialized on one lock), `pool_protocol_compat`
-(real Unix sockets in-process, no workers), `stream_json_contract` (golden
-replay through the real stream-json reader thread), and the always-on half
-of `claude_contracts`.
+**Library-level — spawn no process.** The guard pins the claim literally:
+no `std::process::Command` anywhere in the row's compilation unit. The one
+sanctioned exception is a target whose spawning code sits entirely behind
+`#[ignore]`d tests, with the carve-out declared in the row's notes —
+`claude_contracts`'s live probes, which are also credentials-gated (next
+section).
 
 **Credentials (API auth).** Required only by the two `#[ignore]`'d
 `claude_contracts` live re-measurements — which *check* for

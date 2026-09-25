@@ -9,6 +9,25 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Test-target classification guard.** AGENTS.md §"Execution requirements"
+  now carries the exhaustive classification as an explicit table (every
+  `tests/*.rs` target in exactly one row: compiled-binaries, repo-scripts,
+  real-claude, library-level, plus the `config_error_helpers` helper
+  carve-out), and `tests/docs_test_classification.rs` enforces it in CI:
+  unclassified new targets, stale rows, and duplicate classifications fail;
+  each group's dependency claim is verified against the target's
+  compilation unit (target + `mod`-included helpers — `CARGO_BIN_EXE_*` /
+  `current_exe()` for binary rows, spawning without a binary locator for
+  script rows, a `"claude"` probe for real-claude rows, no
+  `std::process::Command` for library-level rows outside the `#[ignore]`d
+  live-probe carve-out); the Cargo.toml autodiscovery assumptions behind
+  the enumeration are pinned; and the Ignored table plus the §"Test
+  structure" table are cross-checked against the tree (bead
+  claudepr-26cf624a). The old prose-enumerated group lists and the
+  inaccurate "no tests of its own" claim about the standalone
+  `config_error_helpers` target are gone — the helper's `cfg(test)` unit
+  tests run in every target that includes it.
+
 - **NEEDLE adapter installation contract defined and pinned.**
   `docs/notes/installer-needle-adapter.md` is now the authoritative statement
   of `install.sh`'s conditional NEEDLE leg (previously promised only in the
