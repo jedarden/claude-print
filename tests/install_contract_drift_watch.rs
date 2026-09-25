@@ -219,12 +219,16 @@ fn installed_files(env: &InstallerEnv) -> Vec<InstalledFile> {
         },
         InstalledFile {
             source: "scripts/claude-print-contract-drift-watch.service",
-            destination: env.units_dir().join("claude-print-contract-drift-watch.service"),
+            destination: env
+                .units_dir()
+                .join("claude-print-contract-drift-watch.service"),
             mode: 0o644,
         },
         InstalledFile {
             source: "scripts/claude-print-contract-drift-watch.timer",
-            destination: env.units_dir().join("claude-print-contract-drift-watch.timer"),
+            destination: env
+                .units_dir()
+                .join("claude-print-contract-drift-watch.timer"),
             mode: 0o644,
         },
     ]
@@ -284,9 +288,11 @@ fn installer_places_the_documented_files_paths_modes_and_unit_contents() {
     // the service runs the exact libexec path that was just populated (and
     // pins the checkout the detector measures), and the timer activates
     // that service, daily and persistent, on timers.target.
-    let service =
-        fs::read_to_string(env.units_dir().join("claude-print-contract-drift-watch.service"))
-            .unwrap();
+    let service = fs::read_to_string(
+        env.units_dir()
+            .join("claude-print-contract-drift-watch.service"),
+    )
+    .unwrap();
     assert!(
         service.contains("ExecStart=%h/.local/libexec/claude-print/contract-drift-watch.sh"),
         "the service must ExecStart the libexec copy the installer places:\n{service}"
@@ -295,9 +301,11 @@ fn installer_places_the_documented_files_paths_modes_and_unit_contents() {
         service.contains("Environment=CLAUDE_PRINT_CONTRACT_REPO=%h/claude-print"),
         "the service must pin the contract repo:\n{service}"
     );
-    let timer =
-        fs::read_to_string(env.units_dir().join("claude-print-contract-drift-watch.timer"))
-            .unwrap();
+    let timer = fs::read_to_string(
+        env.units_dir()
+            .join("claude-print-contract-drift-watch.timer"),
+    )
+    .unwrap();
     for line in [
         "OnCalendar=daily",
         "Persistent=true",
@@ -325,8 +333,8 @@ fn installer_places_the_documented_files_paths_modes_and_unit_contents() {
         "daemon-reload must precede enable --now; log: {log:?}"
     );
     assert!(
-        log.iter().any(|l| l
-            == "--user list-timers claude-print-contract-drift-watch.timer --no-pager"),
+        log.iter()
+            .any(|l| l == "--user list-timers claude-print-contract-drift-watch.timer --no-pager"),
         "the installer must show the resulting timer; log: {log:?}"
     );
     let stdout = stdout_of(&output);
@@ -349,7 +357,9 @@ fn installer_is_idempotent_and_restores_drifted_copies() {
     assert!(first.status.success(), "first run: {}", stderr_of(&first));
 
     // Local drift between runs: an edited unit and a loosened script mode.
-    let timer_path = env.units_dir().join("claude-print-contract-drift-watch.timer");
+    let timer_path = env
+        .units_dir()
+        .join("claude-print-contract-drift-watch.timer");
     let mut drifted = fs::read_to_string(&timer_path).unwrap();
     drifted.push_str("# local drift\n");
     fs::write(&timer_path, drifted).unwrap();
@@ -502,7 +512,13 @@ fn installer_linger_warning_fires_only_when_lingering_is_disabled() {
         "the warning must name the remedy: {stderr}"
     );
 
-    let on = build_installer_env(&root.path().join("on"), Systemctl::Fake, true, true, Some("yes"));
+    let on = build_installer_env(
+        &root.path().join("on"),
+        Systemctl::Fake,
+        true,
+        true,
+        Some("yes"),
+    );
     let output = run_installer(&on, false);
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     assert!(

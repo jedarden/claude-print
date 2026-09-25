@@ -184,8 +184,15 @@ fn watch_current_exits_zero_writes_pass_and_never_touches_bead() {
         result.starts_with("PASS timestamp=") && result.contains("verdict=current"),
         "state line must record the green verdict: {result}"
     );
-    let mode = fs::metadata(state.join("last-result")).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600, "the state line stays mode 600: {result}");
+    let mode = fs::metadata(state.join("last-result"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "the state line stays mode 600: {result}"
+    );
     assert!(
         !bead_args.exists(),
         "a CURRENT watch must not invoke bead for any reason"
@@ -273,18 +280,26 @@ fn watch_drift_idempotent_hits_are_recorded_not_duplicated() {
     // a repeat while the drift persists, and a binding that already points
     // at a closed bead. Both stay exit-1 drifts; only the record differs.
     for (result_line, recorded) in [
-        ("EXISTING claudepr-stub1111", "follow-up=existing claudepr-stub1111"),
+        (
+            "EXISTING claudepr-stub1111",
+            "follow-up=existing claudepr-stub1111",
+        ),
         (
             "EXISTING_CLOSED claudepr-stub2222",
             "follow-up=existing-closed claudepr-stub2222",
         ),
     ] {
-        let state = dir.path().join(format!("state-{}", recorded.split(' ').next().unwrap()));
+        let state = dir
+            .path()
+            .join(format!("state-{}", recorded.split(' ').next().unwrap()));
         let out = run_watch(
             Some(&bin),
             &[
                 ("CLAUDE_PRINT_DRIFT_STATE_DIR", state.display().to_string()),
-                ("BEAD_ARGS_FILE", dir.path().join("bead-args.txt").display().to_string()),
+                (
+                    "BEAD_ARGS_FILE",
+                    dir.path().join("bead-args.txt").display().to_string(),
+                ),
                 ("BEAD_CREATE_RESULT", result_line.to_string()),
             ],
         );
@@ -339,7 +354,10 @@ fn watch_drift_when_bead_create_fails_records_failure() {
         Some(&bin),
         &[
             ("CLAUDE_PRINT_DRIFT_STATE_DIR", state.display().to_string()),
-            ("BEAD_ARGS_FILE", dir.path().join("bead-args.txt").display().to_string()),
+            (
+                "BEAD_ARGS_FILE",
+                dir.path().join("bead-args.txt").display().to_string(),
+            ),
             ("BEAD_CREATE_FAIL", "1".to_string()),
         ],
     );
@@ -460,8 +478,10 @@ fn units_installer_and_maintenance_doc_stay_wired() {
     // The service runs the installed watcher and pins the checkout it
     // measures; both bead (~/.cargo/bin) and claude (~/.local/bin) are
     // reachable on its PATH.
-    let service = fs::read_to_string(repo_path("scripts/claude-print-contract-drift-watch.service"))
-        .unwrap();
+    let service = fs::read_to_string(repo_path(
+        "scripts/claude-print-contract-drift-watch.service",
+    ))
+    .unwrap();
     for fragment in [
         "ExecStart=%h/.local/libexec/claude-print/contract-drift-watch.sh",
         "Environment=CLAUDE_PRINT_CONTRACT_REPO=%h/claude-print",
@@ -476,8 +496,8 @@ fn units_installer_and_maintenance_doc_stay_wired() {
 
     // The timer: daily, persistent (a missed window fires on the next boot),
     // activating exactly that service.
-    let timer = fs::read_to_string(repo_path("scripts/claude-print-contract-drift-watch.timer"))
-        .unwrap();
+    let timer =
+        fs::read_to_string(repo_path("scripts/claude-print-contract-drift-watch.timer")).unwrap();
     for fragment in [
         "OnCalendar=daily",
         "Persistent=true",
