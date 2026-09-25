@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Contract version** | v1 |
-| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json` |
+| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json`; the README's Configuration-section summary (key table, shipped defaults, path precedence) by the same test (bead claudepr-746dd1c4) |
 | **Implementation** | `src/config.rs` (`Config::default_path`, `Config::load_or_default`, the `resolve_*` tiering, `Defaults::validate`), path selection wired by `src/main.rs`, `HOME` policy by `src/util.rs::get_home`, user-facing message shaping by `src/error.rs` (`From<Error> for ClaudePrintError`) and `src/emitter.rs` (`emit_error`) |
 | **Provenance** | bead claudepr-227efdb1 (2026-09-25) |
 
@@ -14,8 +14,8 @@ malformed, or invalid. The README's Configuration section summarizes; where the
 two differ, this document wins. Every example below is replayed verbatim by the
 fixture — the TOML blocks are parsed by the real loader, the error lines are
 produced by the real error path, and the test fails if the implementation, the
-fixture, or this document drift apart. Changing the contract means changing all
-three in one commit.
+fixture, this document, or the README's Configuration summary drift apart.
+Changing the contract means changing all of them in one commit.
 
 ## Scope
 

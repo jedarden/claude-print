@@ -30,6 +30,13 @@
 //!    verbatim in the contract doc (and, when `also_in_readme`, in the
 //!    README's Configuration section) — an example edited on one side
 //!    without the other fails here.
+//! 6. **README Configuration-section alignment** — the README's `##
+//!    Configuration` summary (which the contract doc declares subordinate:
+//!    "where the two differ, this document wins") is extracted and its key
+//!    table (columns, key set, types, built-in defaults, CLI counterparts),
+//!    shipped-defaults TOML block, and File-location precedence list are
+//!    asserted against the fixture, so a contract change that updates the
+//!    note but forgets the README fails here too (bead claudepr-746dd1c4).
 //!
 //! A contract change therefore updates implementation, fixture, and document
 //! together in one commit — which is the point.
@@ -195,6 +202,38 @@ fn user_facing(err: claude_print::error::Error) -> String {
 fn contains_message(haystack: &str, message: &str) -> bool {
     let stripped = message.strip_suffix('\n').unwrap_or(message);
     haystack.contains(stripped) || haystack.contains(&serde_json::to_string(message).unwrap())
+}
+
+// ── README Configuration-section extraction ──────────────────────────────────
+
+/// The README's `## Configuration` section — from its heading up to the next
+/// level-2 heading. The contract doc declares this section its summary
+/// ("where the two differ, this document wins"), and every README-side pin
+/// below is scoped to this slice, so a contract-relevant string that merely
+/// survives elsewhere in the README cannot satisfy a Configuration-section
+/// check.
+fn readme_configuration_section() -> &'static str {
+    let start = README
+        .find("\n## Configuration\n")
+        .unwrap_or_else(|| panic!("README.md must carry a `## Configuration` heading"))
+        + 1; // keep the heading line itself in the slice
+    let rest = &README[start..];
+    // `\n## ` (with the trailing space) matches only level-2 headings, not
+    // the `###` subsections inside Configuration.
+    let end = rest.find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// A `### <title>` subsection of an extracted section, from its heading up
+/// to the next `###` heading.
+fn readme_subsection<'a>(section: &'a str, title: &str) -> &'a str {
+    let heading = format!("### {title}");
+    let start = section
+        .find(&heading)
+        .unwrap_or_else(|| panic!("the Configuration section must carry a `{heading}` subsection"));
+    let rest = &section[start..];
+    let end = rest.find("\n### ").map(|i| i + 1).unwrap_or(rest.len());
+    &rest[..end]
 }
 
 // ── layer 1: loader alignment ────────────────────────────────────────────────
@@ -608,12 +647,15 @@ fn documented_examples_appear_verbatim_in_the_doc() {
 
 /// Examples the README's Configuration section also shows (`also_in_readme`)
 /// are pinned there too — the summary cannot drift from the contract either.
-/// TOML blocks are pinned only where `toml_in_readme` says the README shows
-/// the file (the README displays some errors without the file that produced
-/// them); error messages are pinned for every `also_in_readme` case.
+/// The pins are scoped to the extracted Configuration section, so an example
+/// that survives only elsewhere in the README still fails. TOML blocks are
+/// pinned only where `toml_in_readme` says the README shows the file (the
+/// README displays some errors without the file that produced them); error
+/// messages are pinned for every `also_in_readme` case.
 #[test]
 fn readme_examples_still_match() {
     let fx = fixture();
+    let readme = readme_configuration_section();
 
     for case in &fx.cases {
         if case.also_in_readme != Some(true) {
@@ -623,9 +665,10 @@ fn readme_examples_still_match() {
             if let Some(toml) = case.toml.as_deref() {
                 if !toml.is_empty() {
                     assert!(
-                        README.contains(toml),
+                        readme.contains(toml),
                         "case {} is toml_in_readme but its TOML does not appear verbatim \
-                         in README.md — update README and fixture together",
+                         in the README's Configuration section — update README and fixture \
+                         together",
                         case.id
                     );
                 }
@@ -633,9 +676,9 @@ fn readme_examples_still_match() {
         }
         if let Some(err) = case.error.as_deref() {
             assert!(
-                contains_message(README, err),
+                contains_message(readme, err),
                 "case {} is also_in_readme but its error message appears in neither raw \
-                 nor JSON-escaped form in README.md",
+                 nor JSON-escaped form in the README's Configuration section",
                 case.id
             );
         }
@@ -647,9 +690,9 @@ fn readme_examples_still_match() {
         }
         if let Some(err) = rule.expect_error.as_deref() {
             assert!(
-                contains_message(README, err),
+                contains_message(readme, err),
                 "rule {} is also_in_readme but its error appears in neither raw nor \
-                 JSON-escaped form in README.md",
+                 JSON-escaped form in the README's Configuration section",
                 rule.id
             );
         }
@@ -666,10 +709,245 @@ fn readme_examples_still_match() {
         };
         let example = payload.strip_suffix('\n').unwrap_or(payload);
         assert!(
-            !example.is_empty() && README.contains(example),
+            !example.is_empty() && readme.contains(example),
             "case {} is also_in_readme but its emitted line does not appear verbatim in \
-             README.md — update README and fixture together",
+             the README's Configuration section — update README and fixture together",
             case.id
+        );
+    }
+}
+
+// ── layer 6: README Configuration-section alignment ──────────────────────────
+
+/// Markdown table rows from `text`: every `|`-prefixed line except the
+/// `---` separator, split into trimmed cells. The header row is kept —
+/// callers pin or skip it explicitly.
+fn markdown_table_rows(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .filter(|line| line.starts_with('|'))
+        .filter(|line| {
+            !line
+                .chars()
+                .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+        })
+        .map(|line| {
+            line.trim()
+                .trim_start_matches('|')
+                .trim_end_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// The `1. `, `2. `, … items of a numbered markdown list, in document order.
+/// A non-list line never parses as a number, so prose is skipped naturally.
+fn numbered_list_items(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let (number, rest) = trimmed.split_once(". ")?;
+            Some((number.parse().ok()?, rest.to_string()))
+        })
+        .collect()
+}
+
+/// Cell content without the inline-code backticks the README wraps flag
+/// names in — `` `--model`, `-m` `` becomes `--model, -m`, the fixture's
+/// `cli_flag` spelling.
+fn strip_backticks(cell: &str) -> String {
+    cell.replace('`', "")
+}
+
+/// The fixture spells the TOML type out in full (`boolean`); the README's
+/// table abbreviates it to `bool`, matching the `# bool` comment both
+/// documents carry inside the shipped-defaults block. Every other type must
+/// match exactly — the `u32`/`u64` annotations are contract substance.
+fn type_cell_matches(cell: &str, fixture_type: &str) -> bool {
+    cell == fixture_type || cell == fixture_type.replace("boolean", "bool")
+}
+
+/// A built-in default as the README prints it: strings bare (no quotes),
+/// bools and integers as literals.
+fn render_default(value: &serde_json::Value, key: &str) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => panic!("key {key}: fixture builtin_default must be a scalar, got {other}"),
+    }
+}
+
+/// The user-facing spelling of a fixture `default_path` template: the
+/// `{xdg}`/`{home}` temp-dir placeholders become the environment variables
+/// the README's precedence summary prints.
+fn fixture_display_path(fx: &Fixture, placeholder: &str, var: &str) -> String {
+    let rule = fx
+        .default_path
+        .iter()
+        .find(|r| {
+            r.expect_path
+                .as_deref()
+                .is_some_and(|p| p.starts_with(placeholder))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "fixture must carry a default_path rule templating {placeholder} for the \
+                 README precedence summary"
+            )
+        });
+    rule.expect_path
+        .as_deref()
+        .unwrap()
+        .replace(placeholder, var)
+}
+
+/// The README's Keys table is the contract's key table in summary form: the
+/// same five columns, exactly the fixture's four keys in order, the same
+/// types, built-in defaults, and CLI counterparts. A key added to the
+/// contract without a README row (or a README row without a contract key)
+/// fails here, as does any default or flag drifting between the two.
+#[test]
+fn readme_key_table_matches_the_contract_fixture() {
+    let fx = fixture();
+    let keys_sub = readme_subsection(readme_configuration_section(), "Keys");
+
+    let mut rows = markdown_table_rows(keys_sub);
+    assert!(
+        !rows.is_empty(),
+        "the Keys subsection must carry the key table"
+    );
+    let header = rows.remove(0);
+    assert_eq!(
+        header,
+        [
+            "Key",
+            "Type",
+            "Built-in default",
+            "CLI counterpart",
+            "Meaning"
+        ]
+        .map(String::from),
+        "the README key table must keep the contract's columns"
+    );
+
+    let names: Vec<String> = rows.iter().map(|r| strip_backticks(&r[0])).collect();
+    let wanted: Vec<String> = fx.keys.iter().map(|k| k.name.clone()).collect();
+    assert_eq!(
+        names, wanted,
+        "the README key table must list exactly the fixture's keys, in order, and no others"
+    );
+
+    for (row, key) in rows.iter().zip(&fx.keys) {
+        assert_eq!(
+            row.len(),
+            5,
+            "key {}: every README row must keep five cells",
+            key.name
+        );
+        assert!(
+            type_cell_matches(&row[1], &key.toml_type),
+            "key {}: README type cell {:?} must match the fixture's {:?} (only the \
+             `boolean` → `bool` abbreviation is allowed)",
+            key.name,
+            row[1],
+            key.toml_type
+        );
+        let default = render_default(&key.builtin_default, &key.name);
+        assert!(
+            row[2] == format!("`{default}`") || row[2].starts_with(&format!("`{default}` ")),
+            "key {}: README built-in default cell {:?} must lead with the fixture's \
+             `{default}` — update README and fixture together",
+            key.name,
+            row[2]
+        );
+        assert_eq!(
+            strip_backticks(&row[3]),
+            key.cli_flag,
+            "key {}: README CLI counterpart must match the fixture",
+            key.name
+        );
+    }
+}
+
+/// The README's File-location precedence summary must restate the fixture's
+/// `default_path` rules in order: `--config` first, then the XDG path, then
+/// the HOME path — with the path strings derived from the fixture's own
+/// templates, so renaming the file or moving the directory trips here too.
+#[test]
+fn readme_path_precedence_summary_matches_the_fixture_rules() {
+    let fx = fixture();
+    let location = readme_subsection(readme_configuration_section(), "File location");
+
+    let items = numbered_list_items(location);
+    let numbers: Vec<usize> = items.iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        numbers,
+        [1usize, 2, 3],
+        "the README precedence summary must be exactly the contract's three rules"
+    );
+
+    let xdg_path = fixture_display_path(&fx, "{xdg}", "$XDG_CONFIG_HOME");
+    let home_path = fixture_display_path(&fx, "{home}", "$HOME");
+
+    assert!(
+        items[0].1.contains("--config"),
+        "precedence rule 1 must name the --config override, got {:?}",
+        items[0].1
+    );
+    assert!(
+        items[1].1.contains(&xdg_path),
+        "precedence rule 2 must print the fixture's XDG path `{xdg_path}` (XDG wins over \
+         HOME), got {:?}",
+        items[1].1
+    );
+    assert!(
+        items[2].1.contains(&home_path),
+        "precedence rule 3 must print the fixture's HOME path `{home_path}`, got {:?}",
+        items[2].1
+    );
+}
+
+/// The shipped-defaults TOML block — the fixture case pinning every key at
+/// its built-in default — must appear verbatim *inside* the Configuration
+/// section, and each key's assignment line must state the fixture's
+/// `builtin_default`: `model = "claude-sonnet-4-6"`, `inherit_hooks = true`,
+/// `max_turns = 30`, `timeout_secs = 3600`.
+#[test]
+fn readme_shipped_defaults_block_lives_in_the_configuration_section() {
+    let fx = fixture();
+    let section = readme_configuration_section();
+    let case = fx
+        .cases
+        .iter()
+        .find(|c| c.id == "shipped-defaults-block")
+        .expect("fixture must carry the shipped-defaults-block case");
+    let toml = case
+        .toml
+        .as_deref()
+        .expect("shipped-defaults-block must carry its TOML");
+
+    assert!(
+        section.contains(toml),
+        "the shipped-defaults TOML block must appear verbatim inside the README's \
+         Configuration section — update README and fixture together"
+    );
+
+    // The per-key anchor: independent of the block's comment alignment, each
+    // shipped default is stated as a TOML assignment.
+    for key in &fx.keys {
+        let default = render_default(&key.builtin_default, &key.name);
+        let assignment = if key.builtin_default.is_string() {
+            format!("{} = \"{}\"", key.name, default)
+        } else {
+            format!("{} = {}", key.name, default)
+        };
+        assert!(
+            section.contains(&assignment),
+            "the Configuration section must show `{assignment}` — the shipped default \
+             for {} per the fixture",
+            key.name
         );
     }
 }
