@@ -37,9 +37,29 @@ fixture selected by `tests/claude_contracts.rs`) and
 `.{input,expected,errors}.jsonl` triple selected by
 `tests/stream_json_contract.rs`). Historical captures may remain beside the
 active files, but every active reference must be re-measured and re-pinned
-with the same Claude version. The currently committed stream-json golden
-family is still stamped 2.1.270 while the runtime pin is 2.1.282, so the gate
-intentionally remains red until that family is re-measured and re-pinned.
+with the same Claude version — and since claudepr-b590e46d (2026-09-25) the
+active pins must agree with each other and with the **Measured against:**
+stamp as one measurement of one version; the detector rejects divergence
+outright (exit 2, no claude consulted), and the always-on
+`active_fixture_families_share_one_pinned_version` test in
+`tests/contract_maintenance.rs` enforces the same invariant in every
+`cargo test` run while explicitly exempting unreferenced historical files.
+The stream-json golden family — born pinned to 2.1.270 while the runtime pin
+had moved to 2.1.282, leaving the gate intentionally red (claudepr-e65ab413)
+— was re-measured and re-pinned to 2.1.282 on 2026-09-25: two sandboxed PTY
+sessions through claude-print itself re-verified the PTY transcript shape
+(no `result` record; compact JSON; no CR/blank lines), the 2.1.282
+user/assistant/`mode` record envelopes (the assistant envelope now carries
+`session_id` *and* `sessionId`, `model`, `stop_reason`, and an expanded
+`usage`; 2.1.282 also writes `mode`, `permission-mode`, `attachment`,
+`last-prompt`, `ai-title`, `cost-state` records — all forwarded, the reader
+is type-agnostic), and — observed live for the first time on 2.1.282 —
+`thinking` blocks (`type`/`thinking`/`signature`) and split assistant
+records sharing a `message.id` with distinct `uuid`s. The regenerated
+`stream_json_golden_v2.1.282` triple was produced through the capture path
+(expected = a replay of the staged input by the real reader thread, errors =
+the real `emit_error`), never hand-edited; the `v2.1.270` family is retained
+beside it as measurement history.
 
 **Isolation:** every probe ran with `HOME` redirected into a throwaway
 `mktemp` sandbox (fresh `.claude.json`, trust pre-seeded for the probe cwd
@@ -211,9 +231,15 @@ It also checks the active references for both version-pinned fixture classes,
 `tests/fixtures/claude_contracts_v*.json` and
 `tests/fixtures/stream_json_golden_v*`'s
 `.{input,expected,errors}.jsonl` family; historical fixture files that are no
-longer selected by a contract test do not hold the gate back. A version bump
-therefore stays red until the runtime evidence and the stream-json goldens
-are re-measured and their active references are re-pinned together.
+longer selected by a contract test do not hold the gate back. And it rejects
+divergent active pins outright (claudepr-b590e46d): the doc stamp and both
+active families must agree with each other before anything is compared
+against the installed binary — a half-landed re-pin fails the gate (exit 2)
+even where claude is absent, and `tests/contract_maintenance.rs`'s
+`active_fixture_families_share_one_pinned_version` pins the same invariant
+into every `cargo test` run. A version bump therefore stays red until the
+runtime evidence and the stream-json goldens are re-measured and their
+active references are re-pinned together.
 Versions move in two ways; either should trigger the check:
 
 - the dev host auto-updates the native install

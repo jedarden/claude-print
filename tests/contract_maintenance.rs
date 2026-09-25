@@ -7,10 +7,15 @@
 //! tests pin that wiring so the automation cannot silently detach from the
 //! doc again:
 //!
+//! - active-version consistency (claudepr-b590e46d, always-on) — the doc's
+//!   **Measured against:** stamp and BOTH active fixture families
+//!   (`claude_contracts_v*.json`, `stream_json_golden_v*.{input,expected,
+//!   errors}.jsonl`) must name one Claude version; fixture files no test
+//!   references are historical captures and are exempt;
 //! - detector parse — `scripts/check-claude-version-bump.sh` exits 0/1/2
 //!   against a stubbed `claude`, with the stub's version derived from the
-//!   doc's live **Measured against:** stamp; the active fixture references are
-//!   checked too, so a stale stream-json golden pin is visible;
+//!   doc's live **Measured against:** stamp, and rejects divergent active
+//!   pins against a skeleton repo without consulting any `claude` at all;
 //! - the gate's contract against a stubbed `claude`/`gh`/`cargo` (hermetic —
 //!   a single stub-bin PATH, so unstubbed binaries are genuinely absent):
 //!   exit code, evidence-bundle shape, the refreshed
@@ -65,12 +70,15 @@ fn bumped(pin: &str) -> String {
 }
 
 /// Symlink the real core utilities the bash scripts need (bash, grep, head,
-/// cat, mkdir, dirname) into the stub bin dir, so a single-entry PATH is
-/// self-contained. `printf`/`command`/`cd` are bash builtins and need no
-/// link. Idempotent: existing links (and stubs) are left alone.
+/// cat, mkdir, dirname, sort, wc, tr) into the stub bin dir, so a
+/// single-entry PATH is self-contained. `printf`/`command`/`cd` are bash
+/// builtins and need no link. Idempotent: existing links (and stubs) are
+/// left alone.
 fn link_coreutils(bin: &Path) {
     fs::create_dir_all(bin).unwrap();
-    for tool in ["bash", "grep", "head", "cat", "mkdir", "dirname"] {
+    for tool in [
+        "bash", "grep", "head", "cat", "mkdir", "dirname", "sort", "wc", "tr",
+    ] {
         let dest = bin.join(tool);
         if dest.symlink_metadata().is_ok() {
             continue;
@@ -209,10 +217,136 @@ fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
 
+// ── Active-version consistency (claudepr-b590e46d; always-on, no claude) ─────
+
+/// The version-pinned fixture classes the maintenance gate treats as active
+/// evidence, paired with the contract test that selects each family.
+const ACTIVE_FIXTURE_SOURCES: [(&str, &str); 2] = [
+    ("claude_contracts", "tests/claude_contracts.rs"),
+    ("stream_json_golden", "tests/stream_json_contract.rs"),
+];
+
+/// A version-shaped token (`x.y.z`, all-numeric parts) at the start of `s`,
+/// or None. A trailing `.` (the fixture-extension boundary, as in
+/// `2.1.282.json`) ends the token and is not part of it.
+fn leading_version(s: &str) -> Option<&str> {
+    let end = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let candidate = s[..end].trim_end_matches('.');
+    let parts: Vec<&str> = candidate.split('.').collect();
+    (parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+    .then_some(candidate)
+}
+
+/// Every active version-pinned fixture reference in a contract test source —
+/// `(class, version)` pairs parsed from `fixtures/<class>_v<x.y.z>` path
+/// fragments, the same tokens `scripts/check-claude-version-bump.sh` greps
+/// out, so this check and the detector cannot disagree about what "active"
+/// means.
+fn active_fixture_refs(source: &str) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    for (class, _) in ACTIVE_FIXTURE_SOURCES {
+        let marker = format!("fixtures/{class}_v");
+        let mut rest = source;
+        while let Some(at) = rest.find(&marker) {
+            rest = &rest[at + marker.len()..];
+            if let Some(version) = leading_version(rest) {
+                refs.push((class.to_string(), version.to_string()));
+            }
+        }
+    }
+    refs
+}
+
+/// The maintenance check the reconciled fixture families owe their name to:
+/// all ACTIVE evidence — the doc stamp and every fixture family a contract
+/// test references — must name one Claude version, while historical fixture
+/// files that no test references stay exempt. Runs everywhere `cargo test`
+/// runs, with no claude binary and no live anything, so a half-landed re-pin
+/// (one family re-pinned, the doc or the other family left behind) fails the
+/// always-on suite, not just the CI gate.
+#[test]
+fn active_fixture_families_share_one_pinned_version() {
+    let pin = doc_pin();
+    let mut active: Vec<(String, String)> = Vec::new();
+
+    for (_, source_rel) in ACTIVE_FIXTURE_SOURCES {
+        let source =
+            fs::read_to_string(repo_path(source_rel)).expect("contract test source must exist");
+        let refs = active_fixture_refs(&source);
+        assert!(
+            !refs.is_empty(),
+            "{source_rel} must reference its version-pinned fixture family"
+        );
+        for (class, version) in &refs {
+            assert_eq!(
+                version, &pin,
+                "active {class} fixture is pinned to {version} but the doc stamp is {pin} — \
+                 re-measure and re-pin every active family together \
+                 (docs/notes/claude-contract-probes.md §Re-pin)"
+            );
+            // The referenced family must actually exist beside the reference.
+            let prefix = format!("{class}_v{version}");
+            let family_exists = fs::read_dir(repo_path("tests/fixtures"))
+                .unwrap()
+                .any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&prefix)
+                });
+            assert!(
+                family_exists,
+                "active {prefix} fixture family is missing from tests/fixtures/"
+            );
+            active.push((class.to_string(), version.clone()));
+        }
+    }
+
+    // Every version-pinned fixture file on disk is either active (referenced,
+    // version-checked above) or historical (exempt by design): classify each
+    // so a file can never silently fall outside the check, and prove the
+    // historical families in this repo — claude_contracts 2.1.270/2.1.281,
+    // stream_json_golden 2.1.270 — really are exempt, not accidentally
+    // conforming.
+    let mut historical: Vec<String> = Vec::new();
+    for entry in fs::read_dir(repo_path("tests/fixtures")).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        let Some(class) = ACTIVE_FIXTURE_SOURCES
+            .iter()
+            .map(|(c, _)| *c)
+            .find(|c| name.starts_with(&format!("{c}_v")))
+        else {
+            continue;
+        };
+        let version = leading_version(&name[class.len() + 2..])
+            .unwrap_or_else(|| panic!("fixture {name} has no version-shaped name"));
+        let is_active = active.iter().any(|(c, v)| *c == class && *v == version);
+        if !is_active {
+            historical.push(format!("{class}_v{version}"));
+        }
+    }
+    assert!(
+        historical.iter().any(|h| h.starts_with("claude_contracts")),
+        "expected retained claude_contracts history, got {historical:?}"
+    );
+    assert!(
+        historical
+            .iter()
+            .any(|h| h.starts_with("stream_json_golden")),
+        "expected retained stream_json_golden history, got {historical:?}"
+    );
+}
+
 // ── Detector parse (scripts/check-claude-version-bump.sh) ────────────────────
 
 #[test]
-fn detector_doc_pin_matches_but_stale_golden_keeps_drift_red() {
+fn detector_current_when_stub_matches_every_active_pin() {
     let pin = doc_pin();
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -220,21 +354,31 @@ fn detector_doc_pin_matches_but_stale_golden_keeps_drift_red() {
 
     let out = run_script("scripts/check-claude-version-bump.sh", Some(&bin), &[], &[]);
 
-    // The documentation pin is current, but the active stream-json golden
-    // family is intentionally still pinned to 2.1.270. The detector must not
-    // call this current merely because the doc stamp matches.
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    // After the claudepr-b590e46d reconciliation every active pin — doc stamp,
+    // claude_contracts, stream_json_golden — names the same version, so a
+    // matching installed binary is CURRENT: the intentionally-red
+    // stale-golden era (claudepr-e65ab413) is over.
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("DRIFT"), "{stdout}");
-    assert!(stdout.contains("fixture (stream_json_golden)"), "{stdout}");
+    assert!(stdout.contains("CURRENT"), "{stdout}");
+    for class in ["claude_contracts", "stream_json_golden"] {
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(&format!("fixture ({class}):")))
+            .unwrap_or_else(|| panic!("no fixture line for {class}: {stdout}"));
+        assert!(
+            line.trim_end().ends_with(&pin),
+            "active {class} pin must be {pin}: {line}"
+        );
+    }
 }
 
 #[test]
 fn detector_drift_names_the_golden_repin_step() {
-    let pin = doc_pin();
+    let live = bumped(&doc_pin());
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
-    stub_claude(&bin, &format!("{pin} (Claude Code)"));
+    stub_claude(&bin, &format!("{live} (Claude Code)"));
 
     let out = run_script("scripts/check-claude-version-bump.sh", Some(&bin), &[], &[]);
 
@@ -247,6 +391,72 @@ fn detector_drift_names_the_golden_repin_step() {
     assert!(
         stdout.contains("stream_json_golden_v<version>.*.jsonl"),
         "{stdout}"
+    );
+}
+
+/// A skeleton repo whose active pins disagree (doc + claude_contracts at one
+/// version, the stream-json golden family one behind) is rejected with exit 2
+/// BEFORE any claude is consulted — the divergence check needs no installed
+/// binary, so a half-landed re-pin is caught even on a claude-less host.
+#[test]
+fn detector_rejects_divergent_active_pins_without_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("docs/notes")).unwrap();
+    fs::create_dir_all(root.join("tests/fixtures")).unwrap();
+    fs::copy(
+        repo_path("scripts/check-claude-version-bump.sh"),
+        root.join("scripts/check-claude-version-bump.sh"),
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/notes/claude-contract-probes.md"),
+        "**Measured against:** `claude` 9.9.901 (`9.9.901 (Claude Code)`), 2026-09-25\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/claude_contracts.rs"),
+        "const FIXTURE: &str = include_str!(\"fixtures/claude_contracts_v9.9.901.json\");\n",
+    )
+    .unwrap();
+    // Divergent: the golden family is one patch behind the doc/contracts pin.
+    fs::write(
+        root.join("tests/stream_json_contract.rs"),
+        concat!(
+            "const INPUT: &str = include_str!(\"fixtures/stream_json_golden_v9.9.900.input.jsonl\");\n",
+            "const EXPECTED: &str = include_str!(\"fixtures/stream_json_golden_v9.9.900.expected.jsonl\");\n",
+            "const ERRORS: &str = include_str!(\"fixtures/stream_json_golden_v9.9.900.errors.jsonl\");\n",
+        ),
+    )
+    .unwrap();
+    for name in [
+        "claude_contracts_v9.9.901.json",
+        "stream_json_golden_v9.9.900.input.jsonl",
+        "stream_json_golden_v9.9.900.expected.jsonl",
+        "stream_json_golden_v9.9.900.errors.jsonl",
+    ] {
+        fs::write(root.join("tests/fixtures").join(name), "{}\n").unwrap();
+    }
+
+    let bin = root.join("bin");
+    let out = Command::new("bash")
+        .arg(root.join("scripts/check-claude-version-bump.sh"))
+        .env("PATH", stub_path(&bin)) // no claude stub: none is needed
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "divergent active pins must fail closed, without claude; stderr: {}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("active version pins disagree"), "{stderr}");
+    assert!(
+        stderr.contains("9.9.901") && stderr.contains("9.9.900"),
+        "{stderr}"
     );
 }
 
@@ -290,7 +500,7 @@ fn detector_indeterminate_on_unparsable_version() {
 // ── Gate contract, hermetic (stubbed claude / gh / cargo) ────────────────────
 
 #[test]
-fn gate_stale_golden_records_evidence_and_refreshes_version_file() {
+fn gate_current_records_evidence_and_refreshes_version_file() {
     let pin = doc_pin();
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -303,9 +513,13 @@ fn gate_stale_golden_records_evidence_and_refreshes_version_file() {
         &[],
     );
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    // Every active pin reconciled to one version (claudepr-b590e46d): a
+    // matching installed binary is a green gate — the stale-golden era in
+    // which this same run exited 1 (claudepr-e65ab413) is over.
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let evidence = dir.path().join("evidence");
-    assert_eq!(status_value(&evidence, "alert"), "re-run-due");
+    assert_eq!(status_value(&evidence, "alert"), "none");
+    assert_eq!(status_value(&evidence, "contract-maintenance"), "CURRENT");
     assert_eq!(status_value(&evidence, "pinned"), pin);
     assert_eq!(status_value(&evidence, "installed"), pin);
     // Version artifact: the full first line, the same shape
@@ -317,8 +531,7 @@ fn gate_stale_golden_records_evidence_and_refreshes_version_file() {
     // Evidence bundle shape per §Wiring: detection + probes (SKIPPED) +
     // status + next-steps; live-contract-tests.txt only when tests ran.
     let detection = read_text(&evidence.join("detection.txt"));
-    assert!(detection.contains("detector-exit: 1"));
-    assert!(detection.contains("fixture (stream_json_golden)"));
+    assert!(detection.contains("detector-exit: 0"));
     for probe in [
         "probe-claude-contracts.sh",
         "probe-stop-toolallowed.sh",
@@ -329,10 +542,7 @@ fn gate_stale_golden_records_evidence_and_refreshes_version_file() {
     }
     assert!(!evidence.join("live-contract-tests.txt").exists());
     assert!(evidence.join("next-steps.txt").exists());
-    assert_eq!(
-        status_value(&evidence, "follow-up"),
-        "not-requested (pass --file-follow-up)"
-    );
+    assert_eq!(status_value(&evidence, "follow-up"), "n/a (no drift)");
 }
 
 #[test]
@@ -433,7 +643,7 @@ fn gate_drift_without_follow_up_flag_never_calls_gh() {
 }
 
 #[test]
-fn gate_stale_golden_without_follow_up_never_calls_gh() {
+fn gate_current_without_follow_up_never_calls_gh() {
     let pin = doc_pin();
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
@@ -448,14 +658,16 @@ fn gate_stale_golden_without_follow_up_never_calls_gh() {
         &[("GH_ARGS_FILE", gh_args.display().to_string())],
     );
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    // CURRENT gates never touch gh — follow-up filing is drift-only, so even
+    // --file-follow-up would be inert here (and is not passed).
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     assert!(
         !gh_args.exists(),
-        "without --file-follow-up, gh is not called"
+        "a CURRENT gate must not invoke gh for any reason"
     );
     assert_eq!(
         status_value(&dir.path().join("evidence"), "follow-up"),
-        "not-requested (pass --file-follow-up)"
+        "n/a (no drift)"
     );
 }
 
@@ -524,7 +736,7 @@ fn gate_runs_cheap_live_contracts_when_not_skipped() {
         &[("CARGO_ARGS_FILE", cargo_args.display().to_string())],
     );
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let evidence = dir.path().join("evidence");
     let live = read_text(&evidence.join("live-contract-tests.txt"));
     assert!(live.contains("live-tests-exit: 0"), "{live}");
@@ -551,7 +763,7 @@ fn gate_live_tests_skip_flag_leaves_no_transcript() {
         &[],
     );
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr_of(&out));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let evidence = dir.path().join("evidence");
     assert!(!evidence.join("live-contract-tests.txt").exists());
     assert_eq!(

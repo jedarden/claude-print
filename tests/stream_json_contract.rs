@@ -3,24 +3,29 @@
 //! The contract these fixtures pin is specified in
 //! `docs/notes/stream-json-contract.md`; each test names the section it pins.
 //! Golden fixtures are version-pinned like the transcript captures
-//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.270` in the filename
+//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.282` in the filename
 //! is the pinned Claude Code version from
-//! `docs/notes/claude-contract-probes.md`, and the record shapes are modeled
-//! on those captures.
+//! `docs/notes/claude-contract-probes.md`. The record envelopes were
+//! re-measured against live claude 2.1.282 on 2026-09-25 (claudepr-b590e46d:
+//! two sandboxed PTY sessions; user/assistant/`mode` envelopes transcribed,
+//! `thinking` blocks and split assistant records sharing a `message.id`
+//! observed live); the prior `v2.1.270` family is retained in `tests/fixtures/`
+//! as measurement history.
 //!
 //! What the golden pairs pin, and why each file exists:
 //!
-//! * `stream_json_golden_v2.1.270.input.jsonl` — a PTY-shaped transcript (the
-//!   shape `claude-print` actually tails: `summary`/`user`/`assistant`/
+//! * `stream_json_golden_v2.1.282.input.jsonl` — a PTY-shaped transcript (the
+//!   shape `claude-print` actually tails: `mode`/`summary`/`user`/`assistant`/
 //!   `system` records, NO `result` record) carrying one instance of every
-//!   byte-level case the contract calls out: compact JSON, spaced JSON (no
+//!   byte-level case the contract calls out: a 2.1.282 `mode` record (the
+//!   new-in-2.1.282 minimal record type), compact JSON, spaced JSON (no
 //!   re-serialization), unicode text, a `thinking` block, split assistant
 //!   records sharing a `message.id` (forwarded verbatim, no dedup), a blank
 //!   line (dropped), and a CRLF-terminated line (CR trimmed).
-//! * `stream_json_golden_v2.1.270.expected.jsonl` — the exact stdout bytes a
+//! * `stream_json_golden_v2.1.282.expected.jsonl` — the exact stdout bytes a
 //!   full replay must produce: input minus the blank line, CR removed, every
 //!   line LF-terminated.
-//! * `stream_json_golden_v2.1.270.errors.jsonl` — the exact bytes of the two
+//! * `stream_json_golden_v2.1.282.errors.jsonl` — the exact bytes of the two
 //!   synthesized `result` error objects: the session-error line written to
 //!   stdout (line 1) and the config-error line written to stderr (line 2).
 //!
@@ -42,15 +47,15 @@ use claude_print::emitter::{
 };
 use claude_print::error::ClaudePrintError;
 
-const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.270.input.jsonl");
-const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.270.expected.jsonl");
-const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.270.errors.jsonl");
+const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.282.input.jsonl");
+const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.282.expected.jsonl");
+const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.282.errors.jsonl");
 const CAPTURE_V233: &str = include_str!("fixtures/transcript_v2.1.233.jsonl");
 
 /// The claude version stamped into the golden error objects — the pinned
 /// version from `docs/notes/claude-contract-probes.md`, in the same
 /// `<x.y.z> (Claude Code)` form `resolve_claude_version` records.
-const GOLDEN_CLAUDE_VERSION: &str = "2.1.270 (Claude Code)";
+const GOLDEN_CLAUDE_VERSION: &str = "2.1.282 (Claude Code)";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -121,7 +126,7 @@ fn byte_offset_after_lines(bytes: &[u8], n: usize) -> usize {
 
 /// The expected bytes for a replay that starts at the snapshot offset after
 /// the first `n` input lines: the first `n` lines of the expected fixture
-/// correspond to the first `n` input lines (the blank input line is line 8),
+/// correspond to the first `n` input lines (the blank input line is line 9),
 /// so skipping is line-aligned between the two files.
 fn expected_from_line(n: usize) -> Vec<u8> {
     EXPECTED.as_bytes()[byte_offset_after_lines(EXPECTED.as_bytes(), n)..].to_vec()
@@ -158,13 +163,13 @@ fn wait_for_bytes(writer: &ChunkLogWriter, min_len: usize) {
 fn staged_transcript(dir: &Path, bytes: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
     let projects_dir = dir.join("projects").join("gold-cwd");
     std::fs::create_dir_all(&projects_dir).unwrap();
-    let transcript = projects_dir.join("gold-session-270.jsonl");
+    let transcript = projects_dir.join("gold-session-282.jsonl");
     std::fs::write(&transcript, bytes).unwrap();
     let identity = dir.join("session-identity.json");
     std::fs::write(
         &identity,
         format!(
-            r#"{{"session_id":"gold-session-270","transcript_path":"{}","cwd":"/gold/cwd"}}"#,
+            r#"{{"session_id":"gold-session-282","transcript_path":"{}","cwd":"/gold/cwd"}}"#,
             transcript.display(),
         ),
     )
@@ -260,7 +265,7 @@ fn golden_incremental_arrival_replays_expected_bytes_in_order() {
     let dir = tempfile::TempDir::new().unwrap();
     let projects_dir = dir.path().join("projects").join("gold-cwd");
     std::fs::create_dir_all(&projects_dir).unwrap();
-    let transcript = projects_dir.join("gold-session-270.jsonl");
+    let transcript = projects_dir.join("gold-session-282.jsonl");
     std::fs::write(&transcript, b"").unwrap();
 
     let writer = ChunkLogWriter::new();
