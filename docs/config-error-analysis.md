@@ -83,8 +83,10 @@ actionable `HOME …` guidance, while a config failure emits a
 
 ## Entry-point dispatch (current behavior)
 
-`main()` dispatches in this order. Line references are to `src/main.rs` at
-commit `14f907c` (2026-09-24); the symbol names are the stable anchors.
+`main()` dispatches in this order; the cited symbols (`src/main.rs`,
+`src/cli.rs`, `src/config.rs`, `src/check.rs`, `src/error.rs`,
+`src/emitter.rs`, `src/util.rs`) are the stable anchors — line numbers are
+deliberately omitted, they rotted once already.
 
 ```
 main()
