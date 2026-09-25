@@ -49,6 +49,21 @@ fn generation_body(marker: &str) -> String {
     format!("#!/bin/sh\nprintf 'fake claude-print {marker}\\n'\n")
 }
 
+/// The documented exception to [`BINARY_BODY`]'s exit-0 contract: a binary
+/// whose `--check` exits 1 — the post-install smoke's failure shape (a
+/// release whose artifact passes verification and placement but is broken on
+/// the installing machine). Only `--check` fails, with a marker line on
+/// stderr; any other invocation prints how it was invoked, so stdout
+/// asserts can tell the legs apart (a run whose smoke failed must never
+/// reach the `--version` leg that follows it).
+fn check_failing_body(marker: &str) -> String {
+    format!(
+        "#!/bin/sh\ncase \"$1\" in\n  --check)\n    printf 'fake claude-print {marker}: \
+         simulated --check failure\\n' >&2\n    exit 1\n    ;;\n  *)\n    printf 'fake \
+         claude-print {marker} invoked as: %s\\n' \"$1\"\n    ;;\nesac\n"
+    )
+}
+
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
@@ -722,6 +737,120 @@ fn mid_install_placement_failure_leaves_the_previous_binary_recoverable_and_repo
         String::from_utf8_lossy(&restored.stdout).contains("v1"),
         "the rolled-back binary must be the previous generation: {}",
         String::from_utf8_lossy(&restored.stdout)
+    );
+}
+
+#[test]
+fn a_failed_post_install_check_aborts_the_install_with_the_new_binary_live_and_prev_intact() {
+    // Row three of the failed-upgrade triage table
+    // (docs/notes/installer-rollback.md): placement succeeded and a later
+    // leg aborted — here the `--check` smoke itself, against a release whose
+    // binary passes verification and placement but fails the smoke. The
+    // installer must propagate the failure (nonzero exit, the documented
+    // `Error: claude-print --check failed` line, the check's own output
+    // surfacing), print no success output after it (no `--version` leg, no
+    // completion banner), and leave the documented state: the NEW binary
+    // live at the install path, the previous one verbatim at `.prev` — from
+    // which the documented deliberate rollback restores a binary that passes
+    // the post-rollback `--check`/`--version` gate.
+    let release = build_release_with_binary_body(
+        &[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET],
+        &check_failing_body("v2"),
+    );
+    let home = tempfile::tempdir().unwrap();
+    preplace_prior_install(home.path(), &generation_body("v1"), None);
+
+    let output = run_install(home.path(), release.path());
+
+    // The failure propagates: nonzero exit, the documented error line on
+    // stderr, and the failing check's own output surfacing rather than
+    // being swallowed.
+    assert!(
+        !output.status.success(),
+        "a failed post-install check must fail the install"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("Error: claude-print --check failed"),
+        "stderr must carry the documented check-failure line: {stderr}"
+    );
+    assert!(
+        stderr.contains("simulated --check failure"),
+        "the failing check's own output must surface: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The run really reached the check leg — every earlier leg succeeded,
+    // so the failure can only be the check's.
+    assert!(
+        stdout.contains("Backing up existing binary"),
+        "the upgrade shape must be established before the failure: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Installed {}",
+            installed_path(home.path(), BINARY_INSTALL_NAME).display()
+        )),
+        "the binary must have been placed before the check ran: {stdout}"
+    );
+    assert!(
+        stdout.contains("Running claude-print --check"),
+        "the smoke must have run — the failure is the check's, not an earlier leg's: {stdout}"
+    );
+    // No success output: the run stops short of the `--version` leg and the
+    // completion banner (the note's success marker).
+    assert!(
+        !stdout.contains("invoked as:"),
+        "the binary must never run in its printing mode — no --version leg after a failed check: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Installation complete"),
+        "a failed check must never print the completion banner: {stdout}"
+    );
+    // The documented state (triage row three): the NEW binary is live, and
+    // the previous one sits verbatim at the rollback copy.
+    assert_eq!(
+        fs::read_to_string(installed_path(home.path(), BINARY_INSTALL_NAME)).unwrap(),
+        check_failing_body("v2"),
+        "the live binary must be the new release — the failure struck after placement"
+    );
+    let prev = installed_path(home.path(), PREV_INSTALL_NAME);
+    assert_eq!(
+        fs::read_to_string(&prev).unwrap(),
+        generation_body("v1"),
+        "the rollback copy must hold the previous binary verbatim"
+    );
+    assert_eq!(mode_of(&prev), 0o755, "the rollback copy stays executable");
+    // The check is the final leg, so everything placed before it stands —
+    // the fixture too (contrast a `mock_claude`-leg failure, which skips
+    // the legs after it).
+    assert!(
+        installed_path(home.path(), MOCK_INSTALL_NAME).exists(),
+        "legs before the check must keep their placements"
+    );
+    // The documented deliberate rollback (README "Roll back one version in
+    // one step" overwrites the untrusted new binary) then restores the
+    // previous generation, which passes the post-rollback gate: `--check`
+    // exits 0 and `--version` names the replaced generation.
+    fs::rename(&prev, installed_path(home.path(), BINARY_INSTALL_NAME)).unwrap();
+    for gate in ["--check", "--version"] {
+        let run = Command::new(installed_path(home.path(), BINARY_INSTALL_NAME))
+            .arg(gate)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "the rolled-back binary must pass the post-rollback {gate} gate: {}",
+            stderr_of(&run)
+        );
+    }
+    let version = Command::new(installed_path(home.path(), BINARY_INSTALL_NAME))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&version.stdout).contains("v1"),
+        "the rolled-back binary must identify as the previous generation: {}",
+        String::from_utf8_lossy(&version.stdout)
     );
 }
 

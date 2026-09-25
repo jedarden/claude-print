@@ -100,7 +100,8 @@ row two by
 `mid_install_placement_failure_leaves_the_previous_binary_recoverable_and_reports_the_failure`
 — which also pins that no success line appears: no `Installed …`, no
 `--check` smoke, no completion banner, and nothing placed after the failed
-step.
+step; row three (the `--check`-smoke arm) by
+`a_failed_post_install_check_aborts_the_install_with_the_new_binary_live_and_prev_intact`.
 
 ### The mid-install failure window
 
@@ -169,3 +170,4 @@ fake `file://` releases (per-generation binary bodies):
 | `fresh_install_creates_no_rollback_copy` | No existing binary means no `.prev` |
 | `a_failed_install_disturbs_neither_the_live_binary_nor_the_existing_rollback_copy` | Ordering: a digest mismatch aborts before the backup, leaving the live binary and an existing `.prev` byte-identical |
 | `mid_install_placement_failure_leaves_the_previous_binary_recoverable_and_reports_the_failure` | The mid-install failure window: with verification passed and the backup taken, a failing final placement (an `install` shim on `PATH` matching only the main binary's destination, simulating the disk-full shape) exits nonzero with the tool's error on stderr, prints no success line (`Installed …`, `--check`, `Installation complete`), places nothing further, and leaves the live path vacant — while `.prev` holds the previous binary verbatim at mode 755, still runnable, and the documented rollback `mv` restores a working binary from it |
+| `a_failed_post_install_check_aborts_the_install_with_the_new_binary_live_and_prev_intact` | The post-install `--check` failure (triage row three): a release whose binary passes verification and placement but fails the smoke exits nonzero with the documented `Error: claude-print --check failed` line and the check's own output on stderr, prints no success output after the failed leg (no `--version` line, no `Installation complete.`), and leaves the documented state — the new binary live at the install path, `.prev` holding the previous generation verbatim at mode 755, and every earlier leg's placement standing — from which the documented rollback `mv` restores a binary that passes the post-rollback `--check`/`--version` gate |
