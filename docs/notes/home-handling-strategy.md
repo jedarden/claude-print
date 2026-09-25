@@ -42,13 +42,18 @@ HOME path '/home/service' is not writable: ...; grant write permission or set HO
 
 ## Call-site behavior
 
+Every production `get_home()` call site, in resolution or validation:
+
 | Module | Function | HOME behavior |
 | --- | --- | --- |
 | `util.rs` | `get_home()` | Sole production environment read; enforces the contract above |
+| `main.rs` | `main()` | Validates `get_home()` before dispatch — a process-wide prerequisite check (also for early-exit entry points such as `--version`); derives no paths |
 | `config.rs` | `Config::default_path()` | Uses `get_home()` only when `XDG_CONFIG_HOME` is unavailable |
-| `poller.rs` | `resolve_stop_info()` | Uses `get_home()` only when an absent transcript path must be derived |
+| `poller.rs` | `resolve_stop_info()` | Passes `get_home` to `resolve_stop_info_with`, which consults it only when an absent transcript path must be derived |
 | `poller.rs` | `derive_transcript_path()` | Always uses `get_home()` |
-| `poller.rs` | `projects_dir_for_cwd()` | Always uses `get_home()` |
+| `poller.rs` | `projects_dir_for()` | Always uses `get_home()`; `projects_dir_for_cwd()` and the pool path delegate here |
+| `session.rs` | `Session::run()` | Validates `get_home()` at entry so direct library callers match the CLI preflight |
+| `session.rs` | `Session::run_pooled()` | Same entry validation as `Session::run()`, before touching the worker |
 | `session.rs` | `pretrust_cwd()` | Always uses `get_home()` for `~/.claude.json` |
 
 An explicit Stop-hook `transcript_path` does not need HOME. Likewise, an
@@ -67,6 +72,18 @@ read-only, and chroot-like HOME values, as well as CLI error rendering:
 ```bash
 cargo test --test home_unset
 ```
+
+The call-site discipline itself is guarded standing: no direct HOME
+environment read (`var("HOME")` / `var_os("HOME")`, or a `home_dir()`
+bypass) outside `src/util.rs`, exactly one inside it, and the table above
+pinned against the actual call sites:
+
+```bash
+cargo test --test home_env_guard
+```
+
+A new or moved `get_home()` call site fails that guard until this table
+and its snapshot are updated in the same commit.
 
 See [`docs/test-coverage-home-unset.md`](../test-coverage-home-unset.md) for the
 individual cases and [`docs/research/home-handling-audit.md`](../research/home-handling-audit.md)
