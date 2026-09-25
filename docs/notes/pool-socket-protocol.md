@@ -375,14 +375,14 @@ with `error: pool protocol failure: ...`; it never falls back (INV-10).
 One full acquire, driven by hand (length prefixes shown as hex):
 
 ```
-C→D  00 00 00 1b  {"type":"acquire","timeout_secs":60}        (27 bytes)
+C→D  00 00 00 24  {"type":"acquire","timeout_secs":60}        (36 bytes)
 D→C  00 00 00 xx  {"type":"worker_assigned","worker_id":"...",
                    "message":"Worker ready","stop_fifo":"/tmp/.../stop.fifo",
                    "pid":12345,"cwd":"/srv/daemon"}            (xx bytes)
 D→C  (sendmsg: 1 NUL byte in-band + SCM_RIGHTS cmsg carrying the PTY master fd)
      ...client drives the session over the transferred fd...
 C→D  (new connection)
-     00 00 00 2a  {"type":"release","worker_id":"..."}         (42 bytes)
+     00 00 00 xx  {"type":"release","worker_id":"..."}         (xx bytes)
 D→C  00 00 00 xx  {"type":"worker_assigned","worker_id":"...",
                    "message":"Worker released","stop_fifo":"","pid":0,"cwd":""}
 ```
@@ -390,9 +390,9 @@ D→C  00 00 00 xx  {"type":"worker_assigned","worker_id":"...",
 Refusal example (`pool_full`):
 
 ```
-C→D  00 00 00 1b  {"type":"acquire","timeout_secs":60}
-D→C  00 00 00 45  {"type":"error","error":"Pool full - no ready workers",
-                   "code":"pool_full"}
+C→D  00 00 00 24  {"type":"acquire","timeout_secs":60}         (36 bytes)
+D→C  00 00 00 4a  {"type":"error","error":"Pool full - no ready workers",
+                   "code":"pool_full"}                          (74 bytes)
 ```
 
 ## Security notes
