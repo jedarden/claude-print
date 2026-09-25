@@ -48,6 +48,20 @@ static musl build) against the tagged commit before publishing.
   panics if a real `needle` sneaks into the pinned `PATH` so the no-NEEDLE
   cases cannot pass vacuously.
 
+- **installer-needle-adapter note pinned to the installer and its tests.**
+  The note is now inside the pinning scope itself (bead claudepr-36893892):
+  `tests/install_sh.rs` walks a table of (Semantics clause, `install.sh`
+  fragment, enforcing test) triples — each documented clause must survive
+  verbatim in `docs/notes/installer-needle-adapter.md`, the fragment
+  implementing it must survive verbatim in `install.sh`'s source, and the
+  note's Hermetic-coverage table must still name the test that enforces it
+  — and the two position claims (the leg between the `mock_claude` leg and
+  the `--check` smoke; `mkdir -p` inside the detection branch, before the
+  source check) are checked against `install.sh`'s own source order.
+  Rewording the note, changing the installer's mechanics, or renaming a
+  pinning test now fails the build instead of letting the note and the
+  installer drift apart.
+
 - **Billing-canary installation and operations documented.** The "Install on
   each host" section of `scripts/billing-canary.md` is now the complete
   operator workflow for `install-billing-canary.sh`: prerequisites (including

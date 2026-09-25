@@ -64,3 +64,18 @@ can never pass vacuously on a NEEDLE-equipped host.
 | `an_existing_adapter_is_overwritten_in_place_at_0644_with_no_backup_copy` | Overwrite + permissions: a stale mode-0600 adapter is replaced byte-for-byte at mode 0644, and the agents dir holds exactly the adapter (no `.prev`) |
 | `no_adapter_beside_the_script_skips_the_needle_leg_with_a_note` | Missing source (a staging copy of the script with no template beside it — the `curl … \| sh` shape): the documented note prints verbatim, no adapter is placed, the agents dir is still created (the `mkdir` precedes the source check), the install succeeds |
 | `a_failed_install_places_no_needle_adapter` | Ordering: a tampered binary aborts before the leg — no adapter, no `~/.needle`, no adapter line on stdout |
+
+This note itself is pinned too (bead claudepr-36893892):
+`needle_adapter_note_rows_match_the_installer_and_name_live_pinning_tests`
+walks the `NEEDLE_NOTE_SEMANTICS` table of (Semantics clause, `install.sh`
+fragment, enforcing test) triples — each clause must survive here verbatim,
+the fragment implementing it must survive verbatim in `install.sh`'s source,
+and the coverage table above must still name the enforcing test (coverage is
+checked within this Hermetic-coverage section, so a test named only in
+passing prose does not count) — and
+`needle_adapter_note_ordering_claims_match_the_installer_s_control_flow`
+checks the two position claims (the leg between the `mock_claude` leg and
+the `--check` smoke; `mkdir -p` inside the detection branch, before the
+source check) against `install.sh`'s own source order. Rewording a row
+here, changing the installer's mechanics, or renaming a pinning test fails
+the build on exactly one side of that triangle.

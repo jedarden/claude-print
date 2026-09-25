@@ -1190,3 +1190,185 @@ fn readme_install_names_the_installer_s_own_manifest_asset_and_opt_out_var() {
         "the README Install section must spell the opt-out `SKIP_MOCK_CLAUDE=1`"
     );
 }
+
+// ---------------------------------------------------------------------------
+// installer-needle-adapter note pinning — the note is the authoritative
+// statement of the NEEDLE leg (its own intro says so, and the README's
+// Install sentence defers to it), so the note itself is held inside the
+// pinning scope with the same three-way shape as the README pin above:
+// every Semantics row must survive verbatim in the note, the install.sh
+// fragment that implements it must survive verbatim in the installer, and
+// the note's Hermetic-coverage table must still name the test in this file
+// that enforces it against a real run. Rewording the note, changing the
+// installer's mechanics, or renaming/deleting a pinning test each break
+// exactly one side of that triangle.
+// ---------------------------------------------------------------------------
+
+/// docs/notes/installer-needle-adapter.md — the NEEDLE-leg contract this
+/// section pins against `install.sh` and the enforcing tests.
+const NEEDLE_ADAPTER_NOTE_MD: &str = include_str!("../docs/notes/installer-needle-adapter.md");
+
+/// The note's "Hermetic coverage" section — the coverage table plus the
+/// note-pin paragraph after it, and the only part of the note where naming
+/// a test counts as declaring coverage. Scoping the coverage assertions
+/// here means a test name that survives only in the note's prose cannot
+/// satisfy them vacuously.
+fn needle_note_coverage_section() -> &'static str {
+    NEEDLE_ADAPTER_NOTE_MD
+        .split("## Hermetic coverage")
+        .nth(1)
+        .expect(
+            "docs/notes/installer-needle-adapter.md must keep its \
+             '## Hermetic coverage' section — the coverage pin has nowhere to live",
+        )
+}
+
+/// One row of the Semantics table in docs/notes/installer-needle-adapter.md:
+/// (documented clause, install.sh fragment implementing it, enforcing test).
+/// The clause is matched verbatim against the note, the fragment verbatim
+/// against install.sh's source, and the test both against this file (it must
+/// exist under exactly this name) and against the note's Hermetic-coverage
+/// table (it must be named there, in backticks).
+const NEEDLE_NOTE_SEMANTICS: &[(&str, &str, &str)] = &[
+    // Detection, command arm: `needle` on PATH.
+    (
+        "`needle` is found on `PATH` (`command -v needle`)",
+        r#"command -v needle >/dev/null 2>&1 || [ -d "${NEEDLE_AGENTS_DIR}" ]"#,
+        "needle_on_the_path_installs_the_repo_adapter_template_into_the_agents_dir",
+    ),
+    // Detection, directory arm: an existing agents dir alone.
+    (
+        "`~/.needle/agents` already exists as a directory",
+        r#"[ -d "${NEEDLE_AGENTS_DIR}" ]"#,
+        "an_existing_agents_dir_alone_triggers_the_adapter_leg",
+    ),
+    // Source: the checkout beside the script, never a release artifact —
+    // pinned by the test comparing the installed bytes to the repo template.
+    (
+        "`claude-print.yaml` from the directory containing `install.sh` — the checkout, NOT a release artifact",
+        r#"install -m 644 "${SCRIPT_DIR}/claude-print.yaml" "${NEEDLE_AGENTS_DIR}/claude-print.yaml""#,
+        "needle_on_the_path_installs_the_repo_adapter_template_into_the_agents_dir",
+    ),
+    // Destination: $HOME-rooted agents dir.
+    (
+        "`~/.needle/agents/claude-print.yaml` (`$HOME`-rooted, absolute)",
+        r#"NEEDLE_AGENTS_DIR="${HOME}/.needle/agents""#,
+        "needle_on_the_path_installs_the_repo_adapter_template_into_the_agents_dir",
+    ),
+    // Permissions: install -m forces 0644 over the repo copy's 0664 and any
+    // drifted destination mode (the enforcing test pre-chmods 0600).
+    (
+        "`install -m 644`: mode 0644 always",
+        r#"install -m 644 "${SCRIPT_DIR}/claude-print.yaml""#,
+        "an_existing_adapter_is_overwritten_in_place_at_0644_with_no_backup_copy",
+    ),
+    // Overwrite: unconditional, in place, no backup copy.
+    (
+        "An existing adapter is replaced in place, byte-for-byte with the checkout's template. There is no backup copy",
+        r#"install -m 644 "${SCRIPT_DIR}/claude-print.yaml" "${NEEDLE_AGENTS_DIR}/claude-print.yaml""#,
+        "an_existing_adapter_is_overwritten_in_place_at_0644_with_no_backup_copy",
+    ),
+    // No-NEEDLE case: the mkdir lives inside the detection branch, so an
+    // undetected machine gets no ~/.needle at all.
+    (
+        "the leg is skipped in silence: nothing NEEDLE-related is printed and `~/.needle` is not created",
+        r#"mkdir -p "${NEEDLE_AGENTS_DIR}""#,
+        "without_needle_the_agents_dir_is_not_created_and_nothing_needle_related_is_printed",
+    ),
+    // Missing source: the documented skip note, pinned verbatim on both
+    // sides (the installer's echo and the note's quoting of it).
+    (
+        "Note: claude-print.yaml not found alongside install.sh — skipping NEEDLE config",
+        "Note: claude-print.yaml not found alongside install.sh — skipping NEEDLE config",
+        "no_adapter_beside_the_script_skips_the_needle_leg_with_a_note",
+    ),
+];
+
+#[test]
+fn needle_adapter_note_rows_match_the_installer_and_name_live_pinning_tests() {
+    for (clause, installer_fragment, test_name) in NEEDLE_NOTE_SEMANTICS {
+        assert!(
+            NEEDLE_ADAPTER_NOTE_MD.contains(clause),
+            "the note must carry the documented clause verbatim: {clause:?} — \
+             update docs/notes/installer-needle-adapter.md and this pin together"
+        );
+        assert!(
+            INSTALL_SH_SOURCE.contains(installer_fragment),
+            "install.sh no longer carries the fragment implementing {clause:?}: \
+             {installer_fragment:?} — the note and the installer have diverged"
+        );
+        assert!(
+            THIS_TEST_SOURCE.contains(&format!("fn {test_name}()")),
+            "the clause {clause:?} is pinned to `{test_name}`, which no longer \
+             exists in tests/install_sh.rs — restore the test or re-point the pin"
+        );
+        assert!(
+            needle_note_coverage_section().contains(&format!("`{test_name}`")),
+            "the note's Hermetic-coverage table must name `{test_name}` as the \
+             test enforcing {clause:?} — a row whose enforcing test goes unnamed \
+             degrades into documentation-only"
+        );
+    }
+}
+
+#[test]
+fn needle_adapter_note_ordering_claims_match_the_installer_s_control_flow() {
+    // The note's two position claims are checkable against install.sh's own
+    // source order: the adapter leg sits between the mock_claude leg and the
+    // --check smoke, and the mkdir inside the detection branch precedes the
+    // source check (why a missing source still creates the agents dir, and
+    // why a no-NEEDLE machine gets no ~/.needle at all).
+    let adapter_copy = INSTALL_SH_SOURCE
+        .find(r#"install -m 644 "${SCRIPT_DIR}/claude-print.yaml""#)
+        .expect("install.sh must copy the adapter template with install -m 644");
+    let mock_leg = INSTALL_SH_SOURCE
+        .find("Installed ${INSTALL_DIR}/mock_claude")
+        .expect("install.sh must record the mock_claude placement");
+    let check_leg = INSTALL_SH_SOURCE
+        .find("Running claude-print --check")
+        .expect("install.sh must run the --check smoke");
+    let detection = INSTALL_SH_SOURCE
+        .find(r#"command -v needle >/dev/null 2>&1 || [ -d "${NEEDLE_AGENTS_DIR}" ]"#)
+        .expect("install.sh must carry the NEEDLE detection");
+    let mkdir = INSTALL_SH_SOURCE
+        .find(r#"mkdir -p "${NEEDLE_AGENTS_DIR}""#)
+        .expect("install.sh must create the agents dir");
+    let source_check = INSTALL_SH_SOURCE
+        .find(r#"if [ -f "${SCRIPT_DIR}/claude-print.yaml" ]"#)
+        .expect("install.sh must test for the template beside the script");
+
+    assert!(
+        mock_leg < adapter_copy && adapter_copy < check_leg,
+        "the note pins the adapter leg between the mock_claude leg and the \
+         --check smoke; install.sh's source order says otherwise"
+    );
+    assert!(
+        detection < mkdir && mkdir < source_check,
+        "the note pins the mkdir inside the detection branch and before the \
+         source check; install.sh's source order says otherwise"
+    );
+
+    // The note must still make both claims, and its Hermetic-coverage table
+    // must still name the test that enforces the ordering against a real
+    // (tampered-release) run.
+    for claim in [
+        "The leg runs after the binary and `mock_claude` legs and before the `--check` smoke",
+        "the `mkdir` precedes the source check",
+    ] {
+        assert!(
+            NEEDLE_ADAPTER_NOTE_MD.contains(claim),
+            "the note must carry the ordering claim verbatim: {claim:?}"
+        );
+    }
+    let ordering_test = "a_failed_install_places_no_needle_adapter";
+    assert!(
+        THIS_TEST_SOURCE.contains(&format!("fn {ordering_test}()")),
+        "the ordering claim is pinned to `{ordering_test}`, which no longer \
+         exists in tests/install_sh.rs — restore the test or re-point the pin"
+    );
+    assert!(
+        needle_note_coverage_section().contains(&format!("`{ordering_test}`")),
+        "the note's Hermetic-coverage table must name `{ordering_test}` as the \
+         test enforcing the ordering claim"
+    );
+}
