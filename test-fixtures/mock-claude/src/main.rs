@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::IntoRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
@@ -24,6 +25,27 @@ fn main() {
             let mut bytes: Vec<u8> = Vec::new();
             for arg in std::env::args() {
                 bytes.extend_from_slice(arg.as_bytes());
+                bytes.push(0);
+            }
+            let _ = std::fs::write(&path, &bytes);
+        }
+    }
+
+    // MOCK_RECORD_ENV=<path> (claudepr-bfe97ce4): dump this process's full
+    // environment (NUL-separated KEY=VALUE entries, mirroring
+    // /proc/self/environ) so integration tests can assert on the exact
+    // environment the session child received — e.g. that an inherited
+    // CLAUDE_CONFIG_DIR was scrubbed by pty.rs before exec, while the forced
+    // variables did arrive. mock_claude IS the child, so vars_os() here is
+    // precisely the environment claude-print built. Skipped for the
+    // `--version` probe for the same reason MOCK_RECORD_ARGS is.
+    if !is_version_probe {
+        if let Ok(path) = std::env::var("MOCK_RECORD_ENV") {
+            let mut bytes: Vec<u8> = Vec::new();
+            for (key, value) in std::env::vars_os() {
+                bytes.extend_from_slice(key.as_bytes());
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_bytes());
                 bytes.push(0);
             }
             let _ = std::fs::write(&path, &bytes);
@@ -380,6 +402,19 @@ fn main() {
         .map(std::path::PathBuf::from)
         .expect("HOME must be set and non-empty");
 
+    // claudepr-bfe97ce4: model real claude's CLAUDE_CONFIG_DIR handling —
+    // with the variable set (claude-print's scrub regressed or bypassed),
+    // Claude Code relocates its whole config dir and writes transcripts under
+    // `<CLAUDE_CONFIG_DIR>/projects/<slug>/`. Mirroring that faithfully is
+    // what lets tests/claude_config_dir_contract.rs prove an inherited
+    // redirect never reaches the child: the transcript must land under HOME's
+    // real config dir, never under the decoy. pty.rs scrubs the variable, so
+    // production-of-record runs (and every other fixture) keep the HOME path.
+    let config_root = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"));
+
     // Compute the cwd slug exactly as claude 2.1.263 does: fold every byte
     // outside [a-zA-Z0-9] to '-', INCLUDING the leading '/' of an absolute
     // path (so non-ASCII alphanumerics fold too, like any other punctuation).
@@ -410,7 +445,7 @@ fn main() {
         None
     } else {
         Some(
-            home.join(".claude")
+            config_root
                 .join("projects")
                 .join(&cwd_slug)
                 .join(format!("{session_id}.jsonl"))
@@ -516,7 +551,7 @@ fn main() {
     let derived_transcript_path: Option<String> =
         if transcript_path.is_none() && write_derived_jsonl && !omit_session_id && !omit_cwd {
             Some(
-                home.join(".claude")
+                config_root
                     .join("projects")
                     .join(&cwd_slug)
                     .join(format!("{session_id}.jsonl"))
@@ -602,8 +637,7 @@ fn main() {
             payload.clone()
         } else {
             let spurious_session = format!("{session_id}-spurious-{i}");
-            let spurious_transcript = home
-                .join(".claude")
+            let spurious_transcript = config_root
                 .join("projects")
                 .join(&cwd_slug)
                 .join(format!("{spurious_session}.jsonl"))

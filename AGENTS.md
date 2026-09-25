@@ -285,6 +285,17 @@ These must hold across all changes:
 1. **Do not set `CLAUDE_CONFIG_DIR`** — transcripts must land in
    `~/.claude/projects/` (the real config dir). The temp dir is only used for the
    Stop hook settings injection, and it must not redirect the config dir.
+   Enforced in the child-env builder: `CLAUDE_CONFIG_DIR` is in `SCRUBBED_ENV`
+   (`src/pty.rs`), so claude-print never sets it **and** a value inherited from
+   an outer wrapper (agent cleanrooms export it to relocate claude's whole
+   config dir) is dropped before `execvpe` — the poller's transcript
+   derivation and the stream-json live reader are HOME-rooted and cannot
+   follow a redirect. Regression coverage: `tests/claude_config_dir_contract.rs`
+   (child env, source wiring, and binary end-to-end transcript placement) plus
+   the `scrub_env_*` unit tests in `src/pty.rs` (claudepr-bfe97ce4). mock-claude
+   models real claude's redirect (it honors `CLAUDE_CONFIG_DIR` when present),
+   so the binary leg relocates the transcript to the decoy on a scrub
+   regression and fails instead of passing vacuously.
 
 2. **Clean up the temp dir on all exit paths** — no `claude-print-<pid>-*`
    directories may be left in `$TMPDIR`. The `TempDir` handle in `HookInstaller`

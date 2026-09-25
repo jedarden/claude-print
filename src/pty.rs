@@ -58,11 +58,27 @@ fn get_winsize(fd: i32) -> libc::winsize {
 /// "wait for Stop, read the transcript" design with nothing to read
 /// (claudepr-26e7a0b6). Every agent- or NEEDLE-launched run inherits it from
 /// its parent session, which is why this only ever bit under fleet dispatch.
+///
+/// `CLAUDE_CONFIG_DIR` is the transcript-placement invariant (AGENTS.md
+/// "Key invariants" #1, plan HR-4, ADR-001): the child must keep the real
+/// config dir so its transcript lands in `$HOME/.claude/projects/`, the only
+/// tree claude-print reads — the poller's derivation fallback
+/// (`poller.rs::derive_transcript_path`) and the stream-json live reader
+/// (`projects_dir_for_cwd`) are both HOME-rooted and cannot follow a
+/// redirect. claude-print itself never sets the variable (the temp dir exists
+/// solely for the Stop hook settings injection); scrubbing also drops a value
+/// *inherited* from an outer wrapper — agent cleanrooms export
+/// CLAUDE_CONFIG_DIR to relocate claude's whole config dir — which would
+/// otherwise move the transcript out of reach while the child keeps its
+/// session identity from $HOME: the same inherited-leak class as the session
+/// markers above. Regression coverage: `tests/claude_config_dir_contract.rs`
+/// (claudepr-bfe97ce4).
 const SCRUBBED_ENV: &[&str] = &[
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDECODE",
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_SKIP_PROMPT_HISTORY",
+    "CLAUDE_CONFIG_DIR",
 ];
 
 /// Variables forced on in the child regardless of what the parent had.
@@ -548,5 +564,47 @@ mod tests {
         assert!(!env
             .iter()
             .any(|e| e.to_bytes().starts_with(b"CLAUDE_CODE_CHILD_SESSION=")));
+    }
+
+    // ── Real-config-dir contract (claudepr-bfe97ce4) ─────────────────────────
+    //
+    // Invariant 1 / ADR-001, env half: CLAUDE_CONFIG_DIR must not reach the
+    // child — neither injected by claude-print nor inherited from an outer
+    // wrapper. Binary end-to-end coverage (transcript placement under
+    // $HOME/.claude/projects) lives in tests/claude_config_dir_contract.rs;
+    // mock-claude honors CLAUDE_CONFIG_DIR when present, so removing this
+    // scrub entry fails that suite (mutation-verified) instead of passing
+    // vacuously.
+
+    #[test]
+    fn scrub_env_drops_inherited_claude_config_dir() {
+        // An outer wrapper (agent cleanroom) exporting CLAUDE_CONFIG_DIR
+        // relocates claude's whole config dir; inherited, the child would
+        // write its transcript out of reach of claude-print's HOME-rooted
+        // readers — the exact outcome invariant 1 exists to prevent.
+        let env = env_of(&[
+            ("CLAUDE_CONFIG_DIR", "/tmp/decoy-claude-config"),
+            ("PATH", "/usr/bin"),
+        ]);
+        assert!(
+            !env.iter().any(|e| e.starts_with("CLAUDE_CONFIG_DIR=")),
+            "an inherited CLAUDE_CONFIG_DIR must not reach the child: {env:?}"
+        );
+        assert!(
+            env.iter().any(|e| e == "PATH=/usr/bin"),
+            "unrelated variables must be preserved: {env:?}"
+        );
+    }
+
+    #[test]
+    fn scrub_env_never_injects_claude_config_dir() {
+        // ADR-001's letter: claude-print itself must never set the variable —
+        // the temp dir is for the Stop hook settings only and must not
+        // redirect the config dir.
+        let env = env_of(&[("PATH", "/usr/bin")]);
+        assert!(
+            !env.iter().any(|e| e.starts_with("CLAUDE_CONFIG_DIR=")),
+            "claude-print must not set CLAUDE_CONFIG_DIR in the child env: {env:?}"
+        );
     }
 }
