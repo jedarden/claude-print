@@ -260,6 +260,41 @@ and `serve` never load it.
 
 `claude-print` never creates or writes the file; you own it.
 
+### Claude Code state (`CLAUDE_CONFIG_DIR`)
+
+The rules above configure the wrapper, not Claude Code itself. Claude Code's
+own state — credentials, `settings.json`, history, and the session
+transcripts claude-print reads back — is not configurable through
+`claude-print`: it lives under `$HOME/.claude/`, session transcripts under
+`$HOME/.claude/projects/`.
+
+`CLAUDE_CONFIG_DIR` — Claude Code's variable for relocating that state — is
+deliberately unsupported:
+
+- `claude-print` never sets it. The per-run temp directory exists only for
+  the Stop-hook settings injection; it never redirects the config dir.
+- An inherited value is scrubbed from the child environment before the
+  child `claude` is spawned (`SCRUBBED_ENV` in `src/pty.rs`). Outer wrappers
+  — agent cleanrooms, NEEDLE-style sandboxes — export `CLAUDE_CONFIG_DIR` to
+  relocate Claude Code's whole config dir, and everything they spawn
+  inherits it; left in place, it would move the child's transcript root
+  while claude-print keeps watching `$HOME/.claude/projects`.
+
+The scrub is load-bearing: claude-print locates the transcript HOME-rooted
+(`derive_transcript_path` and `projects_dir_for_cwd` in `src/poller.rs`; the
+stream-json live reader binds through the same root) and cannot follow a
+redirect. `scripts/check-billing.sh` inspects the newest transcript under
+`~/.claude/projects/`, so a redirected session would also be invisible to
+the release billing checks. The invariant is enforced by
+`tests/claude_config_dir_contract.rs`.
+
+To relocate Claude Code state — sandboxing, per-worker isolation — set `HOME`
+instead and provision it as described in
+[HOME in containers and chroots](#home-in-containers-and-chroots). No flag,
+config key, or environment variable redirects the config dir. Full contract:
+[`docs/notes/config-file-contract.md`](docs/notes/config-file-contract.md),
+"Claude Code state and `CLAUDE_CONFIG_DIR`".
+
 ### Keys
 
 The schema is the `Defaults` struct in `src/config.rs`: one optional

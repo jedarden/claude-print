@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Contract version** | v1 |
-| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json`; the README's Configuration-section summary (key table, shipped defaults, path precedence) by the same test (bead claudepr-746dd1c4), and the engineering analysis `docs/config-error-analysis.md`'s contract-bearing excerpts (quoted examples, path precedence and XDG edges, resolution limitation) likewise (bead claudepr-09637c58) |
+| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json`; the README's Configuration-section summary (key table, shipped defaults, path precedence) by the same test (bead claudepr-746dd1c4), and the engineering analysis `docs/config-error-analysis.md`'s contract-bearing excerpts (quoted examples, path precedence and XDG edges, resolution limitation) likewise (bead claudepr-09637c58); the Claude-state/`CLAUDE_CONFIG_DIR` section and its README counterpart by `tests/claude_config_dir_docs_contract.rs` (bead claudepr-e46458c4) |
 | **Implementation** | `src/config.rs` (`Config::default_path`, `Config::load_or_default`, the `resolve_*` tiering, `Defaults::validate`), path selection wired by `src/main.rs`, `HOME` policy by `src/util.rs::get_home`, user-facing message shaping by `src/error.rs` (`From<Error> for ClaudePrintError`) and `src/emitter.rs` (`emit_error`) |
 | **Provenance** | bead claudepr-227efdb1 (2026-09-25) |
 
@@ -60,6 +60,53 @@ A valid `HOME` is required in every case, even when `XDG_CONFIG_HOME` or
 `--config` supplies the path: `main.rs` validates `HOME` process-wide before
 dispatching any entry point, because Claude Code state and transcripts live
 under `$HOME` regardless of where the config file came from.
+
+## Claude Code state and `CLAUDE_CONFIG_DIR`
+
+The file this contract describes configures the wrapper only. Claude Code's
+own state — credentials, `settings.json`, history, and the session
+transcripts claude-print reads back — is not configurable through
+claude-print at all: it lives under `$HOME/.claude/`, session transcripts
+under `$HOME/.claude/projects/<cwd-slug>/<session-id>.jsonl`.
+
+`CLAUDE_CONFIG_DIR` — Claude Code's variable for relocating that state — is
+deliberately outside this contract and unsupported, in both directions:
+
+1. claude-print never sets it. The per-run temp directory exists solely for
+   the Stop-hook settings injection (`src/hook.rs`) and never redirects the
+   config dir.
+2. A value inherited from the parent environment is scrubbed from the child
+   environment before `execvpe`: `CLAUDE_CONFIG_DIR` is an entry in
+   `SCRUBBED_ENV` (`src/pty.rs`), the one list the pre-fork child-env
+   builder filters through. Outer wrappers — agent cleanrooms, NEEDLE-style
+   sandboxes — export it to relocate Claude Code's whole config dir, and
+   everything they spawn inherits it.
+
+Both rules exist because claude-print's transcript readers are HOME-rooted by
+construction: the poller's transcript-path derivation
+(`derive_transcript_path`, from `session_id` + `cwd`) and the stream-json
+live reader's binding (`projects_dir_for_cwd`) both root at `get_home()` and
+cannot follow a redirect. A leaked `CLAUDE_CONFIG_DIR` would relocate the
+child's transcript while claude-print keeps watching the HOME-rooted tree —
+and `scripts/check-billing.sh` inspects the newest transcript under
+`~/.claude/projects/`, so a redirected session would also be invisible to
+the release billing checks.
+
+Relocating Claude Code state therefore means setting `HOME` — under the
+strict resolution of the File location rules above, provisioned per
+`docs/notes/home-handling-strategy.md`. No flag, config key, or environment
+variable redirects the config dir through claude-print.
+
+The behavioral invariant is enforced by `tests/claude_config_dir_contract.rs`
+(bead claudepr-bfe97ce4); this section's wording — and the README's
+`### Claude Code state (CLAUDE_CONFIG_DIR)` summary — are pinned against the
+implementation by `tests/claude_config_dir_docs_contract.rs` (bead
+claudepr-e46458c4): every sentence above must appear in the section, every
+cited file must exist, the HOME-rooting claim is replayed behaviorally (both
+readers derived under a throwaway `HOME` with a decoy `CLAUDE_CONFIG_DIR`
+inherited), and the no-redirection claim is checked against clap's parser
+definitions, the closed-world `[defaults]` schema, and `FORCED_ENV`.
+Rewording this section means updating the pin in the same commit.
 
 ## TOML structure
 
