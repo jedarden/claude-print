@@ -1,5 +1,17 @@
 # Billing Context
 
+| | |
+|---|---|
+| **Pinned by** | `tests/billing_entrypoint_contract.rs` — the child environment, phantom-name exclusion, transcript evidence, this table, and the causal chain; the README's `## Why this exists` and the README's `### Billing classification verification` summaries are pinned by the same test |
+| **Implementation** | `src/pty.rs` (`FORCED_ENV`, `PtySpawner::spawn`, and `child_env_forces_cli_entrypoint`); `src/check.rs` (`--check` billing row); `scripts/check-billing.sh` (JSONL evidence) |
+| **Provenance** | bead claudepr-3388da2f |
+
+This note is the normative vocabulary for the subscription-billing invariant.
+The names below are deliberately separate: the wire-level field is not the
+environment input, and the transcript field is evidence of the choice rather
+than another input. A change to the code, this table or causal chain, or either
+README summary updates all three surfaces in one commit.
+
 ## The billing-entrypoint contract
 
 Three names circulate around this invariant; they are not interchangeable.
@@ -21,6 +33,13 @@ So the causal chain reads: **FORCED_ENV forces `CLAUDE_CODE_ENTRYPOINT=cli`
 it (JSON evidence)**. The `--check` self-test covers the first link without
 credentials; AS-4 (`check-billing.sh` + canary) covers the last, which is the
 only link whose failure is a real billing regression.
+
+The child-environment half is behaviorally pinned by
+`tests/nested_session.rs` and `tests/billing_entrypoint_contract.rs`; the
+transcript-evidence half is pinned by the latter and
+`scripts/check-billing.sh`. The table, causal-chain wording, and the README
+summaries named above are drift-pinned by
+`tests/billing_entrypoint_contract.rs` (bead claudepr-3388da2f).
 
 ## The June 15, 2026 Split
 

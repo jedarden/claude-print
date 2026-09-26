@@ -10,6 +10,13 @@ The billing path is determined by an `isatty` check inside the `claude` binary: 
 
 `claude-print` allocates a PTY, drives the interactive TUI over it, auto-dismisses the trust dialog, injects the user prompt via bracketed paste, waits for the Stop hook via a FIFO, reads the JSONL transcript, and emits clean stdout output — giving callers `claude -p` wire-compatible output while billing against the subscription.
 
+The names in that explanation are distinct: `cc_entrypoint` is the wire-level
+billing field, `CLAUDE_CODE_ENTRYPOINT` is the environment input
+`claude-print` forces to `cli`; the alternative `sdk-cli` classification uses
+the credit pool; and `entrypoint` is the transcript JSONL evidence of the
+classification Claude Code chose. The full vocabulary and causal chain are in
+[`docs/notes/billing-context.md`](docs/notes/billing-context.md).
+
 ## Prerequisites
 
 - **Claude Code** must be installed and authenticated. See [claude.ai/code](https://claude.ai/code).

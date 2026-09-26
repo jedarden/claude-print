@@ -49,26 +49,7 @@ fn child_env_forces_cli_entrypoint_over_inherited_sdk_cli() {
 /// but `src/` and `scripts/` (and the installer that runs them) may not.
 #[test]
 fn phantom_claude_cc_entrypoint_absent_from_operational_surfaces() {
-    let mut offenders = Vec::new();
-    for dir in ["src", "scripts"] {
-        let root = repo_path(dir);
-        let mut stack = vec![root.clone()];
-        for entry in walk(&mut stack) {
-            let Ok(text) = fs::read_to_string(&entry) else {
-                continue; // binary or unreadable — not a textual surface
-            };
-            if text.contains("CLAUDE_CC_ENTRYPOINT") {
-                offenders.push(entry);
-            }
-        }
-    }
-    // install.sh sits at the repo root, not under scripts/.
-    let install = repo_path("install.sh");
-    if let Ok(text) = fs::read_to_string(&install) {
-        if text.contains("CLAUDE_CC_ENTRYPOINT") {
-            offenders.push(install);
-        }
-    }
+    let offenders = phantom_operational_offenders();
 
     assert!(
         offenders.is_empty(),
@@ -102,6 +83,186 @@ fn check_output_carries_the_billing_entrypoint_row() {
         "--check billing row must name the forced variable; got:\n{}",
         stdout
     );
+}
+
+// ── billing-context documentation contract ─────────────────────────────────
+
+/// The normative billing note is a contract surface, not background prose:
+/// its three-name table and causal chain must continue to describe the source
+/// and the behavioral tests that implement them. This is deliberately scoped
+/// to the note's own H2 section so a copied phrase elsewhere cannot satisfy
+/// the pin vacuously.
+#[test]
+fn billing_context_doc_pins_the_three_name_table_and_causal_chain() {
+    let doc = read_repo_file("docs/notes/billing-context.md");
+    let contract = normalized(markdown_section(&doc, "The billing-entrypoint contract"));
+
+    for phrase in [
+        "| `cc_entrypoint` | Anthropic's **wire-level billing header field**",
+        "`cli` draws from the unlimited subscription; `sdk-cli` from the Agent SDK credit pool.",
+        "Not an environment variable — no transcript and no env ever carries the literal name.",
+        "| `CLAUDE_CODE_ENTRYPOINT` | The **authoritative environment input**.",
+        "claude-print *forces* it to `cli` in the child environment (`FORCED_ENV` in `src/pty.rs`)",
+        "| `entrypoint` (JSONL field) | The **JSON evidence**.",
+        "top-level `entrypoint` field on transcript events.",
+        "`CLAUDE_CC_ENTRYPOINT` is not part of this contract.",
+        "tests/billing_entrypoint_contract.rs",
+    ] {
+        assert!(
+            contract.contains(phrase),
+            "billing-context.md's contract section must carry {phrase:?};\nsection:\n{contract}"
+        );
+    }
+
+    let causal_chain = concat!(
+        "FORCED_ENV forces `CLAUDE_CODE_ENTRYPOINT=cli` (env input) → PTY makes ",
+        "`isatty` true → Claude Code picks TUI mode and sends `cc_entrypoint=cli` ",
+        "on the wire → the transcript's `entrypoint` field records it (JSON evidence)"
+    );
+    assert!(
+        contract.contains(causal_chain),
+        "the normative causal chain must stay scoped to this contract section:\n{contract}"
+    );
+
+    let pty = read_repo_file("src/pty.rs");
+    let forced = const_block(&pty, "FORCED_ENV");
+    let entries: Vec<&str> = forced
+        .lines()
+        .filter(|line| line.contains("(\""))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            "(\"CLAUDE_CODE_ENTRYPOINT\", \"cli\"),",
+            "(\"CLAUDE_CODE_FORCE_SESSION_PERSISTENCE\", \"1\"),",
+        ],
+        "FORCED_ENV membership and the doc's three-name table must move together"
+    );
+    assert!(
+        pty.contains("for (key, value) in FORCED_ENV")
+            && pty.contains("execvpe(cmd, &argv, &child_env)")
+            && pty.contains("openpty(None, None)"),
+        "the causal chain's forced env must reach the real PTY child via execvpe"
+    );
+
+    let nested = read_repo_file("tests/nested_session.rs");
+    let billing = read_repo_file("tests/billing_entrypoint_contract.rs");
+    for (source, marker) in [
+        (
+            nested.as_str(),
+            "FORCED_ENV: sets CLAUDE_CODE_ENTRYPOINT=cli explicitly",
+        ),
+        (nested.as_str(), "DOES have CLAUDE_CODE_ENTRYPOINT=cli"),
+        (
+            billing.as_str(),
+            "child_env_forces_cli_entrypoint_over_inherited_sdk_cli",
+        ),
+        (
+            billing.as_str(),
+            "check_billing_fails_on_non_cli_entrypoint",
+        ),
+    ] {
+        assert!(
+            source.contains(marker),
+            "the causal-chain doc pin must name a behavior still asserted by tests: {marker:?}"
+        );
+    }
+
+    assert!(
+        doc.contains("| **Pinned by** |")
+            && doc.contains("README's `## Why this exists`")
+            && doc.contains("README's `### Billing classification verification`"),
+        "billing-context.md must declare the documentation pin and both README summaries"
+    );
+    assert!(
+        phantom_operational_offenders().is_empty(),
+        "CLAUDE_CC_ENTRYPOINT is a documentation-only phantom and must stay out of src/, \
+         scripts/, and install.sh"
+    );
+}
+
+/// The README has two user-facing billing summaries: the introductory
+/// `Why this exists` explanation and the detailed verification subsection.
+/// Both must agree with the normative note's vocabulary and point back to it;
+/// otherwise a code/doc update can leave operators reading a stale layer.
+#[test]
+fn readme_billing_summaries_agree_with_billing_context() {
+    let doc = normalized(&markdown_section(
+        &read_repo_file("docs/notes/billing-context.md"),
+        "The billing-entrypoint contract",
+    ));
+    let readme = read_repo_file("README.md");
+    let why = normalized(markdown_section(&readme, "Why this exists"));
+    let troubleshooting = markdown_section(&readme, "Troubleshooting");
+    let verification = normalized(markdown_subsection(
+        troubleshooting,
+        "Billing classification verification",
+    ));
+
+    for identifier in [
+        "`cc_entrypoint`",
+        "`CLAUDE_CODE_ENTRYPOINT`",
+        "`entrypoint`",
+        "`cli`",
+        "`sdk-cli`",
+        "`FORCED_ENV`",
+        "`src/pty.rs`",
+        "scripts/check-billing.sh",
+        "isatty",
+        "PTY",
+        "JSONL",
+    ] {
+        assert!(
+            doc.contains(identifier),
+            "billing-context.md's contract section is missing {identifier:?}"
+        );
+        assert!(
+            why.contains(identifier) || verification.contains(identifier),
+            "README billing summaries must retain {identifier:?} from the normative doc"
+        );
+    }
+
+    for phrase in [
+        "Anthropic routes `claude -p` (headless/SDK mode) through a separate Agent SDK credit pool",
+        "Only the interactive TUI (`cc_entrypoint=cli`) draws from the unlimited subscription.",
+        "The billing path is determined by an `isatty` check inside the `claude` binary",
+        "`claude-print` allocates a PTY",
+        "The full vocabulary and causal chain are in [`docs/notes/billing-context.md`](docs/notes/billing-context.md).",
+    ] {
+        assert!(
+            why.contains(phrase),
+            "README's `Why this exists` section must carry {phrase:?};\nsection:\n{why}"
+        );
+    }
+
+    for phrase in [
+        "Three names are involved here and they are not the same thing",
+        "`cc_entrypoint` — Anthropic's wire-level billing header",
+        "`CLAUDE_CODE_ENTRYPOINT` — the environment input claude-print controls",
+        "`entrypoint` (transcript JSONL field) — the observable evidence",
+        "forced to `cli` in the child regardless of inheritance (`FORCED_ENV`, `src/pty.rs`)",
+        "[`docs/notes/billing-context.md`](docs/notes/billing-context.md) for the full contract",
+    ] {
+        assert!(
+            verification.contains(phrase),
+            "README's billing verification summary must carry {phrase:?};\nsection:\n{verification}"
+        );
+    }
+
+    for identifier in [
+        "`cc_entrypoint`",
+        "`CLAUDE_CODE_ENTRYPOINT`",
+        "`entrypoint`",
+        "`FORCED_ENV`",
+        "`src/pty.rs`",
+        "scripts/check-billing.sh",
+    ] {
+        assert!(
+            doc.contains(identifier) && verification.contains(identifier),
+            "README verification summary and billing-context.md must agree on {identifier:?}"
+        );
+    }
 }
 
 /// The JSON-evidence half: scripts/check-billing.sh must locate the
@@ -567,6 +728,80 @@ fn tempfile_dir() -> PathBuf {
 
 fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
+}
+
+fn read_repo_file(relative: &str) -> String {
+    let path = repo_path(relative);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {relative}: {e}"))
+}
+
+/// The body of a `## <heading>` section, scoped to the next level-two
+/// heading. Subsections remain part of the returned body.
+fn markdown_section<'a>(markdown: &'a str, heading: &str) -> &'a str {
+    let marker = format!("## {heading}");
+    let start = markdown
+        .find(&format!("\n{marker}\n"))
+        .map(|position| position + 1)
+        .or_else(|| markdown.starts_with(&marker).then_some(0))
+        .unwrap_or_else(|| panic!("heading '{marker}' not found"));
+    let after_heading = &markdown[start + marker.len()..];
+    let body = after_heading.strip_prefix('\n').unwrap_or(after_heading);
+    let end = body.find("\n## ").unwrap_or(body.len());
+    &body[..end]
+}
+
+/// The body of a `### <heading>` subsection, scoped to the next level-three
+/// heading inside an already extracted level-two section.
+fn markdown_subsection<'a>(section: &'a str, heading: &str) -> &'a str {
+    let marker = format!("### {heading}");
+    let start = section
+        .find(&marker)
+        .unwrap_or_else(|| panic!("subheading '{marker}' not found"));
+    let body = &section[start + marker.len()..];
+    let end = body.find("\n### ").unwrap_or(body.len());
+    &body[..end]
+}
+
+fn normalized(markdown: &str) -> String {
+    markdown.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Extract a named `const NAME: &[..] = &[...]` block from its source file.
+/// Scoping this to the block prevents comments or unrelated fixtures from
+/// satisfying the source pin after the real const changes.
+fn const_block<'a>(source: &'a str, name: &str) -> &'a str {
+    source
+        .split(&format!("const {name}"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("source must still define const {name}"))
+        .split("];")
+        .next()
+        .unwrap_or_else(|| panic!("the {name} block must be terminated"))
+}
+
+fn phantom_operational_offenders() -> Vec<PathBuf> {
+    let mut offenders = Vec::new();
+    for dir in ["src", "scripts"] {
+        let root = repo_path(dir);
+        let mut stack = vec![root];
+        for entry in walk(&mut stack) {
+            let Ok(text) = fs::read_to_string(&entry) else {
+                continue; // binary or unreadable — not a textual surface
+            };
+            if text.contains("CLAUDE_CC_ENTRYPOINT") {
+                offenders.push(entry);
+            }
+        }
+    }
+
+    // install.sh sits at the repo root, not under scripts/.
+    let install = repo_path("install.sh");
+    if let Ok(text) = fs::read_to_string(&install) {
+        if text.contains("CLAUDE_CC_ENTRYPOINT") {
+            offenders.push(install);
+        }
+    }
+    offenders
 }
 
 fn walk(stack: &mut Vec<PathBuf>) -> Vec<PathBuf> {
