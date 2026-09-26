@@ -32,7 +32,7 @@ The identity relay (`identity.sh`) is the same script with `<identity-path>` in 
 
 Key points:
 - The target path is embedded as a shell single-quoted string — no variable expansion at execution time; a single quote in the temp-dir path is escaped `'\''`, so metacharacters in the path can never become shell syntax (bf-5sj7, pinned by `src/hook.rs::hook_sh_escaping_handles_shell_metacharacters` and `::identity_sh_is_executable_and_targets_identity_file`)
-- If the write fails, the hook exits cleanly (`|| true`); Claude Code does not wait beyond the 10s timeout
+- If the write fails, the hook exits cleanly (`|| true`); Claude Code does not wait beyond the 10s timeout — enforcement measured (a hook sleeping past its configured per-hook `timeout` is killed and the session proceeds: 2.1.282, 16/16 firings killed, 8/8 sessions exit 0 with the reply rendered, claude exiting 5.0 s after the Stop hook started; `scripts/probe-stop-edge-contracts.sh` Arm T, pinned in `tests/fixtures/claude_contracts_v2.1.282.json`; see `docs/notes/claude-contract-probes.md` §Hook-timeout enforcement)
 - The hooks are executed by Claude Code via `--settings <temp>/settings.json`
 
 ## settings.json

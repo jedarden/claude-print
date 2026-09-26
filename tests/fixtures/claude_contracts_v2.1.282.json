@@ -8,7 +8,7 @@
     "scripts/probe-stop-edge-contracts.sh"
   ],
   "evidence": "docs/notes/claude-contract-probes.md",
-  "resolves": ["PO-1", "PO-2", "OQ-1", "OQ-2", "Stop-poller assumption (plan §7)"],
+  "resolves": ["PO-1", "PO-2", "OQ-1", "OQ-2", "Stop-poller assumption (plan §7)", "relay-hook timeout (hook-design.md Relay Hook)"],
   "contracts": {
     "settings_flag_merges_not_replaces": true,
     "all_loaded_sources_hooks_fire": true,
@@ -21,7 +21,9 @@
     "stop_firings_multi_round_tool_use_completed_turn": 1,
     "stop_firings_tui_per_turn": 1,
     "stop_firings_max_turns_cutoff": 0,
-    "stop_firings_max_turns_cutoff_exit_code": 1
+    "stop_firings_max_turns_cutoff_exit_code": 1,
+    "hook_timeout_kills_overrun_hook": true,
+    "hook_timeout_overrun_session_proceeds": true
   },
   "notes": {
     "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host's real ~/.claude files were never read or written. Auth traveled by inherited environment only.",
@@ -29,6 +31,7 @@
     "tui_per_turn_evidence": "Two turns in one TUI session (probe-tui-second-turn.sh): turn 1 fired 1 Stop with reply rendered (41.6 s), turn 2 fired 1 Stop with reply rendered SECOND-OK (3.3 s); TUI screen showed (running stop hook) on both. The tool-using arms matched: probe-1 T2 fired 1 Stop per loaded source per turn (2 firings per turn across user+project, 62.5 s / 32.5 s) and Arm T's multi-round prompt fired exactly 1 Stop (60.5 s). Arm T's second prompt that evening was an incomplete turn (no reply, no Stop after a 205 s wait) - per the maintenance doc an incomplete turn is a re-run, not a contract finding; the same arm completed cleanly on 2.1.281 earlier the same day (1 Stop, 60.0 s).",
     "degraded_path_hazard": "Historical (2.1.270): on runs where the model's tool calls are permission-DENIED (no allowlist, headless), one run out of two produced an extra Stop firing. Re-measured against this same 2.1.282 on 2026-09-25 (claudepr-d9553d38, scripts/probe-stop-edge-contracts.sh Arm D): 15 completed denied runs across three invocations - all exit 0, stop_hook_active false, the model's own reply confirming its Bash calls were blocked - and every run fired exactly one Stop; the hazard did not reproduce. Kept on record as historical (mechanism unexplained, small samples; not reachable in the NEEDLE fleet - claude-print.yaml passes --dangerously-skip-permissions). The single-fire poller keeps its tolerance: first payload -> transcript retry/fallback, watchdog bounds the session.",
     "print_mode_tool_use_evidence": "Two sequential permitted Bash rounds in one -p run (Arm P): exactly 1 Stop at the turn's true end (payload last_assistant_message: DONE, stop_hook_active: false, single session id), claude exit 0. The unallowlisted T1 arm also completed this time (exit 0) with exactly 1 Stop of its own.",
-    "cutoff_evidence": "A -p run cut off by --max-turns fires no Stop of its own: T3 (--max-turns 2, exit 1) added zero firings on 2.1.282, exactly as on 2.1.281 (where the T1 arm outgrowing --max-turns 6 showed the same shape) and 2.1.270 - cutoffs belong to the --stop-hook-timeout watchdog, not the Stop poller."
+    "cutoff_evidence": "A -p run cut off by --max-turns fires no Stop of its own: T3 (--max-turns 2, exit 1) added zero firings on 2.1.282, exactly as on 2.1.281 (where the T1 arm outgrowing --max-turns 6 showed the same shape) and 2.1.270 - cutoffs belong to the --stop-hook-timeout watchdog, not the Stop poller.",
+    "hook_timeout_evidence": "Arm T (added 2026-09-26, claudepr-352cf1df, scripts/probe-stop-edge-contracts.sh): the relay-position hook (--settings file, run with --setting-sources= so it is the only loaded hook - the isolation-mode shape) configured with a per-hook timeout of 5 s while sleeping 30 s, wired on SessionStart and Stop. Two invocations of 4 single-turn runs each against this same pinned 2.1.282 (a full three-arm run, then an Arm-T-only run ARM_S_RUNS=0 ARM_D_RUNS=0; the host binary had drifted to 2.1.283, so the persisted versions-dir 2.1.282 was measured on a PATH shim - the probe stamped the version itself): all 16 event firings KILLED (start logged, end never - the 30 s sleep never completed), every run exit 0 with the reply rendered (reply-contains-OK 4/4 per invocation), and the claude process exiting 5.0 s after the Stop hook's start in 8/8 runs - the configured timeout, not the 30 s sleep. Enforcement is of the per-hook timeout field itself (measured at 5 s), which is the same field src/hook.rs sets to 10 on both relay hooks - the measured form of hook-design.md's 'does not wait beyond the 10s timeout' clause."
   }
 }

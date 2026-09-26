@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# probe-stop-edge-contracts.sh — the two Stop/OQ-1 edge measurements the
-# original 2.1.270 run measured once (claudepr-6ef2541c) and the 2.1.281 /
-# 2.1.282 re-pins did not repeat: the sleeping-hook cross-source concurrency
-# probe (OQ-1's direct proof that hooks from different sources execute
-# CONCURRENTLY, not sequentially — timestamps alone cannot show this) and the
-# degraded-path Stop count (headless run whose tool calls are permission-
-# denied — the hazard that produced one EXTRA Stop firing in 1 of 2 runs on
-# 2.1.270). Re-measured against 2.1.282 on 2026-09-25 (claudepr-d9553d38);
-# this script is the reproducible owner of both and is re-run by the
-# maintenance gate's --run-probes set like the other model-turn probes.
+# probe-stop-edge-contracts.sh — the Stop/OQ-1 edge measurements the original
+# 2.1.270 run measured once (claudepr-6ef2541c) and the 2.1.281 / 2.1.282
+# re-pins did not repeat: the sleeping-hook cross-source concurrency probe
+# (OQ-1's direct proof that hooks from different sources execute CONCURRENTLY,
+# not sequentially — timestamps alone cannot show this) and the degraded-path
+# Stop count (headless run whose tool calls are permission-denied — the
+# hazard that produced one EXTRA Stop firing in 1 of 2 runs on 2.1.270).
+# Re-measured against 2.1.282 on 2026-09-25 (claudepr-d9553d38). Arm T (added
+# 2026-09-26, claudepr-352cf1df, measured against the same pinned 2.1.282 —
+# via the persisted versions-dir binary on a PATH shim while the host had
+# drifted to 2.1.283; see claude-contract-probes.md §Reproducing)
+# extends the suite to hook-timeout enforcement — the relay contract
+# hook-design.md relies on when it configures `"timeout": 10` and states
+# Claude Code "does not wait beyond the 10s timeout". This script is the
+# reproducible owner of all three arms and is re-run by the maintenance
+# gate's --run-probes set like the other model-turn probes.
 #
 # Arm S (sleeping hooks — concurrency): project-source hook sleeps 300 ms and
 #   logs start/end timestamps; the `--settings` relay hook sleeps 0 ms and
@@ -23,6 +29,15 @@
 #   vs cut off by --max-turns (exit 1, zero firings — the measured cutoff
 #   contract, a re-run shape, not a finding) — an extra Stop would be >1
 #   firing per loaded source on a completed run.
+#
+# Arm T (relay-hook timeout enforcement): the `--settings` hook — the relay
+#   position, run with `--setting-sources=` (empty) so it is the ONLY loaded
+#   hook, claude-print's isolation-mode shape — is configured with a per-hook
+#   `timeout` of N seconds but sleeps far past it. Per event (SessionStart,
+#   Stop) and run: did the hook log `end` after its `start` (it outlived the
+#   timeout) or was it killed first (`end` never appears), did the session
+#   proceed (exit 0, reply rendered), and how long after the Stop hook's
+#   start did the claude process exit (≈ the timeout, not the sleep)?
 #
 # Isolation guarantees (identical to probe-claude-contracts.sh): every claude
 # invocation runs with HOME redirected into a throwaway sandbox; the real
@@ -48,6 +63,9 @@ SETTINGS_FILE="$PROBE_ROOT/relay-settings.json"
 
 ARM_S_RUNS="${ARM_S_RUNS:-6}"
 ARM_D_RUNS="${ARM_D_RUNS:-5}"
+ARM_T_RUNS="${ARM_T_RUNS:-4}"
+ARM_T_TIMEOUT="${ARM_T_TIMEOUT:-5}"
+ARM_T_SLEEP="${ARM_T_SLEEP:-30}"
 
 mkdir -p "$PROJ/.claude" "$SANDBOX_HOME/.claude"
 : >"$LOG"
@@ -140,7 +158,8 @@ FORCED_ENV=(CLAUDE_CODE_ENTRYPOINT=cli CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 C
 loglines() { wc -l <"$LOG" 2>/dev/null || echo 0; }
 
 printf 'claude version: %s\n' "$CLAUDE_VERSION"
-printf 'arm S runs: %s   arm D runs: %s\n' "$ARM_S_RUNS" "$ARM_D_RUNS"
+printf 'arm S runs: %s   arm D runs: %s   arm T runs: %s (timeout %ss, sleep %ss)\n' \
+    "$ARM_S_RUNS" "$ARM_D_RUNS" "$ARM_T_RUNS" "$ARM_T_TIMEOUT" "$ARM_T_SLEEP"
 
 # ---------------------------------------------------------------------------
 # Arm S — sleeping-hook cross-source concurrency (OQ-1 direct proof)
@@ -275,6 +294,86 @@ while [ "$i" -le "$ARM_D_RUNS" ]; do
         printf '  [D%d] output tail: %s\n' "$i" "$(printf '%s' "$out" | tail -c 300 | tr '\n' ' ')"
     fi
     summarize_arm_d_run "$BASE"
+    i=$((i + 1))
+done
+
+# ---------------------------------------------------------------------------
+# Arm T — relay-hook timeout enforcement: a hook sleeping past its configured
+# per-hook `timeout` is killed and the session proceeds (the contract
+# hook-design.md's `timeout: 10` relay hooks rely on)
+# ---------------------------------------------------------------------------
+echo
+echo "===== Arm T: relay-position hook sleeps ${ARM_T_SLEEP}s past its ${ARM_T_TIMEOUT}s timeout"
+
+# Same start/sleep/end logging hook as Arm S, sleeping far past the timeout
+# configured below. Killed-early shows as: `start` logged, `end` never.
+write_sleeping_hook "$PROBE_ROOT/log-timed.sh" timed "$ARM_T_SLEEP"
+cat >"$SETTINGS_FILE" <<EOF
+{"hooks": {
+  "SessionStart": [{"hooks": [{"type": "command", "command": "$PROBE_ROOT/log-timed.sh", "timeout": $ARM_T_TIMEOUT}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "$PROBE_ROOT/log-timed.sh", "timeout": $ARM_T_TIMEOUT}]}]
+}}
+EOF
+
+analyze_arm_t_run() { # <base-line-count> <run-label> <claude-exit-ts>
+    python3 - "$LOG" "$1" "$2" "$3" "$ARM_T_TIMEOUT" <<'EOF'
+import sys
+
+log_path, base_s, label, exit_ts, timeout_s = (
+    sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4]), float(sys.argv[5]),
+)
+entries = {}
+with open(log_path) as fh:
+    for i, line in enumerate(fh, 1):
+        if i <= base_s:
+            continue
+        parts = line.rstrip("\n").split("|")
+        if len(parts) != 4 or parts[1] != "timed":
+            continue
+        try:
+            ts = float(parts[0])
+        except ValueError:
+            continue
+        entries[(parts[2], parts[3])] = ts
+
+for event in ("SessionStart", "Stop"):
+    st = entries.get((event, "start"))
+    en = entries.get((event, "end"))
+    if st is None:
+        print(f"  {event}: no firing logged")
+        print(f"STAT-T {label} {event} absent")
+        continue
+    if en is None:
+        print(f"  {event}: start {st:.6f}, END NEVER LOGGED — hook killed before "
+              f"its sleep finished (timeout {timeout_s:.0f}s honored)")
+        print(f"STAT-T {label} {event} killed=1 completed=0")
+    else:
+        print(f"  {event}: start {st:.6f} -> end {en:.6f} "
+              f"(ran {(en - st) * 1000:.0f} ms — OUTLIVED the {timeout_s:.0f}s timeout)")
+        print(f"STAT-T {label} {event} killed=0 completed=1")
+    if event == "Stop":
+        print(f"  Stop hook start -> claude exit: {exit_ts - st:.1f}s "
+              f"(timeout {timeout_s:.0f}s, sleep far longer)")
+EOF
+}
+
+i=1
+while [ "$i" -le "$ARM_T_RUNS" ]; do
+    BASE="$(loglines)"
+    RUN_START="$(date +%s)"
+    out="$( cd "$PROJ" && HOME="$SANDBOX_HOME" timeout 180 env "${SCRUB_ENV[@]}" "${FORCED_ENV[@]}" \
+        "$CLAUDE_BIN" -p --setting-sources= --settings "$SETTINGS_FILE" \
+        "Reply with exactly: OK" </dev/null 2>&1 )"
+    rc=$?
+    END_TS="$(date +%s.%N)"
+    wall=$(( $(date +%s) - RUN_START ))
+    if printf '%s' "$out" | grep -q 'OK'; then rok=yes; else rok=no; fi
+    printf '  [T%d] claude exit=%s reply-contains-OK=%s (wall %ss)\n' "$i" "$rc" "$rok" "$wall"
+    printf '  [T%d] reply head: %s\n' "$i" "$(printf '%s' "$out" | head -c 60 | tr '\n' ' ')"
+    if [ "$rc" -ne 0 ]; then
+        printf '  [T%d] output tail: %s\n' "$i" "$(printf '%s' "$out" | tail -c 300 | tr '\n' ' ')"
+    fi
+    analyze_arm_t_run "$BASE" "T$i" "$END_TS"
     i=$((i + 1))
 done
 

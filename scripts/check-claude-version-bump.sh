@@ -154,7 +154,7 @@ echo "  1. cargo test --test claude_contracts -- --ignored   # cheap pre-check (
 echo "  2. bash scripts/probe-claude-contracts.sh            # merge/suppression/Stop"
 echo "  3. bash scripts/probe-stop-toolallowed.sh            # multi-round Stop (print)"
 echo "  4. bash scripts/probe-tui-second-turn.sh             # TUI once-per-turn"
-echo "  5. bash scripts/probe-stop-edge-contracts.sh         # concurrency + degraded-path"
+echo "  5. bash scripts/probe-stop-edge-contracts.sh         # concurrency + degraded-path + hook-timeout (Arm T)"
 echo "  6. Re-pin claude_contracts_v<version>.json and stream_json_golden_v<version>.*.jsonl"
 echo "     (update each active test reference and the documented stamp), or file"
 echo "     follow-up beads if a contract moved."

@@ -8,8 +8,9 @@
 //! auto-updater superseded; re-run procedure in
 //! docs/notes/claude-contract-probes.md §Maintenance) with the live probe
 //! scripts (`scripts/probe-claude-contracts.sh`,
-//! `scripts/probe-stop-toolallowed.sh`, and — for the two edge measurements
-//! the re-pins had left unrepeated, re-measured 2026-09-25 —
+//! `scripts/probe-stop-toolallowed.sh`, and — for the edge measurements: the
+//! two the re-pins had left unrepeated, re-measured 2026-09-25, plus the
+//! relay-hook timeout-enforcement arm added 2026-09-26 (claudepr-352cf1df) —
 //! `scripts/probe-stop-edge-contracts.sh`); the observed values are pinned in
 //! `tests/fixtures/claude_contracts_v2.1.282.json` and documented in
 //! `docs/notes/claude-contract-probes.md`.
@@ -84,6 +85,19 @@ struct Contracts {
     stop_firings_multi_round_tool_use_completed_turn: u32,
     /// Stop contract: a run cut off by `--max-turns` fires no Stop at all.
     stop_firings_max_turns_cutoff: u32,
+    /// Relay-hook timeout: a hook sleeping past its configured per-hook
+    /// `timeout` (the field `src/hook.rs` sets to 10 on both relay hooks) is
+    /// killed by Claude Code — it logs its start and its end line never
+    /// appears (`probe-stop-edge-contracts.sh` Arm T).
+    hook_timeout_kills_overrun_hook: bool,
+    /// Relay-hook timeout: the session proceeds despite the killed hook —
+    /// exit 0 with the reply rendered, the process exiting on the order of
+    /// the configured timeout rather than the hook's sleep (measured 2.1.282:
+    /// 8/8 runs exit 0, claude exiting 5.0 s after the Stop hook's start
+    /// against a 5 s timeout / 30 s sleep). This is the
+    /// "does not wait beyond the 10s timeout" clause of
+    /// `docs/notes/hook-design.md` §Relay Hook.
+    hook_timeout_overrun_session_proceeds: bool,
 }
 
 fn fixture() -> ContractFixture {
@@ -139,6 +153,14 @@ fn fixture_pins_measured_contracts() {
         1
     );
     assert_eq!(f.contracts.stop_firings_max_turns_cutoff, 0);
+    assert!(
+        f.contracts.hook_timeout_kills_overrun_hook,
+        "relay-hook timeout measured: an overrun hook is killed (start logged, end never)"
+    );
+    assert!(
+        f.contracts.hook_timeout_overrun_session_proceeds,
+        "relay-hook timeout measured: the session proceeds past a killed hook"
+    );
 }
 
 // ── Argv contract: claude-print must emit exactly the verified spellings ────

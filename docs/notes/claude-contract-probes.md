@@ -4,9 +4,10 @@
 claude-print dev host. Probe harness: `scripts/probe-claude-contracts.sh` (merge /
 suppression / single-turn Stop), `scripts/probe-stop-toolallowed.sh` (multi-round
 Stop contract, print mode), `scripts/probe-tui-second-turn.sh` (TUI
-once-per-turn contract), and `scripts/probe-stop-edge-contracts.sh` (the two
-edge measurements the re-pins had left unrepeated — sleeping-hook cross-source
-concurrency and degraded-path permission-denied Stop counts; added 2026-09-25).
+once-per-turn contract), and `scripts/probe-stop-edge-contracts.sh` (the edge
+measurements — sleeping-hook cross-source concurrency and degraded-path
+permission-denied Stop counts, added 2026-09-25; relay-hook timeout
+enforcement, added 2026-09-26).
 Re-run them after any Claude Code update; results are
 version-pinned — the maintenance workflow (drift detection, re-run procedure,
 re-pin checklist, follow-up rule) is defined in §Maintenance at the bottom of
@@ -38,7 +39,11 @@ on 2026-09-25 (claudepr-d9553d38, `scripts/probe-stop-edge-contracts.sh`,
 which is now part of the probe set): concurrent cross-source execution
 reproduced in **12/12** event pairs and the extra-Stop hazard **did not
 reproduce** (15/15 permission-denied runs across three invocations fired
-exactly one Stop). The only
+exactly one Stop). The relay-hook timeout-enforcement contract (Arm T of the
+same script, added 2026-09-26, claudepr-352cf1df) was likewise measured
+against that same pinned 2.1.282 — §Hook-timeout enforcement below — so every
+contract this document states is backed by a measurement of the pinned
+version. The only
 2.1.270 numbers still quoted below — the superseded TUI timings kept for
 per-version contrast — carry an explicit historical attribution where they
 appear. Per-version fixtures:
@@ -160,6 +165,47 @@ Evidence (2.1.282; P2: project source + `--settings`; P6: user source +
   (Side observation: `--allowedTools` consumes a variadic value list — pass it
   as `--allowedTools=Bash` or it will swallow a following positional prompt.)
 
+## Hook-timeout enforcement — an overrun relay hook is killed; the session proceeds
+
+`docs/notes/hook-design.md` §Relay Hook configures both relay hooks with
+`"timeout": 10` and states Claude Code "does not wait beyond the 10s timeout"
+— a claim the merge/suppression/Stop pins above did not cover. Measured
+directly against the pinned 2.1.282 (Arm T of
+`scripts/probe-stop-edge-contracts.sh`, added 2026-09-26, claudepr-352cf1df;
+the host binary had auto-updated to 2.1.283, so the persisted
+`~/.local/share/claude/versions/2.1.282` was measured on a PATH shim —
+§Reproducing): the relay-position hook (a `--settings` file, run with
+`--setting-sources=` so it is the only loaded hook — claude-print's
+isolation-mode shape) was configured with a per-hook `"timeout": 5` while
+its script slept 30 s, wired on SessionStart and Stop, across two
+invocations of 4 real single-turn runs each (a full three-arm run of the
+script, then an Arm-T-only run with `ARM_S_RUNS=0 ARM_D_RUNS=0`):
+
+| Signal | Result (2.1.282, 2026-09-26) |
+|---|---|
+| Hook killed before its sleep finished — `end` line never logged after `start` | **16/16** event firings (per invocation: 4 SessionStart + 4 Stop) |
+| Session proceeds — claude exit code | **8/8** runs exit 0 |
+| Session proceeds — reply rendered | 8/8 runs (`reply-contains-OK` 4/4 per invocation) |
+| claude process exit − Stop hook start | **5.0 s** every run (8/8) — the configured 5 s timeout, not the 30 s sleep |
+
+Conclusions:
+
+- The per-hook `timeout` field is **enforced by kill**, not advisory: a hook
+  that outlives it never completes (in every firing the hook's post-sleep log
+  write never happened).
+- The session is **not blocked beyond the timeout**: `-p` runs exit 0 with
+  the reply rendered, and the claude process exits ≈ the configured timeout
+  after the Stop hook starts. Claude Code waits *up to* the timeout, then
+  kills and moves on — exactly the clause the relay design relies on when it
+  bounds `hook.sh`/`identity.sh` at 10 s. Enforcement was measured at 5 s; it
+  is enforcement *of the field* `src/hook.rs` sets to 10 on both relay hooks,
+  so the relay value is the same mechanism at a different setting.
+- claude-print's own relay hooks exit in milliseconds (`cat > target ||
+  true`); this contract bounds the pathological case — a relay hook that
+  hangs — at the configured timeout per hook event rather than an unbounded
+  stall, alongside the `--stop-hook-timeout` watchdog that bounds the
+  session as a whole.
+
 ## Stop firing contract — single-turn baseline
 
 Every completed single-turn `claude -p` run (P1, P2, P3, P4, P6: no tool use)
@@ -245,15 +291,32 @@ plan.md §Stop Poller for the concluded contract)
 bash scripts/probe-claude-contracts.sh        # merge/suppression/single-turn Stop
 bash scripts/probe-stop-toolallowed.sh        # multi-round Stop contract (print mode)
 bash scripts/probe-tui-second-turn.sh         # TUI once-per-turn contract
-bash scripts/probe-stop-edge-contracts.sh     # sleeping-hook concurrency + degraded-path Stop counts
+bash scripts/probe-stop-edge-contracts.sh     # sleeping-hook concurrency + degraded-path Stop counts + hook-timeout enforcement
 ```
 
 Each run is self-contained (sandboxed HOME, scrubbed `CLAUDECODE*` env, forced
 `CLAUDE_CODE_ENTRYPOINT=cli` + `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`,
 mirroring `src/pty.rs`'s child-environment contract) and prints its version
-stamp. Runtime ≈ 1–6 minutes each (model turns via the configured provider).
+stamp. Runtime ≈ 1–6 minutes each (model turns via the configured provider;
+the Arm T default adds 4 more turns to `probe-stop-edge-contracts.sh`).
 `tests/claude_contracts.rs` pins the fixture and re-verifies the cheap
 contracts live under `cargo test --test claude_contracts -- --ignored`.
+
+During a drift window (the host auto-updater has repointed `~/.local/bin/
+claude` past the **Measured against:** stamp, but the re-pin hasn't landed),
+run the probes against the *pinned* version rather than polluting the pin
+with the newer binary's numbers: old versions persist under
+`~/.local/share/claude/versions/`, so put a symlink named `claude` on PATH
+ahead of it —
+
+```bash
+mkdir -p /tmp/claude-pin-<v> && ln -sf ~/.local/share/claude/versions/<v> /tmp/claude-pin-<v>/claude
+PATH="/tmp/claude-pin-<v>:$PATH" bash scripts/probe-stop-edge-contracts.sh
+```
+
+— and let the probe's own version stamp identify what was measured (the
+Arm T evidence above was gathered this way, against 2.1.282 while the host
+binary had drifted to 2.1.283).
 
 Two probe-authoring notes for whoever reruns these: `--allowedTools` takes a
 variadic value list, so pass `--allowedTools=Bash` (equals form) or it will
@@ -390,14 +453,17 @@ drift, run all four scripts from §Reproducing —
 each is self-contained (sandboxed mktemp `HOME`, scrubbed `CLAUDECODE*` env,
 trust pre-seeded for the probe cwd only, auth by inherited environment) and
 stamps the version it measured. Budget 1–6 min each (`probe-stop-edge-contracts.sh`
-runs 11 model turns across its two arms — budget up to ~15 min). Note that
+runs 15 model turns across its three arms — budget up to ~20 min). Note that
 `probe-tui-second-turn.sh` can legitimately fail to produce a second
 completed reply (an incomplete turn firing no Stop *is* the contract) — an
 incomplete second turn is a re-run, not a contract finding; only
 "reply rendered + no Stop" would be. Likewise an Arm D run that exits 1 with
 zero Stops was cut off by `--max-turns` (the measured cutoff contract) — a
 re-run, not a finding; only "completed run (exit 0) with ≠1 Stop per loaded
-source" would be.
+source" would be. And an Arm T run that exits non-zero or logs no firing for
+an event (model-turn failure, `timeout` wrapper) is a re-run — the findings
+are "hook `end` logged past its timeout" (timeout not enforced) or "session
+blocked or failed after the kill" (enforcement is not clean).
 
 **Re-pin** (all contracts unchanged): re-stamp **Measured against:** at the
 top of this file; copy `tests/fixtures/claude_contracts_v<old>.json` to
@@ -427,3 +493,4 @@ evidence only (timestamps, counts, tags — never payloads):
 | `--setting-sources=` suppression (PO-2/OQ-2) | `--no-inherit-hooks` mode (plan) |
 | once-per-turn Stop | Stop Poller single-fire design (plan §Stop Poller) |
 | `--max-turns` cutoff fires no Stop | watchdog ownership of cutoff cases (plan) |
+| per-hook `timeout` no longer enforced (overrun hook not killed, or the session blocked past the kill) | relay `"timeout": 10` bound in `hook-design.md` §Relay Hook; `--stop-hook-timeout` watchdog interaction |
