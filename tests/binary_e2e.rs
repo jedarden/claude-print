@@ -1238,3 +1238,356 @@ max_turns = 0"#;
         v.get("error_message")
     );
 }
+
+// ── --mcp-config forwarding semantics (claudepr-af36fc41) ─────────────────────
+//
+// The config-file contract (docs/notes/config-file-contract.md §"--mcp-config:
+// a config-shaped flag with no config tier") pins the boundary this section
+// proves behaviorally through the mock child's MOCK_RECORD_ARGS argv dump:
+//
+//   * non-empty list → `--strict-mcp-config` exactly once, then one
+//     `--mcp-config <entry>` pair per entry in entry order, after the relay
+//     `--settings=` and before the forwarded `--model`/`--max-turns`;
+//   * empty list (flag absent) → neither flag in the child argv;
+//   * repeated, comma-delimited, and `=`-joined spellings are equivalent;
+//   * no interaction with `Config::load_or_default` in either direction —
+//     a config file that loads leaves the segment byte-identical, and a
+//     config file that fails still exits 2 with the flag present, including
+//     the closed-world rejection of an `mcp_config` `[defaults]` key;
+//   * a missing value is a clap usage error answered before the config step.
+//
+// The pooled leg (the flag is inert on an already-launched worker) lives in
+// `tests/pool_socket_e2e.rs` — pooled invocations do not build child argv at
+// all. The argv shapes are additionally unit-tested at the source in
+// `src/session.rs` (`build_child_argv_*`).
+
+/// The `--mcp-config` forwarding segment of a recorded child argv: the index
+/// of the (unique) `--strict-mcp-config` flag and the entry values that
+/// follow it as `--mcp-config <value>` pairs. Panics when the strict flag is
+/// absent — the flag-absent shape is asserted by its own test below, so a
+/// missing flag here is a recording or forwarding defect worth failing on.
+fn mcp_forwarding_segment(args: &[String]) -> (usize, Vec<String>) {
+    let strict = args
+        .iter()
+        .position(|a| a == "--strict-mcp-config")
+        .unwrap_or_else(|| panic!("--strict-mcp-config missing from child argv: {args:?}"));
+    let occurrences = args
+        .iter()
+        .filter(|a| a.as_str() == "--strict-mcp-config")
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "--strict-mcp-config must appear EXACTLY ONCE, got {occurrences} in {args:?}"
+    );
+    let mut values = Vec::new();
+    let mut i = strict + 1;
+    while args.get(i).map(String::as_str) == Some("--mcp-config") {
+        let value = args
+            .get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| panic!("--mcp-config at index {i} without a value: {args:?}"));
+        values.push(value);
+        i += 2;
+    }
+    (strict, values)
+}
+
+/// One recorded run: spawn the compiled binary with `flag_args` plus a prompt,
+/// MOCK_RECORD_ARGS pointing at `record`, and `XDG_CONFIG_HOME` at `config`
+/// (None = ambient). Returns the decoded argv.
+fn run_recorded(
+    flag_args: &[&str],
+    record: &std::path::Path,
+    config: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut cmd = claude_print();
+    for flag in flag_args {
+        cmd.arg(flag);
+    }
+    cmd.arg("test prompt");
+    cmd.env("MOCK_RECORD_ARGS", record);
+    if let Some(config) = config {
+        cmd.env("XDG_CONFIG_HOME", config);
+    }
+    let out = run(&mut cmd, BUDGET);
+    assert_eq!(
+        out.code,
+        Some(0),
+        "recorded run {flag_args:?}: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    read_recorded_argv(record)
+}
+
+/// Non-empty `--mcp-config` → the child argv carries exactly
+/// `--strict-mcp-config --mcp-config <e1> --mcp-config <e2>` in entry order —
+/// a path entry and an inline-JSON entry both forwarded verbatim — positioned
+/// after the relay `--settings=` and before the forwarded `--model`.
+#[test]
+fn mcp_config_forwards_strict_flag_plus_one_pair_per_entry_in_order() {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+    let inline_json = r#"{"mcpServers":{"fs":{"command":"ls"}}}"#;
+
+    let args = run_recorded(
+        &[
+            "--mcp-config",
+            "/tmp/first-mcp.json",
+            "--mcp-config",
+            inline_json,
+        ],
+        &record,
+        None,
+    );
+
+    let (strict, values) = mcp_forwarding_segment(&args);
+    assert_eq!(
+        values,
+        ["/tmp/first-mcp.json".to_string(), inline_json.to_string()],
+        "entries must forward in entry order, verbatim: {args:?}"
+    );
+    // The exact window, flag-for-flag and value-for-value.
+    assert_eq!(
+        &args[strict..strict + 5],
+        &[
+            "--strict-mcp-config".to_string(),
+            "--mcp-config".to_string(),
+            "/tmp/first-mcp.json".to_string(),
+            "--mcp-config".to_string(),
+            inline_json.to_string(),
+        ],
+        "the mcp segment must be exactly strict + one pair per entry: {args:?}"
+    );
+    // Position: immediately after the relay --settings=<temp>, immediately
+    // before the first forwarded claude arg (--model).
+    assert!(
+        args[strict - 1].starts_with("--settings="),
+        "the segment must follow the relay --settings=, got {:?}",
+        args[strict - 1]
+    );
+    assert_eq!(
+        args[strict + 5], "--model",
+        "the segment must precede the forwarded --model, got {:?}",
+        args[strict + 5]
+    );
+}
+
+/// Repetition, the comma delimiter, and the `=`-joined spelling are one
+/// surface: all three yield the same entry list and a byte-identical argv
+/// from `--strict-mcp-config` onward (the relay `--settings=` path differs
+/// per run by construction — it is a fresh temp dir each spawn).
+#[test]
+fn mcp_config_comma_delimited_and_equals_spellings_match_repeated() {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+
+    let repeated = run_recorded(
+        &["--mcp-config", "/a.json", "--mcp-config", "/b.json"],
+        &record,
+        None,
+    );
+    let comma = run_recorded(&["--mcp-config", "/a.json,/b.json"], &record, None);
+    let equals = run_recorded(&["--mcp-config=/a.json,/b.json"], &record, None);
+
+    let (r_pos, r_vals) = mcp_forwarding_segment(&repeated);
+    let (c_pos, c_vals) = mcp_forwarding_segment(&comma);
+    let (e_pos, e_vals) = mcp_forwarding_segment(&equals);
+    assert_eq!(
+        r_vals,
+        ["/a.json".to_string(), "/b.json".to_string()],
+        "repeated spelling: {repeated:?}"
+    );
+    assert_eq!(c_vals, r_vals, "comma spelling must match repeated: {comma:?}");
+    assert_eq!(
+        e_vals, r_vals,
+        "=-joined spelling must match repeated: {equals:?}"
+    );
+    assert_eq!(
+        &comma[c_pos..],
+        &repeated[r_pos..],
+        "comma spelling must yield a byte-identical tail from the strict flag on"
+    );
+    assert_eq!(
+        &equals[e_pos..],
+        &repeated[r_pos..],
+        "=-joined spelling must yield a byte-identical tail from the strict flag on"
+    );
+}
+
+/// No `--mcp-config` on the invocation → neither `--strict-mcp-config` nor
+/// `--mcp-config` appears in the child argv (the empty list forwards nothing;
+/// the child's own default MCP resolution stays in force).
+#[test]
+fn absent_mcp_config_omits_both_mcp_flags_from_child_argv() {
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+
+    let args = run_recorded(&[], &record, None);
+
+    assert!(
+        args.iter().any(|a| a.starts_with("--settings=")),
+        "relay --settings= must be forwarded (recording sanity), got: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a == "--strict-mcp-config"),
+        "--strict-mcp-config must be OMITTED without --mcp-config, got: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a == "--mcp-config"),
+        "--mcp-config must be OMITTED without the flag, got: {args:?}"
+    );
+}
+
+/// `Config::load_or_default`, positive direction: a config file that loads —
+/// and actively applies two of its four keys — leaves the `--mcp-config`
+/// segment byte-identical. The `--model` value moving from the built-in
+/// default to the config value proves the file was genuinely read and
+/// tiered, so the unchanged segment is non-interaction, not a skipped load.
+#[test]
+fn mcp_config_segment_is_independent_of_the_config_file() {
+    let empty = setup_config_content("");
+    let active = setup_config_content(
+        "[defaults]\nmodel = \"claude-opus-4-8\"\ninherit_hooks = false\n",
+    );
+    let dir = TempDir::new().unwrap();
+    let record = dir.path().join("child_argv");
+
+    let flags = &["--mcp-config", "/a.json", "--mcp-config", "/b.json"];
+    let without_config = run_recorded(flags, &record, Some(empty.path()));
+    let with_config = run_recorded(flags, &record, Some(active.path()));
+
+    let (bare_pos, bare_vals) = mcp_forwarding_segment(&without_config);
+    let (cfg_pos, cfg_vals) = mcp_forwarding_segment(&with_config);
+    assert_eq!(cfg_vals, bare_vals, "the entry list must not tier: {with_config:?}");
+    assert_eq!(
+        &with_config[cfg_pos..cfg_pos + 5],
+        &without_config[bare_pos..bare_pos + 5],
+        "the mcp segment must be byte-identical with a loaded config: {with_config:?}"
+    );
+
+    // The config file WAS loaded and applied on the same run: the model moved
+    // off the built-in default, and isolation mode inserted --setting-sources=
+    // ahead of the segment (the segment is content-anchored, not index-pinned).
+    let model_of = |args: &[String]| {
+        args.iter()
+            .position(|a| a == "--model")
+            .map(|i| args[i + 1].clone())
+            .unwrap_or_else(|| panic!("no --model forwarded in {args:?}"))
+    };
+    assert_eq!(
+        model_of(&without_config),
+        "claude-sonnet-4-6",
+        "empty config: the built-in default model must be forwarded"
+    );
+    assert_eq!(
+        model_of(&with_config),
+        "claude-opus-4-8",
+        "active config: defaults.model must win over the built-in default"
+    );
+    assert!(
+        with_config.iter().any(|a| a == "--setting-sources="),
+        "active config: inherit_hooks=false must apply on the same run, got: {with_config:?}"
+    );
+    assert!(
+        !without_config.iter().any(|a| a == "--setting-sources="),
+        "empty config: isolation must be off, got: {without_config:?}"
+    );
+}
+
+/// `Config::load_or_default`, negative direction: there is no TOML spelling
+/// for the setting. An `mcp_config` key inside `[defaults]` is rejected by
+/// the closed-world schema (exit 2, unknown field naming the four real keys),
+/// and the rejection fires with `--mcp-config` present on the very same
+/// invocation — the flag neither rescues nor bypasses the config step, and a
+/// garbage-TOML config fails identically with the flag along for the ride.
+#[test]
+fn mcp_config_key_in_defaults_is_rejected_with_the_flag_present() {
+    for poison in [
+        "[defaults]\nmcp_config = [\"/a.json\"]\n",
+        "[[\n",
+    ] {
+        let config = setup_malformed_config(poison);
+        let mut cmd = claude_print();
+        cmd.arg("--mcp-config")
+            .arg("/on-the-cli.json")
+            .arg("test prompt");
+        cmd.env("XDG_CONFIG_HOME", config.path());
+
+        let out = run(&mut cmd, BUDGET);
+        assert_eq!(
+            out.code,
+            Some(2),
+            "poison {poison:?} with --mcp-config present: expected exit 2\n\
+             stdout:\n{}\nstderr:\n{}",
+            out.stdout,
+            out.stderr
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "config errors write nothing to stdout, got:\n{}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("invalid config:"),
+            "the shared config-error prefix must lead the message: {}",
+            out.stderr
+        );
+    }
+
+    // The closed-world tier specifically: the mcp_config key is named and the
+    // four real keys are listed (text mode renders the full parse error).
+    let config = setup_malformed_config("[defaults]\nmcp_config = [\"/a.json\"]\n");
+    let mut cmd = claude_print();
+    cmd.arg("--mcp-config")
+        .arg("/on-the-cli.json")
+        .arg("test prompt");
+    cmd.env("XDG_CONFIG_HOME", config.path());
+    let out = run(&mut cmd, BUDGET);
+    for needle in [
+        "unknown field",
+        "`mcp_config`",
+        "`inherit_hooks`",
+        "`model`",
+        "`max_turns`",
+        "`timeout_secs`",
+    ] {
+        assert!(
+            out.stderr.contains(needle),
+            "closed-world rejection must contain {needle}: {}",
+            out.stderr
+        );
+    }
+}
+
+/// `--mcp-config` with no value is a clap usage error (exit 2) — and because
+/// `Cli::parse()` answers before `main()`'s config step runs, the usage error
+/// wins even when the discovered config is garbage: proof the flag's own
+/// error surface sits entirely in front of `Config::load_or_default`.
+#[test]
+fn mcp_config_without_a_value_is_a_usage_error_before_the_config_step() {
+    let config = setup_malformed_config("[[\n");
+    let mut cmd = claude_print();
+    cmd.arg("--mcp-config");
+    cmd.env("XDG_CONFIG_HOME", config.path());
+
+    let out = run(&mut cmd, BUDGET);
+    assert_eq!(
+        out.code,
+        Some(2),
+        "missing value: expected clap usage exit 2\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr
+            .contains("a value is required for '--mcp-config <MCP_CONFIG>'"),
+        "the clap usage error must name the flag: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("invalid config:"),
+        "the poisoned discovered config must NOT be reached: {}",
+        out.stderr
+    );
+}

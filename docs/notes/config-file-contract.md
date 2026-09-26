@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Contract version** | v1 |
-| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json`; the README's Configuration-section summary (key table, shipped defaults, path precedence) by the same test (bead claudepr-746dd1c4), and the engineering analysis `docs/config-error-analysis.md`'s contract-bearing excerpts (quoted examples, path precedence and XDG edges, resolution limitation) likewise (bead claudepr-09637c58); the Claude-state/`CLAUDE_CONFIG_DIR` section and its README counterpart by `tests/claude_config_dir_docs_contract.rs` (bead claudepr-e46458c4) |
+| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json`; the README's Configuration-section summary (key table, shipped defaults, path precedence) by the same test (bead claudepr-746dd1c4), and the engineering analysis `docs/config-error-analysis.md`'s contract-bearing excerpts (quoted examples, path precedence and XDG edges, resolution limitation) likewise (bead claudepr-09637c58); the Claude-state/`CLAUDE_CONFIG_DIR` section and its README counterpart by `tests/claude_config_dir_docs_contract.rs` (bead claudepr-e46458c4); the `--mcp-config` boundary section by the mock-child argv recordings in `tests/binary_e2e.rs` and `tests/pool_socket_e2e.rs` (bead claudepr-af36fc41) |
 | **Implementation** | `src/config.rs` (`Config::default_path`, `Config::load_or_default`, the `resolve_*` tiering, `Defaults::validate`), path selection wired by `src/main.rs`, `HOME` policy by `src/util.rs::get_home`, user-facing message shaping by `src/error.rs` (`From<Error> for ClaudePrintError`) and `src/emitter.rs` (`emit_error`) |
 | **Provenance** | bead claudepr-227efdb1 (2026-09-25) |
 
@@ -203,6 +203,75 @@ always passes `Some(cli.max_turns)` / `Some(cli.timeout)` into the resolvers —
 the config tier never fires. Control these two with the CLI flags (or, for
 NEEDLE, the `invoke` template in `claude-print.yaml`). The keys are accepted
 so a future fix can honor them without a format change.
+
+## `--mcp-config`: a config-shaped flag with no config tier
+
+`--mcp-config` is the only long flag other than `--config` whose name contains
+"config" (the no-redirection claim above enumerates exactly those two), so its
+boundary with this file is worth stating precisely: **it is not a
+configuration-file setting and has no config tier.** The closed-world
+`[defaults]` schema has no `mcp_config` key — a config file carrying one is
+rejected at parse time by the same unknown-field tier as any other stray key
+(§"TOML structure"), naming `mcp_config` and the four real keys, exit 2, before
+any session starts. There is no `resolve_*` tiering for it either: unlike
+`--model` there is no "flag → config → built-in" chain, because absence has no
+built-in value to fall back to — it forwards nothing (§ below).
+
+What the flag shapes instead is the **child argv**. When one or more values are
+given, `main.rs` carries them into `LaunchOptions::mcp_configs` and
+`Session::build_child_argv` emits — after the relay `--settings=` (and after
+`--setting-sources=` when isolation mode is on), before the forwarded
+`--model`/`--max-turns` — exactly this segment:
+
+```text
+--strict-mcp-config --mcp-config <entry> [--mcp-config <entry> …]
+```
+
+one `--mcp-config <entry>` pair per entry in entry order, with
+`--strict-mcp-config` exactly once and only when the list is non-empty (an
+empty list forwards neither flag, leaving the child's own default MCP
+resolution in force). The strict flag is the point of the feature (bf-uj0
+bound MCP init): only the named configs load, so inherited/project/global MCP
+servers that can hang on connect cannot wedge headless startup.
+
+**Accepted spellings.** The flag is repeatable and comma-delimited
+(`value_delimiter = ','` in `src/cli.rs`): `--mcp-config a --mcp-config b`,
+`--mcp-config a,b`, and `--mcp-config=a,b` all yield the same two entries in
+the same order. A value is required — `--mcp-config` with no value is a clap
+usage error (exit 2, `a value is required for '--mcp-config <MCP_CONFIG>'`),
+answered inside `Cli::parse()` before the config file is ever read. There is
+no short form.
+
+**Values are forwarded verbatim — the child is the validator.** claude-print
+checks neither that a path exists nor that inline JSON parses; a bad value
+surfaces as the child's own startup failure through the ordinary session error
+paths (first-output watchdog, `--show-child-stderr`). The only
+claude-print-side failure is the argv NUL guard (`Error::Internal`,
+`mcp-config value invalid`), unreachable from a shell since NUL cannot cross
+`execve`.
+
+**Interaction with this file: none, in both directions.** A config file that
+loads (even one actively setting `model` or `inherit_hooks`) leaves the
+`--mcp-config` segment of the child argv byte-identical, and a config file
+that fails to load still exits 2 with its `invalid config:` error whether or
+not `--mcp-config` was passed — the flag neither rescues nor bypasses the
+config step.
+
+**Pooled invocations do not use this argv path.** With `--pool-socket` the
+acquired worker's `claude` was already launched by the daemon with a fixed
+argv (`--settings=` plus `--setting-sources=` only — `pool.rs`'s
+`create_worker` never sets MCP configs), so the flag cannot reach the child.
+It is inert, never fatal: the prompt still runs on the daemon's launch, and
+with `--verbose` the client lists `--mcp-config` in its `not applied:`
+diagnostic alongside the other per-invocation launch flags (README §"Warm PTY
+pool" documents the same for its siblings).
+
+The forwarding order, the spelling equivalence, the config independence, the
+closed-world rejection, and the pool leg are pinned by mock-child argv
+recordings (`MOCK_RECORD_ARGS`) in `tests/binary_e2e.rs` and
+`tests/pool_socket_e2e.rs` (bead claudepr-af36fc41); the argv shapes are
+additionally unit-tested at the source in `src/session.rs`
+(`build_child_argv_*`).
 
 ## Missing file
 

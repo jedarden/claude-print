@@ -14,6 +14,14 @@
 //!     `pooled_json_invocation_emits_the_transcript_sourced_result_object`
 //!     (also pins that billing/usage capture survives the pool path),
 //!     `pooled_stream_json_invocation_forwards_the_worker_transcript`.
+//!   * **per-invocation launch flags are inert on the pool** (claudepr-af36fc41,
+//!     the `--mcp-config` leg) —
+//!     `pooled_invocation_keeps_mcp_config_off_the_worker_argv_and_reports_it_unapplied`:
+//!     the worker's `claude` is launched by the daemon with a fixed argv, so the
+//!     client's `--mcp-config` never reaches any child argv (proved by a
+//!     daemon-side MOCK_RECORD_ARGS dump of the worker's own argv) — the run
+//!     still succeeds on the daemon's launch and the flag is named in the
+//!     client's `not applied:` verbose diagnostic.
 //!   * **stateless fallback, socket absent** —
 //!     `absent_pool_socket_runs_the_stateless_session_quietly`.
 //!   * **stateless fallback, socket present but nothing listening** —
@@ -631,6 +639,112 @@ fn pooled_text_invocation_answers_through_an_acquired_worker() {
         !out.stderr.contains("falling back"),
         "a healthy pool must never fall back\nstderr:\n{}",
         out.stderr
+    );
+
+    // Daemon side: one assignment, one release, replacement warmed.
+    daemon.wait_for("Released worker", 1, LEDGER);
+    daemon.wait_for("Spawning worker", 2, REPLACE);
+    daemon.wait_for("settled and ready", 2, WARMUP);
+    daemon.terminate(1);
+}
+
+/// `--mcp-config` on a pooled invocation (claudepr-af36fc41): the flag cannot
+/// reach the child, because the worker's `claude` was launched by the daemon
+/// with a fixed argv before the client existed — pooled invocations do not
+/// build child argv at all. Three proofs in one run:
+///
+///  * the daemon-side `MOCK_RECORD_ARGS` dump (inherited by the worker it
+///    spawns) shows the worker's own argv carries `--settings=` and
+///    `--setting-sources=` and NO mcp flags, even with the client passing
+///    `--mcp-config`;
+///  * the invocation is inert, never fatal — it still acquires, drives, and
+///    releases a prewarmed worker and answers from its transcript;
+///  * the client's `--verbose` diagnostic lists `--mcp-config` in its
+///    `not applied:` line rather than silently dropping the flag.
+#[test]
+fn pooled_invocation_keeps_mcp_config_off_the_worker_argv_and_reports_it_unapplied() {
+    let fx = Fixture::start();
+    // The recording path lives under the fixture's HOME so the worker (which
+    // inherits the daemon's env via build_child_env) can write it; the client
+    // never sees MOCK_RECORD_ARGS, so the only recorder is the worker itself.
+    let record = fx.home.path().join("worker_argv");
+    let record_str = record.to_string_lossy().into_owned();
+    let mut daemon = fx.daemon(&[("MOCK_RECORD_ARGS", record_str.as_str())]);
+    daemon.wait_for("settled and ready", 1, WARMUP);
+
+    let mut cmd = fx.client();
+    cmd.arg("--pool-socket")
+        .arg(&fx.socket)
+        .arg("--verbose")
+        .arg("--mcp-config")
+        .arg("/client-side-mcp.json")
+        .arg(PROMPT);
+    let out = run(&mut cmd, POOLED_BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "the pooled invocation with --mcp-config must still succeed\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains("Hello from mock_claude"),
+        "the answer must come from the driven worker's transcript\nstdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("driving prewarmed worker"),
+        "the client must drive a prewarmed worker, not fall back\nstderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("falling back"),
+        "a healthy pool must never fall back\nstderr:\n{}",
+        out.stderr
+    );
+    let not_applied = out
+        .stderr
+        .lines()
+        .find(|l| l.contains("not applied:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the client must report the inert flag in a 'not applied:' \
+                 diagnostic\nstderr:\n{}",
+                out.stderr
+            )
+        });
+    assert!(
+        not_applied.contains("--mcp-config"),
+        "the 'not applied:' diagnostic must name --mcp-config: {not_applied}"
+    );
+
+    // The worker's own argv, recorded at daemon spawn before the client ran:
+    // the daemon's launch and nothing else — the client's flag never touched
+    // a child argv on the pool path.
+    let bytes = std::fs::read(&record)
+        .unwrap_or_else(|e| panic!("worker argv recording missing at {}: {e}", record.display()));
+    let worker_args: Vec<String> = bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    assert!(
+        worker_args.iter().any(|a| a.starts_with("--settings=")),
+        "the worker argv must carry the relay --settings= (recording sanity), \
+         got: {worker_args:?}"
+    );
+    assert!(
+        worker_args.iter().any(|a| a == "--setting-sources="),
+        "pool workers launch isolated (--setting-sources=), got: {worker_args:?}"
+    );
+    assert!(
+        !worker_args.iter().any(|a| a == "--strict-mcp-config"),
+        "--strict-mcp-config must never reach a pooled worker's argv, got: {worker_args:?}"
+    );
+    assert!(
+        !worker_args.iter().any(|a| a == "--mcp-config"),
+        "--mcp-config must never reach a pooled worker's argv, got: {worker_args:?}"
     );
 
     // Daemon side: one assignment, one release, replacement warmed.
