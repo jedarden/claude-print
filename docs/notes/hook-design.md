@@ -1,5 +1,15 @@
 # Hook Design
 
+| | |
+|---|---|
+| **Pinned by** | `tests/docs_hook_contract.rs` — this table plus the doc's normative IPC claims (the `<TMPDIR>/claude-print-<pid>-<rand>/` layout and the pid-ownership premise of the orphan sweep, the 0700 dir / 0600 stop.fifo / 0750 relay-script modes including the hostile-umask-000 case, the `write_cat_script` single-quoted target with `'\''` escaping and the `|| true` failure-swallowing body, the session-identity.json sibling-of-stop.fifo invariant, and the per-run `--settings <temp>/settings.json` wiring) held against the real `HookInstaller`; the transcript-slug section by `tests/docs_slug_consistency.rs`; the measured Claude Code runtime behaviors (settings merge, source suppression, Stop frequency, hook-timeout enforcement) by `tests/claude_contracts.rs` and the probe scripts it names; the behavioral twins of the mode/escape/cleanup/sweep claims by the `src/hook.rs` unit tests cited inline |
+| **Implementation** | `src/hook.rs` (`HookInstaller::new`, `write_cat_script`, `shell_single_quoted`, `cleanup_orphans`); `src/pty.rs` (the PTY child the relay hooks fire in — the temp dir exists solely for the Stop-hook settings injection); the `--settings=<temp>/settings.json` argv forwarding in `src/session.rs` and `src/pool.rs` |
+| **Provenance** | bead claudepr-cddbb476 |
+
+This note is the normative spec for the Stop FIFO + UserPromptSubmit
+identity relay. Changing the contract means changing this document, the
+implementation, and the pinning test in one commit.
+
 Two relay hooks are the IPC mechanism between Claude Code and `claude-print`. When the AI completes a turn, Claude Code fires the **Stop** hook with a JSON payload containing session metadata; `claude-print` reads this from a FIFO to know when the response is ready. When the prompt is submitted, Claude Code fires the **UserPromptSubmit** hook; `claude-print` relays that payload into a per-drive identity file so the stream-json reader can bind to this session's transcript before any assistant event exists (see [UserPromptSubmit Identity Relay](#userpromptsubmit-identity-relay)).
 
 ## Temp Directory Structure
