@@ -38,9 +38,87 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Repository root, baked at compile time so the guard always reads the
-/// extraction it runs from.
-const REPO: &str = env!("CARGO_MANIFEST_DIR");
+/// Probe files that identify a claude-print checkout: a directory holding
+/// both is a usable repo root for this guard.
+const ROOT_PROBES: [&str; 2] = ["AGENTS.md", "Cargo.toml"];
+
+/// Repository root this guard reads, resolved at *runtime* — never the bare
+/// compile-time `env!("CARGO_MANIFEST_DIR")`, which bakes the building
+/// checkout's path into the test binary. The local cargo wrapper maps
+/// `.git`-less extractions onto one shared target dir, so an extraction of
+/// unchanged content instant-reuses a cached test binary compiled in an
+/// extraction that has since been deleted; a baked-only root then fails
+/// every later run of that binary with file-NotFound panics that have
+/// nothing to do with drift (bead claudepr-23f81f16). Candidates, most
+/// authoritative first, each probe-verified before use:
+///
+/// 1. `$CLAUDE_PRINT_TEST_REPO` — explicit override for direct binary runs;
+///    when set it is authoritative and must itself be a checkout.
+/// 2. the runtime `CARGO_MANIFEST_DIR` cargo sets in the test process to
+///    the package under test — the live extraction even in a cache-reused
+///    binary (the same dance as `tests/docs_slug_consistency.rs`).
+/// 3. the compile-time `CARGO_MANIFEST_DIR` — last resort for running the
+///    test binary directly, where cargo sets neither variable.
+///
+/// If no candidate survives its probe the guard panics naming every
+/// candidate it rejected — loud, never a vacuous pass off a wrong tree.
+fn repo_root() -> PathBuf {
+    resolve_repo_root(
+        std::env::var("CLAUDE_PRINT_TEST_REPO").ok().as_deref(),
+        std::env::var("CARGO_MANIFEST_DIR").ok().as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+    .unwrap_or_else(|e| panic!("locating the repo root to read AGENTS.md and tests/ from: {e}"))
+}
+
+/// [`repo_root`]'s candidate chain as a pure function, so the precedence
+/// and the loud failure are testable without racing the process-wide
+/// environment from parallel tests.
+fn resolve_repo_root(
+    env_override: Option<&str>,
+    runtime_manifest: Option<&str>,
+    baked_manifest: &str,
+) -> Result<PathBuf, String> {
+    if let Some(override_root) = env_override {
+        if is_repo_root(Path::new(override_root)) {
+            return Ok(PathBuf::from(override_root));
+        }
+        return Err(format!(
+            "$CLAUDE_PRINT_TEST_REPO={override_root:?} is set but not a claude-print \
+             checkout (probe: {:?} + {:?}) — an explicit override is authoritative and \
+             is never silently skipped for another candidate",
+            ROOT_PROBES[0], ROOT_PROBES[1]
+        ));
+    }
+    // Runtime value first, baked value only as fallback; one chain so the
+    // failure names everything that was tried.
+    let mut chain: Vec<(&str, &str)> = vec![("compile-time", baked_manifest)];
+    if let Some(runtime) = runtime_manifest {
+        if runtime != baked_manifest {
+            chain.insert(0, ("runtime", runtime));
+        }
+    }
+    let mut rejected = Vec::new();
+    for (origin, candidate) in chain {
+        let path = Path::new(candidate);
+        if is_repo_root(path) {
+            return Ok(path.to_path_buf());
+        }
+        rejected.push(format!("{origin} CARGO_MANIFEST_DIR={}", path.display()));
+    }
+    Err(format!(
+        "no candidate repo root is a claude-print checkout (probe: {:?} + {:?}): {} — \
+         run via `cargo test` from a checkout, or set $CLAUDE_PRINT_TEST_REPO to one",
+        ROOT_PROBES[0],
+        ROOT_PROBES[1],
+        rejected.join("; ")
+    ))
+}
+
+/// Whether `p` holds this guard's root probes.
+fn is_repo_root(p: &Path) -> bool {
+    ROOT_PROBES.iter().all(|f| p.join(f).is_file())
+}
 
 /// Parse sentinels: the exact header lines of the three AGENTS.md tables
 /// this guard consumes. Locating tables by header keeps the guard immune to
@@ -80,7 +158,7 @@ const SPAWN_MARKERS: [&str; 2] = ["process::Command", "Command::new"];
 const SELF_TARGET: &str = "docs_test_classification";
 
 fn read_repo(rel: &str) -> String {
-    fs::read_to_string(Path::new(REPO).join(rel))
+    fs::read_to_string(repo_root().join(rel))
         .unwrap_or_else(|e| panic!("reading {rel} from the repo root: {e}"))
 }
 
@@ -177,7 +255,7 @@ fn targets_in(classification: &BTreeMap<String, (String, String)>, group: &str) 
 /// `cargo_autodiscovery_assumptions_hold`.
 fn filesystem_targets() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for entry in fs::read_dir(Path::new(REPO).join("tests")).expect("reading tests/") {
+    for entry in fs::read_dir(repo_root().join("tests")).expect("reading tests/") {
         let path = entry.expect("readdir entry in tests/").path();
         if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
             let name = path.file_name().expect("file name").to_string_lossy();
@@ -197,6 +275,7 @@ fn filesystem_targets() -> BTreeSet<String> {
 /// `config_startup_errors` locates the binary only through its
 /// `config_error_helpers` module.
 fn compilation_unit(target: &str) -> BTreeMap<String, String> {
+    let root = repo_root();
     let mut unit: BTreeMap<String, String> = BTreeMap::new();
     let mut queue = vec![format!("tests/{target}.rs")];
     while let Some(rel) = queue.pop() {
@@ -204,7 +283,7 @@ fn compilation_unit(target: &str) -> BTreeMap<String, String> {
             continue;
         }
         let content = read_repo(&rel);
-        for dep in mod_includes(&rel, &content) {
+        for dep in mod_includes(&root, &rel, &content) {
             if !unit.contains_key(&dep) {
                 queue.push(dep);
             }
@@ -216,8 +295,9 @@ fn compilation_unit(target: &str) -> BTreeMap<String, String> {
 
 /// Repo-relative paths of the `mod name;` declarations in `content`.
 /// Inline `mod name { … }` blocks (no semicolon) declare no file and are
-/// ignored.
-fn mod_includes(rel: &str, content: &str) -> Vec<String> {
+/// ignored. `root` anchors the probe that decides between the two file
+/// layouts, since `base` is repo-relative, not process-relative.
+fn mod_includes(root: &Path, rel: &str, content: &str) -> Vec<String> {
     let base = Path::new(rel).parent().unwrap_or_else(|| Path::new("."));
     let mut out = Vec::new();
     let mut pending_path: Option<String> = None;
@@ -232,7 +312,7 @@ fn mod_includes(rel: &str, content: &str) -> Vec<String> {
         if let Some(name) = mod_name(t) {
             let file = match pending_path.take() {
                 Some(p) => base.join(p),
-                None => default_mod_path(base, &name),
+                None => default_mod_path(root, base, &name),
             };
             out.push(file.display().to_string());
         } else if !t.is_empty() && !t.starts_with("//") {
@@ -265,10 +345,10 @@ fn parse_path_attr(t: &str) -> Option<String> {
 }
 
 /// Where a plain `mod name;` resolves: `name.rs` beside the includer, else
-/// `name/main.rs`.
-fn default_mod_path(parent: &Path, name: &str) -> PathBuf {
+/// `name/main.rs` — probed under `root`, not the process working directory.
+fn default_mod_path(root: &Path, parent: &Path, name: &str) -> PathBuf {
     let flat = parent.join(format!("{name}.rs"));
-    if flat.is_file() {
+    if root.join(&flat).is_file() {
         flat
     } else {
         parent.join(name).join("main.rs")
@@ -378,7 +458,7 @@ fn cargo_autodiscovery_assumptions_hold() {
         "`autotests = false` disables the autodiscovery this guard enumerates with — \
          extend tests/{SELF_TARGET}.rs"
     );
-    let tests_dir = Path::new(REPO).join("tests");
+    let tests_dir = repo_root().join("tests");
     for entry in fs::read_dir(&tests_dir).expect("reading tests/") {
         let path = entry.expect("readdir entry in tests/").path();
         if path.is_dir() {
@@ -547,5 +627,70 @@ fn test_structure_table_lists_every_target() {
         missing.is_empty() && extra.is_empty(),
         "AGENTS.md §\"Test structure\" must list every tests/*.rs target — missing \
          rows: {missing:?}; rows for nonexistent targets: {extra:?}"
+    );
+}
+
+#[test]
+fn repo_root_resolution_follows_the_candidate_chain() {
+    let live = repo_root();
+    let live_str = live.display().to_string();
+    // A second, minimal checkout: resolution only stats the probe files, so
+    // empty ones are enough to make it a valid candidate.
+    let other = tempfile::tempdir().expect("tempdir for a second repo root");
+    for probe in ROOT_PROBES {
+        fs::write(other.path().join(probe), "").expect("writing root probe file");
+    }
+    let other_str = other.path().display().to_string();
+
+    // 1. the override outranks the runtime manifest when both are checkouts
+    assert_eq!(
+        resolve_repo_root(Some(&other_str), Some(&live_str), &live_str),
+        Ok(other.path().to_path_buf())
+    );
+    // 2. the runtime manifest outranks the baked value
+    assert_eq!(
+        resolve_repo_root(None, Some(&other_str), &live_str),
+        Ok(other.path().to_path_buf())
+    );
+    // 3. the baked value is the fallback (direct binary runs: cargo sets
+    //    no runtime manifest)
+    assert_eq!(
+        resolve_repo_root(None, None, &other_str),
+        Ok(other.path().to_path_buf())
+    );
+}
+
+#[test]
+fn repo_root_resolution_fails_loudly_naming_every_candidate() {
+    // An existing directory without the probe files — the shape a deleted
+    // extraction's parent, or a typo'd path, has.
+    let not_a_checkout = tempfile::tempdir().expect("tempdir that is not a checkout");
+    let bogus = not_a_checkout.path().display().to_string();
+    let err = resolve_repo_root(None, Some(&bogus), &bogus).unwrap_err();
+    assert!(
+        err.contains(&bogus),
+        "the failure must name the rejected candidate: {err}"
+    );
+    assert!(
+        err.contains("CLAUDE_PRINT_TEST_REPO"),
+        "the failure must name the escape hatch: {err}"
+    );
+    assert!(
+        err.contains(ROOT_PROBES[0]) && err.contains(ROOT_PROBES[1]),
+        "the failure must name the probe files so the gap is actionable: {err}"
+    );
+}
+
+#[test]
+fn a_set_repo_root_override_is_authoritative() {
+    let live = repo_root();
+    let live_str = live.display().to_string();
+    let not_a_checkout = tempfile::tempdir().expect("tempdir that is not a checkout");
+    let bogus = not_a_checkout.path().display().to_string();
+    let err = resolve_repo_root(Some(&bogus), Some(&live_str), &live_str).unwrap_err();
+    assert!(
+        err.contains("$CLAUDE_PRINT_TEST_REPO") && err.contains(&bogus),
+        "a set-but-wrong override must fail naming itself, not fall through to \
+         another tree: {err}"
     );
 }
