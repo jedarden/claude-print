@@ -94,10 +94,12 @@ const LOCATOR_PARAGRAPH_SENTINEL: &str = "Tests need no path pinning";
 /// grammar checker names the shapes it parses.
 const SELF_TARGET: &str = "docs_build_layout";
 
-/// `tests/benchmark_reproducibility.rs` carries the same literals as its
-/// own lint needles (`"/build/"` et al.) — it asserts on those strings, it
-/// does not build paths from them.
-const LINT_EXEMPT: [&str; 1] = ["benchmark_reproducibility"];
+/// Files whose non-comment code carries these literals as data, not
+/// paths: `tests/benchmark_reproducibility.rs` asserts on the strings
+/// (its own lint needles), and `tests/target_path_guard.rs` — the
+/// standing guard for this discipline across `tests/`, `scripts/`, and
+/// `build.rs` — has them as its needle list.
+const LINT_EXEMPT: [&str; 2] = ["benchmark_reproducibility", "target_path_guard"];
 
 /// Written-out build-output path fragments no test source may contain in
 /// non-comment code: the stock layout, the musl release layout, and the

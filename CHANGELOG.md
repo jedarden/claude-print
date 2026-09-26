@@ -9,6 +9,22 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Hardcoded-target-path guard.** `tests/target_path_guard.rs` (bead
+  claudepr-7a9e7130) enforces AGENTS.md §"Where the build output lands"'s
+  locator discipline standing across every surface that resolves build
+  output — all of `tests/` and `scripts/` (any file type, fixtures
+  included) plus `build.rs` at the root (absent today, covered from the
+  day one appears). A written-out `target/debug`, `target/release`,
+  musl-triple, or `/build/` redirect path fails the build outside a
+  two-tier allowlist: whole-file exemptions for guards whose needles
+  assert on the literals, and exact-line content-anchored exemptions for
+  documentation and assertion quotes, each with its rationale in the same
+  commit as the exception. Allowlist hygiene fails on stale, pointless,
+  or redundant entries, and always-on negative meta-tests prove planted
+  hardcodes are reported in all three scanned locations, commented
+  mentions are not, and dropping a live exemption re-flags its line. A
+  test that pins `target/debug/…` passes on a stock checkout and fails
+  only on fleet hosts — this guard is what makes that drift fail CI.
 - **Test-target classification guard.** AGENTS.md §"Execution requirements"
   now carries the exhaustive classification as an explicit table (every
   `tests/*.rs` target in exactly one row: compiled-binaries, repo-scripts,
