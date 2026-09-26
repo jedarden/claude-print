@@ -109,7 +109,7 @@ the adapter copy's own contract (detection, source, mode, overwrite) in
 
 ### Repository & contributions
 
-`git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository and the destination for all pushes. The GitHub repo (`jedarden/claude-print`) is a read-only push mirror — do not treat it as authoritative, and expect it to always reflect Forgejo rather than the reverse. "Read-only" describes source and refs: mirror syncs carry Forgejo → GitHub and never the reverse. Release artifacts run the other way conceptually — they are published only to GitHub Releases, and Forgejo hosts no release assets. The canonical publication path is one-directional: a `vX.Y.Z` tag is pushed to Forgejo first, the `claude-print-ci` Argo Workflow builds the tagged commit from Forgejo, and the workflow publishes the artifacts to GitHub Releases, from which nothing flows back. That makes GitHub Releases the supported download path for `install.sh`, with `CLAUDE_PRINT_RELEASE_URL` redirecting the installer to any host serving the same assets when GitHub is unreachable (see [Install](#install)). Contribute by pushing to Forgejo directly, or by opening an issue or PR on either host — mirror-side PRs are applied on Forgejo before merge.
+`git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository and the destination for all pushes. The GitHub repo (`jedarden/claude-print`) is a read-only push mirror — do not treat it as authoritative, and expect it to always reflect Forgejo rather than the reverse. "Read-only" describes source and refs: mirror syncs carry Forgejo → GitHub and never the reverse. Release artifacts run the other way conceptually — they are published only to GitHub Releases, and Forgejo hosts no release assets. The canonical publication path is one-directional: a `vX.Y.Z` tag is pushed to Forgejo first, the `claude-print-ci` Argo Workflow builds the tagged commit from Forgejo, and the workflow publishes the artifacts to GitHub Releases, from which nothing flows back. That makes GitHub Releases the supported download path for `install.sh`, with `CLAUDE_PRINT_RELEASE_URL` redirecting the installer to any host serving the same assets when GitHub is unreachable (see [Install](#install)). Contribute by pushing to Forgejo directly, or by opening an issue or PR on either host — mirror-side PRs are applied on Forgejo before merge. The operator runbook for that publication path — commit and tag selection, mirror publication order, the supported asset names, and `sha256sums.txt` generation — is [`docs/notes/release-runbook.md`](docs/notes/release-runbook.md).
 
 ### Build from source
 
@@ -787,6 +787,11 @@ Before cutting a release tag:
 5. Update version in `Cargo.toml`
 6. Commit and push: `git tag v0.x.y && git push origin v0.x.y` (origin is Forgejo, the canonical host — the tag must land there first; see the workflow's tag-to-Forgejo note)
 7. Monitor the `claude-print-ci` Argo Workflow for a successful build and publish — release artifacts land on GitHub Releases, the supported download channel (see [Repository & contributions](#repository--contributions))
+
+[`docs/notes/release-runbook.md`](docs/notes/release-runbook.md) is the
+operator runbook this checklist feeds into — commit and tag selection, mirror
+publication order, the supported asset names, `sha256sums.txt` generation,
+version verification, and artifact validation.
 
 ## Structure
 
