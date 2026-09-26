@@ -44,6 +44,7 @@ use claude_print::session::{LaunchOptions, Session};
 use serde::Deserialize;
 
 const FIXTURE: &str = include_str!("fixtures/claude_contracts_v2.1.282.json");
+const DOC: &str = include_str!("../docs/notes/claude-contract-probes.md");
 
 /// The measured contracts, as recorded by the probe run.
 #[derive(Debug, Deserialize)]
@@ -52,6 +53,7 @@ struct ContractFixture {
     claude_version: String,
     measured_at: String,
     contracts: Contracts,
+    doc_evidence: DocEvidence,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,8 +102,241 @@ struct Contracts {
     hook_timeout_overrun_session_proceeds: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct DocEvidence {
+    /// The evidence projection is deliberately part of the active fixture:
+    /// it is the machine-readable source for the numbers quoted in the
+    /// contract-probe document, rather than another copy hidden in this test.
+    active_version: String,
+    cross_source: CrossSourceDocEvidence,
+    permission_denied_runs: CountEvidence,
+    hook_timeout: HookTimeoutDocEvidence,
+    stop_counts: StopDocEvidence,
+    active_tui_seconds: Vec<f64>,
+    historical: Vec<HistoricalDocEvidence>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+struct CountEvidence {
+    observed: u32,
+    total: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrossSourceDocEvidence {
+    concurrent_pairs: CountEvidence,
+    relay_first_pairs: CountEvidence,
+    earlier_concurrent_pairs: CountEvidence,
+    earlier_relay_first_pairs: Vec<CountEvidence>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookTimeoutDocEvidence {
+    killed_firings: CountEvidence,
+    successful_sessions: CountEvidence,
+    rendered_replies: CountEvidence,
+    rendered_per_invocation: CountEvidence,
+    elapsed_seconds: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct StopDocEvidence {
+    single_turn_per_loaded_source: u32,
+    multi_round: u32,
+    permission_denied: u32,
+    tui_turn_1: u32,
+    tui_turn_2: u32,
+    max_turns_cutoff: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoricalDocEvidence {
+    version: String,
+    cross_source_relay_first_runs: Option<CountEvidence>,
+    permission_denied_extra_stop_runs: Option<CountEvidence>,
+    arm_t_seconds: Option<Vec<f64>>,
+    tui_seconds: Vec<f64>,
+}
+
 fn fixture() -> ContractFixture {
     serde_json::from_str(FIXTURE).expect("contract fixture must parse")
+}
+
+fn count(observed: u32, total: u32) -> CountEvidence {
+    CountEvidence { observed, total }
+}
+
+/// Return the first unsigned integer at or after `start`.
+fn next_integer(text: &str, start: usize) -> (u32, usize) {
+    let tail = &text[start..];
+    let offset = tail
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or_else(|| panic!("expected an integer after byte {start}"));
+    let begin = start + offset;
+    let end = begin
+        + text[begin..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len() - begin);
+    (
+        text[begin..end]
+            .parse()
+            .unwrap_or_else(|_| panic!("integer is too large: {}", &text[begin..end])),
+        end,
+    )
+}
+
+/// Parse the document's prose form, e.g. `12 of 12`.
+fn count_of(text: &str, marker: &str) -> CountEvidence {
+    let marker_end = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("document is missing marker {marker:?}"))
+        + marker.len();
+    let (observed, observed_end) = next_integer(text, marker_end);
+    let of = text[observed_end..]
+        .find(" of ")
+        .unwrap_or_else(|| panic!("document is missing `of` after {marker:?}"));
+    let (total, _) = next_integer(text, observed_end + of + " of ".len());
+    count(observed, total)
+}
+
+/// Parse every `N/N` ratio in a scoped document fragment. Keeping the whole
+/// sequence makes stale evidence fail even if a re-pin adds the new number
+/// while leaving the old number behind.
+fn slash_counts(text: &str) -> Vec<CountEvidence> {
+    let bytes = text.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let begin = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'/' {
+            continue;
+        }
+        i += 1;
+        let denominator_begin = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if denominator_begin == i {
+            continue;
+        }
+        result.push(count(
+            text[begin..(denominator_begin - 1)].parse().unwrap(),
+            text[denominator_begin..i].parse().unwrap(),
+        ));
+    }
+    result
+}
+
+/// Parse decimal values written as seconds (`41.6 s`) in a scoped fragment.
+fn seconds(text: &str) -> Vec<f64> {
+    let bytes = text.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let begin = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        let token = &text[begin..i];
+        if token.matches('.').count() != 1 {
+            continue;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b's' {
+            result.push(token.parse().unwrap());
+        }
+    }
+    result
+}
+
+fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let start = text
+        .find(start)
+        .unwrap_or_else(|| panic!("document is missing start marker {start:?}"))
+        + start.len();
+    let end = start
+        + text[start..]
+            .find(end)
+            .unwrap_or_else(|| panic!("document is missing end marker {end:?}"));
+    &text[start..end]
+}
+
+fn versions(text: &str) -> std::collections::BTreeSet<String> {
+    version_tokens(text).into_iter().collect()
+}
+
+fn version_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|token| {
+            let parts: Vec<_> = token.split('.').collect();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn first_version_after(text: &str, marker: &str) -> String {
+    let marker_end = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("document is missing marker {marker:?}"))
+        + marker.len();
+    version_tokens(&text[marker_end..])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("document has no version after {marker:?}"))
+}
+
+fn first_table_integer(text: &str, scenario: &str) -> u32 {
+    let line = text
+        .lines()
+        .find(|line| line.starts_with('|') && line.contains(scenario))
+        .unwrap_or_else(|| panic!("document is missing table row {scenario:?}"));
+    let cell = line
+        .split('|')
+        .nth(2)
+        .unwrap_or_else(|| panic!("table row {scenario:?} has no Stop-firings cell"));
+    next_integer(cell, 0).0
+}
+
+fn count_words_in_phrase(text: &str, phrase: &str) -> CountEvidence {
+    let _ = text
+        .find(phrase)
+        .unwrap_or_else(|| panic!("document is missing phrase {phrase:?}"));
+    let words = [
+        ("one", 1u32),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+    ];
+    let values: Vec<_> = phrase
+        .split_whitespace()
+        .filter_map(|word| words.iter().find(|(known, _)| *known == word))
+        .map(|(_, value)| *value)
+        .collect();
+    assert_eq!(values.len(), 2, "expected two word counts in {phrase:?}");
+    count(values[0], values[1])
 }
 
 // ── Fixture sanity ───────────────────────────────────────────────────────────
@@ -161,6 +396,162 @@ fn fixture_pins_measured_contracts() {
         f.contracts.hook_timeout_overrun_session_proceeds,
         "relay-hook timeout measured: the session proceeds past a killed hook"
     );
+}
+
+// ── Documentation evidence pin ──────────────────────────────────────────────
+
+/// Keep the prose evidence in lockstep with the active runtime fixture.
+///
+/// The maintenance gate already reconciles the fixture version with the
+/// document's `Measured against:` stamp. This is the second half of that
+/// contract: it parses the quoted evidence values from the document and
+/// compares them with the active fixture's typed `doc_evidence` projection.
+/// The historical values are included because a re-pin must not silently
+/// relabel an old measurement or leave an old timing attached to a new one.
+#[test]
+fn contract_probe_document_evidence_matches_active_fixture() {
+    let f = fixture();
+    let d = &f.doc_evidence;
+    assert_eq!(d.active_version, f.claude_version);
+    assert_eq!(
+        first_version_after(DOC, "**Measured against:** `claude` "),
+        f.claude_version
+    );
+
+    let merge = between(DOC, "## PO-1 / OQ-1", "## OQ-2 / PO-2");
+    assert_eq!(
+        count_of(merge, "concurrently in "),
+        d.cross_source.concurrent_pairs
+    );
+    assert_eq!(
+        count_of(merge, "project hook in "),
+        d.cross_source.relay_first_pairs
+    );
+    assert_eq!(
+        slash_counts(
+            merge
+                .split("same shape — concurrent ")
+                .nth(1)
+                .expect("merge section must cite earlier concurrent runs")
+        ),
+        std::iter::once(d.cross_source.earlier_concurrent_pairs)
+            .chain(d.cross_source.earlier_relay_first_pairs.iter().copied())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        count_of(merge, "start-order flip in "),
+        d.historical
+            .iter()
+            .find(|h| h.cross_source_relay_first_runs.is_some())
+            .and_then(|h| h.cross_source_relay_first_runs)
+            .expect("fixture must retain the historical cross-source count")
+    );
+
+    let timeout = between(
+        DOC,
+        "## Hook-timeout enforcement",
+        "## Stop firing contract — single-turn baseline",
+    );
+    assert_eq!(
+        slash_counts(timeout),
+        vec![
+            d.hook_timeout.killed_firings,
+            d.hook_timeout.successful_sessions,
+            d.hook_timeout.rendered_replies,
+            d.hook_timeout.rendered_per_invocation,
+            d.hook_timeout.successful_sessions,
+        ]
+    );
+    let timeout_start = timeout
+        .find("claude process exit − Stop hook start")
+        .expect("timeout section must cite process-vs-hook timing");
+    assert_eq!(
+        seconds(&timeout[timeout_start..])[0],
+        d.hook_timeout.elapsed_seconds
+    );
+    assert_eq!(first_version_after(timeout, "Result ("), d.active_version);
+
+    let stop = between(
+        DOC,
+        "## Stop firing contract — multi-round tool use",
+        "## Reproducing",
+    );
+    assert_eq!(
+        first_table_integer(stop, "Single-turn `claude -p`, no tools"),
+        d.stop_counts.single_turn_per_loaded_source
+    );
+    assert_eq!(
+        first_table_integer(stop, "two sequential permitted Bash rounds"),
+        d.stop_counts.multi_round
+    );
+    assert_eq!(
+        first_table_integer(stop, "tool calls permission-denied"),
+        d.stop_counts.permission_denied
+    );
+    assert_eq!(
+        first_table_integer(stop, "TUI, turn 1"),
+        d.stop_counts.tui_turn_1
+    );
+    assert_eq!(
+        first_table_integer(stop, "TUI, turn 2"),
+        d.stop_counts.tui_turn_2
+    );
+    assert_eq!(
+        first_table_integer(stop, "cut off by `--max-turns 2`"),
+        d.stop_counts.max_turns_cutoff
+    );
+    assert_eq!(slash_counts(stop), vec![d.permission_denied_runs]);
+    let historical_degraded = d
+        .historical
+        .iter()
+        .find(|h| h.permission_denied_extra_stop_runs.is_some())
+        .expect("fixture must retain the historical degraded-path count");
+    assert!(stop.contains(&historical_degraded.version));
+    assert_eq!(
+        count_words_in_phrase(stop, "one of the two degraded runs"),
+        historical_degraded
+            .permission_denied_extra_stop_runs
+            .expect("historical degraded-path count must be present")
+    );
+
+    let footnote = between(stop, "*(Timings in the table above are", ")*");
+    let active_timing = between(
+        footnote,
+        &format!("Full {}", d.active_version),
+        "The same-day",
+    );
+    assert_eq!(seconds(active_timing), d.active_tui_seconds);
+
+    for historical in &d.historical {
+        assert!(
+            footnote.contains(&historical.version),
+            "historical version {} must be explicitly attributed in the document",
+            historical.version
+        );
+        if let Some(arm_t_seconds) = &historical.arm_t_seconds {
+            let arm_t = between(footnote, &historical.version, "probe-tui-second-turn");
+            assert_eq!(seconds(arm_t), *arm_t_seconds);
+        }
+        if historical.arm_t_seconds.is_none() {
+            let tui = between(
+                footnote,
+                &format!("the original {} run", historical.version),
+                "per-version",
+            );
+            assert_eq!(seconds(tui), historical.tui_seconds);
+        } else {
+            let same_day = between(footnote, &historical.version, ", and the original");
+            assert_eq!(seconds(same_day), historical.tui_seconds);
+        }
+    }
+
+    let mut expected_versions = std::collections::BTreeSet::new();
+    expected_versions.insert(d.active_version.clone());
+    for historical in &d.historical {
+        expected_versions.insert(historical.version.clone());
+    }
+    assert_eq!(versions(merge), expected_versions);
+    assert_eq!(versions(stop), expected_versions);
 }
 
 // ── Argv contract: claude-print must emit exactly the verified spellings ────

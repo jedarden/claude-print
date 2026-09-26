@@ -37,5 +37,47 @@
     "print_mode_tool_use_evidence": "Two sequential permitted Bash rounds in one -p run (Arm P): exactly 1 Stop at the turn's true end (payload last_assistant_message: DONE, stop_hook_active: false, single session id), claude exit 0. The unallowlisted T1 arm also completed this time (exit 0) with exactly 1 Stop of its own.",
     "cutoff_evidence": "A -p run cut off by --max-turns fires no Stop of its own: T3 (--max-turns 2, exit 1) added zero firings on 2.1.282, exactly as on 2.1.281 (where the T1 arm outgrowing --max-turns 6 showed the same shape) and 2.1.270 - cutoffs belong to the --stop-hook-timeout watchdog, not the Stop poller.",
     "hook_timeout_evidence": "Arm T (added 2026-09-26, claudepr-352cf1df, scripts/probe-stop-edge-contracts.sh): the relay-position hook (--settings file, run with --setting-sources= so it is the only loaded hook - the isolation-mode shape) configured with a per-hook timeout of 5 s while sleeping 30 s, wired on SessionStart and Stop. Two invocations of 4 single-turn runs each against this same pinned 2.1.282 (a full three-arm run, then an Arm-T-only run ARM_S_RUNS=0 ARM_D_RUNS=0; the host binary had drifted to 2.1.283, so the persisted versions-dir 2.1.282 was measured on a PATH shim - the probe stamped the version itself): all 16 event firings KILLED (start logged, end never - the 30 s sleep never completed), every run exit 0 with the reply rendered (reply-contains-OK 4/4 per invocation), and the claude process exiting 5.0 s after the Stop hook's start in 8/8 runs - the configured timeout, not the 30 s sleep. Enforcement is of the per-hook timeout field itself (measured at 5 s), which is the same field src/hook.rs sets to 10 on both relay hooks - the measured form of hook-design.md's 'does not wait beyond the 10s timeout' clause."
+  },
+  "doc_evidence": {
+    "active_version": "2.1.282",
+    "cross_source": {
+      "concurrent_pairs": {"observed": 12, "total": 12},
+      "relay_first_pairs": {"observed": 6, "total": 12},
+      "earlier_concurrent_pairs": {"observed": 12, "total": 12},
+      "earlier_relay_first_pairs": [
+        {"observed": 4, "total": 12},
+        {"observed": 5, "total": 12}
+      ]
+    },
+    "permission_denied_runs": {"observed": 15, "total": 15},
+    "hook_timeout": {
+      "killed_firings": {"observed": 16, "total": 16},
+      "successful_sessions": {"observed": 8, "total": 8},
+      "rendered_replies": {"observed": 8, "total": 8},
+      "rendered_per_invocation": {"observed": 4, "total": 4},
+      "elapsed_seconds": 5.0
+    },
+    "stop_counts": {
+      "single_turn_per_loaded_source": 1,
+      "multi_round": 1,
+      "permission_denied": 1,
+      "tui_turn_1": 1,
+      "tui_turn_2": 1,
+      "max_turns_cutoff": 0
+    },
+    "active_tui_seconds": [62.5, 32.5, 60.5, 41.6, 3.3],
+    "historical": [
+      {
+        "version": "2.1.270",
+        "cross_source_relay_first_runs": {"observed": 1, "total": 4},
+        "permission_denied_extra_stop_runs": {"observed": 1, "total": 2},
+        "tui_seconds": [22.6, 15.1]
+      },
+      {
+        "version": "2.1.281",
+        "arm_t_seconds": [48.0, 60.0],
+        "tui_seconds": [48.0, 60.0, 13.0, 9.1]
+      }
+    ]
   }
 }
