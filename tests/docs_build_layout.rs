@@ -19,13 +19,24 @@
 //! - **§"Test structure"** — the fixtures row documents an exhaustive
 //!   inventory of `tests/fixtures/`, and descriptions throughout the
 //!   table name test files and fixtures that must keep existing.
+//! - **§"mock_claude" and the bin-naming example commands**
+//!   (claudepr-15471b3f) — the directory the membership sentence calls a
+//!   workspace member, the `cargo build -p <name>` rebuild selector, and
+//!   the artifact table's fixture row are re-derived from the root
+//!   manifest's `[workspace]` members list and the member's own
+//!   `[package]`/`[[bin]]` declarations; every `--bin <name>` in
+//!   §"Where the build output lands" is re-derived from Cargo.toml's
+//!   `[[bin]]` set.
 //!
 //! What this guard deliberately does **not** pin: the fleet wrapper's
 //! per-repo redirect (`/build/claude-print`) is an environment fact of the
 //! hosts, not a repository fact — the guard only requires the fleet column
 //! to be one consistent absolute base carrying the same cargo-relative
 //! suffixes as the stock column, and reads that base from the table
-//! itself instead of hardcoding it here.
+//! itself instead of hardcoding it here. The *success* of the documented
+//! `cargo run --bin <name> -- --check` under either layout is likewise an
+//! environment fact, unpinned here — only the names the example commands
+//! use are repository claims.
 //!
 //! One claim was already drifted when this guard landed and is fixed in
 //! the same commit: the locator prose attributed `current_exe()` to
@@ -39,9 +50,12 @@
 //! always-on negative meta-tests mutate each guarded input in memory — a
 //! corrupted stock cell, a mutated `Cargo.toml` bin set, a drifted CI musl
 //! triple, a mis-attributed locator example, a stale or undocumented
-//! fixtures-row entry — and require the owning check to panic naming the
-//! drift. Attempt 2 of the parent bead proved those failures only in
-//! discarded scratch runs; committing them makes the non-vacuity claim
+//! fixtures-row entry, an unlisted member directory or mismatched `-p`
+//! selector, a renamed member package or `[[bin]]`, and an example `--bin`
+//! name Cargo.toml no longer builds — and require the owning check to
+//! panic naming the drift. Attempt 2 of the parent bead proved those
+//! failures only in discarded scratch runs; committing them makes the
+//! non-vacuity claim
 //! itself re-proven on every `cargo test`, the same hermetic meta-test
 //! pattern as `tests/contract_maintenance.rs` (which proves its gate
 //! rejects divergent pins without any real claude).
@@ -66,6 +80,11 @@ const TEST_STRUCTURE_HEADER: &str = "| Location | What it tests |";
 /// prose assertions so a string surviving elsewhere in the document cannot
 /// satisfy them vacuously.
 const OUTPUT_LANDS_HEADING: &str = "### Where the build output lands";
+
+/// Same scoping role as `OUTPUT_LANDS_HEADING`, for the fixture-member
+/// claims: the section that documents `test-fixtures/mock-claude/` as a
+/// workspace member and the command that rebuilds it.
+const MOCK_CLAUDE_HEADING: &str = "### mock_claude";
 
 /// The paragraph this guard locates by sentinel — the locator claim.
 const LOCATOR_PARAGRAPH_SENTINEL: &str = "Tests need no path pinning";
@@ -241,25 +260,31 @@ fn tests_tree_rs_files() -> Vec<String> {
     out
 }
 
-/// The package's `[[bin]]` names from a Cargo.toml manifest — the set of
-/// binaries any `cargo build`/`cargo test` produces, and therefore the only
-/// names the artifact table may document. Pure: the negative meta-tests
-/// call it on mutated manifest text.
-fn cargo_bins_from(manifest_text: &str) -> Vec<String> {
-    let manifest: toml::Value = toml::from_str(manifest_text).expect("parsing Cargo.toml");
+/// The `[[bin]]` names a parsed manifest declares — the shared core of the
+/// root package's derivation below and the fixture member's own
+/// declaration, which are pinned the same way.
+fn declared_bins(manifest: &toml::Value) -> Vec<String> {
     let bins = manifest
         .get("bin")
         .and_then(|b| b.as_array())
-        .expect("Cargo.toml must declare its [[bin]] targets");
-    let names: Vec<String> = bins
-        .iter()
+        .expect("the manifest must declare its [[bin]] targets");
+    bins.iter()
         .map(|b| {
             b.get("name")
                 .and_then(|n| n.as_str())
                 .expect("[[bin]] name")
                 .to_string()
         })
-        .collect();
+        .collect()
+}
+
+/// The package's `[[bin]]` names from a Cargo.toml manifest — the set of
+/// binaries any `cargo build`/`cargo test` produces, and therefore the only
+/// names the artifact table may document. Pure: the negative meta-tests
+/// call it on mutated manifest text.
+fn cargo_bins_from(manifest_text: &str) -> Vec<String> {
+    let manifest: toml::Value = toml::from_str(manifest_text).expect("parsing Cargo.toml");
+    let names = declared_bins(&manifest);
     assert!(
         names.contains(&"claude-print".to_string()) && names.contains(&"mock-claude".to_string()),
         "the artifact table and this guard assume Cargo.toml builds the `claude-print` \
@@ -271,6 +296,62 @@ fn cargo_bins_from(manifest_text: &str) -> Vec<String> {
 /// The package's `[[bin]]` names from the live Cargo.toml.
 fn cargo_bins() -> Vec<String> {
     cargo_bins_from(&repo_file("Cargo.toml"))
+}
+
+/// The root manifest's `[workspace]` members list — the truth the
+/// §"mock_claude" membership claim is pinned against. Pure: the negative
+/// meta-tests call it on mutated manifest text.
+fn workspace_members_from(manifest_text: &str) -> Vec<String> {
+    let manifest: toml::Value = toml::from_str(manifest_text).expect("parsing Cargo.toml");
+    manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("the root Cargo.toml must declare its [workspace] members list")
+        .iter()
+        .map(|m| m.as_str().expect("a workspace member path").to_string())
+        .collect()
+}
+
+/// The fixture member's `(package name, [[bin]] names)` from its own
+/// manifest — the facts behind §"mock_claude"'s rebuild command and the
+/// artifact table's fixture row. Pure over the manifest text so the
+/// negative meta-tests can drive it with a renamed member.
+fn member_facts_from(manifest_text: &str) -> (String, Vec<String>) {
+    let manifest: toml::Value =
+        toml::from_str(manifest_text).expect("parsing the fixture member's Cargo.toml");
+    let package = manifest
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .expect("the fixture member must declare its [package] name")
+        .to_string();
+    let bins = declared_bins(&manifest);
+    assert!(
+        !bins.is_empty(),
+        "AGENTS.md §mock_claude documents the fixture as \"compiled as a separate \
+         binary\" — the member manifest's [[bin]] declarations are what make that true"
+    );
+    (package, bins)
+}
+
+/// The directory §"mock_claude" claims as a workspace member: the last
+/// backticked token before the "is a workspace member" phrase — the
+/// subject of that sentence, located positionally the same way the locator
+/// paragraph's examples are. Panics if the claim sentence is gone (that is
+/// drift, not a pass).
+fn claimed_member_dir(scoped: &str) -> String {
+    const CLAIM: &str = "is a workspace member";
+    let at = scoped.find(CLAIM).unwrap_or_else(|| {
+        panic!(
+            "AGENTS.md must keep the \"... {CLAIM} ...\" membership sentence in \
+             §mock_claude — it is the membership claim this guard pins"
+        )
+    });
+    let subject = backticked(&scoped[..at]).pop().unwrap_or_else(|| {
+        panic!("the \"{CLAIM}\" sentence must name its member directory in backticks")
+    });
+    subject.trim_end_matches('/').to_string()
 }
 
 /// The one musl toolchain a CI WorkflowTemplate installs, derived the same
@@ -830,6 +911,139 @@ fn where_output_lands_section_names_this_guard() {
     );
 }
 
+/// Every `--bin <name>` (or `--bin=<name>`) selector in §"Where the build
+/// output lands" must name a real `[[bin]]` from Cargo.toml — the
+/// section's example commands (`cargo run --bin <name> -- --check`) have
+/// their names re-derived, never trusted from the doc. The commands'
+/// *success* under either layout is the environment half of the claim and
+/// stays unpinned (parent-bead boundary). Pure over the section text;
+/// panics on drift.
+fn check_section_bin_selectors(scoped: &str, bins: &[String]) {
+    let tokens: Vec<&str> = scoped.split_whitespace().collect();
+    let mut selectors: Vec<String> = Vec::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        if let Some(name) = tok.strip_prefix("--bin=") {
+            selectors.push(name.to_string());
+        } else if *tok == "--bin" {
+            selectors.push(
+                tokens
+                    .get(i + 1)
+                    .expect("a `--bin` selector must be followed by its binary name")
+                    .to_string(),
+            );
+        }
+    }
+    assert!(
+        !selectors.is_empty(),
+        "AGENTS.md \"Where the build output lands\" must keep its `--bin` example \
+         (`cargo run --bin <name> -- --check`) — it is the documented \
+         no-path-resolution alternative this section teaches"
+    );
+    for name in &selectors {
+        assert!(
+            bins.contains(name),
+            "the section's `--bin {name}` names a binary Cargo.toml does not build — \
+             the example commands' bin names are re-derived from the [[bin]] set, \
+             never trusted from the doc (builds: {bins:?})"
+        );
+    }
+}
+
+#[test]
+fn output_lands_bin_selectors_name_real_bins() {
+    let doc = agents_md();
+    check_section_bin_selectors(section(&doc, OUTPUT_LANDS_HEADING), &cargo_bins());
+}
+
+/// The §"mock_claude" member claims, checkable against caller-supplied
+/// inputs (live files for the always-on test, mutated text for the
+/// negative meta-tests). Three pins, each re-derived from a manifest and
+/// never trusted from the doc:
+///
+/// - the directory the section calls "a workspace member" is in the root
+///   manifest's `[workspace]` members list;
+/// - the `cargo build -p <name>` rebuild command selects the member's real
+///   `[package]` name (`-p` is a package selector, so a renamed member
+///   breaks the documented command until the doc follows);
+/// - every `[[bin]]` the member declares is documented in the artifact
+///   table's debug shape — the same row re-derivation the root bins get.
+///
+/// Panics on drift.
+fn check_mock_claude_member_claims(
+    doc: &str,
+    root_manifest: &str,
+    member_manifest: &str,
+    triple: &str,
+) {
+    let scoped = section(doc, MOCK_CLAUDE_HEADING);
+
+    // (a) Membership: the claim sentence's subject must be a listed member.
+    let member_path = claimed_member_dir(scoped);
+    let members = workspace_members_from(root_manifest);
+    assert!(
+        members.contains(&member_path),
+        "AGENTS.md §mock_claude calls `{member_path}` a workspace member, but the \
+         root Cargo.toml's [workspace] members list is {members:?} — the membership \
+         claim is re-derived from the manifest, never trusted from the doc"
+    );
+
+    // (b) The rebuild command's `-p` selector names the member's package.
+    let rebuild = scoped
+        .lines()
+        .find(|l| l.trim_start().starts_with("cargo build -p "))
+        .unwrap_or_else(|| {
+            panic!(
+                "AGENTS.md §mock_claude must keep its `cargo build -p <name>` rebuild \
+                 command — it is the documented way to rebuild the fixture explicitly"
+            )
+        });
+    let documented_p = rebuild
+        .trim()
+        .strip_prefix("cargo build -p ")
+        .expect("the line was located by that prefix")
+        .split_whitespace()
+        .next()
+        .expect("`cargo build -p` names a package")
+        .to_string();
+    let (package, member_bins) = member_facts_from(member_manifest);
+    assert_eq!(
+        documented_p, package,
+        "AGENTS.md §mock_claude documents `cargo build -p {documented_p}` as the \
+         fixture rebuild command, but the member at `{member_path}` is package \
+         `{package}` — `-p` selects by package name, so the command must follow the \
+         member's real name"
+    );
+
+    // (c) The fixture row: every bin the member declares is a documented
+    // debug-shape artifact, parsed with the same grammar as the root rows.
+    let bins = cargo_bins_from(root_manifest);
+    let mut documented: BTreeSet<(String, String)> = BTreeSet::new();
+    for (stock, _) in artifact_rows_from(doc) {
+        let (shape, bin) = parse_stock_cell(&stock, triple, &bins);
+        documented.insert((shape, bin));
+    }
+    for bin in &member_bins {
+        assert!(
+            documented.contains(&("debug".to_string(), bin.clone())),
+            "the artifact table's fixture row must document `{bin}` in the debug \
+             shape — the §mock_claude member at `{member_path}` declares it as a \
+             [[bin]], and the table's rows are re-derived from real [[bin]] \
+             declarations, root and member alike (documented: {documented:?})"
+        );
+    }
+}
+
+#[test]
+fn mock_claude_member_claims_match_the_manifests() {
+    let doc = agents_md();
+    let root_manifest = repo_file("Cargo.toml");
+    // The member manifest is read through the directory the doc claims;
+    // the membership pin inside the check settles whether that claim holds.
+    let member_dir = claimed_member_dir(section(&doc, MOCK_CLAUDE_HEADING));
+    let member_manifest = repo_file(&format!("{member_dir}/Cargo.toml"));
+    check_mock_claude_member_claims(&doc, &root_manifest, &member_manifest, &ci_musl_triple());
+}
+
 // ── Negative meta-tests: the guard must FAIL when its inputs rot ─────────────
 //
 // Attempt 2 of the parent bead proved each mutation fails the right
@@ -1083,5 +1297,99 @@ fn negative_meta_stale_fixture_row_entry_fails_the_inventory_check() {
             "present but not documented",
             "meta_drift_probe_unnamed_v0.json",
         ],
+    );
+}
+
+/// A drifted §mock_claude membership claim fails the membership pin from
+/// both sides: the doc naming a directory the root manifest does not list,
+/// and the manifest dropping a member the doc still names
+/// (claudepr-15471b3f).
+#[test]
+fn negative_meta_unlisted_member_directory_fails_the_membership_pin() {
+    let doc = agents_md();
+    let root_manifest = repo_file("Cargo.toml");
+    let member_manifest = repo_file("test-fixtures/mock-claude/Cargo.toml");
+    let triple = ci_musl_triple();
+
+    let mutated_doc = replaced_once(
+        &doc,
+        "`test-fixtures/mock-claude/` is a workspace member",
+        "`test-fixtures/mock-claud/` is a workspace member",
+    );
+    assert_drift(
+        || check_mock_claude_member_claims(&mutated_doc, &root_manifest, &member_manifest, &triple),
+        &["test-fixtures/mock-claud", "members list"],
+    );
+
+    let mutated_root = replaced_once(
+        &root_manifest,
+        "\".\", \"test-fixtures/mock-claude\"]",
+        "\".\"]",
+    );
+    assert_drift(
+        || check_mock_claude_member_claims(&doc, &mutated_root, &member_manifest, &triple),
+        &["test-fixtures/mock-claude", "members list"],
+    );
+}
+
+/// A drifted rebuild command or member manifest fails the other §mock_claude
+/// pins: the doc's `-p` selector diverging from the member's package name
+/// (the tempting wrong "fix" for the section's underscore/hyphen mix), the
+/// member's package renamed away under a still-correct doc, and the
+/// member's own `[[bin]]` renamed out from under the artifact table's
+/// fixture row (claudepr-15471b3f).
+#[test]
+fn negative_meta_drifted_rebuild_or_member_fails_the_mock_claude_pins() {
+    let doc = agents_md();
+    let root_manifest = repo_file("Cargo.toml");
+    let member_manifest = repo_file("test-fixtures/mock-claude/Cargo.toml");
+    let triple = ci_musl_triple();
+
+    let mutated_doc = replaced_once(
+        &doc,
+        "cargo build -p mock-claude",
+        "cargo build -p mock_claude",
+    );
+    assert_drift(
+        || check_mock_claude_member_claims(&mutated_doc, &root_manifest, &member_manifest, &triple),
+        &["mock_claude", "selects by package name"],
+    );
+
+    let mutated_member = replaced_once(
+        &member_manifest,
+        "[package]\nname = \"mock-claude\"",
+        "[package]\nname = \"mock-claude-drift\"",
+    );
+    assert_drift(
+        || check_mock_claude_member_claims(&doc, &root_manifest, &mutated_member, &triple),
+        &["mock-claude-drift", "selects by package name"],
+    );
+
+    let mutated_member = replaced_once(
+        &member_manifest,
+        "[[bin]]\nname = \"mock-claude\"",
+        "[[bin]]\nname = \"mock-claude-drift\"",
+    );
+    assert_drift(
+        || check_mock_claude_member_claims(&doc, &root_manifest, &mutated_member, &triple),
+        &["mock-claude-drift", "fixture row"],
+    );
+}
+
+/// A `--bin` name the §"Where the build output lands" example command no
+/// longer builds fails the selector re-derivation that owns it. The same
+/// command text also lives in the doc's earlier commands fence; anchoring
+/// the mutation on the section's trailing prose targets the in-section
+/// occurrence, the one this guard owns (claudepr-15471b3f).
+#[test]
+fn negative_meta_unbuilt_bin_selector_fails_the_example_pin() {
+    let mutated = replaced_once(
+        &agents_md(),
+        "cargo run --bin claude-print -- --check` sidesteps",
+        "cargo run --bin claude-prnt -- --check` sidesteps",
+    );
+    assert_drift(
+        || check_section_bin_selectors(section(&mutated, OUTPUT_LANDS_HEADING), &cargo_bins()),
+        &["claude-prnt", "does not build"],
     );
 }
