@@ -20,15 +20,17 @@ Changing the contract means changing all of them in one commit.
 ## Scope
 
 `claude-print` reads **at most one optional TOML file** per invocation. The
-file is read only by normal prompt runs; `--version`, `--check`, and `serve`
-never load it (`main.rs` dispatches those entry points before the config
-step). `claude-print` never creates, writes, or scaffolds the file — you own
-it entirely. Nothing else is configurable through this file: relay-hook
-internals, watchdog budgets other than `timeout_secs`, output formats, and
-pool behavior are CLI-only.
+file is read only by normal prompt runs; `--help`, `--version`, `--check`,
+and `serve` never load it (`main.rs` dispatches `--version`, `--check`, and
+`serve` before the config step, and `--help` is answered by clap inside
+`Cli::parse()`, before `main()`'s body runs at all). `claude-print` never
+creates, writes, or scaffolds the file — you own it entirely. Nothing else
+is configurable through this file: relay-hook internals, watchdog budgets
+other than `timeout_secs`, output formats, and pool behavior are CLI-only.
 
 That dispatch scope is pinned at the binary level by
-`tests/config_entry_point_scope.rs` (bead claudepr-58e1a4b0): each of those
+`tests/config_entry_point_scope.rs` (bead claudepr-58e1a4b0; the `--help`
+arm is bead claudepr-81b1f1d3): each of those
 entry points runs with a poisoned config — unreadable, or garbage TOML — at
 the discovered path and via `--config`, and must produce byte-identical
 output and exit status to a run with no config file present at all.

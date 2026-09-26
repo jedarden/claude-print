@@ -147,8 +147,9 @@ main()
 | `serve` | Yes | `which` check up front; workers are spawned with this binary | **Never** — dispatched before prompt/config state | 0 clean signal shutdown, 2 setup or accept failure |
 | prompt run | Yes | `which` check; then the session child | Yes — after prompt resolution | 0 / 1 / 2 / 4 / 124 / 130 |
 
-The "Never" column for `--version`, `--check`, and `serve` is pinned at the
-binary level by `tests/config_entry_point_scope.rs` (bead claudepr-58e1a4b0):
+The "Never" column for `--help`, `--version`, `--check`, and `serve` is
+pinned at the binary level by `tests/config_entry_point_scope.rs` (bead
+claudepr-58e1a4b0; the `--help` arm is bead claudepr-81b1f1d3):
 each entry point runs with a poisoned config — a directory at the path
 (unreadable tier) or garbage TOML (parse tier) — at the discovered path (both
 the `$XDG_CONFIG_HOME` and `$HOME/.config` rules) and via `--config`, and its
@@ -165,7 +166,10 @@ stdout (empty stderr) and exits 0 during parsing, before any of `main()`'s
 body — including the `HOME` preflight — executes. It is therefore the one
 entry point that works without a valid `HOME` and never invokes the claude
 binary at all. Pinned by `tests/help_version_e2e.rs::`
-`help_exit0_text_on_stdout_stderr_empty` (claudepr-be05847d).
+`help_exit0_text_on_stdout_stderr_empty` (claudepr-be05847d); its
+"Never loads the config file" row is pinned by the `--help` arm of
+`tests/config_entry_point_scope.rs` (claudepr-81b1f1d3) — the same
+poisoned-config identity as the other three entry points.
 
 ### `--version` / `-V`
 

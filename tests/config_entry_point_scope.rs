@@ -3,10 +3,13 @@
 //!
 //! `docs/notes/config-file-contract.md` §"Scope" and
 //! `docs/config-error-analysis.md` both document that the config file is
-//! read **only by ordinary prompt runs**: `--version`, `--check`, and
-//! `serve` never load it — `main.rs` dispatches all three before the config
-//! step. The contract's own fixture (`tests/config_contract.rs`) replays
-//! TOML blocks and error lines through the library loader; the dispatch
+//! read **only by ordinary prompt runs**: `--help`, `--version`, `--check`,
+//! and `serve` never load it — `main.rs` dispatches `--version`, `--check`,
+//! and `serve` before the config step, and `--help` is answered by clap
+//! inside `Cli::parse()`, before `main()`'s body runs at all
+//! (claudepr-81b1f1d3). The contract's own fixture
+//! (`tests/config_contract.rs`) replays TOML blocks and error lines through
+//! the library loader; the dispatch
 //! scope is a *binary-level* property no existing suite exercises, and a
 //! regression that made `serve` or `--check` consult `config.toml` would
 //! silently change daemon/check behavior based on user config.
@@ -150,9 +153,16 @@ fn run(cmd: &mut Command, budget: Duration) -> Outcome {
 
 // ── The matrix: entry points × channels × poisons ────────────────────────────
 
-/// The three non-prompt entry points, as invocable argv shapes.
+/// The four non-prompt entry points, as invocable argv shapes.
 #[derive(Clone, Copy)]
 enum EntryPoint {
+    /// `--help`: exit 0, the full help text on stdout, empty stderr. Not a
+    /// `main()` dispatch at all — clap answers it inside `Cli::parse()` and
+    /// exits before `main()`'s first statement, one step earlier than the
+    /// other three (which at least reach `main()`'s HOME preflight). The
+    /// pin therefore covers a config load placed anywhere in `main()`, and
+    /// a fortiori one placed before the dispatches.
+    Help,
     /// `--version`: exit 0, one stdout line, empty stderr.
     Version,
     /// `--check`: exit 0 with the all-pass table when mock-claude is the
@@ -168,6 +178,7 @@ enum EntryPoint {
 impl EntryPoint {
     fn label(self) -> &'static str {
         match self {
+            EntryPoint::Help => "--help",
             EntryPoint::Version => "--version",
             EntryPoint::Check => "--check",
             EntryPoint::ServeFastFail => "serve (fast-fail: --pool-size 0)",
@@ -176,6 +187,9 @@ impl EntryPoint {
 
     fn add_args(self, cmd: &mut Command, socket: &Path) {
         match self {
+            EntryPoint::Help => {
+                cmd.arg("--help");
+            }
             EntryPoint::Version => {
                 cmd.arg("--version");
             }
@@ -196,6 +210,26 @@ impl EntryPoint {
     /// `check::run_with_clean`, and `tests/serve.rs`.
     fn anchor_baseline(self, out: &Outcome, socket: &Path) {
         match self {
+            EntryPoint::Help => {
+                assert_eq!(
+                    out.code,
+                    Some(0),
+                    "--help baseline: expected exit 0\nstdout:\n{}\nstderr:\n{}",
+                    out.stdout,
+                    out.stderr
+                );
+                assert!(
+                    out.stdout
+                        .contains("Usage: claude-print [OPTIONS] [PROMPT] [COMMAND]"),
+                    "--help baseline: stdout must be the help text, got:\n{}",
+                    out.stdout
+                );
+                assert!(
+                    out.stderr.is_empty(),
+                    "--help baseline: stderr must be empty, got:\n{}",
+                    out.stderr
+                );
+            }
             EntryPoint::Version => {
                 assert_eq!(
                     out.code,
@@ -454,7 +488,19 @@ fn assert_entry_point_is_blind_to_poisoned_config(
     );
 }
 
-// ── The three entry points × the full channel/poison matrix ──────────────────
+// ── The four entry points × the full channel/poison matrix ───────────────────
+
+/// `--help` is the one entry point that never reaches `main()`'s body —
+/// clap answers it inside `Cli::parse()` — so this arm pins the earliest
+/// dispatch slot of the four: a config load placed anywhere in `main()`
+/// (before, between, or after the other entry points' dispatches) still
+/// cannot make `--help` output waver (claudepr-81b1f1d3).
+#[test]
+fn help_never_loads_the_config_file() {
+    for (channel, poison) in MATRIX {
+        assert_entry_point_is_blind_to_poisoned_config(EntryPoint::Help, channel, poison);
+    }
+}
 
 #[test]
 fn version_never_loads_the_config_file() {

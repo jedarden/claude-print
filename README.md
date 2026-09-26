@@ -267,8 +267,8 @@ itself fails — exit 2, this stderr line (text mode):
 error: invalid config: HOME environment variable not set or empty; set HOME to the user's home directory
 ```
 
-The config file is read only by normal prompt runs — `--version`, `--check`,
-and `serve` never load it.
+The config file is read only by normal prompt runs — `--help`, `--version`,
+`--check`, and `serve` never load it.
 
 `claude-print` never creates or writes the file; you own it.
 
