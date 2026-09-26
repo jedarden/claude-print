@@ -31,11 +31,20 @@
 //! and then asserted against the README table and `install.sh`'s mapping,
 //! so all three must agree or the build fails.
 //!
-//! Library-level: reads three files, spawns nothing. The installer's
-//! *behavior* per matrix row (exit 1 before any download, nothing placed,
-//! the actionable message on stderr) is pinned hermetically by
-//! `tests/install_sh_arch.rs`; this file pins what the three artifacts
-//! claim about each other.
+//! Library-level: spawns nothing. The installer's *behavior* per matrix row
+//! (exit 1 before any download, nothing placed, the actionable message on
+//! stderr) is pinned hermetically by `tests/install_sh_arch.rs`; this file
+//! pins what the artifacts claim about each other — README, WorkflowTemplate,
+//! install.sh, and the installer suites' fakes. Since claudepr-aa1fe307 it
+//! also pins the matrix's PTY/ConPTY statement to the implementation it is
+//! a claim about: "PTY support requires POSIX — no Windows ConPTY"
+//! (Prerequisites) and the non-Linux row's ConPTY reason stand on
+//! `src/pty.rs`'s POSIX `openpty`/`login_tty` spawner and `src/check.rs`'s
+//! same-API probe, so those wirings are pinned and no `cfg(windows)`
+//! branch, `std::os::windows` import, or ConPTY mention under `src/`, and
+//! no Windows PTY dependency in `Cargo.toml`, may appear while they stand —
+//! a ConPTY port or a backend swap fails the build until the platform
+//! claim moves in the same commit.
 
 use std::fs;
 use std::path::PathBuf;
@@ -55,19 +64,23 @@ const LINUX_ASSET_SUFFIX: &str = "-linux";
 /// so the doc claim and the tested message cannot fork.
 const MATRIX_LINE: &str = "x86_64 Linux only";
 
-/// Read a repo file, resolving the root from the *runtime*
+/// The checkout under test, resolved from the *runtime*
 /// `CARGO_MANIFEST_DIR` (compile-time value as fallback). The compile-time
 /// value alone bakes the building checkout's path into the test binary;
 /// when the shared target cache reuses that binary from a different
 /// extraction — exactly the clean-tree verification NEEDLE re-runs — the
 /// read would hit a directory that no longer exists. See
 /// `tests/docs_slug_consistency.rs::doc_files` for the full rationale.
-fn repo_file(relative: &str) -> String {
-    let root = PathBuf::from(
+fn repo_root() -> PathBuf {
+    PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR")
             .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string()),
-    );
-    fs::read_to_string(root.join(relative))
+    )
+}
+
+/// Read a repo file from the checkout under test.
+fn repo_file(relative: &str) -> String {
+    fs::read_to_string(repo_root().join(relative))
         .unwrap_or_else(|e| panic!("read {relative} from the checkout under test: {e}"))
 }
 
@@ -320,6 +333,128 @@ fn installer_suites_fake_up_releases_from_the_published_asset_names() {
         assert!(
             source.contains(&format!("const MOCK_ASSET: &str = \"{mock_asset}\";")),
             "{suite} must fake the published fixture asset name {mock_asset:?}"
+        );
+    }
+}
+
+/// Every `.rs` file under `src/` (recursively — the module map is flat
+/// today, but a Windows port would arrive as a new subtree), as
+/// `(file_name, contents)` pairs sorted by path for deterministic failure
+/// messages.
+fn src_rust_sources() -> Vec<(String, String)> {
+    fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+            let path = entry
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    collect(&repo_root().join("src"), &mut paths);
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .strip_prefix(repo_root())
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {name} from the checkout under test: {e}"));
+            (name, body)
+        })
+        .collect()
+}
+
+/// The PTY/ConPTY half of the platform claim, pinned to the implementation
+/// it is a claim about (claudepr-aa1fe307). The artifact pins above bind
+/// README ↔ WorkflowTemplate ↔ install.sh, but none of them reads the PTY
+/// implementation — until this test, "PTY support requires POSIX — no
+/// Windows ConPTY" was verified only as README text, so a ConPTY port (a
+/// `windows-sys` dependency, a `#[cfg(windows)]` branch in `src/pty.rs`)
+/// or a swap of the PTY backend off POSIX `openpty` would have left the
+/// statement stale with every test green.
+#[test]
+fn pty_conpty_statement_matches_the_implementation() {
+    let readme = repo_file("README.md");
+    let section = supported_platforms_section(&readme);
+
+    // Doc side: both PTY/ConPTY statements, exactly as written.
+    assert!(
+        readme.contains("PTY support requires POSIX — no Windows ConPTY"),
+        "Prerequisites must carry the POSIX requirement and its no-ConPTY \
+         consequence in one sentence"
+    );
+    assert!(
+        section.contains("claude-print is Linux-only"),
+        "the non-Linux row must state the Linux-only scope"
+    );
+    assert!(
+        section.contains("Windows would need ConPTY — a POSIX PTY does not exist there"),
+        "the non-Linux row must carry the ConPTY reason verbatim"
+    );
+
+    // Implementation side: the PTY pair is allocated through the POSIX
+    // openpty(3) API and the child's controlling terminal set by POSIX
+    // login_tty(3) — the two calls "requires POSIX" rests on — and the
+    // --check PTY probe uses the same API, so the self-check keeps
+    // proving the claim rather than a different mechanism.
+    let pty = repo_file("src/pty.rs");
+    assert!(
+        pty.contains("use nix::pty::{openpty"),
+        "src/pty.rs must allocate the PTY pair through the POSIX openpty API \
+         the README claim rests on"
+    );
+    assert!(
+        pty.contains("libc::login_tty("),
+        "src/pty.rs must set the child's controlling terminal via POSIX \
+         login_tty — the claim \"PTY support requires POSIX\" rests on it"
+    );
+    assert!(
+        repo_file("src/check.rs").contains("use nix::pty::openpty;"),
+        "the --check PTY probe (src/check.rs) must use the same POSIX \
+         openpty API as the spawner"
+    );
+
+    // Nothing Windows-shaped may exist under src/ while the claim stands.
+    // The needles are deliberately precise so the slice method `.windows(`
+    // (used by other suites' sources) can never trip one.
+    for (name, body) in src_rust_sources() {
+        for needle in [
+            "cfg(windows)",
+            "cfg(target_os = \"windows\")",
+            "std::os::windows",
+        ] {
+            assert!(
+                !body.contains(needle),
+                "{name} carries {needle:?} — a Windows code path cannot appear \
+                 while the README says \"no Windows ConPTY\"; move the platform \
+                 claim (README matrix + this pin) in the same commit"
+            );
+        }
+        assert!(
+            !body.to_lowercase().contains("conpty"),
+            "{name} mentions ConPTY — the README says there is no Windows \
+             ConPTY support; reconcile the claim and this pin in one commit"
+        );
+    }
+
+    // The dependency graph agrees: no Windows PTY backend may be declared
+    // while the claim stands. The `windows` substring covers `windows-sys`,
+    // `windows-args`, and any `[target.'cfg(windows)'.dependencies]`
+    // section heading; the rest are the known portable/ConPTY backends.
+    let cargo_toml = repo_file("Cargo.toml").to_lowercase();
+    for needle in ["windows", "winapi", "conpty", "portable-pty", "wezterm-pty"] {
+        assert!(
+            !cargo_toml.contains(needle),
+            "Cargo.toml names {needle:?} — a Windows/ConPTY PTY backend cannot \
+             be declared while the README says \"no Windows ConPTY\""
         );
     }
 }
