@@ -35,6 +35,17 @@
 //! now names real examples of both, and this test verifies every named
 //! example against its source.
 //!
+//! The guard's own FAILURE behavior is itself pinned (claudepr-4d967120):
+//! always-on negative meta-tests mutate each guarded input in memory — a
+//! corrupted stock cell, a mutated `Cargo.toml` bin set, a drifted CI musl
+//! triple, a mis-attributed locator example, a stale or undocumented
+//! fixtures-row entry — and require the owning check to panic naming the
+//! drift. Attempt 2 of the parent bead proved those failures only in
+//! discarded scratch runs; committing them makes the non-vacuity claim
+//! itself re-proven on every `cargo test`, the same hermetic meta-test
+//! pattern as `tests/contract_maintenance.rs` (which proves its gate
+//! rejects divergent pins without any real claude).
+//!
 //! Library-level like the rows it guards: reads AGENTS.md, Cargo.toml,
 //! the CI WorkflowTemplate, and the `tests/` tree; resolves the built
 //! artifacts through cargo's real locators at runtime; spawns nothing.
@@ -230,12 +241,12 @@ fn tests_tree_rs_files() -> Vec<String> {
     out
 }
 
-/// The package's `[[bin]]` names from Cargo.toml — the set of binaries any
-/// `cargo build`/`cargo test` produces, and therefore the only names the
-/// artifact table may document.
-fn cargo_bins() -> Vec<String> {
-    let manifest: toml::Value =
-        toml::from_str(&repo_file("Cargo.toml")).expect("parsing Cargo.toml");
+/// The package's `[[bin]]` names from a Cargo.toml manifest — the set of
+/// binaries any `cargo build`/`cargo test` produces, and therefore the only
+/// names the artifact table may document. Pure: the negative meta-tests
+/// call it on mutated manifest text.
+fn cargo_bins_from(manifest_text: &str) -> Vec<String> {
+    let manifest: toml::Value = toml::from_str(manifest_text).expect("parsing Cargo.toml");
     let bins = manifest
         .get("bin")
         .and_then(|b| b.as_array())
@@ -257,13 +268,18 @@ fn cargo_bins() -> Vec<String> {
     names
 }
 
-/// The one musl toolchain the CI WorkflowTemplate installs, derived the
-/// same way `tests/platform_matrix_docs.rs` derives it. The artifact
-/// table's musl row and AGENTS.md's musl build command both take their
-/// triple from here, so CI widening the release fails this guard until
-/// the documentation is deliberately updated.
-fn ci_musl_triple() -> String {
-    let template = repo_file("claude-print-ci-workflowtemplate.yml");
+/// The package's `[[bin]]` names from the live Cargo.toml.
+fn cargo_bins() -> Vec<String> {
+    cargo_bins_from(&repo_file("Cargo.toml"))
+}
+
+/// The one musl toolchain a CI WorkflowTemplate installs, derived the same
+/// way `tests/platform_matrix_docs.rs` derives it. The artifact table's
+/// musl row and AGENTS.md's musl build command both take their triple from
+/// here, so CI widening the release fails this guard until the
+/// documentation is deliberately updated. Pure: the negative meta-tests
+/// call it on mutated template text.
+fn ci_musl_triple_from(template: &str) -> String {
     let adds: Vec<String> = template
         .lines()
         .filter_map(|l| l.trim().strip_prefix("rustup target add "))
@@ -278,6 +294,11 @@ fn ci_musl_triple() -> String {
          build commands together (mirroring tests/platform_matrix_docs.rs)"
     );
     adds[0].clone()
+}
+
+/// The one musl toolchain the live CI WorkflowTemplate installs.
+fn ci_musl_triple() -> String {
+    ci_musl_triple_from(&repo_file("claude-print-ci-workflowtemplate.yml"))
 }
 
 /// Parse a stock-checkout cell into `(profile_shape, bin)`, where the shape
@@ -361,10 +382,54 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The artifact table as `(stock cell, fleet cell)` pairs, validated for
-/// row shape and duplicate rows.
-fn artifact_rows() -> Vec<(String, String)> {
-    let rows = table_rows(&agents_md(), ARTIFACT_TABLE_HEADER);
+/// The `tests/fixtures/` inventory row of `doc`'s Test structure table,
+/// joined back into one line of row text — the input the inventory check
+/// consumes, pure over the document so the negative meta-tests can mutate
+/// it in memory.
+fn fixtures_row_text(doc: &str) -> String {
+    let rows = table_rows(doc, TEST_STRUCTURE_HEADER);
+    let row = rows
+        .iter()
+        .find(|r| r[0].trim_matches('`') == "tests/fixtures/")
+        .expect("the Test structure table must keep a `tests/fixtures/` inventory row");
+    row.join(" | ")
+}
+
+/// The live `tests/fixtures/` directory listing.
+fn fixtures_on_disk() -> BTreeSet<String> {
+    fs::read_dir(repo_path("tests/fixtures"))
+        .expect("reading tests/fixtures/")
+        .map(|e| {
+            e.expect("readdir entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The fixtures inventory row's exhaustiveness contract: `row_text` must
+/// name exactly the fixture set `on_disk` (brace forms expanded), so a
+/// fixture can neither be added silently nor documented after it stops
+/// existing. Pure over its inputs. Panics on drift.
+fn check_fixtures_inventory(row_text: &str, on_disk: &BTreeSet<String>) {
+    let row_mentioned = fixture_row_names(row_text);
+    assert!(!on_disk.is_empty(), "tests/fixtures/ has no fixtures?");
+    let undocumented: Vec<_> = on_disk.difference(&row_mentioned).collect();
+    let stale: Vec<_> = row_mentioned.difference(on_disk).collect();
+    assert!(
+        undocumented.is_empty() && stale.is_empty(),
+        "the AGENTS.md fixtures inventory row and tests/fixtures/ disagree — \
+         fixtures present but not documented (add rows to the cell): \
+         {undocumented:?}; documented but absent (drop them): {stale:?}"
+    );
+}
+
+/// The artifact table of `doc` as `(stock cell, fleet cell)` pairs,
+/// validated for row shape and duplicate rows. Pure: the negative
+/// meta-tests call it on mutated AGENTS.md text.
+fn artifact_rows_from(doc: &str) -> Vec<(String, String)> {
+    let rows = table_rows(doc, ARTIFACT_TABLE_HEADER);
     assert!(
         !rows.is_empty(),
         "the stock-vs-fleet artifact table ({ARTIFACT_TABLE_HEADER}) has no rows"
@@ -388,15 +453,15 @@ fn artifact_rows() -> Vec<(String, String)> {
     out
 }
 
-#[test]
-fn stock_fleet_artifact_table_matches_cargo_bins_and_ci_toolchain() {
-    let bins = cargo_bins();
-    let triple = ci_musl_triple();
+/// The §"Where the build output lands" artifact-table contract, checkable
+/// against caller-supplied inputs (live files for the always-on test,
+/// mutated text for the negative meta-tests). Panics on drift.
+fn check_artifact_table(doc: &str, bins: &[String], triple: &str) {
     let mut documented: BTreeSet<(String, String)> = BTreeSet::new();
     let mut fleet_cells: Vec<(String, String)> = Vec::new(); // (stock suffix, fleet cell)
 
-    for (stock, fleet) in artifact_rows() {
-        let (shape, bin) = parse_stock_cell(&stock, &triple, &bins);
+    for (stock, fleet) in artifact_rows_from(doc) {
+        let (shape, bin) = parse_stock_cell(&stock, triple, bins);
         documented.insert((shape, bin));
         let suffix = stock
             .strip_prefix("target/")
@@ -461,16 +526,27 @@ fn stock_fleet_artifact_table_matches_cargo_bins_and_ci_toolchain() {
 }
 
 #[test]
-fn documented_musl_build_command_matches_the_ci_toolchain() {
-    let triple = ci_musl_triple();
+fn stock_fleet_artifact_table_matches_cargo_bins_and_ci_toolchain() {
+    check_artifact_table(&agents_md(), &cargo_bins(), &ci_musl_triple());
+}
+
+/// The documented musl build command must build the release the CI
+/// toolchain actually publishes. Pure over `(doc, triple)` so the negative
+/// meta-tests can drive it with a drifted triple. Panics on drift.
+fn check_musl_build_command(doc: &str, triple: &str) {
     let expected = format!("cargo build --target {triple} --release");
     assert!(
-        agents_md().contains(&expected),
+        doc.contains(&expected),
         "AGENTS.md's build commands must build the musl release CI actually \
          publishes — expected {expected:?}, derived from the WorkflowTemplate's \
          `rustup target add` set (tests/platform_matrix_docs.rs pins the README \
          and install.sh side of the same matrix)"
     );
+}
+
+#[test]
+fn documented_musl_build_command_matches_the_ci_toolchain() {
+    check_musl_build_command(&agents_md(), &ci_musl_triple());
 }
 
 #[test]
@@ -493,7 +569,7 @@ fn target_dir_snippet_derives_the_artifact_it_names() {
     // The snippet's example artifact is the table's stock debug row.
     let stock_debug = "target/debug/claude-print";
     assert!(
-        artifact_rows()
+        artifact_rows_from(&doc)
             .iter()
             .any(|(stock, _)| stock == stock_debug),
         "the snippet addresses {stock_debug:?}, which the artifact table no \
@@ -501,18 +577,22 @@ fn target_dir_snippet_derives_the_artifact_it_names() {
     );
 }
 
-#[test]
-fn locator_examples_in_the_path_resolution_prose_are_real() {
-    let doc = agents_md();
-    let para = doc
-        .split("\n\n")
+/// The paragraph carrying the locator claim, located by sentinel.
+fn locator_paragraph(doc: &str) -> &str {
+    doc.split("\n\n")
         .find(|p| p.contains(LOCATOR_PARAGRAPH_SENTINEL))
         .unwrap_or_else(|| {
             panic!(
                 "AGENTS.md must keep the \"{LOCATOR_PARAGRAPH_SENTINEL}\" paragraph — \
                  it is the locator claim this guard pins"
             )
-        });
+        })
+}
+
+/// The locator-paragraph contract, checkable against caller-supplied
+/// paragraph text (verified against the live test sources it names).
+/// Panics on drift.
+fn check_locator_paragraph(para: &str) {
     assert!(
         para.contains("current_exe()") && para.contains("CARGO_BIN_EXE_claude-print"),
         "the locator paragraph must name both documented locators — \
@@ -564,6 +644,11 @@ fn locator_examples_in_the_path_resolution_prose_are_real() {
              that actually resolves the binary that way"
         );
     }
+}
+
+#[test]
+fn locator_examples_in_the_path_resolution_prose_are_real() {
+    check_locator_paragraph(locator_paragraph(&agents_md()));
 }
 
 #[test]
@@ -714,29 +799,7 @@ fn test_structure_table_mentions_resolve_and_fixtures_row_is_exhaustive() {
     // (c) The `tests/fixtures/` inventory row is exhaustive: every fixture
     // on disk is named in it (brace forms expanded), so a fixture can no
     // longer be added silently.
-    let fixtures_row = rows
-        .iter()
-        .find(|r| r[0].trim_matches('`') == "tests/fixtures/")
-        .expect("the Test structure table must keep a `tests/fixtures/` inventory row");
-    let row_mentioned = fixture_row_names(&fixtures_row.join(" | "));
-    let on_disk: BTreeSet<String> = fs::read_dir(repo_path("tests/fixtures"))
-        .expect("reading tests/fixtures/")
-        .map(|e| {
-            e.expect("readdir entry")
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect();
-    assert!(!on_disk.is_empty(), "tests/fixtures/ has no fixtures?");
-    let undocumented: Vec<_> = on_disk.difference(&row_mentioned).collect();
-    let stale: Vec<_> = row_mentioned.difference(&on_disk).collect();
-    assert!(
-        undocumented.is_empty() && stale.is_empty(),
-        "the AGENTS.md fixtures inventory row and tests/fixtures/ disagree — \
-         fixtures present but not documented (add rows to the cell): \
-         {undocumented:?}; documented but absent (drop them): {stale:?}"
-    );
+    check_fixtures_inventory(&fixtures_row_text(&agents_md()), &fixtures_on_disk());
 
     // (d) The module-directory row: `tests/integration/` exists and is
     // included by `tests/integration.rs`, not an autodiscovered target.
@@ -764,5 +827,261 @@ fn where_output_lands_section_names_this_guard() {
         "AGENTS.md {OUTPUT_LANDS_HEADING} must point at its drift guard \
          tests/{SELF_TARGET}.rs — an unfindable guard rots (the \
          benchmark_reproducibility pattern)"
+    );
+}
+
+// ── Negative meta-tests: the guard must FAIL when its inputs rot ─────────────
+//
+// Attempt 2 of the parent bead proved each mutation fails the right
+// assertion in a scratch run and then discarded the evidence; these legs
+// make that proof permanent (claudepr-4d967120). Every leg mutates the
+// LIVE document in memory — nothing is written to disk — and requires the
+// owning check to panic naming the drift. A mutation that passes means the
+// guard is vacuous for it; a panic that misses the expected fragments
+// means it failed for an unrelated reason. Both fail the meta-test, which
+// is the committed form of the non-vacuity claim.
+
+/// Run `check` and require it to panic with every fragment of `expected`
+/// in the message — the failure must be the drift the mutation plants, not
+/// an incidental one. The panic hook is silenced for the caught unwind so
+/// expected-failure output never pollutes the log; it is restored before
+/// any real assertion here can fire.
+fn assert_drift<F>(check: F, expected: &[&str])
+where
+    F: FnOnce() + std::panic::UnwindSafe,
+{
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(check);
+    std::panic::set_hook(prev_hook);
+    let message = match outcome {
+        Ok(()) => panic!(
+            "the mutated input PASSED the check — the drift guard is vacuous \
+             for this mutation"
+        ),
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+    };
+    for fragment in expected {
+        assert!(
+            message.contains(fragment),
+            "the check failed, but not for the planted drift — panic message:\n\
+             {message}\nmissing fragment: {fragment:?}"
+        );
+    }
+}
+
+/// `text` with the single occurrence of `from` replaced by `to`. Panics on
+/// any count but one, so a meta-test can never "mutate" an input the live
+/// document no longer carries (or carries twice) and silently test
+/// something else.
+fn replaced_once(text: &str, from: &str, to: &str) -> String {
+    let count = text.matches(from).count();
+    assert_eq!(
+        count, 1,
+        "the negative meta-tests mutate {from:?} in the live document — \
+         expected exactly one occurrence, found {count}"
+    );
+    text.replacen(from, to, 1)
+}
+
+/// The first `tests/<name>.rs` example on one side of the locator split
+/// whose source uses that side's locator and NOT the other one — the
+/// relocation victim whose mis-attribution the check must catch. Choosing
+/// by property (not position) keeps the leg valid when the documented
+/// examples change; a suite using both locators (e.g. `tests/home_unset.rs`
+/// resolves the binary via the env var but also calls `current_exe()` for
+/// an unrelated check) would make the mutation undetectable.
+fn single_locator_example(side: &str, targets: &BTreeSet<String>, locator: &str) -> String {
+    let other = if locator == "current_exe" {
+        "CARGO_BIN_EXE_claude-print"
+    } else {
+        "current_exe"
+    };
+    backticked(side)
+        .into_iter()
+        .find_map(|token| {
+            let stem = token.strip_prefix("tests/")?.strip_suffix(".rs")?;
+            if !targets.contains(stem) {
+                return None;
+            }
+            let src = repo_file(&format!("tests/{stem}.rs"));
+            (noncomment_contains(&src, locator) && !noncomment_contains(&src, other))
+                .then(|| stem.to_string())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the locator paragraph's `{locator}` side must name at least one \
+                 suite that uses only that locator — the negative meta-test needs \
+                 a relocation victim"
+            )
+        })
+}
+
+/// A corrupted stock cell — a profile shape cargo never produces, or a bin
+/// name Cargo.toml does not build — fails the artifact-table derivation
+/// that owns the stock column.
+#[test]
+fn negative_meta_corrupted_stock_cell_fails_the_artifact_table_check() {
+    let doc = agents_md();
+    let bins = cargo_bins();
+    let triple = ci_musl_triple();
+
+    let mutated = replaced_once(&doc, "target/debug/claude-print", "target/dbg/claude-print");
+    assert_drift(
+        || check_artifact_table(&mutated, &bins, &triple),
+        &["dbg/claude-print", "is neither"],
+    );
+
+    let mutated = replaced_once(
+        &doc,
+        "target/debug/claude-print",
+        "target/debug/claude-prnt",
+    );
+    assert_drift(
+        || check_artifact_table(&mutated, &bins, &triple),
+        &["claude-prnt", "does not build"],
+    );
+}
+
+/// A mutated Cargo.toml bin set — the mock-claude fixture renamed away —
+/// fails the derivation's own precondition, and the row parser rejects the
+/// table row naming the bin the mutated set no longer builds.
+#[test]
+fn negative_meta_mutated_bin_set_fails_the_artifact_derivation() {
+    let manifest = repo_file("Cargo.toml");
+    let mutated = replaced_once(
+        &manifest,
+        "name = \"mock-claude\"",
+        "name = \"mock-claude-drift\"",
+    );
+    assert_drift(
+        || {
+            cargo_bins_from(&mutated);
+        },
+        &["mock-claude", "assume Cargo.toml builds"],
+    );
+
+    let bins_without_fixture: Vec<String> = cargo_bins()
+        .into_iter()
+        .filter(|b| b != "mock-claude")
+        .collect();
+    assert_drift(
+        || check_artifact_table(&agents_md(), &bins_without_fixture, &ci_musl_triple()),
+        &["mock-claude", "does not build"],
+    );
+}
+
+/// A drifted CI musl triple fails both musl-owning checks: the artifact
+/// table's musl row no longer parses against the toolchain, and the
+/// documented build command no longer matches it.
+#[test]
+fn negative_meta_drifted_ci_musl_triple_fails_the_musl_claims() {
+    let live = ci_musl_triple();
+    let other_arch = if live.starts_with("x86_64-") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let drifted = format!("{other_arch}{}", &live[live.find('-').unwrap()..]);
+    let mutated = replaced_once(
+        &repo_file("claude-print-ci-workflowtemplate.yml"),
+        &format!("rustup target add {live}"),
+        &format!("rustup target add {drifted}"),
+    );
+    // The derivation follows the WorkflowTemplate, not the documentation.
+    assert_eq!(ci_musl_triple_from(&mutated), drifted);
+
+    let doc = agents_md();
+    let bins = cargo_bins();
+    assert_drift(
+        || check_artifact_table(&doc, &bins, &drifted),
+        &[drifted.as_str(), "is neither"],
+    );
+    assert_drift(
+        || check_musl_build_command(&doc, &drifted),
+        &[drifted.as_str(), "musl release CI actually publishes"],
+    );
+}
+
+/// A mis-attributed locator example — a suite moved to the wrong side of
+/// the prose's locator split — fails the attribution check that owns it,
+/// naming the file it was wrongly moved to.
+#[test]
+fn negative_meta_misattributed_locator_example_fails_the_prose_check() {
+    let para = locator_paragraph(&agents_md()).to_string();
+    let split = para
+        .find("`CARGO_BIN_EXE")
+        .expect("the live paragraph carries the compile-time locator");
+    let (head, tail) = para.split_at(split);
+    let targets = filesystem_targets();
+
+    // env-var side → current_exe side: remove the victim's token from the
+    // tail and plant it before the split.
+    let env_victim = single_locator_example(tail, &targets, "CARGO_BIN_EXE_claude-print");
+    let token = format!("`tests/{env_victim}.rs`");
+    assert_drift(
+        || {
+            check_locator_paragraph(&format!(
+                "{} and {token}{}",
+                head,
+                replaced_once(tail, &token, "")
+            ))
+        },
+        &[
+            &format!("tests/{env_victim}.rs"),
+            "documented as a current_exe() example",
+        ],
+    );
+
+    // current_exe side → env-var side: remove from the head, append at the
+    // paragraph's end (past the split).
+    let exe_victim = single_locator_example(head, &targets, "current_exe");
+    let token = format!("`tests/{exe_victim}.rs`");
+    assert_drift(
+        || {
+            check_locator_paragraph(&format!(
+                "{}{} and {token}",
+                replaced_once(head, &token, ""),
+                tail
+            ))
+        },
+        &[
+            &format!("tests/{exe_victim}.rs"),
+            "documented as a CARGO_BIN_EXE_claude-print example",
+        ],
+    );
+}
+
+/// A stale fixtures-row entry (documented but absent) and an undocumented
+/// fixture (present on disk but unnamed) each fail the inventory
+/// exhaustiveness check that owns the row — attempt 2's
+/// "adding an undocumented fixture" scratch run, committed.
+#[test]
+fn negative_meta_stale_fixture_row_entry_fails_the_inventory_check() {
+    let row = fixtures_row_text(&agents_md());
+    let on_disk = fixtures_on_disk();
+
+    let ghost = "meta_drift_probe_absent_v0.json";
+    assert!(
+        !on_disk.contains(ghost),
+        "the ghost fixture name must not exist"
+    );
+    assert_drift(
+        || check_fixtures_inventory(&format!("{row} and `{ghost}`"), &on_disk),
+        &["documented but absent", ghost],
+    );
+
+    let mut with_ghost = on_disk.clone();
+    with_ghost.insert("meta_drift_probe_unnamed_v0.json".to_string());
+    assert_drift(
+        || check_fixtures_inventory(&row, &with_ghost),
+        &[
+            "present but not documented",
+            "meta_drift_probe_unnamed_v0.json",
+        ],
     );
 }
