@@ -32,8 +32,15 @@ arms re-measured the multi-round and TUI Stop contracts
 in §Stop firing contract below). Evidence tables below cite the 2.1.283
 re-measurement — the same version the **Measured against:** stamp and the
 active fixtures pin — so the doc body upholds the one-pin invariant the gate
-enforces on the fixtures. The two 2.1.270 measurements the 2.1.281/2.1.282
-re-pins had left unrepeated — the sleeping-hook concurrency probe and the
+enforces on the fixtures. Since claudepr-893bfc4e (2026-09-26) that upholding
+is mechanical, not by-hand: the detection step parses the stamp, every
+evidence-table row, and every `Evidence (…)` preamble out of this markdown
+and fails (exit 2) on any cited version that is neither the active pin nor
+explicitly marked historical on the same line — so the fixtures-move/
+prose-lags shape of an incomplete re-pin (the reverted claudepr-2e8c3884)
+fails CI instead of surviving to review. The two 2.1.270 measurements the
+2.1.281/2.1.282 re-pins had left unrepeated — the sleeping-hook
+concurrency probe and the
 degraded-path extra Stop — were re-measured against that same pinned 2.1.282
 on 2026-09-25 (claudepr-d9553d38, `scripts/probe-stop-edge-contracts.sh`,
 which is now part of the probe set): concurrent cross-source execution
@@ -54,7 +61,10 @@ claudepr-72d0ba4c drift run), re-measuring every contract unchanged, with
 Arm T now measured natively (§Hook-timeout enforcement). The only
 2.1.270 numbers still quoted below — the superseded TUI timings kept for
 per-version contrast — carry an explicit historical attribution where they
-appear. Per-version fixtures:
+appear; inside the evidence tables that attribution is the word `historical`
+on the same line as the superseded number, which is exactly what the
+detection step's prose check accepts for a non-pin citation. Per-version
+fixtures:
 `tests/fixtures/claude_contracts_v2.1.281.json` and
 `tests/fixtures/claude_contracts_v2.1.282.json` (the two prior same-host
 runs, retained) and `tests/fixtures/claude_contracts_v2.1.283.json` (the
@@ -482,9 +492,19 @@ active families must agree with each other before anything is compared
 against the installed binary — a half-landed re-pin fails the gate (exit 2)
 even where claude is absent, and `tests/contract_maintenance.rs`'s
 `active_fixture_families_share_one_pinned_version` pins the same invariant
-into every `cargo test` run. A version bump therefore stays red until the
-runtime evidence and the stream-json goldens are re-measured and their
-active references are re-pinned together.
+into every `cargo test` run. Since claudepr-893bfc4e the detector also
+enforces the one-pin invariant on this document's prose: every version
+cited on the **Measured against:** line, in a markdown table row, or in an
+`Evidence (…)` preamble must be the active pin or carry the word
+`historical` on the same line (the explicit attribution superseded numbers
+keep) — anything else is mixed-version evidence and exits 2 before `claude`
+is consulted, so the fixtures-move/prose-lags shape of an incomplete re-pin
+(the reverted claudepr-2e8c3884) fails the gate mechanically instead of
+surviving to review; `tests/contract_maintenance.rs`'s
+`doc_evidence_prose_upholds_the_one_pin_invariant` pins the prose check
+into every `cargo test` run the same way. A version bump therefore stays
+red until the runtime evidence and the stream-json goldens are re-measured
+and their active references are re-pinned together.
 Versions move in two ways; either should trigger the check:
 
 - the dev host auto-updates the native install
@@ -606,8 +626,13 @@ object — `start`/`end` taken from the probes'
 provenance note instead, having been measured under the 2026-09-24
 full-re-run discipline before the guard existed); then
 repoint `FIXTURE` in `tests/claude_contracts.rs` together with its header
-comment and any version-citing assertion messages. Commit doc + fixture +
-same version. Re-measure the stream-json capture path — **in the same pinned
+comment and any version-citing assertion messages, and update this
+document's evidence citations — every version cited in the **Measured
+against:** stamp, an evidence-table row, or an `Evidence (…)` preamble must
+name the new pin or carry the `historical` marker, or the detector's prose
+one-pin check (claudepr-893bfc4e) fails the re-pin commit itself. Commit
+doc + fixture + same version. Re-measure the stream-json capture path —
+**in the same pinned
 session as the probes** (§Version guard, "pinning a whole re-pin session",
 so the goldens provably come from the same single version) — and regenerate the
 complete `tests/fixtures/stream_json_golden_v<new>.{input,expected,errors}.jsonl`

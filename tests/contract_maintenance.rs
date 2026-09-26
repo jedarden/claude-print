@@ -12,6 +12,12 @@
 //!   (`claude_contracts_v*.json`, `stream_json_golden_v*.{input,expected,
 //!   errors}.jsonl`) must name one Claude version; fixture files no test
 //!   references are historical captures and are exempt;
+//! - doc-prose one-pin (claudepr-893bfc4e, always-on + detector) — the doc's
+//!   evidence prose (the stamp, markdown table rows, `Evidence (`
+//!   preambles) may cite only the active pin or explicitly `historical`
+//!   numbers, so the fixtures-move/prose-lags shape of an incomplete re-pin
+//!   (the reverted claudepr-2e8c3884) fails every `cargo test` run and the
+//!   CI gate, not just review;
 //! - detector parse — `scripts/check-claude-version-bump.sh` exits 0/1/2
 //!   against a stubbed `claude`, with the stub's version derived from the
 //!   doc's live **Measured against:** stamp, and rejects divergent active
@@ -242,6 +248,83 @@ fn leading_version(s: &str) -> Option<&str> {
     .then_some(candidate)
 }
 
+/// Every version-shaped token (`x.y.z`, all-numeric parts) cited on one line,
+/// mirroring the detector's `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` scan: greedy
+/// digit runs, leftmost-first, resuming after each match — so this mirror and
+/// the shell cannot disagree about what a line "cites".
+fn cited_versions(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        match version_starting_at(bytes, at) {
+            Some(end) => {
+                out.push(line[at..end].to_string());
+                at = end;
+            }
+            None => at += 1,
+        }
+    }
+    out
+}
+
+/// The exclusive end of an `x.y.z` match starting exactly at `at` (each part
+/// a greedy digit run), or `None` — one position's attempt in `grep -oE`'s
+/// leftmost scan.
+fn version_starting_at(bytes: &[u8], at: usize) -> Option<usize> {
+    let digits_end = |mut i: usize| -> usize {
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        i
+    };
+    let digit_at = |i: usize| bytes.get(i).copied().is_some_and(|b| b.is_ascii_digit());
+    if !digit_at(at) {
+        return None;
+    }
+    let a = digits_end(at);
+    if bytes.get(a).copied() != Some(b'.') || !digit_at(a + 1) {
+        return None;
+    }
+    let b = digits_end(a + 1);
+    if bytes.get(b).copied() != Some(b'.') || !digit_at(b + 1) {
+        return None;
+    }
+    Some(digits_end(b + 1))
+}
+
+/// Whether the line carries the historical-attribution marker — the whole
+/// word `historical`, any case, word-boundaries as `grep -w` computes them
+/// (non-alphanumeric-and-underscore on both sides) — which the detector
+/// accepts as the explicit attribution a superseded citation must carry.
+fn carries_historical_marker(line: &str) -> bool {
+    fn word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let hay = line.to_ascii_lowercase();
+    let bytes = hay.as_bytes();
+    hay.match_indices("historical").any(|(at, _)| {
+        (at == 0 || !word_byte(bytes[at - 1]))
+            && (at + "historical".len() == bytes.len()
+                || !word_byte(bytes[at + "historical".len()]))
+    })
+}
+
+/// The class of doc line the prose one-pin check examines, mirroring the
+/// detector's `case` patterns: the stamp, a markdown table row (leading
+/// whitespace then `|`), or an `Evidence (` preamble.
+fn prose_line_kind(line: &str) -> Option<&'static str> {
+    if line.starts_with("**Measured against:**") {
+        Some("the Measured-against stamp")
+    } else if line.trim_start().starts_with('|') {
+        Some("an evidence-table row")
+    } else if line.starts_with("Evidence ") {
+        Some("an evidence preamble")
+    } else {
+        None
+    }
+}
+
 /// Every active version-pinned fixture reference in a contract test source —
 /// `(class, version)` pairs parsed from `fixtures/<class>_v<x.y.z>` path
 /// fragments, the same tokens `scripts/check-claude-version-bump.sh` greps
@@ -340,6 +423,84 @@ fn active_fixture_families_share_one_pinned_version() {
             .iter()
             .any(|h| h.starts_with("stream_json_golden")),
         "expected retained stream_json_golden history, got {historical:?}"
+    );
+}
+
+/// The doc-prose half of the one-pin invariant (claudepr-893bfc4e), pinned
+/// into every `cargo test` run the same way the fixture half above is: on
+/// every checked line of the maintenance doc — the **Measured against:**
+/// stamp, any markdown table row, any `Evidence (` preamble — every cited
+/// version is the active pin or the line carries the explicit `historical`
+/// attribution. So the fixtures-move/prose-lags shape of an incomplete re-pin
+/// (the reverted claudepr-2e8c3884: fixtures and stamp re-pinned while the
+/// tables still cited the old version) fails the always-on suite, not just
+/// the CI gate. Fenced code blocks are not prose and are skipped; narrative
+/// paragraphs outside the evidence tables stay outside the scope (the doc's
+/// §Re-measurement history attributes its own numbers).
+#[test]
+fn doc_evidence_prose_upholds_the_one_pin_invariant() {
+    let doc = fs::read_to_string(repo_path("docs/notes/claude-contract-probes.md"))
+        .expect("docs/notes/claude-contract-probes.md must exist");
+    let pin = doc_pin();
+
+    let mut violations = Vec::new();
+    let mut preambles = 0;
+    let mut marked_superseded_rows = 0;
+    let mut in_fence = false;
+    for (idx, line) in doc.lines().enumerate() {
+        let lineno = idx + 1;
+        // Fences and table rows are matched on the whitespace-trimmed line —
+        // the doc legitimately fences one block inside a list item at a
+        // two-space indent, and markdown treats that as a fence too.
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let Some(kind) = prose_line_kind(line) else {
+            continue;
+        };
+        if kind == "an evidence preamble" {
+            preambles += 1;
+        }
+        let cited = cited_versions(line);
+        if cited.iter().any(|v| v != &pin)
+            && carries_historical_marker(line)
+            && kind == "an evidence-table row"
+        {
+            marked_superseded_rows += 1;
+        }
+        for version in cited {
+            if version != pin && !carries_historical_marker(line) {
+                violations.push(format!(
+                    "line {lineno} ({kind}) cites {version}, neither the pin {pin} \
+                     nor marked historical on that line"
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "mixed-version evidence in docs/notes/claude-contract-probes.md — re-pin \
+         the citations or attribute them per §Re-pin:\n  {}",
+        violations.join("\n  ")
+    );
+
+    // Teeth, the `active_fixture_families_share_one_pinned_version` pattern:
+    // prove the checked surfaces are live, not accidentally empty — the doc
+    // really has `Evidence (` preambles in scope, and the historical-marker
+    // exemption is exercised by a real superseded table citation, so a doc
+    // that stopped carrying either is a scope change someone must notice.
+    assert!(
+        preambles > 0,
+        "no `Evidence (` preamble found — prose-check scope shrank?"
+    );
+    assert!(
+        marked_superseded_rows > 0,
+        "no evidence-table row cites a superseded version under the \
+         `historical` marker — the exemption path is unexercised"
     );
 }
 
@@ -457,6 +618,153 @@ fn detector_rejects_divergent_active_pins_without_claude() {
     assert!(
         stderr.contains("9.9.901") && stderr.contains("9.9.900"),
         "{stderr}"
+    );
+}
+
+/// Build a skeleton repo whose active pins all AGREE at 9.9.901 (stamp +
+/// claude_contracts + stream_json_golden; `doc_body` becomes the maintenance
+/// doc), for exercising the detector's prose check in isolation from drift
+/// and divergence.
+fn skeleton_with_agreeing_pins(root: &Path, doc_body: &str) {
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::create_dir_all(root.join("docs/notes")).unwrap();
+    fs::create_dir_all(root.join("tests/fixtures")).unwrap();
+    fs::copy(
+        repo_path("scripts/check-claude-version-bump.sh"),
+        root.join("scripts/check-claude-version-bump.sh"),
+    )
+    .unwrap();
+    fs::write(root.join("docs/notes/claude-contract-probes.md"), doc_body).unwrap();
+    fs::write(
+        root.join("tests/claude_contracts.rs"),
+        "const FIXTURE: &str = include_str!(\"fixtures/claude_contracts_v9.9.901.json\");\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("tests/stream_json_contract.rs"),
+        concat!(
+            "const INPUT: &str = include_str!(\"fixtures/stream_json_golden_v9.9.901.input.jsonl\");\n",
+            "const EXPECTED: &str = include_str!(\"fixtures/stream_json_golden_v9.9.901.expected.jsonl\");\n",
+            "const ERRORS: &str = include_str!(\"fixtures/stream_json_golden_v9.9.901.errors.jsonl\");\n",
+        ),
+    )
+    .unwrap();
+    for name in [
+        "claude_contracts_v9.9.901.json",
+        "stream_json_golden_v9.9.901.input.jsonl",
+        "stream_json_golden_v9.9.901.expected.jsonl",
+        "stream_json_golden_v9.9.901.errors.jsonl",
+    ] {
+        fs::write(root.join("tests/fixtures").join(name), "{}\n").unwrap();
+    }
+}
+
+/// A skeleton whose active pins agree (all 9.9.901) while the evidence prose
+/// lags — an `Evidence (` preamble citing 9.9.899 and a table row citing
+/// 9.9.900, neither marked historical — is rejected with exit 2 BEFORE any
+/// claude is consulted (claudepr-893bfc4e): the fixtures-move/prose-lags
+/// shape of the incomplete 2.1.283 re-pin (reverted claudepr-2e8c3884) needs
+/// no installed binary to be caught. The fenced row citing 9.9.888 is code,
+/// not prose, and must not appear in the errors.
+#[test]
+fn detector_rejects_mixed_version_prose_without_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    skeleton_with_agreeing_pins(
+        dir.path(),
+        concat!(
+            "**Measured against:** `claude` 9.9.901 (`9.9.901 (Claude Code)`), 2026-09-26\n",
+            "\n",
+            "Evidence (9.9.901; P2 pairs, with a lagging 9.9.899 citation):\n",
+            "\n",
+            "| Run | Result |\n",
+            "|---|---|\n",
+            "| P2 | one firing; the 9.9.900 run behaved the same |\n",
+            "\n",
+            "```text\n",
+            "| P2 | fenced 9.9.888 row — code blocks are not prose |\n",
+            "```\n",
+        ),
+    );
+
+    let bin = dir.path().join("bin");
+    let out = Command::new("bash")
+        .arg(dir.path().join("scripts/check-claude-version-bump.sh"))
+        .env("PATH", stub_path(&bin)) // no claude stub: none may be needed
+        .output()
+        .unwrap();
+
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "mixed-version prose must fail closed, without claude; stderr: {stderr}"
+    );
+    assert!(stderr.contains("mixed-version evidence"), "{stderr}");
+    for cited in ["9.9.899", "9.9.900"] {
+        assert!(
+            stderr.contains(cited),
+            "the error must name the unmarked citation {cited}: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("9.9.901"),
+        "the error must name the active pin the citation disagrees with: {stderr}"
+    );
+    assert!(
+        !stderr.contains("9.9.888"),
+        "a fenced (code-block) citation is not prose and must be skipped: {stderr}"
+    );
+    assert!(
+        !stderr.contains("claude not on PATH"),
+        "the prose check must fail before claude is consulted: {stderr}"
+    );
+}
+
+/// The same skeleton with the superseded citations carrying the explicit
+/// `historical` marker passes the prose check — proven by reaching the next
+/// failure, the absent claude, with its own exit-2 message and no
+/// mixed-version error at all: the marker is the sanctioned way a re-pin
+/// keeps per-version contrast rows (the doc's Arm D row does exactly this).
+#[test]
+fn detector_allows_historical_markers_in_prose() {
+    let dir = tempfile::tempdir().unwrap();
+    skeleton_with_agreeing_pins(
+        dir.path(),
+        concat!(
+            "**Measured against:** `claude` 9.9.901 (`9.9.901 (Claude Code)`), 2026-09-26\n",
+            "\n",
+            "Evidence (9.9.901; P2 pairs; the historical 9.9.899 run for contrast):\n",
+            "\n",
+            "| Run | Result |\n",
+            "|---|---|\n",
+            "| P2 | one firing; the historical 9.9.900 run behaved the same |\n",
+        ),
+    );
+
+    let bin = dir.path().join("bin");
+    let out = Command::new("bash")
+        .arg(dir.path().join("scripts/check-claude-version-bump.sh"))
+        .env("PATH", stub_path(&bin)) // no claude stub: the prose check must pass first
+        .output()
+        .unwrap();
+
+    let stderr = stderr_of(&out);
+    // The absent-claude verdict echoes to stdout (the detector's normal
+    // output stream); the prose-check errors would go to stderr.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "exit 2 is the absent-claude verdict, not a prose failure; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("claude not on PATH"),
+        "a fully marked doc must pass the prose check and reach the claude \
+         step (stdout: {stdout}; stderr: {stderr})"
+    );
+    assert!(
+        !stderr.contains("mixed-version"),
+        "historical-marked citations are attributed, not mixed: {stderr}"
     );
 }
 

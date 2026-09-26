@@ -19,11 +19,25 @@
 # fixture files that no contract test references are exempt: only the active
 # references parsed out of the test sources are pinned.
 #
+# And since 2026-09-26 (claudepr-893bfc4e) the one-pin invariant covers the
+# doc's PROSE, not only the fixtures: every Claude version cited on a checked
+# line of the doc — the **Measured against:** stamp itself, any markdown
+# table row, or an "Evidence (" preamble line — must be the agreed pin or
+# carry the explicit historical-attribution marker (the whole word
+# "historical" on the same line, the convention the doc already keeps
+# superseded numbers under). A citation that is neither is mixed-version
+# evidence — the fixtures-move/prose-lags shape of the incomplete 2.1.283
+# re-pin that had to be reverted (claudepr-2e8c3884) — and fails closed
+# (exit 2) before claude is consulted. Fenced code blocks are skipped, and
+# narrative paragraphs outside the evidence tables stay outside the
+# mechanical scope (§Re-measurement history attributes its own numbers).
+#
 # Exit codes:
 #   0  versions match — evidence is current, nothing to do
 #   1  DRIFT — the installed version differs from any active pin; re-run due
-#   2  cannot determine (claude missing, a version string unparseable, or the
-#      active evidence pins disagree with each other)
+#   2  cannot determine (claude missing, a version string unparseable, the
+#      active evidence pins disagreeing with each other, or doc evidence
+#      prose citing a version that is neither the pin nor marked historical)
 #
 # Read-only: runs `claude --version` only — no sandbox, no HOME writes, no
 # model turns. Safe to run on a schedule or from CI (exit 1 = alert), which
@@ -116,6 +130,66 @@ if [ "$(printf '%s\n' $ALL_PINS | sort -u | wc -l | tr -d ' ')" -ne 1 ]; then
     done
     echo "Re-measure and re-pin every active family to one version" >&2
     echo "(docs/notes/claude-contract-probes.md §Re-pin)." >&2
+    exit 2
+fi
+
+# ── Doc-prose one-pin check (claudepr-893bfc4e) ───────────────────────────────
+#
+# The agreement checks above bind the stamp and the active fixtures as one
+# measurement, but the doc's evidence prose — the per-evidence-table version
+# citations and the superseded numbers quoted inside them — used to be kept
+# aligned only by hand. That is exactly the fixtures-move/prose-lags shape of
+# the incomplete 2.1.283 re-pin that landed mixed-version evidence and had to
+# be reverted (claudepr-2e8c3884): the fixtures and the stamp said one
+# version while the tables still cited another. So the same pin is enforced
+# on the doc body: on every checked line — the **Measured against:** stamp,
+# any markdown table row, or an "Evidence (" preamble — each cited x.y.z is
+# either the agreed pin or the line carries the explicit
+# historical-attribution marker (the whole word "historical", the convention
+# the doc's superseded numbers already keep). Anything else is an error and
+# the detector fails closed here, before claude is consulted. Fenced code
+# blocks are not prose and are skipped.
+
+PROSE_STATUS=0
+prose_lineno=0
+prose_in_fence=0
+while IFS= read -r prose_line || [ -n "$prose_line" ]; do
+    prose_lineno=$((prose_lineno + 1))
+    # Fences and table rows are matched on the whitespace-trimmed line (the
+    # doc fences one block inside a list item at a two-space indent, and
+    # markdown still counts that as a fence) — the same trim
+    # tests/contract_maintenance.rs::prose_line_kind applies, so the two
+    # implementations cannot disagree about which lines are in scope.
+    prose_trim="${prose_line#"${prose_line%%[![:space:]]*}"}"
+    case "$prose_trim" in
+        '```'*) prose_in_fence=$(( 1 - prose_in_fence )); continue ;;
+    esac
+    [ "$prose_in_fence" -eq 0 ] || continue
+    prose_kind=""
+    case "$prose_line" in
+        '**Measured against:**'*) prose_kind="the Measured-against stamp" ;;
+        'Evidence '*) prose_kind="an evidence preamble" ;;
+        *)
+            case "$prose_trim" in
+                '|'*) prose_kind="an evidence-table row" ;;
+            esac
+            ;;
+    esac
+    [ -n "$prose_kind" ] || continue
+    while IFS= read -r cited; do
+        [ -n "$cited" ] || continue
+        [ "$cited" = "$PIN_VERSION" ] && continue
+        if printf '%s\n' "$prose_line" | grep -qi -w 'historical'; then
+            continue
+        fi
+        echo "ERROR: $DOC:$prose_lineno: $prose_kind cites $cited, which is" \
+             "neither the active pin $PIN_VERSION nor marked historical on that" \
+             "line — mixed-version evidence; re-pin the citations or attribute" \
+             "them per docs/notes/claude-contract-probes.md §Re-pin" >&2
+        PROSE_STATUS=1
+    done < <(printf '%s\n' "$prose_line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+done < "$DOC"
+if [ "$PROSE_STATUS" -ne 0 ]; then
     exit 2
 fi
 

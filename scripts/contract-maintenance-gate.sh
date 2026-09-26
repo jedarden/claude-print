@@ -7,8 +7,13 @@
 # owned and scheduled instead of being an unowned doc-level instruction:
 #
 #   detect      scripts/check-claude-version-bump.sh (live `claude --version`
-#               vs the doc stamp and every active version-pinned fixture
-#               family: claude_contracts and stream_json_golden)
+#               vs the doc stamp, every active version-pinned fixture
+#               family: claude_contracts and stream_json_golden, and — since
+#               claudepr-893bfc4e — the doc's evidence prose: every version
+#               cited on the **Measured against:** line, in a table row, or
+#               in an "Evidence (" preamble must be the pin or marked
+#               `historical`, so a fixtures-move/prose-lags incomplete
+#               re-pin fails CI mechanically)
 #   re-run      cargo test --test claude_contracts -- --ignored (cheap live
 #               contracts; the tests self-skip without claude/auth) unless
 #               --skip-live-tests; the four model-turn probe scripts run only
@@ -32,7 +37,8 @@
 #   0  CURRENT        installed claude matches the pinned evidence
 #   1  DRIFT          re-run due — follow-up filed when --file-follow-up
 #   2  INDETERMINATE  version could not be determined (claude missing,
-#                     unparsable output, or a missing doc stamp)
+#                     unparsable output, a missing doc stamp, or doc
+#                     evidence prose diverging from the active pins)
 #
 # Drift is a hard failure where CI runs this gate (claudepr-3094ab2e): the
 # claude-print-ci workflow invokes it as the FIRST quality gate and lets a
@@ -344,8 +350,10 @@ EOF
         ;;
     *)
         cat > "$EVIDENCE_DIR/next-steps.txt" <<EOF
-Version could not be determined (claude missing or unparsable, or no
-**Measured against:** stamp in the doc). Detection output:
+Version could not be determined (claude missing or unparsable, no
+**Measured against:** stamp in the doc, active pins diverging, or doc
+evidence prose citing a version that is neither the pin nor marked
+historical — claudepr-893bfc4e). Detection output:
 ${DET_OUT}
 Fix the environment (install claude: curl -fsSL https://claude.ai/install.sh | bash)
 and re-run the gate; until then the evidence's currency is unknown.
