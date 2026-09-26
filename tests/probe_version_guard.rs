@@ -211,7 +211,11 @@ fn guard_confirms_a_stable_claude() {
     let bin = dir.path().join("bin");
     stub_claude(&bin, "9.9.1 (Claude Code)");
 
-    let out = run_guard(&bin, "probe_version_guard_begin; probe_version_guard_end", &[]);
+    let out = run_guard(
+        &bin,
+        "probe_version_guard_begin; probe_version_guard_end",
+        &[],
+    );
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let stdout = stdout_of(&out);
@@ -459,7 +463,10 @@ fn gate_stable_run_records_version_stability() {
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
     let evidence = dir.path().join("evidence");
-    assert_eq!(status_value(&evidence, "version-stability"), format!("stable ({pin})"));
+    assert_eq!(
+        status_value(&evidence, "version-stability"),
+        format!("stable ({pin})")
+    );
 }
 
 // ── The recording rule: the fixture proves its own single-version run ───────

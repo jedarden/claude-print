@@ -1367,7 +1367,8 @@ fn mcp_config_forwards_strict_flag_plus_one_pair_per_entry_in_order() {
         args[strict - 1]
     );
     assert_eq!(
-        args[strict + 5], "--model",
+        args[strict + 5],
+        "--model",
         "the segment must precede the forwarded --model, got {:?}",
         args[strict + 5]
     );
@@ -1398,7 +1399,10 @@ fn mcp_config_comma_delimited_and_equals_spellings_match_repeated() {
         ["/a.json".to_string(), "/b.json".to_string()],
         "repeated spelling: {repeated:?}"
     );
-    assert_eq!(c_vals, r_vals, "comma spelling must match repeated: {comma:?}");
+    assert_eq!(
+        c_vals, r_vals,
+        "comma spelling must match repeated: {comma:?}"
+    );
     assert_eq!(
         e_vals, r_vals,
         "=-joined spelling must match repeated: {equals:?}"
@@ -1447,9 +1451,8 @@ fn absent_mcp_config_omits_both_mcp_flags_from_child_argv() {
 #[test]
 fn mcp_config_segment_is_independent_of_the_config_file() {
     let empty = setup_config_content("");
-    let active = setup_config_content(
-        "[defaults]\nmodel = \"claude-opus-4-8\"\ninherit_hooks = false\n",
-    );
+    let active =
+        setup_config_content("[defaults]\nmodel = \"claude-opus-4-8\"\ninherit_hooks = false\n");
     let dir = TempDir::new().unwrap();
     let record = dir.path().join("child_argv");
 
@@ -1459,7 +1462,10 @@ fn mcp_config_segment_is_independent_of_the_config_file() {
 
     let (bare_pos, bare_vals) = mcp_forwarding_segment(&without_config);
     let (cfg_pos, cfg_vals) = mcp_forwarding_segment(&with_config);
-    assert_eq!(cfg_vals, bare_vals, "the entry list must not tier: {with_config:?}");
+    assert_eq!(
+        cfg_vals, bare_vals,
+        "the entry list must not tier: {with_config:?}"
+    );
     assert_eq!(
         &with_config[cfg_pos..cfg_pos + 5],
         &without_config[bare_pos..bare_pos + 5],
@@ -1503,10 +1509,7 @@ fn mcp_config_segment_is_independent_of_the_config_file() {
 /// garbage-TOML config fails identically with the flag along for the ride.
 #[test]
 fn mcp_config_key_in_defaults_is_rejected_with_the_flag_present() {
-    for poison in [
-        "[defaults]\nmcp_config = [\"/a.json\"]\n",
-        "[[\n",
-    ] {
+    for poison in ["[defaults]\nmcp_config = [\"/a.json\"]\n", "[[\n"] {
         let config = setup_malformed_config(poison);
         let mut cmd = claude_print();
         cmd.arg("--mcp-config")

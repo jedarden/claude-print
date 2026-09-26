@@ -188,7 +188,7 @@ fn billing_context_doc_pins_the_three_name_table_and_causal_chain() {
 /// otherwise a code/doc update can leave operators reading a stale layer.
 #[test]
 fn readme_billing_summaries_agree_with_billing_context() {
-    let doc = normalized(&markdown_section(
+    let doc = normalized(markdown_section(
         &read_repo_file("docs/notes/billing-context.md"),
         "The billing-entrypoint contract",
     ));
