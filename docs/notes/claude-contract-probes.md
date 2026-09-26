@@ -3,8 +3,11 @@
 **Measured against:** `claude` 2.1.282 (`2.1.282 (Claude Code)`), 2026-09-24, on the
 claude-print dev host. Probe harness: `scripts/probe-claude-contracts.sh` (merge /
 suppression / single-turn Stop), `scripts/probe-stop-toolallowed.sh` (multi-round
-Stop contract, print mode), and `scripts/probe-tui-second-turn.sh` (TUI
-once-per-turn contract). Re-run them after any Claude Code update; results are
+Stop contract, print mode), `scripts/probe-tui-second-turn.sh` (TUI
+once-per-turn contract), and `scripts/probe-stop-edge-contracts.sh` (the two
+edge measurements the re-pins had left unrepeated — sleeping-hook cross-source
+concurrency and degraded-path permission-denied Stop counts; added 2026-09-25).
+Re-run them after any Claude Code update; results are
 version-pinned — the maintenance workflow (drift detection, re-run procedure,
 re-pin checklist, follow-up rule) is defined in §Maintenance at the bottom of
 this file and made executable by `scripts/contract-maintenance-gate.sh`
@@ -28,11 +31,17 @@ arms re-measured the multi-round and TUI Stop contracts
 in §Stop firing contract below). Evidence tables below cite the 2.1.282
 re-measurement — the same version the **Measured against:** stamp and the
 active fixtures pin — so the doc body upholds the one-pin invariant the gate
-enforces on the fixtures; the few 2.1.270 numbers still quoted — the two
-measurements never repeated on a later version (the sleeping-hook
-concurrency probe, the degraded-path extra Stop) and the superseded TUI
-timings kept for per-version contrast — each carry an explicit historical
-attribution where they appear. Per-version fixtures:
+enforces on the fixtures. The two 2.1.270 measurements the 2.1.281/2.1.282
+re-pins had left unrepeated — the sleeping-hook concurrency probe and the
+degraded-path extra Stop — were re-measured against that same pinned 2.1.282
+on 2026-09-25 (claudepr-d9553d38, `scripts/probe-stop-edge-contracts.sh`,
+which is now part of the probe set): concurrent cross-source execution
+reproduced in **12/12** event pairs and the extra-Stop hazard **did not
+reproduce** (15/15 permission-denied runs across three invocations fired
+exactly one Stop). The only
+2.1.270 numbers still quoted below — the superseded TUI timings kept for
+per-version contrast — carry an explicit historical attribution where they
+appear. Per-version fixtures:
 `tests/fixtures/claude_contracts_v2.1.281.json` (the earlier same-day run)
 and `tests/fixtures/claude_contracts_v2.1.282.json` (the pinned one).
 
@@ -107,13 +116,21 @@ Evidence (2.1.282; P2: project source + `--settings`; P6: user source +
   standard-source-first throughout (2–3 ms; P2 SessionStart project
   `…839.154` → relay `…839.157`, P6 user Stop `…870.244` → relay
   `…870.246`) — which order materializes is run-dependent, not a property
-  of the source or the version. The 2.1.270 measurement (historical — this
-  experiment has not been repeated on a later version) supplied the direct
-  concurrency proof a timestamp pair alone cannot: a dedicated probe
-  (project hook sleeping 300 ms and logging start/end; relay hook sleeping
-  0 ms) showed the relay **starting before** the project hook in 1 of 4
-  runs, with the two hooks running **concurrently** (project
-  `start 307.920 / end 308.225`, relay `start 307.914`). The guaranteed
+  of the source or the version. The dedicated sleeping-hook probe (project
+  hook sleeping 300 ms and logging start/end; relay hook sleeping 0 ms —
+  `scripts/probe-stop-edge-contracts.sh` Arm S) supplies the direct
+  concurrency proof a timestamp pair alone cannot. Re-measured against the
+  pinned 2.1.282 on 2026-09-25 (claudepr-d9553d38; 6 runs × 2 event pairs):
+  the two hooks ran **concurrently in 12 of 12 pairs** — the relay always
+  started while the project hook's sleep was still running (project wall
+  time 305–310 ms in every firing, so the sleep demonstrably executed), and
+  the relay **started before** the project hook in **6 of 12 pairs** (relay
+  2.3–6.0 ms ahead: 3 SessionStart pairs, 3 Stop pairs; two earlier
+  same-day invocations of the same probe against the same binary measured
+  the same shape — concurrent 12/12 each, flips 4/12 and 5/12, so the flip
+  rate itself is unstable). That reproduces the original 2.1.270 finding
+  (concurrent firing observed; start-order flip in 1 of 4 runs) on a later
+  version. The guaranteed
   property is only that **all loaded sources fire**.
 - OQ-1's read-race clause, resolved as "cannot be ordered away": the relay may
   deliver the payload while user Stop hooks are still starting or running, so
@@ -160,12 +177,18 @@ Stop counts belong to degraded runs — one of the two degraded runs produced an
 historical hazard note below). Those counts were discarded and the contract
 was re-measured with tools actually permitted
 (`scripts/probe-stop-toolallowed.sh`, `scripts/probe-tui-second-turn.sh`);
-counts and timings below are the 2.1.282 run — the pinned version:
+counts and timings below are the 2.1.282 run — the pinned version. The
+degraded path itself — deliberately re-entered, not just discarded — was
+re-measured against 2.1.282 on 2026-09-25 (`scripts/probe-stop-edge-contracts.sh`
+Arm D: 15 completed permission-denied runs across three invocations, every one
+firing exactly one Stop — see the hazard note below the table). Measured
+scenarios:
 
 | Scenario | Stop firings | Evidence |
 |---|---|---|
 | Single-turn `claude -p`, no tools | 1 per loaded source | P1–P6 (above) |
 | `claude -p`, two sequential permitted Bash rounds (`--allowedTools=Bash`) | **1**, at the turn's true end | one firing, `last_assistant_message: "DONE"`, `stop_hook_active: false`, single session id |
+| `claude -p`, tool calls permission-denied (degraded, no allowlist) | **1** | Arm D (2.1.282, 2026-09-25): 15/15 completed denied runs across three invocations fired exactly one Stop each (`stop_hook_active: false`); the 2.1.270 hazard — one extra Stop in 1 of 2 runs — did not reproduce |
 | TUI, turn 1 (plain reply) | **1** | firing + reply both observed (41.6 s) |
 | TUI, turn 2 in the same session (plain reply) | **1** | firing + reply both observed (3.3 s); TUI status line showed `(running stop hook)` |
 | `claude -p` cut off by `--max-turns 2` mid-task | **0** | exit code 1, zero firings across the run |
@@ -199,12 +222,18 @@ Conclusions:
 - Known hazard (not reachable in the NEEDLE fleet — `claude-print.yaml` passes
   `--dangerously-skip-permissions`): on headless runs where the model's tool
   calls are permission-denied, an extra Stop firing was observed once (2
-  firings for one prompt — a 2.1.270 measurement, historical; the 2.1.282
-  re-run's unallowlisted T1 arm completed cleanly with a single Stop).
-  Mechanism unexplained; the single-fire poller
-  degrades gracefully (first payload → transcript retry/fallback path; the
-  watchdog still bounds the session). Re-measure if permission-denied paths
-  ever become a supported mode.
+  firings for one prompt — a 2.1.270 measurement, historical).
+  **Re-measured against the pinned 2.1.282 on 2026-09-25** (claudepr-d9553d38,
+  `scripts/probe-stop-edge-contracts.sh` Arm D): 15 completed
+  permission-denied runs across three invocations of the probe —
+  all exit 0, the model's own final message confirming its Bash calls were
+  blocked, `stop_hook_active: false` on every firing — and **every run fired
+  exactly one Stop**; the hazard did not reproduce. It stays on record as
+  historical: the mechanism was never explained, the reproducing sample was
+  two runs, and the single-fire poller's tolerance
+  (first payload → transcript retry/fallback path; the watchdog still bounds
+  the session) is kept as cheap insurance. Re-measure (Arm D) if
+  permission-denied paths ever become a supported mode.
 
 (first filled in by the claudepr-6ef2541c probe run against 2.1.270; the
 counts and timings above are re-cited from the 2.1.282 re-measurement — see
@@ -216,6 +245,7 @@ plan.md §Stop Poller for the concluded contract)
 bash scripts/probe-claude-contracts.sh        # merge/suppression/single-turn Stop
 bash scripts/probe-stop-toolallowed.sh        # multi-round Stop contract (print mode)
 bash scripts/probe-tui-second-turn.sh         # TUI once-per-turn contract
+bash scripts/probe-stop-edge-contracts.sh     # sleeping-hook concurrency + degraded-path Stop counts
 ```
 
 Each run is self-contained (sandboxed HOME, scrubbed `CLAUDECODE*` env, forced
@@ -353,16 +383,21 @@ status/log inspection, restart/disable, removal, and failure behavior — is
 **Re-run.** No drift → nothing to do. The cheap live tests re-verify the
 merge and suppression contracts against the installed binary in ~35 s
 (`cargo test --test claude_contracts -- --ignored`) and are the fastest way
-to confirm "no drift within a version" (last verified 2026-09-24 against
-2.1.282: 2/2 passed; previously 2026-09-14 against 2.1.270: 2/2 passed). On
-drift, run all three scripts from §Reproducing —
+to confirm "no drift within a version" (last verified 2026-09-25 against
+2.1.282: 2/2 passed; previously 2026-09-24 against 2.1.282 and 2026-09-14
+against 2.1.270: 2/2 passed each). On
+drift, run all four scripts from §Reproducing —
 each is self-contained (sandboxed mktemp `HOME`, scrubbed `CLAUDECODE*` env,
 trust pre-seeded for the probe cwd only, auth by inherited environment) and
-stamps the version it measured. Budget 1–6 min each. Note that
+stamps the version it measured. Budget 1–6 min each (`probe-stop-edge-contracts.sh`
+runs 11 model turns across its two arms — budget up to ~15 min). Note that
 `probe-tui-second-turn.sh` can legitimately fail to produce a second
 completed reply (an incomplete turn firing no Stop *is* the contract) — an
 incomplete second turn is a re-run, not a contract finding; only
-"reply rendered + no Stop" would be.
+"reply rendered + no Stop" would be. Likewise an Arm D run that exits 1 with
+zero Stops was cut off by `--max-turns` (the measured cutoff contract) — a
+re-run, not a finding; only "completed run (exit 0) with ≠1 Stop per loaded
+source" would be.
 
 **Re-pin** (all contracts unchanged): re-stamp **Measured against:** at the
 top of this file; copy `tests/fixtures/claude_contracts_v<old>.json` to

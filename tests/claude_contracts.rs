@@ -8,7 +8,9 @@
 //! auto-updater superseded; re-run procedure in
 //! docs/notes/claude-contract-probes.md §Maintenance) with the live probe
 //! scripts (`scripts/probe-claude-contracts.sh`,
-//! `scripts/probe-stop-toolallowed.sh`); the observed values are pinned in
+//! `scripts/probe-stop-toolallowed.sh`, and — for the two edge measurements
+//! the re-pins had left unrepeated, re-measured 2026-09-25 —
+//! `scripts/probe-stop-edge-contracts.sh`); the observed values are pinned in
 //! `tests/fixtures/claude_contracts_v2.1.282.json` and documented in
 //! `docs/notes/claude-contract-probes.md`.
 //!
@@ -61,8 +63,11 @@ struct Contracts {
     all_loaded_sources_hooks_fire: bool,
     /// OQ-1: cross-source firing order is *not* contractual — the `--settings`
     /// relay hook typically starts after the standard-source hooks, but
-    /// concurrent (and start-order-flipped) firing was measured. claude-print
-    /// must not depend on order.
+    /// concurrent (and start-order-flipped) firing was measured, and
+    /// re-confirmed on the pinned version by the dedicated sleeping-hook
+    /// probe (`probe-stop-edge-contracts.sh` Arm S, 2026-09-25: concurrent
+    /// execution in 12/12 event pairs, relay started first in 6/12).
+    /// claude-print must not depend on order.
     cross_source_hook_order_guaranteed: bool,
     /// OQ-2: empty `--setting-sources=` suppresses every standard source.
     setting_sources_empty_suppresses_standard_sources: bool,

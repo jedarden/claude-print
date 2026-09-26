@@ -11,7 +11,7 @@
 #               family: claude_contracts and stream_json_golden)
 #   re-run      cargo test --test claude_contracts -- --ignored (cheap live
 #               contracts; the tests self-skip without claude/auth) unless
-#               --skip-live-tests; the three model-turn probe scripts run only
+#               --skip-live-tests; the four model-turn probe scripts run only
 #               with --run-probes (API auth + 1–6 min each) and are otherwise
 #               recorded as SKIPPED — never silently absent
 #   evidence    a bundle under --evidence-dir: detection.txt,
@@ -57,7 +57,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOC="$REPO_ROOT/docs/notes/claude-contract-probes.md"
 DETECTOR="$REPO_ROOT/scripts/check-claude-version-bump.sh"
 GH_REPO="jedarden/claude-print"
-PROBES="probe-claude-contracts.sh probe-stop-toolallowed.sh probe-tui-second-turn.sh"
+PROBES="probe-claude-contracts.sh probe-stop-toolallowed.sh probe-tui-second-turn.sh probe-stop-edge-contracts.sh"
 
 EVIDENCE_DIR="$REPO_ROOT/target/contract-maintenance"
 VERSION_FILE="$REPO_ROOT/target/last-claude-version.txt"
@@ -74,7 +74,7 @@ usage: scripts/contract-maintenance-gate.sh [options]
                        (default: target/last-claude-version.txt)
   --file-follow-up     file/update a GitHub follow-up issue on drift (gh CLI)
   --skip-live-tests    do not run cargo test --test claude_contracts -- --ignored
-  --run-probes         also run the three model-turn probe scripts (API auth +
+  --run-probes         also run the four model-turn probe scripts (API auth +
                        1-6 min each); without it they are recorded as SKIPPED
   -h, --help           this text
 USAGE
@@ -157,7 +157,7 @@ else
     LIVE_SUMMARY="ran (exit $LIVE_EXIT)"
 fi
 
-# ── 4. Probes: the three model-turn scripts, SKIPPED unless asked for ────────
+# ── 4. Probes: the four model-turn scripts, SKIPPED unless asked for ────────
 
 PROBES_SUMMARY="skipped (use --run-probes on an authed host; recorded per script)"
 for probe in $PROBES; do
@@ -261,7 +261,9 @@ installed ${LIVE_VERSION} (documentation stamp: ${PIN_VERSION}).
   2. bash scripts/probe-claude-contracts.sh            # merge/suppression/Stop
   3. bash scripts/probe-stop-toolallowed.sh            # multi-round Stop (print)
   4. bash scripts/probe-tui-second-turn.sh             # TUI once-per-turn
-  5. Re-pin per §Re-pin (doc stamp + claude_contracts_v*.json +
+  5. bash scripts/probe-stop-edge-contracts.sh         # sleeping-hook concurrency
+                                                       # + degraded-path Stop counts
+  6. Re-pin per §Re-pin (doc stamp + claude_contracts_v*.json +
      stream_json_golden_v* family + active test references in one change), or
      file one bead per moved contract per §File follow-ups.
 Procedure: docs/notes/claude-contract-probes.md §Maintenance

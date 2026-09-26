@@ -536,6 +536,7 @@ fn gate_current_records_evidence_and_refreshes_version_file() {
         "probe-claude-contracts.sh",
         "probe-stop-toolallowed.sh",
         "probe-tui-second-turn.sh",
+        "probe-stop-edge-contracts.sh",
     ] {
         let note = read_text(&evidence.join("probes").join(format!("{probe}.txt")));
         assert!(note.contains("SKIPPED"), "{probe}: {note}");
