@@ -110,6 +110,17 @@ fn sha256_of(path: &Path) -> String {
         .to_string()
 }
 
+/// A different but still well-formed 64-hex digest: the first character
+/// flipped between `0` and `1`. The tampered-checksum test forges a manifest
+/// value that no shape or parseability check could reject — only the digest
+/// comparison itself (expected from the manifest vs actual from the bytes)
+/// can catch it, which is exactly what that test pins.
+fn flip_first_hex(digest: &str) -> String {
+    let first = digest.chars().next().unwrap();
+    let flipped = if first == '0' { '1' } else { '0' };
+    format!("{flipped}{}", &digest[1..])
+}
+
 /// A fake release directory: `names` written to disk, plus a `sha256sums.txt`
 /// whose entries match those bytes exactly — what the CI publisher emits.
 fn build_release(names: &[&str]) -> TempDir {
@@ -387,6 +398,133 @@ fn install_fails_closed_on_a_tampered_binary() {
     assert!(
         stderr.contains("sha256 mismatch") && stderr.contains(BINARY_ASSET),
         "stderr must report the mismatch: {stderr}"
+    );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
+    );
+}
+
+#[test]
+fn install_fails_closed_on_a_tampered_checksum_entry_in_the_manifest() {
+    // The mirror image of install_fails_closed_on_a_tampered_binary: here the
+    // artifact is exactly what the publisher built (the probing body, so any
+    // hypothetical execution stays observable) and the corruption lives in
+    // the MANIFEST — the digest VALUE on the binary's entry was altered to a
+    // different but equally well-formed 64-hex string, the shape of a tampered
+    // or mis-published checksum rather than a tampered artifact. The entry is
+    // present and parseable, so presence and format checks all pass; only
+    // comparing the published digest against the downloaded bytes can catch
+    // it. Only the binary's line is rewritten (matched on the name field, not
+    // by replacing the real digest string globally — a blanket replace could
+    // in principle strike another asset's line and leave the target line
+    // intact, which would make the install succeed and the assert below fail
+    // for the wrong reason).
+    let release = build_release_with_binary_body(
+        &[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET],
+        &probing_binary_body(),
+    );
+    let tampered_manifest: String = fs::read_to_string(release.path().join(CHECKSUMS_ASSET))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (digest, name) = line
+                .split_once("  ")
+                .unwrap_or_else(|| panic!("malformed manifest line: {line:?}"));
+            if name == BINARY_ASSET {
+                format!("{}  {name}", flip_first_hex(digest))
+            } else {
+                line.to_string()
+            }
+        })
+        .fold(String::new(), |mut manifest, line| {
+            manifest.push_str(&line);
+            manifest.push('\n');
+            manifest
+        });
+    fs::write(release.path().join(CHECKSUMS_ASSET), tampered_manifest).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
+
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[("EXECUTION_PROBE", execution_probe.to_str().unwrap())],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a tampered checksum entry must abort the install"
+    );
+    assert!(
+        !installed_path(home.path(), BINARY_INSTALL_NAME).exists(),
+        "nothing may be installed against a tampered checksum entry"
+    );
+    assert!(!installed_path(home.path(), MOCK_INSTALL_NAME).exists());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("sha256 mismatch") && stderr.contains(BINARY_ASSET),
+        "stderr must report the mismatch against the tampered entry: {stderr}"
+    );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
+    );
+}
+
+#[test]
+fn install_fails_closed_on_a_partially_transferred_artifact() {
+    // The interrupted-transfer shape: the manifest was published over the
+    // COMPLETE artifact, but the host delivered only a prefix of those bytes
+    // (a mirror or proxy serving a truncated file — any partial delivery
+    // curl still exits 0 on, so the download leg cannot be the guard). The
+    // prefix is severed at the probe's final touch command, so the partial
+    // artifact keeps its shebang and both printf evidence lines: executed in
+    // any mode it still prints the probe line and the plain body's line, so
+    // the ordering assert below can tell "aborted up front" from "ran first,
+    // failed later". (The touch marker itself is severed with the tail — the
+    // printf evidence is the live half of the probe here.) Nothing about the
+    // truncation is detectable except by digest: the file exists, downloads
+    // cleanly, and has a checksum entry, so this pins that verification
+    // compares the actual bytes against the published digest of the complete
+    // artifact — never mere presence or parseability.
+    let release = build_release_with_binary_body(
+        &[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET],
+        &probing_binary_body(),
+    );
+    // The manifest (written above) digests the complete body; now sever the
+    // served artifact to a strict prefix of it.
+    let full_body = probing_binary_body();
+    let severed_at = full_body
+        .rfind("touch ")
+        .expect("the probing body must carry the probe's touch command");
+    assert!(
+        severed_at > 0 && severed_at < full_body.len(),
+        "the severance must produce a strict, non-empty prefix"
+    );
+    fs::write(release.path().join(BINARY_ASSET), &full_body[..severed_at]).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
+
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[("EXECUTION_PROBE", execution_probe.to_str().unwrap())],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a partially transferred artifact must abort the install"
+    );
+    assert!(
+        !installed_path(home.path(), BINARY_INSTALL_NAME).exists(),
+        "a partial artifact must never reach the install dir"
+    );
+    assert!(!installed_path(home.path(), MOCK_INSTALL_NAME).exists());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("sha256 mismatch") && stderr.contains(BINARY_ASSET),
+        "stderr must report the truncation as a digest mismatch: {stderr}"
     );
     assert_aborted_before_execution_or_check(
         &String::from_utf8_lossy(&output.stdout),
@@ -1353,6 +1491,22 @@ const INSTALL_GUARANTEES: &[(&str, &str)] = &[
     (
         "any digest mismatch aborts the install with nothing placed",
         "install_fails_closed_on_a_tampered_binary",
+    ),
+    // Both causes of a digest mismatch, pinned separately (the README names
+    // each): corruption of the published checksum vs corruption of the
+    // transferred bytes. A regression that checked only presence/format of
+    // entries, or compared the manifest against itself, would pass the
+    // tampered-artifact test's world only by accident of which side the
+    // corruption landed on — these two close that axis.
+    (
+        "a tampered checksum entry (the manifest's digest altered, the \
+         artifact itself pristine)",
+        "install_fails_closed_on_a_tampered_checksum_entry_in_the_manifest",
+    ),
+    (
+        "a partially transferred artifact (only a prefix of the bytes the \
+         manifest digests)",
+        "install_fails_closed_on_a_partially_transferred_artifact",
     ),
     // The fixture is the sole optional asset: its manifest entry is the skip
     // decision, so the same omission that is fatal for the binary is a skip
