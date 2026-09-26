@@ -8,6 +8,13 @@
 # Arm P (print): one prompt, two sequential Bash rounds, per-firing detail.
 # Arm T (TUI):   two prompts (multi-round, then plain reply) driven under a
 #                PTY with per-firing detail.
+#
+# Version sensitivity: results are pinned to the claude binary on PATH at run
+# time, and since 2026-09-26 every run is version-guarded
+# (scripts/probe-version-guard.sh, sourced below): the binary is resolved and
+# pinned once, and the run aborts as failed unless its version held to the
+# end — a mid-run auto-update can no longer straddle a measurement
+# (docs/notes/claude-contract-probes.md §Version guard).
 
 set -u
 
@@ -56,8 +63,11 @@ echo "step-one-done"
 EOF
 chmod +x "$PROJ/toolwork.sh"
 
-CLAUDE_BIN="$(command -v claude)"
-echo "claude version: $("$CLAUDE_BIN" --version 2>&1 | head -1)"
+# Version-straddle guard: begin pins CLAUDE_BIN (resolved once) and stamps the
+# start version; probe_version_guard_end, as the script's last line, aborts
+# the run as failed if that binary's version moved mid-run.
+source "$(dirname "$0")/probe-version-guard.sh"
+probe_version_guard_begin
 
 SCRUB=(-u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SKIP_PROMPT_HISTORY)
 FORCE=(CLAUDE_CODE_ENTRYPOINT=cli CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
@@ -250,3 +260,7 @@ EOF
 echo
 echo "===== per-firing payload summary (whole run)"
 summarize "$BASE"
+
+# Last line: the version-straddle bracket closes here — a version change since
+# begin aborts the run as failed (exit 1) so its evidence cannot be pinned.
+probe_version_guard_end

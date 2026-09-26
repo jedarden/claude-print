@@ -43,7 +43,11 @@
 #
 # Version sensitivity: results are pinned to the claude binary on PATH at run
 # time (`claude --version` is stamped into the evidence). Re-run after any
-# Claude Code update.
+# Claude Code update. Since 2026-09-26 every run is also version-guarded
+# (scripts/probe-version-guard.sh, sourced below): the binary is resolved and
+# pinned once, and the run aborts as failed unless its version held to the
+# end — a mid-run auto-update can no longer straddle a measurement
+# (docs/notes/claude-contract-probes.md §Version guard).
 
 set -u
 
@@ -135,8 +139,12 @@ install_hooks "$SANDBOX_HOME/.claude/settings.json" "$SANDBOX_HOME/log-user.sh" 
 # Probe plumbing
 # ---------------------------------------------------------------------------
 
-CLAUDE_BIN="$(command -v claude)"
-CLAUDE_VERSION="$("$CLAUDE_BIN" --version 2>&1 | head -1)"
+# Version-straddle guard: begin pins CLAUDE_BIN (resolved once) and stamps the
+# start version; probe_version_guard_end, as the script's last line, aborts
+# the run as failed if that binary's version moved mid-run.
+source "$(dirname "$0")/probe-version-guard.sh"
+probe_version_guard_begin
+CLAUDE_VERSION="$PROBE_VERSION_START_LINE"
 
 header() { # <probe-id> <description>
     printf '\n===== %s: %s\n' "$1" "$2"
@@ -170,7 +178,7 @@ run_p() { # <label> <extra args...> — timed `claude -p` run, sandbox HOME
     fi
 }
 
-printf 'claude version: %s\n' "$CLAUDE_VERSION"
+printf 'claude version (run): %s\n' "$CLAUDE_VERSION"
 
 # ---------------------------------------------------------------------------
 # P1 — baseline: project hooks fire in print mode
@@ -267,3 +275,7 @@ fi
 printf '\n===== claude %s — raw firing log (ts|tag|event only)\n' "$CLAUDE_VERSION"
 cut -d'|' -f1,2,3 "$LOG" 2>/dev/null
 printf '\n(probe root %s removed on exit)\n' "$PROBE_ROOT"
+
+# Last line: the version-straddle bracket closes here — a version change since
+# begin aborts the run as failed (exit 1) so its evidence cannot be pinned.
+probe_version_guard_end

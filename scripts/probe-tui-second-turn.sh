@@ -13,6 +13,13 @@
 #
 # Same isolation model as the other probes: sandbox HOME, scrubbed env,
 # project-source Stop hook, payloads reduced to safe fields.
+#
+# Version sensitivity: results are pinned to the claude binary on PATH at run
+# time, and since 2026-09-26 every run is version-guarded
+# (scripts/probe-version-guard.sh, sourced below): the binary is resolved and
+# pinned once, and the run aborts as failed unless its version held to the
+# end — a mid-run auto-update can no longer straddle a measurement
+# (docs/notes/claude-contract-probes.md §Version guard).
 
 set -u
 
@@ -53,8 +60,11 @@ cat >"$PROJ/.claude/settings.json" <<EOF
 {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "$HOOK"}]}]}}
 EOF
 
-CLAUDE_BIN="$(command -v claude)"
-echo "claude version: $("$CLAUDE_BIN" --version 2>&1 | head -1)"
+# Version-straddle guard: begin pins CLAUDE_BIN (resolved once) and stamps the
+# start version; probe_version_guard_end, as the script's last line, aborts
+# the run as failed if that binary's version moved mid-run.
+source "$(dirname "$0")/probe-version-guard.sh"
+probe_version_guard_begin
 
 python3 - "$CLAUDE_BIN" "$PROJ" "$SANDBOX_HOME" "$LOG" <<'EOF'
 import fcntl, json, os, pty, re, select, signal, struct, sys, termios, time
@@ -209,3 +219,7 @@ EOF
 echo
 echo "===== firing log (ts|event only)"
 cut -d'|' -f1 "$LOG" 2>/dev/null | paste -d' ' - <(grep -o '"hook_event_name":"[A-Za-z]*"' "$LOG" 2>/dev/null) || true
+
+# Last line: the version-straddle bracket closes here — a version change since
+# begin aborts the run as failed (exit 1) so its evidence cannot be pinned.
+probe_version_guard_end

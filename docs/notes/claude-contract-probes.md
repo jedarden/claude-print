@@ -50,6 +50,14 @@ appear. Per-version fixtures:
 `tests/fixtures/claude_contracts_v2.1.281.json` (the earlier same-day run)
 and `tests/fixtures/claude_contracts_v2.1.282.json` (the pinned one).
 
+That incident also exposed a design gap that outlived it: the straddle was
+recoverable only because it was *noticed* — an unnoticed one would have
+pinned mixed-version evidence that neither the gate nor the one-pin invariant
+can detect after the fact. Since 2026-09-26 (claudepr-9fe76ef4) the probes
+are guarded against straddling at all: each run pins the binary it resolved
+at start and aborts as failed unless that binary's version holds to the end
+of the run (§Version guard below).
+
 The maintenance gate covers both active version-pinned fixture families:
 `tests/fixtures/claude_contracts_v*.json` (the active reference is the
 fixture selected by `tests/claude_contracts.rs`) and
@@ -297,7 +305,11 @@ bash scripts/probe-stop-edge-contracts.sh     # sleeping-hook concurrency + degr
 Each run is self-contained (sandboxed HOME, scrubbed `CLAUDECODE*` env, forced
 `CLAUDE_CODE_ENTRYPOINT=cli` + `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`,
 mirroring `src/pty.rs`'s child-environment contract) and prints its version
-stamp. Runtime ≈ 1–6 minutes each (model turns via the configured provider;
+stamp. Since 2026-09-26 every run is also **version-guarded**
+(§Version guard): the measured binary is resolved and pinned at start, and
+the run exits non-zero if its version changed by the end — a straddled run's
+evidence is invalid and must be re-measured, never cherry-picked from.
+Runtime ≈ 1–6 minutes each (model turns via the configured provider;
 the Arm T default adds 4 more turns to `probe-stop-edge-contracts.sh`).
 `tests/claude_contracts.rs` pins the fixture and re-verifies the cheap
 contracts live under `cargo test --test claude_contracts -- --ignored`.
@@ -325,6 +337,81 @@ swallow a following positional prompt; and a hook log of the form
 field-count check (a filter written for the 4-field `ts|tag|event|payload`
 layout silently counts zero on the 2-field layout, which invalidated one TUI
 driver run before this was caught).
+
+## Version guard — a mid-run auto-update cannot straddle a measurement
+
+The 2026-09-24 double run (§Re-measurement history) was benign only because
+the straddle was noticed. The dangerous shape is the one that is not: an
+auto-update landing mid-run mixes measurements from two Claude versions into
+one probe session, and a re-pin built on it would stamp one version while
+individual evidence numbers came from another — the **Measured against:**
+stamp and the active fixtures would "agree" (satisfying the one-pin invariant
+claudepr-b590e46d enforces) while being false. Detection after the fact
+cannot catch that, so since 2026-09-26 (claudepr-9fe76ef4) every
+`probe-*.sh` refuses to produce mixable evidence in the first place.
+`scripts/probe-version-guard.sh` owns the mechanism, with two layered
+defenses:
+
+- **Pin.** `probe_version_guard_begin` resolves `CLAUDE_BIN` to its final
+  symlink target once (`~/.local/bin/claude` is a symlink the auto-updater
+  repoints; the versions it leaves behind persist under
+  `~/.local/share/claude/versions/`). Every claude invocation in the run then
+  execs that one concrete binary, so a mid-run repoint cannot redirect a
+  measurement — the 2026-09-24 shape cannot occur at all.
+- **Bracket.** `probe_version_guard_end` — the last line of every probe —
+  re-runs `--version` on the pinned binary after the measurements and
+  compares. This catches the remaining straddle shape, the resolved path
+  changing content in place (an install swapping files under a stable path),
+  and any mismatch aborts the run as failed: exit 1, the verdict line
+  `version-guard: verdict=STRADDLED start=<a> end=<b>`, and an ERROR naming
+  the evidence untrustworthy. A missing or unparsable version fails closed
+  with exit 2 instead. A stable run ends by stamping the machine-readable
+  line the re-pin records beside the fixture write (§Re-pin):
+
+  ```text
+  version-guard: verdict=single-version start=<v> end=<v> binary=<path>
+  ```
+
+  If the *host* launcher moved on while the run stayed pinned, a final
+  `version-guard: note=host-claude-moved-on path-now=<v>` line says so: the
+  run's evidence is still single-version (every measurement used the pinned
+  binary), but the operator re-pins knowingly — that is the 2026-09-24 shape
+  made visible instead of silent.
+
+`scripts/contract-maintenance-gate.sh` brackets itself the same way
+(claudepr-9fe76ef4): it captures the live version before detection,
+re-captures before writing its status, and a mid-gate update voids the
+verdict — `version-stability: straddled (start=… end=…)` in
+contract-status.txt, exit 2 (INDETERMINATE, fail closed), with the re-run as
+the next step. A probe that straddled under `--run-probes` records it itself
+(non-zero `probe-exit` in `probes/<script>.txt`), and its evidence must be
+discarded with the gate's.
+
+**Pinning a whole re-pin session.** The per-run pin above protects each
+script on its own; to hold one binary across an entire re-pin session — all
+four probes plus the stream-json golden capture, so the doc stamp, both
+fixture families, and every probe provably name one version — pin it
+yourself before starting. Use the drift-window shim from §Reproducing when
+the session includes the golden capture (claude-print resolves `claude`
+through PATH, so only a PATH pin reaches it):
+
+```bash
+mkdir -p /tmp/claude-pin-<v> && ln -sf ~/.local/share/claude/versions/<v> /tmp/claude-pin-<v>/claude
+export PATH="/tmp/claude-pin-<v>:$PATH"
+```
+
+For the four guarded probes alone, pointing their override at the concrete
+binary is equivalent (the guard resolves it to the same pinned file):
+
+```bash
+export CLAUDE_BIN="$HOME/.local/share/claude/versions/<v>"
+```
+
+Every guarded script in the session then stamps that binary and its verdict
+lines, and a host auto-update mid-session cannot reach any of them. The
+guard's contract — pin resolution, the bracket's verdict lines and exit
+codes, the launcher-repoint immunity, the gate's own bracket, and the
+fixture's `version_guard` record — is pinned by `tests/probe_version_guard.rs`.
 
 ## Maintenance: re-running after a Claude Code update
 
@@ -463,14 +550,26 @@ re-run, not a finding; only "completed run (exit 0) with ≠1 Stop per loaded
 source" would be. And an Arm T run that exits non-zero or logs no firing for
 an event (model-turn failure, `timeout` wrapper) is a re-run — the findings
 are "hook `end` logged past its timeout" (timeout not enforced) or "session
-blocked or failed after the kill" (enforcement is not clean).
+blocked or failed after the kill" (enforcement is not clean). And every probe
+run ends with its version-guard verdict (§Version guard): `single-version`,
+or a run aborted as STRADDLED (exit 1) — a straddled run is itself a re-run;
+discard its evidence entirely and do not cherry-pick from it.
 
 **Re-pin** (all contracts unchanged): re-stamp **Measured against:** at the
 top of this file; copy `tests/fixtures/claude_contracts_v<old>.json` to
-`claude_contracts_v<new>.json`, updating `claude_version`/`measured_at`; and
+`claude_contracts_v<new>.json`, updating `claude_version`/`measured_at`, and
+record the guard verdict beside the write in the fixture's `version_guard`
+object — `start`/`end` taken from the probes'
+`version-guard: verdict=single-version` lines, all four probes agreeing with
+`start == end == claude_version` (the shape is enforced always-on by
+`tests/probe_version_guard.rs`; the 2.1.282 pin carries a `retroactive`
+provenance note instead, having been measured under the 2026-09-24
+full-re-run discipline before the guard existed); then
 repoint `FIXTURE` in `tests/claude_contracts.rs` together with its header
 comment and any version-citing assertion messages. Commit doc + fixture +
-same version. Re-measure the stream-json capture path and regenerate the
+same version. Re-measure the stream-json capture path — **in the same pinned
+session as the probes** (§Version guard, "pinning a whole re-pin session",
+so the goldens provably come from the same single version) — and regenerate the
 complete `tests/fixtures/stream_json_golden_v<new>.{input,expected,errors}.jsonl`
 family, then update all three `include_str!` references, the header comment,
 and the stamped `GOLDEN_CLAUDE_VERSION` in `tests/stream_json_contract.rs`.
@@ -480,6 +579,10 @@ always-on suites and this document keep claiming the same version — that
 commit is also what turns the CI drift gate green again
 (§Wiring above; it is how the 2.1.270 → 2.1.282 re-pin of 2026-09-24 was
 landed, via a 2.1.281 pin the host's auto-updater superseded the same day).
+Since claudepr-9fe76ef4 the gate additionally brackets itself against a
+mid-run update (§Version guard): `version-stability: straddled` in
+contract-status.txt means the verdict was voided and the gate exited 2
+(fail closed) even where detection alone had said CURRENT — re-run it.
 
 **File follow-ups** (a contract moved): one bead per moved contract,
 naming the downstream design that depends on it, and update this document and

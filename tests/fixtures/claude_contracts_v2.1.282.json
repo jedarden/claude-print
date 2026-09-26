@@ -1,6 +1,10 @@
 {
   "claude_version": "2.1.282",
   "measured_at": "2026-09-24",
+  "version_guard": {
+    "retroactive": true,
+    "provenance": "This pin predates the version-straddle guard (scripts/probe-version-guard.sh, added 2026-09-26 by claudepr-9fe76ef4), so it carries no start/end bracket of its own; its single-version provenance is the documented 2026-09-24 discipline instead: the host auto-updated 2.1.281 -> 2.1.282 mid-re-pin, the straddled first run was discarded in full, and the whole suite was re-run to completion against 2.1.282 before this fixture was written (docs/notes/claude-contract-probes.md, Re-measurement history). Every later re-pin records the guard verdicts here instead: start and end from each probe's 'version-guard: verdict=single-version' line, with start == end == claude_version across all four probes (enforced by tests/probe_version_guard.rs)."
+  },
   "probe_scripts": [
     "scripts/probe-claude-contracts.sh",
     "scripts/probe-stop-toolallowed.sh",

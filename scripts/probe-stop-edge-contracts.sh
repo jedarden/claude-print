@@ -52,6 +52,12 @@
 # Version sensitivity: results are pinned to the claude binary on PATH at run
 # time (`claude --version` is stamped into the evidence). Re-run after any
 # Claude Code update (docs/notes/claude-contract-probes.md §Maintenance).
+# Since 2026-09-26 every run is also version-guarded
+# (scripts/probe-version-guard.sh, sourced below): the binary is resolved and
+# pinned once, and the run aborts as failed unless its version held to the
+# end — a mid-run auto-update can no longer straddle a measurement
+# (claude-contract-probes.md §Version guard; this probe's Arm T evidence was
+# itself gathered across a 2.1.283 drift window on a pinned 2.1.282 shim).
 
 set -u
 
@@ -149,15 +155,19 @@ EOF
 # Probe plumbing
 # ---------------------------------------------------------------------------
 
-CLAUDE_BIN="$(command -v claude)"
-CLAUDE_VERSION="$("$CLAUDE_BIN" --version 2>&1 | head -1)"
+# Version-straddle guard: begin pins CLAUDE_BIN (resolved once) and stamps the
+# start version; probe_version_guard_end, as the script's last line, aborts
+# the run as failed if that binary's version moved mid-run.
+source "$(dirname "$0")/probe-version-guard.sh"
+probe_version_guard_begin
+CLAUDE_VERSION="$PROBE_VERSION_START_LINE"
 
 SCRUB_ENV=(-u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SKIP_PROMPT_HISTORY)
 FORCED_ENV=(CLAUDE_CODE_ENTRYPOINT=cli CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1)
 
 loglines() { wc -l <"$LOG" 2>/dev/null || echo 0; }
 
-printf 'claude version: %s\n' "$CLAUDE_VERSION"
+printf 'claude version (run): %s\n' "$CLAUDE_VERSION"
 printf 'arm S runs: %s   arm D runs: %s   arm T runs: %s (timeout %ss, sleep %ss)\n' \
     "$ARM_S_RUNS" "$ARM_D_RUNS" "$ARM_T_RUNS" "$ARM_T_TIMEOUT" "$ARM_T_SLEEP"
 
@@ -383,3 +393,7 @@ done
 printf '\n===== claude %s — raw firing log (ts|tag|event|phase for arm S; ts|payload elided for arm D)\n' "$CLAUDE_VERSION"
 awk -F'|' 'NF==4 {print $1"|"$2"|"$3"|"$4} NF==2 {print $1"|payload"}' "$LOG" 2>/dev/null
 printf '\n(probe root %s removed on exit)\n' "$PROBE_ROOT"
+
+# Last line: the version-straddle bracket closes here — a version change since
+# begin aborts the run as failed (exit 1) so its evidence cannot be pinned.
+probe_version_guard_end

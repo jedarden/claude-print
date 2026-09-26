@@ -45,6 +45,16 @@
 # completion first: it writes the evidence bundle and files/updates the
 # follow-up issue, so the hand-off survives the red build it then raises.
 #
+# Since 2026-09-26 (claudepr-9fe76ef4) the gate also brackets ITSELF against
+# a mid-run Claude update — the 2026-09-24 straddle shape: it captures the
+# live version before detection and re-captures before writing its status,
+# and a mismatch voids the verdict (version-stability: straddled in
+# contract-status.txt, exit 2 INDETERMINATE, fail closed), because neither
+# CURRENT nor DRIFT is certifiable against a binary that stopped being the
+# installed one mid-gate. The probes it runs under --run-probes guard
+# themselves the same way (scripts/probe-version-guard.sh; a straddled probe
+# exits 1 and its evidence must be discarded).
+#
 # Outside of the steps above the gate is read-only: it runs `claude --version`,
 # the detector, (optionally) cargo test / the probe scripts, and — on drift
 # with --file-follow-up — a read-only `gh issue list` plus one issue
@@ -101,6 +111,19 @@ version_token() {
 }
 
 mkdir -p "$EVIDENCE_DIR/probes" || { echo "ERROR: cannot create evidence dir $EVIDENCE_DIR" >&2; exit 2; }
+
+# ── 0. Version-straddle bracket, start capture ───────────────────────────────
+#
+# Taken BEFORE detection so the bracket spans everything the verdict rests on
+# (detector, version artifact, live tests, probes). Step 6 re-captures and a
+# mismatch voids the verdict — the same guard the probe scripts run through
+# scripts/probe-version-guard.sh, applied to the gate itself.
+
+GATE_VERSION_START_LINE=""
+if command -v claude >/dev/null 2>&1; then
+    GATE_VERSION_START_LINE="$(claude --version 2>&1 | head -1)"
+fi
+GATE_VERSION_START="$(version_token "${GATE_VERSION_START_LINE:-}")"
 
 # ── 1. Detect ────────────────────────────────────────────────────────────────
 
@@ -230,13 +253,49 @@ if [ "$GATE_EXIT" -eq 1 ]; then
     fi
 fi
 
-# ── 6. Status, next steps, exit ───────────────────────────────────────────────
+# ── 6. Version-straddle bracket, end capture ─────────────────────────────────
+#
+# A claude that changed version between the start capture and now means the
+# detector's verdict was computed against a binary that stopped being the
+# installed one mid-gate: neither CURRENT nor DRIFT is certifiable, so the
+# verdict is voided and the gate fails closed as INDETERMINATE. (The
+# follow-up above, if any, was filed against the start version before the
+# straddle was knowable; the next gate run re-files idempotently for the
+# version the host settled on.)
+
+GATE_VERSION_END_LINE=""
+if command -v claude >/dev/null 2>&1; then
+    GATE_VERSION_END_LINE="$(claude --version 2>&1 | head -1)"
+fi
+GATE_VERSION_END="$(version_token "${GATE_VERSION_END_LINE:-}")"
+
+STRADDLED=0
+VERSION_STABILITY="unknown (claude version not determinable at gate start or end)"
+if [ -n "$GATE_VERSION_START" ] && [ -n "$GATE_VERSION_END" ]; then
+    if [ "$GATE_VERSION_START" = "$GATE_VERSION_END" ]; then
+        VERSION_STABILITY="stable ($GATE_VERSION_START)"
+    else
+        STRADDLED=1
+        VERSION_STABILITY="straddled (start=$GATE_VERSION_START end=$GATE_VERSION_END)"
+    fi
+elif [ -n "$GATE_VERSION_START" ] || [ -n "$GATE_VERSION_END" ]; then
+    VERSION_STABILITY="indeterminate (start=${GATE_VERSION_START:-unparsable} end=${GATE_VERSION_END:-unparsable})"
+fi
+
+if [ "$STRADDLED" -eq 1 ]; then
+    VERDICT=INDETERMINATE
+    ALERT=indeterminate
+    GATE_EXIT=2
+fi
+
+# ── 7. Status, next steps, exit ───────────────────────────────────────────────
 
 cat > "$EVIDENCE_DIR/contract-status.txt" <<EOF
 contract-maintenance: ${VERDICT}
 alert: ${ALERT}
 pinned: ${PIN_VERSION}
 installed: ${LIVE_VERSION}
+version-stability: ${VERSION_STABILITY}
 fixture-pins:
 ${FIXTURE_PINS:-unknown}
 live-tests: ${LIVE_SUMMARY}
@@ -245,7 +304,20 @@ follow-up: ${FOLLOW_UP}
 gate-exit: ${GATE_EXIT}
 EOF
 
-case "$VERDICT" in
+if [ "$STRADDLED" -eq 1 ]; then
+    cat > "$EVIDENCE_DIR/next-steps.txt" <<EOF
+This gate run itself was STRADDLED by a Claude Code update mid-run
+(start=${GATE_VERSION_START} -> end=${GATE_VERSION_END}): the detection verdict
+compared the pins against a binary that stopped being the installed one before
+the gate finished, so neither CURRENT nor DRIFT is certifiable. Re-run the gate
+— the re-run compares against ${GATE_VERSION_END}, the version the host
+settled on. If this run used --run-probes, discard its probe evidence too:
+each probe's own version guard aborts on the same straddle (non-zero
+probe-exit in probes/*.txt) and its evidence must not be pinned.
+Guard mechanism: docs/notes/claude-contract-probes.md §Version guard
+EOF
+else
+    case "$VERDICT" in
     CURRENT)
         cat > "$EVIDENCE_DIR/next-steps.txt" <<EOF
 Contract evidence is current: installed ${LIVE_VERSION} matches the pinned
@@ -279,7 +351,8 @@ Fix the environment (install claude: curl -fsSL https://claude.ai/install.sh | b
 and re-run the gate; until then the evidence's currency is unknown.
 EOF
         ;;
-esac
+    esac
+fi
 
 echo "contract-maintenance gate: ${VERDICT} (exit ${GATE_EXIT}; alert: ${ALERT})"
 echo "pinned=${PIN_VERSION} installed=${LIVE_VERSION} live-tests: ${LIVE_SUMMARY}"
