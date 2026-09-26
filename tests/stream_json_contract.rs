@@ -3,34 +3,29 @@
 //! The contract these fixtures pin is specified in
 //! `docs/notes/stream-json-contract.md`; each test names the section it pins.
 //! Golden fixtures are version-pinned like the transcript captures
-//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.283` in the filename
+//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.282` in the filename
 //! is the pinned Claude Code version from
 //! `docs/notes/claude-contract-probes.md`. The record envelopes were
-//! re-measured against live claude 2.1.283 on 2026-09-26 (claudepr-72d0ba4c:
-//! two sandboxed PTY sessions driven through claude-print itself, both
-//! replayed byte-identical to their transcripts; the 2.1.282 envelope shapes
-//! carried over with one addition — assistant records now also carry a
-//! top-level `serverClassifierRequest` (a request id or null) — and
-//! `atis-latch` / `file-history-snapshot` record types were observed flowing).
-//! The envelope set was previously re-measured against 2.1.282 on 2026-09-25
-//! (claudepr-b590e46d: `thinking` blocks and split assistant records sharing a
-//! `message.id` observed live); the prior `v2.1.270` and `v2.1.282` families
-//! are retained in `tests/fixtures/` as measurement history.
+//! re-measured against live claude 2.1.282 on 2026-09-25 (claudepr-b590e46d:
+//! two sandboxed PTY sessions; user/assistant/`mode` envelopes transcribed,
+//! `thinking` blocks and split assistant records sharing a `message.id`
+//! observed live); the prior `v2.1.270` family is retained in `tests/fixtures/`
+//! as measurement history.
 //!
 //! What the golden pairs pin, and why each file exists:
 //!
-//! * `stream_json_golden_v2.1.283.input.jsonl` — a PTY-shaped transcript (the
+//! * `stream_json_golden_v2.1.282.input.jsonl` — a PTY-shaped transcript (the
 //!   shape `claude-print` actually tails: `mode`/`summary`/`user`/`assistant`/
 //!   `system` records, NO `result` record) carrying one instance of every
-//!   byte-level case the contract calls out: a 2.1.283 `mode` record (the
-//!   minimal record type introduced in 2.1.282), compact JSON, spaced JSON (no
+//!   byte-level case the contract calls out: a 2.1.282 `mode` record (the
+//!   new-in-2.1.282 minimal record type), compact JSON, spaced JSON (no
 //!   re-serialization), unicode text, a `thinking` block, split assistant
 //!   records sharing a `message.id` (forwarded verbatim, no dedup), a blank
 //!   line (dropped), and a CRLF-terminated line (CR trimmed).
-//! * `stream_json_golden_v2.1.283.expected.jsonl` — the exact stdout bytes a
+//! * `stream_json_golden_v2.1.282.expected.jsonl` — the exact stdout bytes a
 //!   full replay must produce: input minus the blank line, CR removed, every
 //!   line LF-terminated.
-//! * `stream_json_golden_v2.1.283.errors.jsonl` — the exact bytes of the two
+//! * `stream_json_golden_v2.1.282.errors.jsonl` — the exact bytes of the two
 //!   synthesized `result` error objects: the session-error line written to
 //!   stdout (line 1) and the config-error line written to stderr (line 2).
 //!
@@ -52,15 +47,15 @@ use claude_print::emitter::{
 };
 use claude_print::error::ClaudePrintError;
 
-const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.283.input.jsonl");
-const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.283.expected.jsonl");
-const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.283.errors.jsonl");
+const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.282.input.jsonl");
+const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.282.expected.jsonl");
+const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.282.errors.jsonl");
 const CAPTURE_V233: &str = include_str!("fixtures/transcript_v2.1.233.jsonl");
 
 /// The claude version stamped into the golden error objects — the pinned
 /// version from `docs/notes/claude-contract-probes.md`, in the same
 /// `<x.y.z> (Claude Code)` form `resolve_claude_version` records.
-const GOLDEN_CLAUDE_VERSION: &str = "2.1.283 (Claude Code)";
+const GOLDEN_CLAUDE_VERSION: &str = "2.1.282 (Claude Code)";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -168,13 +163,13 @@ fn wait_for_bytes(writer: &ChunkLogWriter, min_len: usize) {
 fn staged_transcript(dir: &Path, bytes: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
     let projects_dir = dir.join("projects").join("gold-cwd");
     std::fs::create_dir_all(&projects_dir).unwrap();
-    let transcript = projects_dir.join("gold-session-283.jsonl");
+    let transcript = projects_dir.join("gold-session-282.jsonl");
     std::fs::write(&transcript, bytes).unwrap();
     let identity = dir.join("session-identity.json");
     std::fs::write(
         &identity,
         format!(
-            r#"{{"session_id":"gold-session-283","transcript_path":"{}","cwd":"/gold/cwd"}}"#,
+            r#"{{"session_id":"gold-session-282","transcript_path":"{}","cwd":"/gold/cwd"}}"#,
             transcript.display(),
         ),
     )
@@ -270,7 +265,7 @@ fn golden_incremental_arrival_replays_expected_bytes_in_order() {
     let dir = tempfile::TempDir::new().unwrap();
     let projects_dir = dir.path().join("projects").join("gold-cwd");
     std::fs::create_dir_all(&projects_dir).unwrap();
-    let transcript = projects_dir.join("gold-session-283.jsonl");
+    let transcript = projects_dir.join("gold-session-282.jsonl");
     std::fs::write(&transcript, b"").unwrap();
 
     let writer = ChunkLogWriter::new();
