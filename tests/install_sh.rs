@@ -64,6 +64,29 @@ fn check_failing_body(marker: &str) -> String {
     )
 }
 
+/// Execution evidence planted inside the downloaded artifact by every
+/// fail-closed verification test: run in any mode, the artifact prints a
+/// distinctive line and touches `$EXECUTION_PROBE`. The fail-closed rule
+/// these tests pin is not just "abort" but *where* — the README promises
+/// every artifact is verified "before it is installed or executed", so the
+/// tests need an artifact whose execution is observable from the outside.
+/// The printf lands in install.sh's captured stdout (the script never
+/// redirects its children); the touch is a side effect that survives even
+/// an execution whose output was swallowed, and is harmless without the
+/// env var set. Appended to [`BINARY_BODY`], the lines are also the
+/// tamper: the digest of the probed body no longer matches a manifest
+/// written over the plain body.
+const EXECUTION_PROBE_LINES: &str = concat!(
+    "printf 'artifact ran despite failed verification\\n'\n",
+    "touch \"${EXECUTION_PROBE:-/dev/null}\" 2>/dev/null || true\n",
+);
+
+/// [`BINARY_BODY`] with the execution probe appended — the artifact the
+/// fail-closed verification tests download.
+fn probing_binary_body() -> String {
+    format!("{BINARY_BODY}{EXECUTION_PROBE_LINES}")
+}
+
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
@@ -186,6 +209,42 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// The ordering half of every fail-closed verification pin, asserted from
+/// the outside: the abort must strike BEFORE the downloaded artifact is
+/// executed in any mode (neither execution evidence exists — not the
+/// probe's line, not the probe's marker, not even the plain body's output,
+/// which the `--check`/`--version` smoke would print) and before the
+/// post-install smoke starts (no `--check` line, no completion banner).
+/// "Nonzero exit with nothing placed" alone cannot prove this: an install
+/// that executed the unverified artifact first and failed somewhere later
+/// would satisfy both — exactly the supply-chain sin the fail-closed rule
+/// exists to prevent.
+fn assert_aborted_before_execution_or_check(stdout: &str, execution_probe: &Path) {
+    assert!(
+        !stdout.contains("artifact ran despite failed verification"),
+        "the unverified artifact must never be executed — its probe line \
+         printed: {stdout}"
+    );
+    assert!(
+        !execution_probe.exists(),
+        "the unverified artifact must never be executed — its probe marker \
+         was touched"
+    );
+    assert!(
+        !stdout.contains("fake claude-print"),
+        "the artifact must never run in any mode — the --check/--version \
+         smoke prints this line: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Running claude-print --check"),
+        "the abort must precede the post-install --check smoke: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Installation complete"),
+        "a failed verification must never print the completion banner: {stdout}"
+    );
+}
+
 /// First executable `tool` on this process's PATH. The placement-failure
 /// shim uses it for the real `install`(1), and the NEEDLE-leg tests use it
 /// to locate the host tools `install.sh` calls — where a host keeps those is
@@ -263,13 +322,21 @@ fn install_succeeds_when_artifacts_match_the_published_checksums() {
 
 #[test]
 fn install_fails_closed_when_the_checksum_manifest_is_missing() {
-    // Assets exist but the publisher published no manifest at all.
+    // Assets exist but the publisher published no manifest at all. The
+    // binary carries the execution probe so the run pins the ordering as
+    // well as the abort: a script that gave up on verification entirely and
+    // executed its way through the install could not pass unnoticed.
     let release = tempfile::tempdir().unwrap();
-    fs::write(release.path().join(BINARY_ASSET), BINARY_BODY).unwrap();
+    fs::write(release.path().join(BINARY_ASSET), probing_binary_body()).unwrap();
     fs::write(release.path().join(MOCK_ASSET), MOCK_BODY).unwrap();
     let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
 
-    let output = run_install(home.path(), release.path());
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[("EXECUTION_PROBE", execution_probe.to_str().unwrap())],
+    );
 
     assert!(
         !output.status.success(),
@@ -285,20 +352,27 @@ fn install_fails_closed_when_the_checksum_manifest_is_missing() {
         stderr.contains(CHECKSUMS_ASSET),
         "stderr must name the missing manifest: {stderr}"
     );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
+    );
 }
 
 #[test]
 fn install_fails_closed_on_a_tampered_binary() {
     let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
-    // Mutate the artifact after the manifest was written over its bytes.
-    fs::write(
-        release.path().join(BINARY_ASSET),
-        format!("{BINARY_BODY}\n# tampered\n"),
-    )
-    .unwrap();
+    // Mutate the artifact after the manifest was written over its bytes —
+    // into the execution-probing body, so the digest mismatch and any
+    // hypothetical execution of the corrupted artifact are both observable.
+    fs::write(release.path().join(BINARY_ASSET), probing_binary_body()).unwrap();
     let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
 
-    let output = run_install(home.path(), release.path());
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[("EXECUTION_PROBE", execution_probe.to_str().unwrap())],
+    );
 
     assert!(
         !output.status.success(),
@@ -314,14 +388,21 @@ fn install_fails_closed_on_a_tampered_binary() {
         stderr.contains("sha256 mismatch") && stderr.contains(BINARY_ASSET),
         "stderr must report the mismatch: {stderr}"
     );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
+    );
 }
 
 #[test]
 fn install_fails_closed_when_an_asset_has_no_checksum_entry() {
     // The manifest exists but describes only the version file — the binary is
-    // missing metadata, which is as fatal as a mismatch.
+    // missing metadata, which is as fatal as a mismatch. The binary still
+    // downloads (the abort strikes at verification, not before it), carrying
+    // the execution probe: an unlisted artifact must be refused without ever
+    // being run.
     let release = tempfile::tempdir().unwrap();
-    fs::write(release.path().join(BINARY_ASSET), BINARY_BODY).unwrap();
+    fs::write(release.path().join(BINARY_ASSET), probing_binary_body()).unwrap();
     fs::write(release.path().join(VERSION_ASSET), "unknown\n").unwrap();
     fs::write(
         release.path().join(CHECKSUMS_ASSET),
@@ -332,8 +413,13 @@ fn install_fails_closed_when_an_asset_has_no_checksum_entry() {
     )
     .unwrap();
     let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
 
-    let output = run_install(home.path(), release.path());
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[("EXECUTION_PROBE", execution_probe.to_str().unwrap())],
+    );
 
     assert!(
         !output.status.success(),
@@ -347,6 +433,10 @@ fn install_fails_closed_when_an_asset_has_no_checksum_entry() {
     assert!(
         stderr.contains("no entry") && stderr.contains(BINARY_ASSET),
         "stderr must report the missing entry: {stderr}"
+    );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
     );
 }
 
@@ -370,6 +460,22 @@ fn install_fails_closed_on_a_tampered_mock_claude() {
     assert!(
         stderr.contains("sha256 mismatch") && stderr.contains(MOCK_ASSET),
         "stderr must report the fixture mismatch: {stderr}"
+    );
+    // The abort must also precede the smoke: the placed binary never runs —
+    // no --check leg, no output from any mode, no completion banner.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("fake claude-print"),
+        "the placed binary must never run — the fixture abort precedes the \
+         smoke: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Running claude-print --check"),
+        "the abort must precede the post-install --check smoke: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Installation complete"),
+        "a failed verification must never print the completion banner: {stdout}"
     );
 }
 
