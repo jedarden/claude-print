@@ -3,7 +3,11 @@
 //! The plan pinned three runtime assumptions as unverified — PO-1/OQ-1
 //! (`--settings` merge + firing order), PO-2/OQ-2 (`--setting-sources=`
 //! suppression), and the Stop-poller's once-per-turn assumption. They were
-//! measured against claude 2.1.282 on 2026-09-24 (re-pinned from the 2.1.270
+//! measured against claude 2.1.283 on 2026-09-26 (claudepr-5dd33e57: the full
+//! four-probe set re-run under the version guard, completing the re-pin the
+//! reverted claudepr-2e8c3884 attempt had left incomplete — every contract
+//! re-measured unchanged), re-pinned from the 2.1.282 measurement of
+//! 2026-09-24 (itself re-pinned from the 2.1.270
 //! measurement of 2026-09-13, via a 2.1.281 run the same day that the host's
 //! auto-updater superseded; re-run procedure in
 //! docs/notes/claude-contract-probes.md §Maintenance) with the live probe
@@ -12,7 +16,7 @@
 //! two the re-pins had left unrepeated, re-measured 2026-09-25, plus the
 //! relay-hook timeout-enforcement arm added 2026-09-26 (claudepr-352cf1df) —
 //! `scripts/probe-stop-edge-contracts.sh`); the observed values are pinned in
-//! `tests/fixtures/claude_contracts_v2.1.282.json` and documented in
+//! `tests/fixtures/claude_contracts_v2.1.283.json` and documented in
 //! `docs/notes/claude-contract-probes.md`.
 //!
 //! The always-on tests below assert that what claude-print *does* (child argv,
@@ -43,7 +47,7 @@ use claude_print::hook::HookInstaller;
 use claude_print::session::{LaunchOptions, Session};
 use serde::Deserialize;
 
-const FIXTURE: &str = include_str!("fixtures/claude_contracts_v2.1.282.json");
+const FIXTURE: &str = include_str!("fixtures/claude_contracts_v2.1.283.json");
 const DOC: &str = include_str!("../docs/notes/claude-contract-probes.md");
 
 /// The measured contracts, as recorded by the probe run.
@@ -94,9 +98,10 @@ struct Contracts {
     hook_timeout_kills_overrun_hook: bool,
     /// Relay-hook timeout: the session proceeds despite the killed hook —
     /// exit 0 with the reply rendered, the process exiting on the order of
-    /// the configured timeout rather than the hook's sleep (measured 2.1.282:
-    /// 8/8 runs exit 0, claude exiting 5.0 s after the Stop hook's start
-    /// against a 5 s timeout / 30 s sleep). This is the
+    /// the configured timeout rather than the hook's sleep (measured 2.1.283:
+    /// 4/4 runs exit 0, claude exiting 5.0 s after the Stop hook's start
+    /// against a 5 s timeout / 30 s sleep; the prior 2.1.282 shim
+    /// measurement, 8/8 runs, produced the identical shape). This is the
     /// "does not wait beyond the 10s timeout" clause of
     /// `docs/notes/hook-design.md` §Relay Hook.
     hook_timeout_overrun_session_proceeds: bool,
@@ -376,7 +381,7 @@ fn fixture_pins_measured_contracts() {
     );
     assert!(
         !f.contracts.setting_sources_none_accepted,
-        "PO-2 fallback spelling rejected by claude 2.1.282"
+        "PO-2 fallback spelling rejected by claude 2.1.283"
     );
     assert_eq!(
         f.contracts
@@ -628,7 +633,7 @@ fn child_argv_matches_verified_spelling_no_inherit_hooks() {
         args.iter().any(|a| a == VERIFIED_SUPPRESS_SPELLING),
         "isolation mode must forward the verified empty spelling {VERIFIED_SUPPRESS_SPELLING:?}: {args:?}"
     );
-    // The `=none` fallback is REJECTED by claude 2.1.282 (P5: exit 1 before
+    // The `=none` fallback is REJECTED by claude 2.1.283 (P5: exit 1 before
     // session start) — it must never be emitted.
     assert!(
         !args.iter().any(|a| a.starts_with("--setting-sources=none")),
@@ -650,7 +655,7 @@ fn relay_settings_schema_matches_live_verified_structure() {
     let val: serde_json::Value = serde_json::from_str(&content).unwrap();
 
     // Double-nested hooks.Stop[ { hooks: [ {type: "command", ...} ] } ] —
-    // accepted and fired by claude 2.1.282 (Hook Installer §2 schema note).
+    // accepted and fired by claude 2.1.283 (Hook Installer §2 schema note).
     let stop = val
         .pointer("/hooks/Stop")
         .and_then(|v| v.as_array())

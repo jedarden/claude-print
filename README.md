@@ -391,8 +391,8 @@ With `inherit_hooks = false` — equivalent to passing `--no-inherit-hooks` —
 claude-print forwards `--setting-sources=` (empty value). That suppresses the
 standard sources, so **your hooks never fire**, while the relay settings stay
 active: the empty spelling is measured to suppress the standard sources and
-still load the `--settings` file (claude 2.1.270, re-confirmed on 2.1.281
-and 2.1.282 —
+still load the `--settings` file (claude 2.1.270, re-confirmed on 2.1.281,
+2.1.282 and 2.1.283 —
 `docs/notes/claude-contract-probes.md`, OQ-2). The relay hooks therefore
 outrank isolation in every mode, and deliberately so: claude-print's Stop
 detection depends on them, which is why no setting can turn them off.

@@ -1,0 +1,160 @@
+{
+  "claude_version": "2.1.283",
+  "measured_at": "2026-09-26",
+  "version_guard": {
+    "start": "2.1.283",
+    "end": "2.1.283",
+    "provenance": "All four probes (scripts/probe-claude-contracts.sh, scripts/probe-stop-toolallowed.sh, scripts/probe-tui-second-turn.sh, scripts/probe-stop-edge-contracts.sh) ran in one pinned session on 2026-09-26 (claudepr-5dd33e57) with CLAUDE_BIN pointed at the concrete binary and a /tmp/claude-pin-2.1.283 PATH shim holding the golden capture to the same version. Each probe stamped 'version-guard: verdict=single-version start=2.1.283 end=2.1.283 binary=/home/coding/.local/share/claude/versions/2.1.283' (start == end == claude_version across all four, enforced by tests/probe_version_guard.rs)."
+  },
+  "probe_scripts": [
+    "scripts/probe-claude-contracts.sh",
+    "scripts/probe-stop-toolallowed.sh",
+    "scripts/probe-tui-second-turn.sh",
+    "scripts/probe-stop-edge-contracts.sh"
+  ],
+  "evidence": "docs/notes/claude-contract-probes.md",
+  "resolves": [
+    "PO-1",
+    "PO-2",
+    "OQ-1",
+    "OQ-2",
+    "Stop-poller assumption (plan §7)",
+    "relay-hook timeout (hook-design.md Relay Hook)"
+  ],
+  "contracts": {
+    "settings_flag_merges_not_replaces": true,
+    "all_loaded_sources_hooks_fire": true,
+    "cross_source_hook_order_guaranteed": false,
+    "setting_sources_empty_accepted": true,
+    "setting_sources_empty_suppresses_standard_sources": true,
+    "settings_file_loads_despite_setting_sources_empty": true,
+    "setting_sources_none_accepted": false,
+    "stop_firings_single_turn_completed_run_per_loaded_source": 1,
+    "stop_firings_multi_round_tool_use_completed_turn": 1,
+    "stop_firings_tui_per_turn": 1,
+    "stop_firings_max_turns_cutoff": 0,
+    "stop_firings_max_turns_cutoff_exit_code": 1,
+    "hook_timeout_kills_overrun_hook": true,
+    "hook_timeout_overrun_session_proceeds": true
+  },
+  "notes": {
+    "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host's real ~/.claude files were never read or written. Auth traveled by inherited environment only.",
+    "cross_source_order_evidence": "2.1.283 run: all four ordinary probe pairs fired standard-source-first (P2: project ...830.132589 -> relay ...830.134552 SessionStart and ...849.787307 -> ...849.789309 Stop, ~2.0 ms apart each; P6: user ...876.156552 -> relay ...876.159304 SessionStart (~2.8 ms) and ...911.578760 -> ...911.580727 Stop (~2.0 ms)) - while the 2.1.282 run had P2's SessionStart pair relay-first, so only the merge (all loaded sources fire) is contractual. The dedicated sleeping-hook probe (Arm S of scripts/probe-stop-edge-contracts.sh, measured natively 2026-09-26 against this same 2.1.283, claudepr-5dd33e57): project hook sleeping 300 ms (measured wall 305-336 ms) vs relay hook 0 ms - the two hooks ran concurrently in 12/12 event pairs and the relay started before the project hook in 4/12 (1.5-14.0 ms ahead: 2 SessionStart pairs, 2 Stop pairs). The pinned 2.1.282 run of 2026-09-25 (claudepr-d9553d38) and two extra same-day invocations had measured the same shape - concurrent 12/12 each, flips 6/12, 4/12 and 5/12 - and an earlier 2.1.283 invocation in the claudepr-72d0ba4c drift window had measured 7 of 12 flips. Concurrency, not ordering, is the guarantee.",
+    "tui_per_turn_evidence": "Two turns in one TUI session (probe-tui-second-turn.sh): turn 1 fired 1 Stop with reply rendered (69.7 s), turn 2 fired 1 Stop with reply rendered SECOND-OK (9.6 s); the TUI status line showed (running Stop hook) on turn 2. On 2.1.283 both tool-using TUI arms went incomplete in both the claudepr-72d0ba4c drift run and this re-pin's session (probe-1 T2: no reply, no Stop, ~270 s waits; the toolallowed Arm T: same at ~205 s) - per the maintenance doc an incomplete turn is a re-run, not a contract finding; the per-turn contract is carried by the dedicated TUI probe above and the completed print-mode arms (Arm P, T1).",
+    "degraded_path_hazard": "Historical (2.1.270): on runs where the model's tool calls are permission-DENIED (no allowlist, headless), one run out of two produced an extra Stop firing. Re-measured against this same 2.1.283 on 2026-09-26 (claudepr-5dd33e57, scripts/probe-stop-edge-contracts.sh Arm D): 5 completed denied runs - all exit 0, stop_hook_active false, the model's own reply confirming its Bash calls were blocked - and every run fired exactly one Stop; the hazard did not reproduce (the pinned 2.1.282 run of 2026-09-25, claudepr-d9553d38, had measured the same shape on 15 of 15 runs across three invocations). Kept on record as historical (mechanism unexplained, small samples; not reachable in the NEEDLE fleet - claude-print.yaml passes --dangerously-skip-permissions). The single-fire poller keeps its tolerance: first payload -> transcript retry/fallback, watchdog bounds the session.",
+    "print_mode_tool_use_evidence": "Two sequential permitted Bash rounds in one -p run (Arm P): exactly 1 Stop at the turn's true end (payload last_assistant_message: DONE, stop_hook_active: false, single session id), claude exit 0. The unallowlisted T1 arm also completed (exit 0) with exactly 1 Stop of its own.",
+    "cutoff_evidence": "A -p run cut off by --max-turns fires no Stop of its own: T3 (--max-turns 2, exit 1) added zero firings on 2.1.283, exactly as on 2.1.282, 2.1.281 and 2.1.270 - cutoffs belong to the --stop-hook-timeout watchdog, not the Stop poller.",
+    "hook_timeout_evidence": "Arm T (added 2026-09-26, claudepr-352cf1df, scripts/probe-stop-edge-contracts.sh): the relay-position hook (--settings file, run with --setting-sources= so it is the only loaded hook - the isolation-mode shape) configured with a per-hook timeout of 5 s while sleeping 30 s, wired on SessionStart and Stop. One invocation of 4 single-turn runs, measured natively against this same pinned 2.1.283 on 2026-09-26 (claudepr-5dd33e57, the same pinned session as the rest of the re-pin): all 8 event firings KILLED (start logged, end never - the 30 s sleep never completed), every run exit 0 with the reply rendered (reply-contains-OK 4/4), and the claude process exiting 5.0 s after the Stop hook's start in 4/4 runs - the configured timeout, not the 30 s sleep. The prior measurement against the pinned 2.1.282 (claudepr-352cf1df, two invocations of 4 runs each on a versions-dir PATH shim while the host had drifted to 2.1.283) had produced the identical shape (16 firings killed, 8/8 sessions proceeding, 5.0 s every run). Enforcement is of the per-hook timeout field itself (measured at 5 s), which is the same field src/hook.rs sets to 10 on both relay hooks - the measured form of hook-design.md's 'does not wait beyond the 10s timeout' clause."
+  },
+  "doc_evidence": {
+    "active_version": "2.1.283",
+    "cross_source": {
+      "concurrent_pairs": {
+        "observed": 12,
+        "total": 12
+      },
+      "relay_first_pairs": {
+        "observed": 4,
+        "total": 12
+      },
+      "earlier_concurrent_pairs": {
+        "observed": 12,
+        "total": 12
+      },
+      "earlier_relay_first_pairs": [
+        {
+          "observed": 6,
+          "total": 12
+        },
+        {
+          "observed": 4,
+          "total": 12
+        },
+        {
+          "observed": 5,
+          "total": 12
+        }
+      ]
+    },
+    "permission_denied_runs": {
+      "observed": 5,
+      "total": 5
+    },
+    "hook_timeout": {
+      "killed_firings": {
+        "observed": 8,
+        "total": 8
+      },
+      "successful_sessions": {
+        "observed": 4,
+        "total": 4
+      },
+      "rendered_replies": {
+        "observed": 4,
+        "total": 4
+      },
+      "rendered_per_invocation": {
+        "observed": 4,
+        "total": 4
+      },
+      "elapsed_seconds": 5.0
+    },
+    "stop_counts": {
+      "single_turn_per_loaded_source": 1,
+      "multi_round": 1,
+      "permission_denied": 1,
+      "tui_turn_1": 1,
+      "tui_turn_2": 1,
+      "max_turns_cutoff": 0
+    },
+    "active_tui_seconds": [
+      69.7,
+      9.6
+    ],
+    "historical": [
+      {
+        "version": "2.1.270",
+        "cross_source_relay_first_runs": {
+          "observed": 1,
+          "total": 4
+        },
+        "permission_denied_extra_stop_runs": {
+          "observed": 1,
+          "total": 2
+        },
+        "tui_seconds": [
+          22.6,
+          15.1
+        ]
+      },
+      {
+        "version": "2.1.281",
+        "arm_t_seconds": [
+          48.0,
+          60.0
+        ],
+        "tui_seconds": [
+          48.0,
+          60.0,
+          13.0,
+          9.1
+        ]
+      },
+      {
+        "version": "2.1.282",
+        "arm_t_seconds": [
+          62.5,
+          32.5,
+          60.5
+        ],
+        "tui_seconds": [
+          62.5,
+          32.5,
+          60.5,
+          41.6,
+          3.3
+        ]
+      }
+    ]
+  }
+}
