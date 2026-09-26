@@ -32,6 +32,21 @@
 //! source (stale runbook "Version verification" section) — all green under
 //! every existing test.
 //!
+//! Since claudepr-7ee7deb7 the suite also pins the *reverse* pointers, from
+//! the README into this note: the README must keep linking the runbook from
+//! both of its release-facing surfaces (§"Repository & contributions" and
+//! §"Release checklist"), and its one-directional publication claims — the
+//! Forgejo canonical repo, the GitHub read-only push mirror, GitHub
+//! Releases as the artifact host with Forgejo hosting no assets, nothing
+//! flowing back, and the `CLAUDE_PRINT_RELEASE_URL` override semantics —
+//! must agree with the runbook's. The first test below only checked the
+//! runbook's links *into* the README; a README reshuffle could drop the
+//! link back, or reword a claim into contradicting the note, all green.
+//! Every agreement leg is mutation-checked by always-on negative
+//! meta-tests (the committed `tests/docs_build_commands.rs` pattern):
+//! each README and runbook mutation the pin guards against is applied in
+//! memory on every run and must fail the owning check naming the drift.
+//!
 //! The asset-name derivation is deliberately duplicated from
 //! `tests/platform_matrix_docs.rs` rather than shared: two readers deriving
 //! the same names independently from the template is the pin — a shared
@@ -424,4 +439,246 @@ fn runbook_mode_and_version_claims_match_the_workflow() {
         runbook_norm.contains("must name the release it came from"),
         "the runbook must state the installed --version identifies the release"
     );
+}
+
+// ── README provenance pointers (claudepr-7ee7deb7) ──────────────────────────
+//
+// The README's release-facing sections link this note and state the
+// one-directional publication claims the note operationalizes. Those
+// pointers are themselves contract — the link can be dropped in a README
+// reshuffle and a claim can be reworded into contradicting the runbook,
+// all green under the tests above, which only ever read the runbook's
+// links INTO the README, never the README's link back.
+
+/// The runbook path the README must keep pointing at — root-relative (the
+/// README sits at the repo root) and the same path this suite reads as the
+/// runbook, so the main test's `repo_file` call doubles as the
+/// link-target-exists check: renaming the note breaks the read before any
+/// assertion can fire.
+const RUNBOOK_PATH: &str = "docs/notes/release-runbook.md";
+
+/// The markdown link form the README carries on both release-facing
+/// surfaces (§"Repository & contributions" and §"Release checklist").
+fn runbook_link() -> String {
+    format!("[`{RUNBOOK_PATH}`]({RUNBOOK_PATH})")
+}
+
+/// The README's one-directional publication claims, each paired with the
+/// runbook text it must agree with: `(claim, README fragment, runbook
+/// fragment)`. Where the two docs state a claim verbatim identically the
+/// fragment is shared; where the wording legitimately differs per doc
+/// (artifact host with vs. without "supported", sentence-initial
+/// capitalization on the no-flow-back claim, redirecting-the-installer vs.
+/// redirects-it) both spellings are pinned, so either side drifting — or
+/// either doc dropping the claim outright while the other still states it —
+/// fails naming the claim.
+const AGREED_PROVENANCE_CLAIMS: &[(&str, &str, &str)] = &[
+    (
+        "Forgejo is the canonical repository",
+        "`git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository",
+        "`git.ardenone.com/jedarden/claude-print` (Forgejo) is the canonical repository",
+    ),
+    (
+        "the GitHub repo is a read-only push mirror",
+        "is a read-only push mirror",
+        "is a read-only push mirror",
+    ),
+    (
+        "GitHub Releases is the artifact host",
+        "GitHub Releases is the artifact host",
+        "GitHub Releases is the supported artifact host",
+    ),
+    (
+        "Forgejo hosts no release assets",
+        "Forgejo hosts no release assets",
+        "Forgejo hosts no release assets",
+    ),
+    (
+        "nothing flows back from GitHub",
+        "nothing flows back",
+        "Nothing flows back",
+    ),
+    (
+        "CLAUDE_PRINT_RELEASE_URL redirects the installer to an equivalent host",
+        "`CLAUDE_PRINT_RELEASE_URL` redirecting the installer to any host serving \
+         the same assets when GitHub is unreachable",
+        "`CLAUDE_PRINT_RELEASE_URL` redirects it to any host serving the same \
+         assets when GitHub is unreachable",
+    ),
+];
+
+/// The README↔runbook link pin, split from the `#[test]`s so the negative
+/// meta-tests can drive the same check over a mutated in-memory README.
+/// Takes the whitespace-normalized README (the pinned leads are prose and
+/// wrap across lines).
+fn check_readme_links_the_runbook(readme_norm: &str) {
+    let link = runbook_link();
+    assert!(
+        readme_norm.contains(&link),
+        "the README must keep linking the release runbook via {link} — the \
+         operator procedure for the publication path it describes"
+    );
+    for lead in [
+        // §"Repository & contributions": the prose introducing the link.
+        "The operator runbook for that publication path",
+        // §"Release checklist": the closing pointer this checklist feeds into.
+        "is the operator runbook this checklist feeds into",
+    ] {
+        assert!(
+            readme_norm.contains(lead),
+            "the README's release-runbook pointer lost its lead {lead:?} — the \
+             link must stay introduced on both release-facing surfaces"
+        );
+    }
+}
+
+/// The provenance-agreement pin, split out for the same reason. Both
+/// arguments normalized; both legs asserted per claim so a one-sided
+/// divergence (either document, in either direction) is named.
+fn check_readme_provenance_claims_agree(readme_norm: &str, runbook_norm: &str) {
+    for (claim, readme_fragment, runbook_fragment) in AGREED_PROVENANCE_CLAIMS {
+        assert!(
+            readme_norm.contains(readme_fragment),
+            "the README's claim that {claim} drifted from the runbook — it must \
+             still carry {readme_fragment:?} while the runbook says \
+             {runbook_fragment:?}"
+        );
+        assert!(
+            runbook_norm.contains(runbook_fragment),
+            "the runbook's claim that {claim} drifted from the README — it must \
+             still carry {runbook_fragment:?} while the README says \
+             {readme_fragment:?}"
+        );
+    }
+}
+
+#[test]
+fn readme_provenance_pointers_agree_with_the_runbook() {
+    let readme = normalized(&repo_file("README.md"));
+    // Read through the same root-relative path the README links (see
+    // RUNBOOK_PATH): this line is the link-resolution half of the pin.
+    let runbook = normalized(&repo_file(RUNBOOK_PATH));
+    check_readme_links_the_runbook(&readme);
+    check_readme_provenance_claims_agree(&readme, &runbook);
+}
+
+// ── Negative meta-tests: the README pins must FAIL when their inputs rot ────
+//
+// The committed non-vacuity pattern of `tests/docs_build_commands.rs`:
+// every leg mutates the live document in memory — nothing is written to
+// disk — and requires the owning check to panic naming the drift. This is
+// the bead's mutation-check acceptance, running on every invocation rather
+// than as a one-off edit.
+
+/// Run `check` and require it to panic with every fragment of `expected` in
+/// the message — the failure must be the planted drift, not an incidental
+/// one. The panic hook is silenced for the caught unwind so expected
+/// failures never pollute the log; it is restored before any real assertion
+/// here can fire.
+fn assert_drift<F>(check: F, expected: &[&str])
+where
+    F: FnOnce() + std::panic::UnwindSafe,
+{
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(check);
+    std::panic::set_hook(prev_hook);
+    let message = match outcome {
+        Ok(()) => panic!(
+            "the mutated input PASSED the check — the drift guard is vacuous \
+             for this mutation"
+        ),
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+    };
+    for fragment in expected {
+        assert!(
+            message.contains(fragment),
+            "the check failed, but not for the planted drift — panic message:\n\
+             {message}\nmissing fragment: {fragment:?}"
+        );
+    }
+}
+
+/// `text` with every occurrence of `from` replaced by `to`. Panics when
+/// `from` is absent, so a meta-test can never "mutate" an input the live
+/// document no longer carries and silently test something else. Every
+/// occurrence, not just one: several claims are stated on more than one
+/// release-facing surface, and the guard must fire exactly when the claim
+/// is gone entirely — a deliberate deduplication that leaves one surviving
+/// statement still passes, as it should.
+fn replaced_all(text: &str, from: &str, to: &str) -> String {
+    assert!(
+        text.contains(from),
+        "the negative meta-tests mutate {from:?} in the live document — it is gone"
+    );
+    text.replace(from, to)
+}
+
+/// Removing the README's runbook link — or its introducing prose from either
+/// release-facing surface — fails the link check naming the pointer.
+#[test]
+fn negative_meta_dropped_readme_runbook_link_fails() {
+    let readme = normalized(&repo_file("README.md"));
+    let link = runbook_link();
+
+    assert_drift(
+        || check_readme_links_the_runbook(&replaced_all(&readme, &link, "")),
+        &["must keep linking the release runbook"],
+    );
+    // The link surviving with its introduction gone is the same silent
+    // drop from a reader's perspective — on either surface.
+    assert_drift(
+        || {
+            check_readme_links_the_runbook(&replaced_all(
+                &readme,
+                "The operator runbook for that publication path",
+                "A note",
+            ))
+        },
+        &["lost its lead"],
+    );
+    assert_drift(
+        || {
+            check_readme_links_the_runbook(&replaced_all(
+                &readme,
+                "is the operator runbook this checklist feeds into",
+                "is a note this checklist mentions",
+            ))
+        },
+        &["lost its lead"],
+    );
+}
+
+/// Diverging either side of any agreed provenance claim — README or runbook,
+/// dropped or reworded past the pinned fragment — fails the agreement check
+/// naming the claim.
+#[test]
+fn negative_meta_diverged_provenance_claim_fails() {
+    let readme = normalized(&repo_file("README.md"));
+    let runbook = normalized(&repo_file(RUNBOOK_PATH));
+
+    for (claim, readme_fragment, runbook_fragment) in AGREED_PROVENANCE_CLAIMS {
+        assert_drift(
+            || {
+                check_readme_provenance_claims_agree(
+                    &replaced_all(&readme, readme_fragment, ""),
+                    &runbook,
+                )
+            },
+            &[claim],
+        );
+        assert_drift(
+            || {
+                check_readme_provenance_claims_agree(
+                    &readme,
+                    &replaced_all(&runbook, runbook_fragment, ""),
+                )
+            },
+            &[claim],
+        );
+    }
 }
