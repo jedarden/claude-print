@@ -1,0 +1,2 @@
+{"claude_version":"2.1.283 (Claude Code)","error_message":"operation timed out","is_error":true,"subtype":"timeout","type":"result"}
+{"claude_version":"2.1.283 (Claude Code)","error_message":"invalid config: bad.toml: unsupported key `frobnicate`","is_error":true,"subtype":"internal_error","type":"result"}

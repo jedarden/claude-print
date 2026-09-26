@@ -95,6 +95,28 @@ is installed. The detector it runs
 checkout, never from an installed copy, so the detection logic cannot go
 stale the way an installed copy would.
 
+## Linger
+
+Both timers live in the systemd **user** manager, and without lingering that
+manager exists only while you are logged in — a daily timer on a headless
+host would never fire while you are away. Enabling linger keeps the user
+manager (and its timers) running across logout, which is the state these
+checks assume on a production host.
+
+- Check: `loginctl show-user "$USER" -p Linger` — `yes` means the timers
+  stay armed after logout.
+- Remedy: `loginctl enable-linger "$USER"`, with `sudo`/polkit where the
+  host demands it.
+- Both installers probe this (when `loginctl` exists and `Linger` is not
+  `yes`) and print the remedy as a warning — never a blocker, since the
+  timers still fire while you are logged in.
+
+The no-linger failure shape is the install-time one under
+[Installation](#installation): with linger off and you logged out,
+`systemctl --user enable --now` exits non-zero with no user bus and no
+`[INFO] Installed and enabled` line — enable linger and re-run the
+installer.
+
 ## Installation
 
 From a checkout of the repo (the install source is the four/three files that
