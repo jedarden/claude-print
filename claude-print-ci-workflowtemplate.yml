@@ -132,9 +132,16 @@ spec:
             cargo clippy --all-targets -- -D warnings
             echo "clippy OK"
 
-            # Run tests (including watchdog regression tests)
+            # Run tests (including watchdog regression tests). --tests is the
+            # documented all-targets form (AGENTS.md §"Build commands") and
+            # the all-targets spelling the selector guard requires: nothing
+            # to quote, identically valid under stock and wrapped cargo.
+            # --tests skips doctests, so the doc example keeps compiling
+            # via --doc. tests/docs_build_commands.rs (claudepr-76a5274c)
+            # pins this invocation — change the two together.
             echo "Running test suite..."
-            cargo test --verbose
+            cargo test --tests --verbose
+            cargo test --doc --verbose
             echo "Tests passed successfully"
 
             echo "Running cargo audit..."

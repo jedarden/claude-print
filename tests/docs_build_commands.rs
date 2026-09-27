@@ -21,7 +21,7 @@
 //! the commands fence above it — including the prohibition — had no
 //! stated pin.
 //!
-//! Two surfaces, both pinned here:
+//! Three surfaces, all pinned here:
 //!
 //! - **§"Build commands" presence** — the bolded prohibition sentence,
 //!   the `cargo test --tests` alternative it prescribes in the same
@@ -30,14 +30,21 @@
 //!   itself may never prescribe a wildcard selector — the fence is the
 //!   copy-paste surface.
 //! - **Repo-wide reintroduction scan** — every file of AGENTS.md,
-//!   README.md, `docs/`, and `scripts/` is parsed with a selector grammar
-//!   (`--test NAME`, `--test=NAME`, surrounding quotes stripped) and any
-//!   selector carrying a glob metacharacter (`*`, `?`, `[`) fails the
-//!   build. The single sanctioned occurrence is the AGENTS.md prohibition
-//!   sentence itself, anchored by content (the exact bolded lead), not by
-//!   file or line — so the exemption cannot hide a prescription: a
-//!   negative meta-test re-flags the hazardous line the moment the
-//!   prohibition lead leaves it.
+//!   README.md, `docs/`, `scripts/`, and the vendored CI
+//!   `claude-print-ci-workflowtemplate.yml` is parsed with a selector
+//!   grammar (`--test NAME`, `--test=NAME`, surrounding quotes stripped)
+//!   and any selector carrying a glob metacharacter (`*`, `?`, `[`)
+//!   fails the build. The single sanctioned occurrence is the AGENTS.md
+//!   prohibition sentence itself, anchored by content (the exact bolded
+//!   lead), not by file or line — so the exemption cannot hide a
+//!   prescription: a negative meta-test re-flags the hazardous line the
+//!   moment the prohibition lead leaves it.
+//! - **CI WorkflowTemplate test commands** (claudepr-76a5274c) — the
+//!   vendored template is the one prohibited-form surface that does not
+//!   merely get copied but *executes*, so it carries its own pin on top
+//!   of the scan: its suite invocation must use the documented
+//!   `cargo test --tests` form, and a commented-out invocation satisfies
+//!   nothing (a `#`-prefixed line does not run).
 //!
 //! The guard's own failure behavior is pinned the same way as
 //! `tests/docs_build_layout.rs` (claudepr-4d967120): always-on negative
@@ -49,7 +56,7 @@
 //! discarded scratch run.
 //!
 //! Library-level like the rows it guards: reads AGENTS.md, README.md,
-//! `docs/`, and `scripts/`; spawns nothing.
+//! `docs/`, `scripts/`, and the CI WorkflowTemplate; spawns nothing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -81,11 +88,26 @@ const ALL_TARGETS_COMMAND: &str = "cargo test --tests";
 /// why it is the sanctioned single-target spelling.
 const GLOB_METACHARS: [char; 3] = ['*', '?', '['];
 
+/// The vendored CI WorkflowTemplate this guard also pins (bead
+/// claudepr-76a5274c): the declarative-config copy is deployed from here,
+/// and the embedded bash is the one surface the prohibition covers that
+/// does not merely get copy-pasted but executes — so a hazardous or
+/// undocumented suite spelling in it is the CI's own drift, not just a
+/// reader's trap.
+const CI_WORKFLOW_FILE: &str = "claude-print-ci-workflowtemplate.yml";
+
+/// The documented all-targets selector token the CI suite invocation must
+/// carry — the same `--tests` the AGENTS.md §"Build commands" fence
+/// prescribes for every test target.
+const ALL_TARGETS_SELECTOR: &str = "--tests";
+
 /// The repo-wide scan scope: AGENTS.md itself (whose single sanctioned
 /// occurrence is the prohibition sentence) plus the operational surfaces
-/// the bead names — README.md, every file under `docs/`, every file under
-/// `scripts/` (any extension, recursively).
-const SCAN_FILES: [&str; 2] = ["AGENTS.md", "README.md"];
+/// the beads name — README.md, every file under `docs/`, every file under
+/// `scripts/` (any extension, recursively), and the vendored CI
+/// WorkflowTemplate (claudepr-76a5274c), whose embedded bash is a command
+/// surface like any script under `scripts/`.
+const SCAN_FILES: [&str; 3] = ["AGENTS.md", "README.md", CI_WORKFLOW_FILE];
 const SCAN_DIRS: [&str; 2] = ["docs", "scripts"];
 
 /// Read a repo file from the checkout under test, resolving the root
@@ -356,8 +378,76 @@ fn check_no_hazardous_selectors(rel: &str, content: &str) {
     }
 }
 
-/// The scan scope as `(repo-relative path, content)` pairs: the two root
-/// files plus every regular file under the scan directories, recursively.
+/// Whether `line` is a comment — `#` after indentation, which covers both
+/// the YAML comments and the `#` lines of the bash embedded in the
+/// WorkflowTemplate's args. A commented-out command does not execute, so
+/// it must satisfy no presence pin.
+fn is_comment_line(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+/// Whether `line` invokes `cargo test`: a non-comment line whose
+/// whitespace tokens carry `cargo` and `test` consecutively. Token
+/// boundaries keep quote-glued mentions (`echo "cargo test"`) out, and
+/// multi-command lines (`cargo build ... && cargo test ...`) in.
+fn invokes_cargo_test(line: &str) -> bool {
+    if is_comment_line(line) {
+        return false;
+    }
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    tokens.windows(2).any(|w| w[0] == "cargo" && w[1] == "test")
+}
+
+/// The CI WorkflowTemplate's test-invocation contract, checkable against
+/// caller-supplied template text (the live file for the always-on test,
+/// mutated text for the negative meta-tests). Panics on drift, in the
+/// order that names the most specific defect first:
+///
+/// 1. the template must invoke `cargo test` at all — a CI template that
+///    never runs the suite has nothing to pin the selector contract onto;
+/// 2. no invocation may carry a wildcard `--test` selector — the template
+///    executes, so the hazardous spelling here is not copy-paste risk but
+///    the CI's own drift;
+/// 3. at least one invocation must carry the documented all-targets
+///    selector `--tests` — the same sanctioned spelling the AGENTS.md
+///    fence prescribes, modeled by the one surface that runs it.
+fn check_ci_workflow_test_commands(content: &str) {
+    let invocations: Vec<&str> = content
+        .lines()
+        .filter(|line| invokes_cargo_test(line))
+        .collect();
+    assert!(
+        !invocations.is_empty(),
+        "{CI_WORKFLOW_FILE} must invoke `cargo test` — a CI template that never runs \
+         the suite has nothing to pin the selector contract onto"
+    );
+    for line in &invocations {
+        if let Some(selector) = hazardous_selector(line) {
+            panic!(
+                "{CI_WORKFLOW_FILE} runs the wildcard `--test` selector {selector:?} \
+                 (line: {:?}) — the workflow command executes, and AGENTS.md \
+                 §\"Build commands\" prohibits that form even where stock Cargo \
+                 would glob-resolve it. Use `{ALL_TARGETS_COMMAND}` (every target) \
+                 or a named `--test <name>` selector (one target)",
+                line.trim()
+            );
+        }
+    }
+    assert!(
+        invocations
+            .iter()
+            .any(|line| line.split_whitespace().any(|t| t == ALL_TARGETS_SELECTOR)),
+        "the CI suite invocation in {CI_WORKFLOW_FILE} must use the documented \
+         all-targets form `{ALL_TARGETS_COMMAND}` — the WorkflowTemplate is the \
+         copy-paste surface that executes, and AGENTS.md §\"Build commands\" names \
+         `{ALL_TARGETS_COMMAND}` as the sanctioned all-targets spelling; drifting \
+         the CI command off it re-opens the exact gap this guard exists to close"
+    );
+}
+
+/// The scan scope as `(repo-relative path, content)` pairs: the root files
+/// (SCAN_FILES) plus every regular file under the scan directories,
+/// recursively.
 fn scanned_files() -> Vec<(String, String)> {
     let root = repo_root();
     let mut out: Vec<(String, String)> = SCAN_FILES
@@ -369,8 +459,9 @@ fn scanned_files() -> Vec<(String, String)> {
     }
     assert!(
         !out.is_empty(),
-        "the scan scope (README.md, docs/, scripts/) came back empty — the guard \
-         cannot be vacuously passing off an unread tree"
+        "the scan scope (AGENTS.md, README.md, the CI WorkflowTemplate, docs/, \
+         scripts/) came back empty — the guard cannot be vacuously passing off \
+         an unread tree"
     );
     out
 }
@@ -408,6 +499,22 @@ fn operational_docs_and_scripts_never_prescribe_a_wildcard_test_selector() {
     for (rel, content) in scanned_files() {
         check_no_hazardous_selectors(&rel, &content);
     }
+}
+
+#[test]
+fn ci_workflowtemplate_test_commands_follow_the_selector_contract() {
+    check_ci_workflow_test_commands(&repo_file(CI_WORKFLOW_FILE));
+    // The template is scan scope too, not just pinned in isolation: a
+    // wildcard planted anywhere in it — command, comment, or prose — must
+    // fail the repo-wide scan test above, so its membership is pinned
+    // here rather than left to SCAN_FILES staying honest on its own.
+    assert!(
+        scanned_files()
+            .iter()
+            .any(|(rel, _)| rel == CI_WORKFLOW_FILE),
+        "{CI_WORKFLOW_FILE} must be inside the repo-wide scan scope — its \
+         embedded bash is a command surface like docs/ and scripts/"
+    );
 }
 
 // ── Negative meta-tests: the guard must FAIL when its inputs rot ─────────────
@@ -571,6 +678,86 @@ fn negative_meta_prohibition_lead_anchors_the_scan_exemption() {
     assert_drift(
         || check_no_hazardous_selectors("AGENTS.md", &mutated),
         &["AGENTS.md", "wildcard `--test` selector"],
+    );
+}
+
+/// The CI WorkflowTemplate pin fails on every drift shape it exists to
+/// catch, and the planted wildcard also fails the repo-wide scan — the
+/// template is scan scope, not an island with its own private grammar.
+#[test]
+fn negative_meta_ci_workflow_drift_fails_the_workflow_pin() {
+    let template = repo_file(CI_WORKFLOW_FILE);
+    // Sanity for the live state: the committed template passes both legs.
+    check_ci_workflow_test_commands(&template);
+    check_no_hazardous_selectors(CI_WORKFLOW_FILE, &template);
+
+    // The documented all-targets form demoted back to the bare invocation
+    // the template carried before the pin existed.
+    assert_drift(
+        || {
+            check_ci_workflow_test_commands(&replaced_once(
+                &template,
+                "cargo test --tests --verbose",
+                "cargo test --verbose",
+            ))
+        },
+        &["documented all-targets form", ALL_TARGETS_COMMAND],
+    );
+
+    // The all-targets selector demoted to a single named target: the
+    // sanctioned one-target spelling, but not the documented all-targets
+    // form — CI quietly stopping at one suite is the silent gap the
+    // presence leg exists to close, so the grammar's sanctioned negative
+    // space must not satisfy it.
+    assert_drift(
+        || {
+            check_ci_workflow_test_commands(&replaced_once(
+                &template,
+                "cargo test --tests --verbose",
+                "cargo test --test docs_build_commands --verbose",
+            ))
+        },
+        &["documented all-targets form"],
+    );
+
+    // A wildcard selector planted into the executing suite command.
+    let planted = replaced_once(
+        &template,
+        "cargo test --tests --verbose",
+        "cargo test --test '*' --verbose",
+    );
+    assert_drift(
+        || check_ci_workflow_test_commands(&planted),
+        &[CI_WORKFLOW_FILE, "wildcard `--test` selector"],
+    );
+    assert_drift(
+        || check_no_hazardous_selectors(CI_WORKFLOW_FILE, &planted),
+        &[CI_WORKFLOW_FILE, "wildcard `--test` selector"],
+    );
+
+    // The invocation commented out: the line still spells the sanctioned
+    // form, but a `#`-prefixed line does not execute and satisfies nothing
+    // — counting it would let a commented-out test step pass the pin.
+    assert_drift(
+        || {
+            check_ci_workflow_test_commands(&replaced_once(
+                &template,
+                "cargo test --tests --verbose",
+                "# cargo test --tests --verbose",
+            ))
+        },
+        &["documented all-targets form"],
+    );
+
+    // A template with no cargo test invocation at all, and one whose only
+    // invocation-shaped line is a comment.
+    assert_drift(
+        || check_ci_workflow_test_commands("set -ex\ncargo build --release\n"),
+        &["must invoke `cargo test`"],
+    );
+    assert_drift(
+        || check_ci_workflow_test_commands("# cargo test --tests --verbose\n"),
+        &["must invoke `cargo test`"],
     );
 }
 
