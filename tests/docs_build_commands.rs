@@ -25,10 +25,13 @@
 //!
 //! - **§"Build commands" presence** — the bolded prohibition sentence,
 //!   the `cargo test --tests` alternative it prescribes in the same
-//!   breath, the named single-target selector guidance, and the exact
-//!   all-targets line in the section's command fence; and the fence
-//!   itself may never prescribe a wildcard selector — the fence is the
-//!   copy-paste surface.
+//!   breath, the named single-target selector guidance, the exact
+//!   all-targets line in the section's command fence, and the exact
+//!   doctest line beside it (`--tests` skips doctests, so a fence that
+//!   stops at the all-targets line documents a verification workflow
+//!   that never runs the doc examples — claudepr-adaad914); and the
+//!   fence itself may never prescribe a wildcard selector — the fence
+//!   is the copy-paste surface.
 //! - **Repo-wide reintroduction scan** — every file of AGENTS.md,
 //!   README.md, `docs/`, `scripts/`, and the vendored CI
 //!   `claude-print-ci-workflowtemplate.yml` is parsed with a selector
@@ -44,7 +47,11 @@
 //!   merely get copied but *executes*, so it carries its own pin on top
 //!   of the scan: its suite invocation must use the documented
 //!   `cargo test --tests` form, and a commented-out invocation satisfies
-//!   nothing (a `#`-prefixed line does not run).
+//!   nothing (a `#`-prefixed line does not run). Because `--tests`
+//!   skips doctests, the invocation set must also carry an uncommented
+//!   `--doc` leg (claudepr-adaad914) — otherwise CI could drop the
+//!   doctest run and stay green, the silent omission a presence pin is
+//!   for.
 //!
 //! The guard's own failure behavior is pinned the same way as
 //! `tests/docs_build_layout.rs` (claudepr-4d967120): always-on negative
@@ -82,6 +89,13 @@ const NAMED_SELECTOR_GUIDANCE: &str = "`cargo test --test <name>`";
 /// The runnable all-targets form the section's command fence must carry.
 const ALL_TARGETS_COMMAND: &str = "cargo test --tests";
 
+/// The doctest form the section's command fence must carry beside it.
+/// `--tests` selects unit + integration targets and skips doctests
+/// entirely, so a fence that stops at [`ALL_TARGETS_COMMAND`] documents a
+/// verification workflow that never runs the doc examples — the same
+/// two-leg split the CI template executes (claudepr-adaad914).
+const DOC_TEST_COMMAND: &str = "cargo test --doc";
+
 /// Glob metacharacters that make a `--test` selector fragile: each crosses
 /// the fleet's TEST_ARGS flatten as a literal and glob-expands in the
 /// unquoted re-expansion. A named selector carries none, which is exactly
@@ -100,6 +114,13 @@ const CI_WORKFLOW_FILE: &str = "claude-print-ci-workflowtemplate.yml";
 /// carry — the same `--tests` the AGENTS.md §"Build commands" fence
 /// prescribes for every test target.
 const ALL_TARGETS_SELECTOR: &str = "--tests";
+
+/// The doctest selector token the CI template's invocation set must carry
+/// on an uncommented `cargo test` line — the executing half of the same
+/// split [`DOC_TEST_COMMAND`] documents. Without this pin the `--doc` leg
+/// could disappear from CI and nothing would fail: `--tests` stays green
+/// precisely because it never ran doctests (claudepr-adaad914).
+const DOC_TEST_SELECTOR: &str = "--doc";
 
 /// The repo-wide scan scope: AGENTS.md itself (whose single sanctioned
 /// occurrence is the prohibition sentence) plus the operational surfaces
@@ -334,6 +355,13 @@ fn check_build_commands_section(section: &str) {
          it is the runnable form of the all-targets prescription; the prose alternative \
          alone is not a command a reader can copy"
     );
+    assert!(
+        fence.iter().any(|l| l.trim() == DOC_TEST_COMMAND),
+        "the section's command fence must carry the exact `{DOC_TEST_COMMAND}` line — \
+         `{ALL_TARGETS_COMMAND}` skips doctests, so a fence that stops there documents \
+         a verification workflow that never runs the doc examples; the doctest leg is \
+         part of the documented workflow, not an optional extra (claudepr-adaad914)"
+    );
     for line in &fence {
         if let Some(selector) = hazardous_selector(line) {
             panic!(
@@ -410,7 +438,11 @@ fn invokes_cargo_test(line: &str) -> bool {
 ///    the CI's own drift;
 /// 3. at least one invocation must carry the documented all-targets
 ///    selector `--tests` — the same sanctioned spelling the AGENTS.md
-///    fence prescribes, modeled by the one surface that runs it.
+///    fence prescribes, modeled by the one surface that runs it;
+/// 4. the invocation set must also carry the doctest selector `--doc` on
+///    an uncommented line — `--tests` skips doctests, so a template that
+///    runs only the all-targets leg stays green while never running the
+///    doc examples (claudepr-adaad914).
 fn check_ci_workflow_test_commands(content: &str) {
     let invocations: Vec<&str> = content
         .lines()
@@ -442,6 +474,17 @@ fn check_ci_workflow_test_commands(content: &str) {
          copy-paste surface that executes, and AGENTS.md §\"Build commands\" names \
          `{ALL_TARGETS_COMMAND}` as the sanctioned all-targets spelling; drifting \
          the CI command off it re-opens the exact gap this guard exists to close"
+    );
+    assert!(
+        invocations
+            .iter()
+            .any(|line| line.split_whitespace().any(|t| t == DOC_TEST_SELECTOR)),
+        "the CI invocation set in {CI_WORKFLOW_FILE} must include a `{DOC_TEST_COMMAND}` \
+         leg beside `{ALL_TARGETS_COMMAND}` (claudepr-adaad914) — `--tests` skips \
+         doctests, so a template that runs only the all-targets leg stays green while \
+         the doc examples silently stop running, which is exactly the omission this \
+         presence pin exists to make impossible; a commented-out `--doc` line does \
+         not execute and satisfies nothing"
     );
 }
 
@@ -614,6 +657,19 @@ fn negative_meta_stripped_contract_fragments_fail_the_section_pin() {
         },
         &["command fence"],
     );
+    // The doctest line demoted to a fence comment: the documented workflow
+    // stops at `--tests` and never runs the doctests `--tests` skips —
+    // verification omitting doctests is the drift this leg exists to catch.
+    assert_drift(
+        || {
+            check_build_commands_section(&replaced_once(
+                &section,
+                "\ncargo test --doc\n",
+                "\n# cargo test --doc\n",
+            ))
+        },
+        &["command fence", "cargo test --doc"],
+    );
     // A hazardous line planted in the fence on a different command line
     // (the sanctioned all-targets line stays, so the presence check above
     // does not fire first) — the copy-paste surface itself goes hazardous.
@@ -733,6 +789,35 @@ fn negative_meta_ci_workflow_drift_fails_the_workflow_pin() {
     assert_drift(
         || check_no_hazardous_selectors(CI_WORKFLOW_FILE, &planted),
         &[CI_WORKFLOW_FILE, "wildcard `--test` selector"],
+    );
+
+    // The doctest leg demoted to a bare invocation: `--tests` still runs,
+    // so the all-targets pin holds, yet doctests silently stop executing in
+    // CI — the all-targets leg stays green precisely because it never ran
+    // them, which is the omission the `--doc` presence leg exists to catch.
+    assert_drift(
+        || {
+            check_ci_workflow_test_commands(&replaced_once(
+                &template,
+                "cargo test --doc --verbose",
+                "cargo test --verbose",
+            ))
+        },
+        &["`cargo test --doc` leg"],
+    );
+
+    // The doctest leg commented out: the line still spells the sanctioned
+    // form, but a `#`-prefixed line does not execute and satisfies nothing
+    // — counting it would let CI "keep" doctests it no longer runs.
+    assert_drift(
+        || {
+            check_ci_workflow_test_commands(&replaced_once(
+                &template,
+                "cargo test --doc --verbose",
+                "# cargo test --doc --verbose",
+            ))
+        },
+        &["`cargo test --doc` leg"],
     );
 
     // The invocation commented out: the line still spells the sanctioned

@@ -142,8 +142,12 @@ spec:
             # the all-targets spelling the selector guard requires: nothing
             # to quote, identically valid under stock and wrapped cargo.
             # --tests skips doctests, so the doc example keeps compiling
-            # via --doc. tests/docs_build_commands.rs (claudepr-76a5274c)
-            # pins this invocation — change the two together.
+            # via --doc — the second leg below, and the same two-leg split
+            # AGENTS.md §"Build commands" documents. tests/docs_build_commands.rs
+            # (claudepr-76a5274c) pins this invocation — change the two
+            # together. The --doc leg is pinned too (claudepr-adaad914):
+            # dropping it, or commenting it out, fails the guard, so
+            # doctests cannot silently stop running.
             echo "Running test suite..."
             cargo test --tests --verbose
             cargo test --doc --verbose
