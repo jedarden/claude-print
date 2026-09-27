@@ -9,6 +9,21 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Documentation link-integrity guard.** `tests/docs_link_integrity.rs`
+  (bead claudepr-a7754a8e) resolves every local cross-reference the
+  documentation corpus makes: every markdown link in README.md, AGENTS.md,
+  and every note under `docs/` — inline and reference definitions, external
+  URLs excluded — must point at a real file through the linking document's
+  relative join, every `#fragment` must match a forge-style heading slug of
+  its target (punctuation dropped, underscores kept, duplicate headings
+  disambiguated), and every `scripts/` / `tests/fixtures/` path citation in
+  code spans and fenced command blocks must exist, brace alternatives
+  expanded and version placeholders (`vX.Y.Z` basenames) skipped. Renamed or
+  removed scripts, fixtures, notes, and headings now fail CI instead of
+  leaving 404s and dead citations; the guard caught and fixed a
+  wrong-depth `../src/util.rs` link in `docs/notes/config-file-contract.md`
+  on landing.
+
 - **Hardcoded-target-path guard.** `tests/target_path_guard.rs` (bead
   claudepr-7a9e7130) enforces AGENTS.md §"Where the build output lands"'s
   locator discipline standing across every surface that resolves build

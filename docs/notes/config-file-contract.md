@@ -57,7 +57,7 @@ The path is resolved in this order — the first rule that matches wins:
    `claude-print/config.toml`. A value that is not valid UTF-8 fails the
    `var()` read and falls through to rule 3.
 3. `$HOME/.config/claude-print/config.toml` — otherwise, via
-   [`get_home`](../src/util.rs)'s strict policy: `HOME` must be set, non-empty,
+   [`get_home`](../../src/util.rs)'s strict policy: `HOME` must be set, non-empty,
    an existing directory, and writable (proven by a create-write-remove probe).
    When it is not, path resolution itself fails with the `HOME` error — never a
    `/root`, passwd, or cwd fallback.
