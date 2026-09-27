@@ -6,9 +6,93 @@ use claude_print::poller::parse_stop_payload;
 use claude_print::startup::{StartupAction, StartupPhase, StartupSeq};
 use claude_print::transcript::parse_transcript;
 use std::io::Write as IoWrite;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// Repo-root probes: a directory holding both is a claude-print checkout.
+const ROOT_PROBES: [&str; 2] = ["AGENTS.md", "Cargo.toml"];
+
+/// Where repo-relative files are read from, resolved at *runtime* — never
+/// the bare compile-time `env!("CARGO_MANIFEST_DIR")`, which bakes the
+/// building checkout's path into the test binary. The local cargo wrapper
+/// maps `.git`-less `git archive` extractions onto one shared target dir,
+/// so an extraction of unchanged content instant-reuses a cached test
+/// binary compiled in an extraction that has since been deleted; a
+/// baked-only root then fails every later run of that binary with
+/// file-NotFound panics that have nothing to do with drift (bead
+/// claudepr-270570be; the same chain as `tests/install_sh.rs`). Candidates, most
+/// authoritative first, each probe-verified before use:
+///
+/// 1. `$CLAUDE_PRINT_TEST_REPO` — explicit override for direct binary runs;
+///    when set it is authoritative and must itself be a checkout.
+/// 2. the runtime `CARGO_MANIFEST_DIR` cargo sets in the test process to
+///    the package under test — the live extraction even in a cache-reused
+///    binary.
+/// 3. the compile-time `CARGO_MANIFEST_DIR` — last resort for running the
+///    test binary directly, where cargo sets neither variable.
+///
+/// If no candidate survives its probe the panic names every candidate it
+/// rejected — loud, never a vacuous pass off a wrong tree.
+fn repo_path(relative: &str) -> PathBuf {
+    resolve_repo_root(
+        std::env::var("CLAUDE_PRINT_TEST_REPO").ok().as_deref(),
+        std::env::var("CARGO_MANIFEST_DIR").ok().as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+    .unwrap_or_else(|e| panic!("locating the repo root to read {relative} from: {e}"))
+    .join(relative)
+}
+
+/// [`repo_path`]'s candidate chain as a pure function, so the precedence
+/// and the loud failure are testable without racing the process-wide
+/// environment from parallel tests (the same shape as
+/// `tests/install_sh.rs`).
+fn resolve_repo_root(
+    env_override: Option<&str>,
+    runtime_manifest: Option<&str>,
+    baked_manifest: &str,
+) -> Result<PathBuf, String> {
+    if let Some(override_root) = env_override {
+        if is_repo_root(Path::new(override_root)) {
+            return Ok(PathBuf::from(override_root));
+        }
+        return Err(format!(
+            "$CLAUDE_PRINT_TEST_REPO={override_root:?} is set but not a claude-print \
+             checkout (probe: {:?} + {:?}) — an explicit override is authoritative and \
+             is never silently skipped for another candidate",
+            ROOT_PROBES[0], ROOT_PROBES[1]
+        ));
+    }
+    // Runtime value first, baked value only as fallback; one chain so the
+    // failure names everything that was tried.
+    let mut chain: Vec<(&str, &str)> = vec![("compile-time", baked_manifest)];
+    if let Some(runtime) = runtime_manifest {
+        if runtime != baked_manifest {
+            chain.insert(0, ("runtime", runtime));
+        }
+    }
+    let mut rejected = Vec::new();
+    for (origin, candidate) in chain {
+        let path = Path::new(candidate);
+        if is_repo_root(path) {
+            return Ok(path.to_path_buf());
+        }
+        rejected.push(format!("{origin} CARGO_MANIFEST_DIR={}", path.display()));
+    }
+    Err(format!(
+        "no candidate repo root is a claude-print checkout (probe: {:?} + {:?}): {} — \
+         run via `cargo test` from a checkout, or set $CLAUDE_PRINT_TEST_REPO to one",
+        ROOT_PROBES[0],
+        ROOT_PROBES[1],
+        rejected.join("; ")
+    ))
+}
+
+/// Whether `p` holds this suite's root probes.
+fn is_repo_root(p: &Path) -> bool {
+    ROOT_PROBES.iter().all(|f| p.join(f).is_file())
+}
 
 // ── Claude version format tracking ───────────────────────────────────────────
 
@@ -41,7 +125,7 @@ fn test_claude_version_recorded() {
     );
     // Write to CI artifact for diff-based regression tracking.  Failure is
     // non-fatal (e.g., read-only filesystem) — the assertion above is the real gate.
-    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    let artifact_dir = repo_path("target");
     let _ = std::fs::create_dir_all(&artifact_dir);
     let _ = std::fs::write(
         artifact_dir.join("last-claude-version.txt"),
@@ -246,8 +330,7 @@ fn startup_10_non_dialog_lines_do_not_trigger() {
 
 /// The screen-scraped claude 2.1.263 caret-on-refuse startup render.
 fn fixture_v2_1_263_capture() -> Vec<u8> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/startup_trust_dialog_v2.1.263.txt");
+    let path = repo_path("tests/fixtures/startup_trust_dialog_v2.1.263.txt");
     std::fs::read(&path).expect("fixture startup_trust_dialog_v2.1.263.txt must exist")
 }
 
@@ -399,8 +482,7 @@ fn startup_unidentifiable_dialog_refuses_rather_than_guessing() {
 
 #[test]
 fn token_regression_fixture_v2_1_168() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.168.jsonl");
+    let path = repo_path("tests/fixtures/transcript_v2.1.168.jsonl");
     let r = parse_transcript(&path).expect("parse fixture failed");
     // Turn 1: msg-001 — in=6178, out=295, cache_create=825, cache_read=26442
     // Turn 2: msg-002 × 3 streaming chunks — in=100, out=50, cache_create=0, cache_read=5000
@@ -429,8 +511,7 @@ fn token_regression_fixture_v2_1_168() {
 
 #[test]
 fn fixture_unknown_usage_fields_ignored() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.168.jsonl");
+    let path = repo_path("tests/fixtures/transcript_v2.1.168.jsonl");
     // The fixture contains `server_tool_use`, `service_tier`, `cache_creation`,
     // `inference_geo`, `speed` in the usage object — all should be silently ignored.
     let r = parse_transcript(&path).expect("parse fixture must succeed");
@@ -444,8 +525,7 @@ fn fixture_unknown_usage_fields_ignored() {
 
 #[test]
 fn token_regression_fixture_v2_1_233() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.233.jsonl");
+    let path = repo_path("tests/fixtures/transcript_v2.1.233.jsonl");
     let r = parse_transcript(&path).expect("parse fixture failed");
     // Turn 1: msg-101 — in=5200, out=245, cache_create=650, cache_read=21000
     // Turn 2: msg-102 × 2 streaming chunks — in=150, out=80 (first chunk), cache_create=0, cache_read=6000
@@ -475,13 +555,97 @@ fn token_regression_fixture_v2_1_233() {
 
 #[test]
 fn fixture_v233_unknown_usage_fields_ignored() {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/transcript_v2.1.233.jsonl");
+    let path = repo_path("tests/fixtures/transcript_v2.1.233.jsonl");
     // The fixture contains `server_tool_use`, `service_tier`, `cache_creation`,
     // `inference_geo`, `speed` in the usage object — all should be silently ignored.
     let r = parse_transcript(&path).expect("parse fixture must succeed");
     assert!(
         r.num_turns > 0,
         "must parse at least one turn despite unknown usage fields"
+    );
+}
+
+// The repo-root resolution itself: pinned so a future edit can't quietly
+// reintroduce a baked-only root — the failure mode the candidate chain
+// exists for (a close gate re-running this suite in a fresh extraction of
+// unchanged content instant-reuses the cached binary, and a baked-only
+// root fails every filesystem test there with FileNotFound, which reads
+// as drift but is cache state; bead claudepr-270570be).
+
+#[test]
+fn repo_root_resolution_follows_the_candidate_chain() {
+    // The live checkout the suite is running in — the same chain the
+    // suite's repo-root resolution uses, minus the override.
+    let live = resolve_repo_root(
+        None,
+        std::env::var("CARGO_MANIFEST_DIR").ok().as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+    .expect("the running suite has a usable repo root");
+    let live_str = live.display().to_string();
+    // A second, minimal checkout: resolution only stats the probe files, so
+    // empty ones are enough to make it a valid candidate.
+    let other = tempfile::tempdir().expect("tempdir for a second repo root");
+    for probe in ROOT_PROBES {
+        std::fs::write(other.path().join(probe), "").expect("writing root probe file");
+    }
+    let other_str = other.path().display().to_string();
+
+    // 1. the override outranks the runtime manifest when both are checkouts
+    assert_eq!(
+        resolve_repo_root(Some(&other_str), Some(&live_str), &live_str),
+        Ok(other.path().to_path_buf())
+    );
+    // 2. the runtime manifest outranks the baked value — the cache-reuse
+    //    case: a dead baked path loses to the live extraction
+    assert_eq!(
+        resolve_repo_root(None, Some(&other_str), &live_str),
+        Ok(other.path().to_path_buf())
+    );
+    // 3. the baked value is the fallback (direct binary runs: cargo sets
+    //    no runtime manifest)
+    assert_eq!(
+        resolve_repo_root(None, None, &other_str),
+        Ok(other.path().to_path_buf())
+    );
+}
+
+#[test]
+fn repo_root_resolution_fails_loudly_naming_every_candidate() {
+    // An existing directory without the probe files — the shape a deleted
+    // extraction's path, or a typo'd path, has.
+    let not_a_checkout = tempfile::tempdir().expect("tempdir that is not a checkout");
+    let bogus = not_a_checkout.path().display().to_string();
+    let err = resolve_repo_root(None, Some(&bogus), &bogus).unwrap_err();
+    assert!(
+        err.contains(&bogus),
+        "the failure must name the rejected candidate: {err}"
+    );
+    assert!(
+        err.contains("CLAUDE_PRINT_TEST_REPO"),
+        "the failure must name the escape hatch: {err}"
+    );
+    assert!(
+        err.contains(ROOT_PROBES[0]) && err.contains(ROOT_PROBES[1]),
+        "the failure must name the probe files so the gap is actionable: {err}"
+    );
+}
+
+#[test]
+fn a_set_repo_root_override_is_authoritative() {
+    let live = resolve_repo_root(
+        None,
+        std::env::var("CARGO_MANIFEST_DIR").ok().as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+    .expect("the running suite has a usable repo root");
+    let live_str = live.display().to_string();
+    let not_a_checkout = tempfile::tempdir().expect("tempdir that is not a checkout");
+    let bogus = not_a_checkout.path().display().to_string();
+    let err = resolve_repo_root(Some(&bogus), Some(&live_str), &live_str).unwrap_err();
+    assert!(
+        err.contains("$CLAUDE_PRINT_TEST_REPO") && err.contains(&bogus),
+        "a set-but-wrong override must fail naming itself, not fall through to \
+         another tree: {err}"
     );
 }
