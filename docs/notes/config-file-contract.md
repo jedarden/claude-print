@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Contract version** | v1 |
-| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json`; the README's Configuration-section summary (key table, shipped defaults, path precedence) by the same test (bead claudepr-746dd1c4), and the engineering analysis `docs/config-error-analysis.md`'s contract-bearing excerpts (quoted examples, path precedence and XDG edges, resolution limitation) likewise (bead claudepr-09637c58); the Claude-state/`CLAUDE_CONFIG_DIR` section and its README counterpart by `tests/claude_config_dir_docs_contract.rs` (bead claudepr-e46458c4); the `--mcp-config` boundary section by the mock-child argv recordings in `tests/binary_e2e.rs` and `tests/pool_socket_e2e.rs` (bead claudepr-af36fc41) |
+| **Pinned by** | `tests/config_contract.rs` against `tests/fixtures/config_contract_examples_v1.json`; the README's Configuration-section summary (key table, shipped defaults, path precedence) by the same test (bead claudepr-746dd1c4), and the engineering analysis `docs/config-error-analysis.md`'s contract-bearing excerpts (quoted examples, path precedence and XDG edges, resolution limitation) likewise (bead claudepr-09637c58); the Claude-state/`CLAUDE_CONFIG_DIR` section and its README counterpart by `tests/claude_config_dir_docs_contract.rs` (bead claudepr-e46458c4); the `--mcp-config` boundary section by the mock-child argv recordings in `tests/binary_e2e.rs` and `tests/pool_socket_e2e.rs` (bead claudepr-af36fc41); the strictly read-only load (§"Scope" below: a prompt run neither creates nor rewrites the file, on any of the three path rules) by `tests/config_readonly_e2e.rs` (bead claudepr-39d4178e) |
 | **Implementation** | `src/config.rs` (`Config::default_path`, `Config::load_or_default`, the `resolve_*` tiering, `Defaults::validate`), path selection wired by `src/main.rs`, `HOME` policy by `src/util.rs::get_home`, user-facing message shaping by `src/error.rs` (`From<Error> for ClaudePrintError`) and `src/emitter.rs` (`emit_error`) |
 | **Provenance** | bead claudepr-227efdb1 (2026-09-25) |
 
@@ -24,7 +24,15 @@ file is read only by normal prompt runs; `--help`, `--version`, `--check`,
 and `serve` never load it (`main.rs` dispatches `--version`, `--check`, and
 `serve` before the config step, and `--help` is answered by clap inside
 `Cli::parse()`, before `main()`'s body runs at all). `claude-print` never
-creates, writes, or scaffolds the file — you own it entirely. Nothing else
+creates, writes, or scaffolds the file — you own it entirely. The read-only
+half of that claim is pinned behaviorally by `tests/config_readonly_e2e.rs`
+(bead claudepr-39d4178e): full mock-claude prompt runs against all three
+path rules below leave a missing path missing — no `config.toml`, no
+`claude-print/` directory, no `$HOME/.config` scaffold, no parent directory
+created for an explicit `--config` — and leave a hand-written config
+byte-identical (contents, mode, mtime, and inode unchanged), with each
+preservation run's recorded child argv proving the file was genuinely
+loaded and applied. Nothing else
 is configurable through this file: relay-hook internals, watchdog budgets
 other than `timeout_secs`, output formats, and pool behavior are CLI-only.
 
@@ -280,7 +288,10 @@ defaults. `Config::load_or_default` returns `Config::default()` when opening
 the path fails with `NotFound`. This holds for the discovered default path
 *and* for an explicit `--config <FILE>` that does not exist, since `main.rs`
 routes both through the same call. Only a file that exists but cannot be read,
-parsed, or validated is fatal.
+parsed, or validated is fatal. Either way the run leaves the path exactly as
+it found it: a missing config stays missing after a successful prompt run —
+nothing is created or scaffolded at the discovered or explicit path, parent
+directories included (`tests/config_readonly_e2e.rs`, bead claudepr-39d4178e).
 
 ## Validation
 
