@@ -663,6 +663,68 @@ fn install_fails_closed_when_an_asset_has_no_checksum_entry() {
 }
 
 #[test]
+fn a_failed_verification_leaves_no_scratch_files_behind() {
+    // The cleanup half of the fail-closed contract (install.sh's scratch-file
+    // comment): the three mktemp scratch files exist for the whole download +
+    // verification window, and the EXIT trap "removes them on every exit
+    // path, including a verification failure". Pinned on the tampered-
+    // artifact abort with TMPDIR pointed at a fresh directory — a trap that
+    // stopped firing would leave download debris in the installing user's
+    // temp space on exactly the runs this suite is about. The pin is wired
+    // non-vacuously: the control below proves the host's mktemp places its
+    // file inside TMPDIR, so an empty directory after the run can only mean
+    // the trap removed what mktemp created there — an mktemp that ignored
+    // TMPDIR fails the control loudly instead of letting this pin pass on a
+    // directory nothing ever touched.
+    let scratch = tempfile::tempdir().unwrap();
+    let control = Command::new("mktemp")
+        .env("TMPDIR", scratch.path())
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "the mktemp TMPDIR control failed: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    let control_path = PathBuf::from(String::from_utf8_lossy(&control.stdout).trim());
+    assert!(
+        control_path.starts_with(scratch.path()),
+        "mktemp must honor TMPDIR for the empty-scratch assert below to be \
+         meaningful (created {control_path:?})"
+    );
+    fs::remove_file(&control_path).unwrap();
+
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    fs::write(release.path().join(BINARY_ASSET), probing_binary_body()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
+
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[
+            ("EXECUTION_PROBE", execution_probe.to_str().unwrap()),
+            ("TMPDIR", scratch.path().to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "the tampered artifact must abort the install"
+    );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
+    );
+    assert!(
+        fs::read_dir(scratch.path()).unwrap().next().is_none(),
+        "the EXIT trap must remove the mktemp scratch files on a \
+         verification failure — debris left in {:?}",
+        scratch.path()
+    );
+}
+
+#[test]
 fn install_fails_closed_on_a_tampered_mock_claude() {
     let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
     fs::write(release.path().join(MOCK_ASSET), "#!/bin/sh\ntampered\n").unwrap();
