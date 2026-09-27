@@ -1331,13 +1331,13 @@ fn negative_meta_drifted_target_dir_snippet_fails_the_derivation_check() {
         "jq -r .target_directory",
     );
     assert_drift(
-        || check_target_dir_snippet(&section(&jq_returned, OUTPUT_LANDS_HEADING)),
+        || check_target_dir_snippet(section(&jq_returned, OUTPUT_LANDS_HEADING)),
         &["jq -r", "spells the target-dir lookup with"],
     );
 
     let key_lost = replaced_once(&doc, "target_directory", "root_directory");
     assert_drift(
-        || check_target_dir_snippet(&section(&key_lost, OUTPUT_LANDS_HEADING)),
+        || check_target_dir_snippet(section(&key_lost, OUTPUT_LANDS_HEADING)),
         &["lost the target-dir derivation", "sed -n"],
     );
 }
