@@ -1560,10 +1560,14 @@ fn pretrust_cwd() -> Result<()> {
 /// other tests on a process-global env var.
 ///
 /// Sets `projects[cwd_abs].hasTrustDialogAccepted = true` in the JSON object at
-/// `claude_json`, creating the file if absent. Safety: if the file exists but is
-/// not a valid JSON object, it is left **untouched** (the trust scanner remains
-/// the fallback) — clobbering the user's config would be far worse than a
-/// possible stall.
+/// `claude_json`, creating the file if absent. Safety: if the file exists but
+/// cannot be read as a JSON object — unparseable, a non-object root, or any
+/// read error other than plain absence (permission, a directory at the path) —
+/// it is left **untouched** (the trust scanner remains the fallback); clobbering
+/// the user's config would be far worse than a possible stall. Only a genuine
+/// `NotFound` reads as fresh. A parseable file whose `projects` map or the cwd's
+/// own entry has a conflicting (non-object) shape is a hard error: proceeding
+/// would silently reintroduce the stall this pre-grant exists to prevent.
 fn pretrust_cwd_at(claude_json: &Path, cwd_abs: &str) -> Result<()> {
     // Read existing content + mode. On a parse error of an *existing* file, do
     // NOT rewrite — clobbering the user's config is worse than a possible stall.
@@ -1589,7 +1593,18 @@ fn pretrust_cwd_at(claude_json: &Path, cwd_abs: &str) -> Result<()> {
                 }
             }
         }
-        Err(_) => (serde_json::json!({}), None),
+        // Absence is the one case that reads as fresh: nothing can be clobbered.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (serde_json::json!({}), None),
+        // Any other read failure is NOT absence — treating it as such would
+        // rename a fresh file over config we never saw (rename(2) needs only
+        // directory write permission, so the target's own mode would not save
+        // it). Soft-skip like the parse-error arms above.
+        Err(e) => {
+            eprintln!(
+                "claude-print: warning: ~/.claude.json is unreadable ({e}); leaving it untouched (trust scanner remains active)"
+            );
+            return Ok(());
+        }
     };
 
     // projects[cwd].hasTrustDialogAccepted = true
@@ -2378,6 +2393,58 @@ mod tests {
             std::fs::read(&json).unwrap(),
             original,
             "non-object root must be left untouched"
+        );
+    }
+
+    /// A read error that is NOT absence (here: permission denied) must take the
+    /// same soft path as a parse error — never a fresh-file rename over config
+    /// we never saw. Skipped under root, which reads through mode 000 and would
+    /// take the merge path instead.
+    #[test]
+    fn pretrust_leaves_permission_denied_file_untouched() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads through mode 000, the scenario cannot be built");
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        let original = br#"{"projects":{"/elsewhere":{"hasTrustDialogAccepted":true}}}"#;
+        std::fs::write(&json, original).unwrap();
+        std::fs::set_permissions(&json, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+
+        std::fs::set_permissions(&json, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::read(&json).unwrap(),
+            original,
+            "an unreadable ~/.claude.json must be left byte-for-byte untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no tmp file must remain after the run"
+        );
+    }
+
+    /// A directory at the path (EISDIR) is likewise not absence: no fresh-file
+    /// rename may be attempted over it, and nothing may be left behind.
+    #[test]
+    fn pretrust_leaves_a_directory_at_the_path_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join(".claude.json");
+        std::fs::create_dir(&json).unwrap();
+
+        pretrust_cwd_at(&json, "/abs/cwd").unwrap();
+
+        assert!(
+            json.is_dir(),
+            "the directory must be left exactly as it was found"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no tmp file must remain after the run"
         );
     }
 

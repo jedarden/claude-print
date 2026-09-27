@@ -132,6 +132,22 @@ fn main() {
     // disables it explicitly. (env_bool_default, not env_flag, so unset ⇒ on.)
     let mock_trust_dialog = env_bool_default("MOCK_TRUST_DIALOG", true);
     let mock_trust_wording = std::env::var("MOCK_TRUST_WORDING").unwrap_or_default();
+    // MOCK_TRUST_FROM_CLAUDE_JSON=1 (claudepr-bd36930d): model the child-side
+    // trust read. Real Claude Code renders the one-time trust dialog only when
+    // the working directory is not yet trusted, and it reads trust ONLY from
+    // ~/.claude.json (`projects[<resolved cwd>].hasTrustDialogAccepted == true`)
+    // — never from --settings, which is exactly why claude-print's
+    // --pretrust-cwd writes that file before spawning. With the knob set the
+    // mock honors the same file through a real JSON parse (see
+    // cwd_pretrusted_in_claude_json): a cwd marked trusted skips the dialog
+    // entirely — the run goes straight to the prompt wait, like a trusted real
+    // claude — and anything else still renders it. Unset leaves the legacy
+    // always-dialog behavior every pre-existing scenario relies on. Pair with
+    // MOCK_TRUST_WORDING=unresolvable for a non-vacuous A/B: an unresolvable
+    // dialog forces the driver's exit-2 refusal, so "no flag → exit 2,
+    // --pretrust-cwd → exit 0" proves the dialog was suppressed by the trust
+    // file and by nothing else.
+    let mock_trust_from_claude_json = env_flag("MOCK_TRUST_FROM_CLAUDE_JSON");
     let mock_unknown_probe = env_flag("MOCK_UNKNOWN_PROBE");
     let mock_response =
         std::env::var("MOCK_RESPONSE").unwrap_or_else(|_| "Hello from mock_claude".to_string());
@@ -254,9 +270,10 @@ fn main() {
         let fd = file.into_raw_fd();
         SIGINT_REPORT_FD.store(fd, Ordering::Relaxed);
         // SAFETY: signal(2) installs the trap above; nothing else runs first.
-        // Raw libc rather than nix: mock_claude is also a standalone workspace
-        // member whose only dependency is libc (its Cargo.toml), and CI builds
-        // it via `cargo build -p mock-claude`.
+        // Raw libc rather than nix: the trap needs only signal(2)/write(2), and
+        // mock_claude keeps its dependency surface at libc (plus serde_json for
+        // the MOCK_TRUST_FROM_CLAUDE_JSON trust read). CI builds it via
+        // `cargo build -p mock-claude`.
         unsafe {
             libc::signal(
                 libc::SIGINT,
@@ -301,7 +318,43 @@ fn main() {
     // whatever is highlighted picks "No, exit" and the child dies — loudly, with
     // exit 3, so any driver that regresses to a bare-CR dismissal fails the
     // whole binary e2e suite instead of passing.
-    if driven_by_claude_print && mock_trust_dialog && !mock_stop_before_inject {
+    //
+    // MOCK_TRUST_FROM_CLAUDE_JSON (see its parsing above): a cwd the trust file
+    // marks trusted suppresses the dialog exactly as a trusted real claude is
+    // suppressed — the pre-grant landed before spawn, so this gate is where the
+    // pretrust e2e proof is observed. The suppressed case emits the trusted
+    // welcome burst below (a silent trusted session would starve the driver's
+    // idle fallback), which is what keeps this branch an either/or.
+    let cwd_pretrusted = mock_trust_from_claude_json && cwd_pretrusted_in_claude_json();
+    if driven_by_claude_print && mock_trust_dialog && cwd_pretrusted && !mock_stop_before_inject {
+        // Trusted-startup welcome burst (claudepr-bd36930d): real claude in an
+        // already-trusted cwd renders no dialog but still paints its TUI
+        // welcome — several hundred bytes of output before it waits for the
+        // prompt. The driver's no-dialog idle fallback (src/startup.rs) needs
+        // IDLE_THRESHOLD_BYTES (200) of output followed by a quiet gap before
+        // it dismisses and injects the prompt; a totally silent trusted
+        // session would instead ride the 45 s hard timeout (<200 bytes) and
+        // die, which is exactly the wedge the first draft of this fixture
+        // hit. The burst is deliberately dialog-classification-safe: no line
+        // carries ≥2 trust keywords, no line starts with a standalone
+        // yes/no (classify() would read it as a dialog entry), no confirm
+        // footer, no caret — so the capture stays "no dialog on screen" and
+        // the idle fallback applies. NB: the cwd is echoed faithfully; a
+        // fixture path containing trust-dialog keywords would break that
+        // safety — keep test working directories boring.
+        let cwd = std::env::current_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        print!("✻ Welcome to Claude Code!\r\n\r\n");
+        print!("  mock-claude research preview · v1.0.0\r\n");
+        print!("  working dir: {cwd}\r\n");
+        print!("  model: mock-sonnet · subscription\r\n");
+        print!("\r\n");
+        print!("  Type a message or /help for a list of commands.\r\n");
+        print!("  /exit quits · ctrl+c interrupts the current turn.\r\n");
+        print!("  Tips: use /compact to summarize the conversation history.\r\n");
+        std::io::stdout().flush().ok();
+    } else if driven_by_claude_print && mock_trust_dialog && !mock_stop_before_inject {
         if mock_trust_wording == "unresolvable" {
             // claudepr-3032a5f7: entries that classify as neither trusting
             // nor refusing — the future-phrasing shape pinned at the state-
@@ -641,8 +694,7 @@ fn main() {
                     APPEND_ON_TERM_FD.store(file.into_raw_fd(), Ordering::Relaxed);
                     // SAFETY: signal(2) installs the handlers above; nothing else
                     // runs first. Raw libc rather than nix for the same reason as
-                    // the SIGINT trap: this workspace member's only dependency is
-                    // libc.
+                    // the SIGINT trap: the handler needs only signal(2)/write(2).
                     unsafe {
                         libc::signal(
                             libc::SIGTERM,
@@ -897,6 +949,38 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// The `MOCK_TRUST_FROM_CLAUDE_JSON` trust read: is this process's cwd marked
+/// trusted in `$HOME/.claude.json`? Mirrors the read real claude makes — trust
+/// comes only from that file (claude-print scrubs `CLAUDE_CONFIG_DIR`, so the
+/// child-side path is always `$HOME/.claude.json`), the key is the resolved cwd
+/// (the same `getcwd` view both processes share), and the flag must be exactly
+/// the boolean `true`. Absence, unparseable content, or any shape mismatch
+/// reads as untrusted: the dialog is the fallback — the same
+/// scanner-remains-the-fallback stance claude-print's own pretrust takes.
+fn cwd_pretrusted_in_claude_json() -> bool {
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return false;
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(home.join(".claude.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    value
+        .get("projects")
+        .and_then(|projects| projects.get(cwd.to_string_lossy().as_ref()))
+        .and_then(|entry| entry.get("hasTrustDialogAccepted"))
+        .and_then(|flag| flag.as_bool())
+        == Some(true)
 }
 
 /// Escape a string for safe embedding inside a JSON string literal.

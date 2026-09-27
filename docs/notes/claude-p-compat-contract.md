@@ -73,6 +73,12 @@ it is load-bearing. Forwarding `--timeout` to the child broke every invocation
 against claude 2.1.263 with `error: unknown option '--timeout'` before the
 prompt was injected (`tests/flag_compat.rs` exists because of it).
 
+`--pretrust-cwd` has a dedicated contract:
+`docs/notes/pretrust-cwd-contract.md` defines the trust-file schema it writes, the
+merge and idempotency semantics, the failure taxonomy, and the
+trusted/untrusted-directory e2e coverage that this table's one-line summary
+compresses.
+
 The `serve` subcommand is claude-print's own daemon entry point — real `claude`
 has nothing like it, so it is not part of the compatibility surface, but its
 flags are part of the parser and listed for completeness:

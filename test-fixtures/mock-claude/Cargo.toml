@@ -9,3 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+# For MOCK_TRUST_FROM_CLAUDE_JSON: the modeled child-side read of the trust
+# file claude-print's --pretrust-cwd writes. The real (independent) parser is
+# the point — a substring probe would let a wrong schema pass the A/B.
+serde_json = "1.0.140"

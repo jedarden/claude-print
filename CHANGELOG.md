@@ -9,6 +9,25 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **`--pretrust-cwd` trust pre-grant contract.**
+  `docs/notes/pretrust-cwd-contract.md` (bead claudepr-bd36930d) is the
+  normative definition behind the compat contract's one-line summary: the
+  exact `projects[<cwd>].hasTrustDialogAccepted: true` schema written to
+  `~/.claude.json`, the launch-path timing (after version resolution,
+  before child construction), the merge and byte-idempotency semantics,
+  the closed soft/hard failure taxonomy, the pooled-invocation
+  inapplicability, and the proof the flag never reaches the child argv.
+  `tests/pretrust_cwd_contract.rs` holds the document against the
+  implementation in both directions — source pins for the trigger/timing/
+  pool-exclusion claims, binary e2e for the schema, the merge, idempotency,
+  and every failure row in both error renderings, and the trusted/
+  untrusted A/B through mock-claude's new `MOCK_TRUST_FROM_CLAUDE_JSON`
+  trust read (the control run's unresolvable dialog exits 2; the flagged
+  run of the same directory exits 0). Pretrust read-failure handling was
+  tightened in the same pass: only genuine absence reads as fresh — any
+  other unreadable `~/.claude.json` (permission, a directory at the path)
+  takes the warn-and-proceed soft path instead of risking a fresh-file
+  rename over config that was never seen.
 - **Forgejo source-of-truth release-workflow verification.**
   `tests/release_provenance.rs` (bead claudepr-c7ca74a6) pins the
   direction invariants the doc pins leave open: no `.github/` CI surface
