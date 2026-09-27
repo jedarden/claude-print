@@ -68,6 +68,11 @@ spec:
             # and source of truth. The GitHub mirror is never a clone source;
             # the GitHub side hosts only the release artifacts published below.
             # Use --no-tags to avoid fetching all tags; fetch specific tag if needed
+            # Both clone arms authenticate through the URL-scoped credential
+            # helper in the env block below (FORGEJO_TOKEN — the same secret
+            # the tag push uses): Forgejo requires auth fleet-wide, so an
+            # anonymous clone fails exit 128 (claude-print-ci-ltlxs,
+            # 2026-09-27) before the contract gate could ever run.
             if [ -n "$TAG" ]; then
               echo "Release mode: building from tag $TAG"
               git clone --depth 1 --branch "$TAG" --single-branch \
@@ -283,10 +288,23 @@ spec:
             echo "Release v${VERSION} created successfully"
         env:
           - name: GIT_CONFIG_COUNT
-            value: "1"
+            value: "2"
+          # Forgejo helper FIRST: git consults credential helpers in config
+          # order and stops at the first complete answer, so the URL-scoped
+          # Forgejo entry must precede the generic GitHub one — otherwise
+          # every git.ardenone.com request would be answered with GH_TOKEN.
+          # The token reaches git through the helper's own pipe, never argv
+          # and never a set -x trace (bead claudepr-b3ac3625: the anonymous
+          # clone died exit 128 in claude-print-ci-ltlxs before the gate
+          # could run — Forgejo requires auth fleet-wide, so the clone rides
+          # the same FORGEJO_TOKEN the tag push below already uses).
           - name: GIT_CONFIG_KEY_0
-            value: credential.helper
+            value: credential.https://git.ardenone.com.helper
           - name: GIT_CONFIG_VALUE_0
+            value: '!f() { test "$1" = get && echo "username=x-token" && echo "password=$FORGEJO_TOKEN"; }; f'
+          - name: GIT_CONFIG_KEY_1
+            value: credential.helper
+          - name: GIT_CONFIG_VALUE_1
             value: '!f() { test "$1" = get && echo "username=x-access-token" && echo "password=$GH_TOKEN"; }; f'
           - name: GH_TOKEN
             valueFrom:
