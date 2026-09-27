@@ -1,3 +1,11 @@
+# Push trigger for the claude-print-ci gate workflow (bead claudepr-b3ac3625).
+# Submits the claude-print-ci WorkflowTemplate — whose FIRST quality gate is
+# scripts/contract-maintenance-gate.sh — on every push to main, so drift
+# detection (docs/notes/claude-contract-probes.md §Maintenance, R-2) cannot
+# silently detach from CI. Two siblings make this wire complete: the stanza
+# below must stay applied under the github-webhooks EventSource
+# (claude-print-eventsource-stanza.yml), and the GitHub mirror repo must
+# carry a push webhook pointing at https://webhooks-ci.ardenone.com/claude-print.
 apiVersion: argoproj.io/v1alpha1
 kind: Sensor
 metadata:
@@ -36,3 +44,51 @@ spec:
                 workflowTemplateRef:
                   name: claude-print-ci
       conditions: claude-print-push
+      # One build at a time per repo, like the closest siblings (sigil-ci):
+      # the template's own mutex already queues repeats, this keeps the
+      # queue itself from piling up on repeated pushes.
+      policy:
+        numParallelConcurrent: 1
+        concurrencyPolicy: Forbid
+  template:
+    # argo-events v1.9.10 Template has NO `spec` field: only metadata,
+    # serviceAccountName, container, volumes, securityContext, nodeSelector,
+    # tolerations, imagePullSecrets, priorityClassName, priority, affinity.
+    # Resources MUST go here, on template.container. Any `template.spec.
+    # containers[]` block below is stored by the CRD's
+    # x-kubernetes-preserve-unknown-fields and then ignored by the controller.
+    # Bursty webhook listener: request covers steady state, limit clears the
+    # burst — the same sizing the fleet's github-push sensors carry
+    # (b2-usage-exporter-sensor, sigil-ci-sensor).
+    container:
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+    spec:
+      containers:
+        - name: main
+          # /healthz checks actual NATS/JetStream connection health, not just
+          # HTTP server health. NOTE (verified live 2026-08-21 on
+          # agentscribe-ci-sensor): the v1.9.10 controller silently drops
+          # these probes from the pod it creates — kept only so a future
+          # argo-events that honors them gets sensible values.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 7777
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 2
+            failureThreshold: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 7777
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3

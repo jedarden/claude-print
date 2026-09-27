@@ -556,9 +556,12 @@ exiting), so the hand-off channel is unchanged. Note that CI installs the
 *latest* stable claude while the dev host auto-updates on its own schedule —
 the two can drift independently, and each is a valid drift signal against
 the same pinned stamp. The `tests/contract_maintenance.rs` suite pins this
-wiring (template fragments including the fatal wrapper, gate exit-code
-contract against a stubbed claude, and the doc/plan mentions) so the
-automation cannot silently detach from this page again.
+wiring (the push trigger that submits the template — the Sensor's
+push/`refs/heads/main` filters and its `workflowTemplateRef` hand-off, fed
+by the vendored EventSource stanza's push subscription — template fragments
+including the fatal wrapper, gate exit-code contract against a stubbed
+claude, and the doc/plan mentions) so the automation cannot silently detach
+from this page again.
 
 **Scheduled watch.** CI fires only on a push, and Claude Code auto-updates
 on its own schedule — the 2026-09-24 re-pin was itself superseded hours

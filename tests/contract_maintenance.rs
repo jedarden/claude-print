@@ -21,7 +21,10 @@
 //! - detector parse — `scripts/check-claude-version-bump.sh` exits 0/1/2
 //!   against a stubbed `claude`, with the stub's version derived from the
 //!   doc's live **Measured against:** stamp, and rejects divergent active
-//!   pins against a skeleton repo without consulting any `claude` at all;
+//!   pins against a skeleton repo without consulting any `claude` at all —
+//!   as do a family disagreeing with itself (a half-moved golden triple)
+//!   and a referenced fixture family missing from tests/fixtures/
+//!   (claudepr-b3ac3625);
 //! - the gate's contract against a stubbed `claude`/`gh`/`cargo` (hermetic —
 //!   a single stub-bin PATH, so unstubbed binaries are genuinely absent):
 //!   exit code, evidence-bundle shape, the refreshed version artifact (an
@@ -32,8 +35,11 @@
 //!   PATH override: the gate's verdict mirrors the detector's, and the
 //!   version file matches the real `claude --version` (or records `unknown`);
 //! - wiring fragments — the WorkflowTemplate invokes the gate on every push
-//!   and stamps the status into release notes, and the maintenance doc /
-//!   plan R-2 / README / AGENTS.md still name it.
+//!   and stamps the status into release notes, the push trigger that
+//!   submits that template stays attached (the Sensor's push +
+//!   refs/heads/main filters and its workflowTemplateRef hand-off, fed by
+//!   the EventSource stanza's push subscription — claudepr-b3ac3625), and
+//!   the maintenance doc / plan R-2 / README / AGENTS.md still name it.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -869,6 +875,124 @@ fn detector_allows_historical_markers_in_prose() {
     );
 }
 
+/// A skeleton whose active pins agree across evidence sources but whose
+/// stream-json golden family disagrees WITH ITSELF — the input file
+/// re-pinned to 9.9.901 while expected/errors stayed at 9.9.900 — is
+/// rejected with exit 2 before any claude is consulted (claudepr-b3ac3625).
+/// The three files of a family are one measurement (one replay captured
+/// once), so a half-moved triple is the incomplete-re-pin shape one level
+/// below the cross-family divergence the test above pins. Both stale .900
+/// files stay on disk so the disagreement is the only failure the detector
+/// can see.
+#[test]
+fn detector_rejects_mixed_pins_within_one_family_without_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    skeleton_with_agreeing_pins(
+        dir.path(),
+        "**Measured against:** `claude` 9.9.901 (`9.9.901 (Claude Code)`), 2026-09-26\n",
+    );
+    fs::write(
+        dir.path().join("tests/stream_json_contract.rs"),
+        concat!(
+            "const INPUT: &str = include_str!(\"fixtures/stream_json_golden_v9.9.901.input.jsonl\");\n",
+            "const EXPECTED: &str = include_str!(\"fixtures/stream_json_golden_v9.9.900.expected.jsonl\");\n",
+            "const ERRORS: &str = include_str!(\"fixtures/stream_json_golden_v9.9.900.errors.jsonl\");\n",
+        ),
+    )
+    .unwrap();
+    for name in [
+        "stream_json_golden_v9.9.900.expected.jsonl",
+        "stream_json_golden_v9.9.900.errors.jsonl",
+    ] {
+        fs::write(dir.path().join("tests/fixtures").join(name), "{}\n").unwrap();
+    }
+
+    let bin = dir.path().join("bin");
+    let out = Command::new("bash")
+        .arg(dir.path().join("scripts/check-claude-version-bump.sh"))
+        .env("PATH", stub_path(&bin)) // no claude stub: none may be needed
+        .output()
+        .unwrap();
+
+    let stderr = stderr_of(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a family disagreeing with itself must fail closed, without claude; \
+         stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("active stream_json_golden fixture references disagree"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("9.9.901") && stderr.contains("9.9.900"),
+        "the error must name both sides of the disagreement: {stderr}"
+    );
+    assert!(
+        !stdout.contains("claude not on PATH"),
+        "the within-family check must fail before claude is consulted \
+         (stdout: {stdout})"
+    );
+}
+
+/// A referenced fixture family missing from tests/fixtures/ — every active
+/// stream-json golden reference points at files that do not exist — is
+/// rejected with exit 2 before any claude is consulted (claudepr-b3ac3625):
+/// a re-pin that moves the test references without landing the files must
+/// fail as a broken repo, not silently read as drift — or worse, current.
+/// The claude_contracts file stays, so the golden family is the only
+/// failure named.
+#[test]
+fn detector_rejects_a_missing_active_fixture_family_without_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    skeleton_with_agreeing_pins(
+        dir.path(),
+        "**Measured against:** `claude` 9.9.901 (`9.9.901 (Claude Code)`), 2026-09-26\n",
+    );
+    for suffix in ["input", "expected", "errors"] {
+        fs::remove_file(
+            dir.path()
+                .join("tests/fixtures")
+                .join(format!("stream_json_golden_v9.9.901.{suffix}.jsonl")),
+        )
+        .unwrap();
+    }
+
+    let bin = dir.path().join("bin");
+    let out = Command::new("bash")
+        .arg(dir.path().join("scripts/check-claude-version-bump.sh"))
+        .env("PATH", stub_path(&bin)) // no claude stub: none may be needed
+        .output()
+        .unwrap();
+
+    let stderr = stderr_of(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a missing active fixture family must fail closed, without claude; \
+         stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "active fixture family is missing for \
+             fixtures/stream_json_golden_v9.9.901",
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("claude_contracts"),
+        "the present claude_contracts family must not be named as missing: {stderr}"
+    );
+    assert!(
+        !stdout.contains("claude not on PATH"),
+        "the missing-family check must fail before claude is consulted \
+         (stdout: {stdout})"
+    );
+}
+
 #[test]
 fn detector_drift_when_installed_differs_from_pin() {
     let live = bumped(&doc_pin());
@@ -1386,6 +1510,117 @@ fn ci_workflowtemplate_wires_the_gate_on_every_push() {
     assert!(
         gate_at < verify_at,
         "the gate must run before the verify-only exit"
+    );
+}
+
+/// The push-trigger half of "runs the gate on every push" (§Wiring,
+/// claudepr-b3ac3625): the template-fragment pin above proves the *invoked*
+/// template runs the gate, but a push is what *submits* it — the EventSource
+/// stanza subscribes to `push` for jedarden/claude-print, the Sensor filters
+/// that stream to push events on the working branch and submits a Workflow,
+/// and its `workflowTemplateRef` is the hand-off to the template the
+/// fragment pin guards. Any of those detaching (an eventName typo, the push
+/// filter narrowed away, a templateRef renamed off the template's
+/// metadata.name) silences the gate on every push while every fragment test
+/// stays green. The `refs/heads/main` filter is pinned as-is: this repo
+/// works directly on main, so main IS "every push" — widening or narrowing
+/// it is a decision someone must notice, not a silent edit.
+#[test]
+fn push_sensor_wires_every_push_to_the_gate_template() {
+    let sensor = fs::read_to_string(repo_path("claude-print-ci-sensor.yml")).unwrap();
+    let stanza = fs::read_to_string(repo_path("claude-print-eventsource-stanza.yml")).unwrap();
+    let template = fs::read_to_string(repo_path("claude-print-ci-workflowtemplate.yml")).unwrap();
+
+    // EventSource stanza: the webhook subscription for the canonical repo
+    // must include push (the only event the sensor consumes).
+    for fragment in [
+        "repositories:",
+        "owner: jedarden",
+        "- claude-print",
+        "events:",
+        "- push",
+    ] {
+        assert!(
+            stanza.contains(fragment),
+            "EventSource stanza lost wiring fragment: {fragment}"
+        );
+    }
+
+    // Sensor: the subscription rides the github-webhooks event source under
+    // the repo's own event name...
+    for fragment in [
+        "eventSourceName: github-webhooks",
+        "eventName: claude-print",
+    ] {
+        assert!(
+            sensor.contains(fragment),
+            "Sensor lost wiring fragment: {fragment}"
+        );
+    }
+    // ...and fires only on push to the working branch. Paths and values are
+    // pinned in order inside the dependencies block, so a value cannot
+    // drift onto the wrong filter.
+    let deps = sensor
+        .split("triggers:")
+        .next()
+        .expect("the dependencies block precedes triggers:");
+    for fragment in [
+        "headers.X-Github-Event",
+        "- push",
+        "body.ref",
+        "refs/heads/main",
+    ] {
+        assert!(
+            deps.contains(fragment),
+            "Sensor push filter lost fragment: {fragment}"
+        );
+    }
+    let event_at = deps.find("headers.X-Github-Event").unwrap();
+    let push_at = deps.find("- push").unwrap();
+    let ref_at = deps.find("body.ref").unwrap();
+    let main_at = deps.find("refs/heads/main").unwrap();
+    assert!(
+        event_at < push_at && push_at < ref_at && ref_at < main_at,
+        "the push value must follow the X-Github-Event path and the \
+         refs/heads/main value the body.ref path: {deps}"
+    );
+
+    // The trigger submits a Workflow that references the gate template BY
+    // NAME — and that name must stay identical to the template's own
+    // metadata.name, the join the template-fragment pin above depends on.
+    let triggers = sensor
+        .split("triggers:")
+        .nth(1)
+        .expect("the triggers block follows dependencies:");
+    for fragment in [
+        "operation: submit",
+        "kind: Workflow",
+        "namespace: argo-workflows",
+        "workflowTemplateRef:",
+        "name: claude-print-ci",
+        // the sensor-level build policy the closest siblings carry
+        "concurrencyPolicy: Forbid",
+    ] {
+        assert!(
+            triggers.contains(fragment),
+            "Sensor trigger lost wiring fragment: {fragment}"
+        );
+    }
+    // The sensor pod itself must stay right-sized (the fleet's github-push
+    // sensor shape): a re-inflated request re-fights the iad-ci capacity
+    // right-sizing on every sync.
+    assert!(
+        sensor.contains("memory: 64Mi"),
+        "the sensor pod request must stay at the fleet's github-push sizing"
+    );
+    assert!(
+        template.contains("name: claude-print-ci"),
+        "the template must keep the metadata.name the sensor's \
+         workflowTemplateRef joins to"
+    );
+    assert!(
+        template.contains("entrypoint: ci"),
+        "the template must keep the ci entrypoint a sensor-submitted run starts from"
     );
 }
 
