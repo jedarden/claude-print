@@ -23,7 +23,7 @@ The billing classification is determined by `isatty(stdout)` inside the `claude`
 | Bracketed paste | Terminal feature that wraps pasted text in `ESC[200~` … `ESC[201~` markers. Prevents embedded newlines from triggering premature Enter in Ink's REPL. |
 | Ink | The React/Yoga-based TUI framework used by Claude Code. Sends DEC terminal probes (DA1, DA2, DSR, XTVERSION, window-size) at startup and hangs indefinitely if unanswered. |
 | login_tty | glibc function: `setsid()` + `ioctl(TIOCSCTTY)` + `dup2(slave, 0/1/2)` + `close(slave)`. Makes the PTY slave the controlling terminal for the child process. |
-| JSONL transcript | Newline-delimited JSON at `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Claude Code appends one event per line as the session progresses. The `<cwd-slug>` is derived by folding **every** non-alphanumeric byte of `cwd` to `-` — the leading `/` included — so `/home/coding/myproject` → `-home-coding-myproject`. Authoritative implementation: `src/poller.rs::cwd_to_slug` (claude 2.1.263 scheme, verified live — bead claudepr-26e7a0b6); docs are kept in sync with it by `tests/docs_slug_consistency.rs`. (Note: folding is not injective — `/home/user/a-b` and `/home/user-a/b` both fold to `-home-user-a-b`; `session_id` resolves the file within the directory.) |
+| JSONL transcript | Newline-delimited JSON at `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`. Claude Code appends one event per line as the session progresses. The `<cwd-slug>` is derived by folding **every** non-alphanumeric byte of `cwd` to `-` — the leading `/` included — so `/home/coding/myproject` → `-home-coding-myproject`. Authoritative implementation: `src/poller.rs::cwd_to_slug` (claude 2.1.263 scheme, verified live 2026-09-07 — bead claudepr-26e7a0b6); docs are kept in sync with it by `tests/docs_slug_consistency.rs`. (Note: folding is not injective — `/home/user/a-b` and `/home/user-a/b` both fold to `-home-user-a-b`; `session_id` resolves the file within the directory.) |
 | usage-fingerprint | Tuple of `(input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens)` used to deduplicate streaming JSONL events from the same API call when `message.id` is absent. |
 | stream-json | Output format where each transcript event line is forwarded to stdout as Claude Code writes it, providing real-time streaming compatible with `claude -p --output-format stream-json`. |
 | mock_claude | Compiled Rust binary (`test-fixtures/mock-claude/`) simulating Claude Code's PTY and JSONL behavior. Controlled via env vars — not a shell script. |
@@ -391,14 +391,14 @@ By default `claude-print` does **not** redirect `CLAUDE_CONFIG_DIR`. The inner `
 - Appends to `~/.claude/history.jsonl`
 - Fires all hooks in `~/.claude/settings.json` (SessionStart, Stop, PreToolUse, trail-boss, ccdash, etc.)
 
-`claude-print` adds its own Stop hook by passing `--settings <temp>/settings.json` with the per-run relay hook. Claude Code merges `--settings` with the user's settings file — all existing hooks continue to fire alongside the relay hook (**measured**: merge confirmed on claude 2.1.270 — project- and user-source hooks and relay hooks all fired in one run; see `docs/notes/claude-contract-probes.md` and OQ-1's resolution below; PO-1's in-process-merge fallback is not needed).
+`claude-print` adds its own Stop hook by passing `--settings <temp>/settings.json` with the per-run relay hook. Claude Code merges `--settings` with the user's settings file — all existing hooks continue to fire alongside the relay hook (**measured**: merge confirmed on claude 2.1.270 — project- and user-source hooks and relay hooks all fired in one run — and re-confirmed unchanged on 2.1.281, 2.1.282 and 2.1.283; see `docs/notes/claude-contract-probes.md` and OQ-1's resolution below; PO-1's in-process-merge fallback is not needed).
 
 This matches exactly what `claude -p` does. Transcripts, token counts, and usage stats land in `~/.claude/` with no special handling.
 
 ### `--no-inherit-hooks` (Isolation Mode)
 
 When `--no-inherit-hooks` is passed:
-- `--setting-sources=` is forwarded to claude (empty value = load no standard settings sources; **measured**: the empty spelling suppresses every standard source while the `--settings` file still loads, claude 2.1.270)
+- `--setting-sources=` is forwarded to claude (empty value = load no standard settings sources; **measured**: the empty spelling suppresses every standard source while the `--settings` file still loads, claude 2.1.270, re-confirmed unchanged through 2.1.283)
 - Only `--settings <temp>/settings.json` is loaded, which contains solely the Stop relay hook
 - User's `~/.claude/settings.json` hooks do not fire (ccdash, trail-boss, etc.)
 - `CLAUDE_CONFIG_DIR` is **not** set even in isolation mode — transcripts still land in `~/.claude/projects/`
@@ -529,7 +529,7 @@ Receives the Stop JSON payload on stdin and writes it to the FIFO. Claude Code d
 
 **`stop.fifo`** — POSIX named pipe created with `nix::unistd::mkfifo()`.
 
-**In `--no-inherit-hooks` mode**, also forward `--setting-sources=` to claude (empty = no standard sources loaded) *(measured per OQ-2 resolution: the empty spelling is accepted, suppresses every standard source, and does not suppress the `--settings` file; the PO-2 fallback spelling `=none` is rejected outright by claude 2.1.270 — exit 1 before session start — so it must never be emitted)*. Only `--settings <temp>/settings.json` is active. This prevents the user's SessionStart/Stop/PreToolUse hooks from firing.
+**In `--no-inherit-hooks` mode**, also forward `--setting-sources=` to claude (empty = no standard sources loaded) *(measured per OQ-2 resolution: the empty spelling is accepted, suppresses every standard source, and does not suppress the `--settings` file; the PO-2 fallback spelling `=none` is rejected outright by claude 2.1.270, re-confirmed unchanged through 2.1.283 — exit 1 before session start — so it must never be emitted)*. Only `--settings <temp>/settings.json` is active. This prevents the user's SessionStart/Stop/PreToolUse hooks from firing.
 
 `tempfile::TempDir` handles cleanup on any drop path.
 
@@ -651,7 +651,7 @@ On Stop receipt:
 
 ```
 1. Open transcript_path (derived if not in payload)
-   Path derivation algorithm (claude 2.1.263 scheme, verified live — bead claudepr-26e7a0b6):
+   Path derivation algorithm (claude 2.1.263 scheme, verified live 2026-09-07 — bead claudepr-26e7a0b6):
    fold **every** non-alphanumeric byte of `cwd` to `-` — the leading `/` included.
    Example: `/home/coding/myproject` → `-home-coding-myproject`.
    Authoritative implementation: `src/poller.rs::cwd_to_slug`, which additionally rejects null
@@ -1218,7 +1218,7 @@ Integration test scenarios:
 | **Unknown event type in JSONL** | `MOCK_UNKNOWN_EVENT_TYPE=1` | parse succeeds, text extracted |
 | **Unknown usage fields** | `MOCK_UNKNOWN_USAGE_FIELDS=1` | ignored, token counts correct |
 | Custom response text | `MOCK_RESPONSE=hello` | response field in json output equals 'hello' |
-| `--no-inherit-hooks` | `--no-inherit-hooks` flag set | `--setting-sources=` (empty value — the only verified form; `=none` is rejected by claude 2.1.270) in child argv, exit 0 |
+| `--no-inherit-hooks` | `--no-inherit-hooks` flag set | `--setting-sources=` (empty value — the only verified form; `=none` is rejected by claude 2.1.270, re-confirmed through 2.1.283) in child argv, exit 0 |
 | Output format json | defaults | output parses as valid JSON |
 | Output format stream-json | defaults | each output line parses as valid JSON |
 | Stop fires before PROMPT_INJECTED | `MOCK_STOP_BEFORE_INJECT=1` | exit 2, `is_error: true` in output (EC-7 path) |
@@ -1234,7 +1234,7 @@ These tests verify that `--settings` relay hook merges correctly and that `--no-
 - `--settings` flag is present in the child process argv (visible via `/proc/<pid>/cmdline`)
 
 **`--no-inherit-hooks` flag:**
-- The `--setting-sources` argument is present in child argv when flag is set and is exactly `--setting-sources=` (empty value). OQ-2 is resolved: the empty form is the verified one (claude 2.1.270), and the `=none` fallback was measured as rejected (exit 1 before session start) — the test pins the single verified form instead of parameterizing over both. `tests/claude_contracts.rs::child_argv_matches_verified_spelling_no_inherit_hooks` asserts this against the measured-contract fixture.
+- The `--setting-sources` argument is present in child argv when flag is set and is exactly `--setting-sources=` (empty value). OQ-2 is resolved: the empty form is the verified one (claude 2.1.270, re-confirmed through 2.1.283), and the `=none` fallback was measured as rejected (exit 1 before session start) — the test pins the single verified form instead of parameterizing over both. `tests/claude_contracts.rs::child_argv_matches_verified_spelling_no_inherit_hooks` asserts this against the measured-contract fixture.
 - `--setting-sources` is absent from child argv when flag is not set
 - Mock that tracks whether a "user hook" fires: with `--no-inherit-hooks`, user hook does not fire; without, it does — implemented as `mock_claude`'s `MOCK_USER_HOOK_MARKER` (claudepr-41ba7be2): the marker file is written iff the child argv carries no `--setting-sources` spelling; the `tests/binary_e2e.rs` inherit-hooks cases pin fired/not-fired for the CLI flag, for both `defaults.inherit_hooks` values, and for the CLI-over-config precedence
 

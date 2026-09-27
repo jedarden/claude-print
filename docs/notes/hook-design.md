@@ -42,7 +42,7 @@ The identity relay (`identity.sh`) is the same script with `<identity-path>` in 
 
 Key points:
 - The target path is embedded as a shell single-quoted string — no variable expansion at execution time; a single quote in the temp-dir path is escaped `'\''`, so metacharacters in the path can never become shell syntax (bf-5sj7, pinned by `src/hook.rs::hook_sh_escaping_handles_shell_metacharacters` and `::identity_sh_is_executable_and_targets_identity_file`)
-- If the write fails, the hook exits cleanly (`|| true`); Claude Code does not wait beyond the 10s timeout — enforcement measured (a hook sleeping past its configured per-hook `timeout` is killed and the session proceeds: 2.1.282, 16/16 firings killed, 8/8 sessions exit 0 with the reply rendered, claude exiting 5.0 s after the Stop hook started; `scripts/probe-stop-edge-contracts.sh` Arm T, pinned in `tests/fixtures/claude_contracts_v2.1.282.json`; see `docs/notes/claude-contract-probes.md` §Hook-timeout enforcement)
+- If the write fails, the hook exits cleanly (`|| true`); Claude Code does not wait beyond the 10s timeout — enforcement measured (a hook sleeping past its configured per-hook `timeout` is killed and the session proceeds: 2.1.283, 8/8 firings killed, 4/4 sessions exit 0 with the reply rendered, claude exiting 5.0 s after the Stop hook started — the prior 2.1.282 measurement showed the identical shape, 16/16 firings killed and 8/8 sessions proceeding; `scripts/probe-stop-edge-contracts.sh` Arm T, pinned in `tests/fixtures/claude_contracts_v2.1.283.json` (the current stamp; the 2.1.282 prior retained per version); see `docs/notes/claude-contract-probes.md` §Hook-timeout enforcement)
 - The hooks are executed by Claude Code via `--settings <temp>/settings.json`
 
 ## settings.json
@@ -94,8 +94,9 @@ If `transcript_path` is absent from the payload, it is derived from `session_id`
 ```
 
 Where `<slug>` folds **every** non-alphanumeric byte of the `cwd` to `-` —
-including the leading `/` — the scheme claude 2.1.263 actually uses for
-`~/.claude/projects/` (verified live; the earlier strip-leading-slash scheme
+including the leading `/` — the scheme claude uses for
+`~/.claude/projects/` (verified live on 2.1.263, 2026-09-07 — vectors pinned
+in `tests/fixtures/slug_vectors_v2.1.263.json`; the earlier strip-leading-slash scheme
 produced slugs claude never creates — bead claudepr-26e7a0b6):
 
 ```
