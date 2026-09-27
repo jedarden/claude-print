@@ -9,6 +9,22 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Forgejo source-of-truth release-workflow verification.**
+  `tests/release_provenance.rs` (bead claudepr-c7ca74a6) pins the
+  direction invariants the doc pins leave open: no `.github/` CI surface
+  anywhere in the tree, the `claude-print-ci` WorkflowTemplate's every
+  `git push`/`git clone` targeting Forgejo (commented-out invocations not
+  exempt), its GitHub mentions confined to the sanctioned `gh release`
+  asset channel, and the CI trigger reaching Argo only through the
+  read-only mirror's push webhook — every leg mutation-checked by
+  always-on negative meta-tests. The live-host half — the checkout's own
+  origin configuration, the Forgejo-side mirror direction, tag-namespace
+  parity (GitHub strictly downstream at identical SHAs), and a live repeat
+  of the publishing scan — is owned by the new
+  `scripts/check-release-provenance.sh` (strictly read-only git inventory;
+  the Forgejo token travels `git credential fill` → curl stdin config,
+  never argv, never a log line), wired into the release runbook's new
+  §"Provenance verification" and pinned by the same suite.
 - **Consolidated `claude -p` compatibility contract.**
   `docs/notes/claude-p-compat-contract.md` (bead claudepr-10f4ffa5) is the
   single normative definition of the drop-in claim: the complete accepted flag

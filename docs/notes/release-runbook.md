@@ -199,6 +199,51 @@ unreachable, `CLAUDE_PRINT_RELEASE_URL` points the installer at any host
 serving the *same* assets (including `sha256sums.txt`); verification is
 unchanged because the manifest travels with the release.
 
+## Provenance verification
+
+Everything above is enforced hermetically (see
+[Hermetic coverage](#hermetic-coverage)); four of the workflow's invariants
+live outside this checkout and can only be checked against the real hosts.
+`scripts/check-release-provenance.sh` is their executable owner — run it
+before cutting a release tag and after any hosting-side change:
+
+```sh
+scripts/check-release-provenance.sh                 # all four checks
+scripts/check-release-provenance.sh --skip mirror   # hosts with no Forgejo credential
+```
+
+- **origin** — the checkout has exactly one remote, `origin`, fetching and
+  pushing the canonical Forgejo URL the WorkflowTemplate clones from. A
+  second remote is a second push target even when it points at Forgejo, so
+  its mere existence is the client-side dual-push the mirror rule
+  prohibits.
+- **mirror** — the Forgejo repo is not itself a pull mirror (nothing flows
+  GitHub → Forgejo) and carries exactly one push mirror, aimed at the
+  GitHub repo, with sync-on-commit enabled — the transport behind the
+  tag-before-release invariant above. Needs a Forgejo credential; skip it
+  where none exists.
+- **tags** — every tag on the GitHub mirror exists on Forgejo pointing at
+  the identical commit, so the mirror is a strict downstream copy of the
+  tag namespace. A tag on GitHub only, or a SHA divergence, is the
+  mirror-prune failure mode from the wrong side and fails; tags only on
+  Forgejo are the healthy in-flight direction (pushed to the source of
+  truth, mirror sync pending) and are reported, not failed.
+- **publishing** — the tracked tree carries no `.github/` surface (GitHub
+  Actions are disabled org-wide; CI is the Argo trio), and the
+  WorkflowTemplate's every `git push` and `git clone` names Forgejo, so its
+  only GitHub writes are the `gh release` asset calls.
+
+Exit codes follow the repo's 0/1/2 convention (as in
+`scripts/check-bead-hygiene.sh`): 0 pass, 1 drift — the script names every
+finding and repairs nothing, 2 cannot determine — a missing tool, an
+ambiguous WorkflowTemplate derivation, no credential for an enabled mirror
+check, or an unreachable host; fail closed. The Forgejo token travels
+`git credential fill` → curl stdin config (`curl -K -`): never an argument,
+never echoed, never written to disk. GitHub is queried anonymously (the
+mirror is public). The script's structure, read-only inventory, and
+credential hygiene — and this section's wiring — are pinned by
+`tests/release_provenance.rs`.
+
 ## Hermetic coverage
 
 | Claim | Pinned by |
@@ -208,3 +253,5 @@ unchanged because the manifest travels with the release.
 | Fail-closed verification (missing manifest / unlisted asset / digest mismatch), rollback copy semantics | `tests/install_sh.rs` |
 | The default release source the override redirects: the tag-less `releases/latest/download` base over the publisher's repo slug (workflow `--repo` flags and Forgejo clone URL agree), manifest-first fetch order, and the x86_64 asset names requested from the default | `tests/install_sh_release_source.rs` |
 | This runbook ↔ the WorkflowTemplate: asset names and the toolchain claim, publication order (tag→Forgejo before `gh release create`, draft/publish idempotency before the build, manifest generation before upload), manifest coverage of exactly the uploaded assets, bare-name generation, mode/version wiring; the README's pointers back to this note (the runbook link on both release-facing surfaces, and the one-directional publication claims — canonical Forgejo repo, read-only push mirror, GitHub Releases artifact host, nothing flows back, the `CLAUDE_PRINT_RELEASE_URL` override — agreed between the two docs) | `tests/release_runbook_docs.rs` |
+| The committed-tree half of the source-of-truth invariant: no `.github/` CI surface anywhere in the tree, WorkflowTemplate refs moving to Forgejo only (push and clone, commented-out invocations included), its GitHub writes limited to the `gh release` asset channel plus their credential, and the CI trigger reaching Argo only through the mirror's push webhook | `tests/release_provenance.rs` |
+| The live-host half of the same invariant — the checkout's own origin configuration, the Forgejo-side mirror direction (no pull mirror, one sync-on-commit push mirror), the tag namespaces of both hosts (GitHub strictly downstream at identical SHAs), and a live repeat of the publishing scan — via `scripts/check-release-provenance.sh`, whose structure, read-only git inventory, and credential hygiene are pinned by `tests/release_provenance.rs` | `scripts/check-release-provenance.sh` + `tests/release_provenance.rs` |
