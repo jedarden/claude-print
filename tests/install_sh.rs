@@ -1635,6 +1635,63 @@ fn an_existing_adapter_is_overwritten_in_place_at_0644_with_no_backup_copy() {
 }
 
 #[test]
+fn rerunning_the_install_reverts_hand_edits_to_the_installed_adapter() {
+    // Idempotence (the note's Semantics table): re-running install.sh
+    // re-copies the template, so a hand edit to the installed adapter
+    // survives only until the next run — README "Warm PTY pool" step 1's
+    // --pool-socket edit is the workflow that matters. Unlike the
+    // overwrite pin above, the stale copy here is produced by a real
+    // first run and edited in place, so what is pinned is the rerun
+    // shape, not a fabricated destination.
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    let home = tempfile::tempdir().unwrap();
+
+    let first = run_install_needle_leg(&repo_path("install.sh"), home.path(), release.path(), true);
+    assert!(first.status.success(), "first run: {}", stderr_of(&first));
+    let dest = adapter_dest(home.path());
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        repo_adapter_bytes(),
+        "the first run must install the checkout template"
+    );
+
+    // The hand edit, applied to the installed copy the way an operator
+    // applies the pool opt-in, plus a drifted mode so the rerun must
+    // re-force 0644 over an edited destination too.
+    let hand_edited = format!(
+        "{}\n# hand edit: --pool-socket added to the invoke template (README \
+         \"Warm PTY pool\")\n",
+        String::from_utf8_lossy(&fs::read(&dest).unwrap())
+    );
+    fs::write(&dest, &hand_edited).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_ne!(
+        fs::read(&dest).unwrap(),
+        repo_adapter_bytes(),
+        "the hand edit must actually differ from the template before the rerun"
+    );
+
+    let second =
+        run_install_needle_leg(&repo_path("install.sh"), home.path(), release.path(), true);
+    assert!(second.status.success(), "rerun: {}", stderr_of(&second));
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        repo_adapter_bytes(),
+        "the rerun must revert the hand edit to the shipped template"
+    );
+    assert_eq!(
+        mode_of(&dest),
+        0o644,
+        "the rerun re-forces 0644 over the edited copy's drifted mode"
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains(&format!("Installed {}", dest.display())),
+        "the rerun records the placement again — it re-copies, it does not skip: {stdout}"
+    );
+}
+
+#[test]
 fn no_adapter_beside_the_script_skips_the_needle_leg_with_a_note() {
     // The missing-source case — the `curl install.sh | sh` shape, reproduced
     // by running a staging copy of the script with no claude-print.yaml
@@ -1949,6 +2006,14 @@ const NEEDLE_NOTE_SEMANTICS: &[(&str, &str, &str)] = &[
         "An existing adapter is replaced in place, byte-for-byte with the checkout's template. There is no backup copy",
         r#"install -m 644 "${SCRIPT_DIR}/claude-print.yaml" "${NEEDLE_AGENTS_DIR}/claude-print.yaml""#,
         "an_existing_adapter_is_overwritten_in_place_at_0644_with_no_backup_copy",
+    ),
+    // Idempotence: the rerun re-copies the template, so hand edits to the
+    // installed adapter revert on the next install run (the enforcing test
+    // runs install.sh twice and hand-edits the installed copy in between).
+    (
+        "Re-running `install.sh` re-copies the template: hand edits to the installed adapter are reverted to the shipped template on the next run",
+        r#"install -m 644 "${SCRIPT_DIR}/claude-print.yaml" "${NEEDLE_AGENTS_DIR}/claude-print.yaml""#,
+        "rerunning_the_install_reverts_hand_edits_to_the_installed_adapter",
     ),
     // No-NEEDLE case: the mkdir lives inside the detection branch, so an
     // undetected machine gets no ~/.needle at all.

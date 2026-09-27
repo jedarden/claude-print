@@ -20,13 +20,12 @@ has NEEDLE installed (the fleet's coding boxes do).
 | Destination | `~/.needle/agents/claude-print.yaml` (`$HOME`-rooted, absolute). The agents dir is created with `mkdir -p` when missing — including when the source is absent, because the `mkdir` precedes the source check. An existing agents dir is preserved as-is (its other files survive). |
 | Permissions | `install -m 644`: mode 0644 always — regardless of the checkout copy's own mode (0664 in the repo) and of a drifted mode on an existing destination (a hand-chmod'd copy is forced back). |
 | Overwrite | An existing adapter is replaced in place, byte-for-byte with the checkout's template. There is no backup copy (contrast the main binary's `claude-print.prev` in [installer-rollback.md]); re-running `install.sh` from a good checkout — or `git checkout claude-print.yaml` in one — is the recovery. |
+| Idempotence | Re-running `install.sh` re-copies the template: hand edits to the installed adapter are reverted to the shipped template on the next run. |
 | No-NEEDLE case | When neither detection arm holds, the leg is skipped in silence: nothing NEEDLE-related is printed and `~/.needle` is not created — the `mkdir` lives inside the detection branch, so an install on a NEEDLE-less machine leaves no trace of the leg. |
 | Missing source | A checkout-less invocation — the `curl install.sh | sh` shape, where no `claude-print.yaml` sits beside the script — prints `Note: claude-print.yaml not found alongside install.sh — skipping NEEDLE config` and continues; the install still succeeds (the adapter is registration, not a runtime dependency). |
 | Ordering | The leg runs after the binary and `mock_claude` legs and before the `--check` smoke, so any earlier failure (missing manifest, unlisted asset, digest mismatch, placement failure) places no adapter and creates no `~/.needle`. A failure inside the leg itself fails the whole install (`set -e`) before the smoke runs. |
 
-Idempotence: re-running `install.sh` re-copies the template, so hand edits to
-the installed adapter are reverted to the shipped template on the next
-install run. The one workflow that matters for is the pool opt-in — README
+The workflow the Idempotence row matters for is the pool opt-in — README
 "Warm PTY pool" step 1 says to add `--pool-socket` to the `invoke` template
 in `~/.needle/agents/claude-print.yaml`; that edit lives until the next
 `install.sh` run, and needs re-applying after an upgrade.
@@ -62,6 +61,7 @@ can never pass vacuously on a NEEDLE-equipped host.
 | `an_existing_agents_dir_alone_triggers_the_adapter_leg` | Detection (dir arm) with no `needle` reachable: same placement, and a pre-existing agents dir keeps its other files |
 | `without_needle_the_agents_dir_is_not_created_and_nothing_needle_related_is_printed` | No-NEEDLE case: no `~/.needle` at all, no NEEDLE line on stdout, the binary/fixture legs unaffected |
 | `an_existing_adapter_is_overwritten_in_place_at_0644_with_no_backup_copy` | Overwrite + permissions: a stale mode-0600 adapter is replaced byte-for-byte at mode 0644, and the agents dir holds exactly the adapter (no `.prev`) |
+| `rerunning_the_install_reverts_hand_edits_to_the_installed_adapter` | Idempotence: a real first run installs the template, the installed copy is hand-edited in place (with a drifted mode), and the second run reverts it byte-for-byte at 0644 — the pool `--pool-socket` workflow |
 | `no_adapter_beside_the_script_skips_the_needle_leg_with_a_note` | Missing source (a staging copy of the script with no template beside it — the `curl … \| sh` shape): the documented note prints verbatim, no adapter is placed, the agents dir is still created (the `mkdir` precedes the source check), the install succeeds |
 | `a_failed_install_places_no_needle_adapter` | Ordering: a tampered binary aborts before the leg — no adapter, no `~/.needle`, no adapter line on stdout |
 
