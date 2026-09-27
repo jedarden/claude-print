@@ -143,9 +143,14 @@ Resolve the directory through cargo instead of hardcoding either location —
 directory where one is enforced and the checkout's `target` dir elsewhere:
 
 ```bash
-TARGET="$(cargo metadata --no-deps --format-version 1 | jq -r .target_directory)"
+TARGET="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 "$TARGET/release/claude-print" --version
 ```
+
+The extraction is plain POSIX `sed`, so the lookup needs nothing beyond a
+stock Cargo environment — no `jq`; if `cargo metadata` fails or omits the
+key, `TARGET` comes back empty and the next line fails on the resulting path
+rather than a silently wrong one.
 
 `cargo run --bin claude-print -- --check` runs the smoke check directly from
 the build and works under both layouts.

@@ -15,7 +15,8 @@
 //!   A renamed `[[bin]]`, a CI toolchain widening, or a suite quietly
 //!   hardcoding `target/debug/…` would leave every claim green.
 //! - **The `cargo metadata` derivation** — the documented way to resolve
-//!   the target dir without hardcoding either column.
+//!   the target dir without hardcoding either column, spelled jq-free on
+//!   purpose (claudepr-307fc854): no stock Cargo environment names `jq`.
 //! - **§"Test structure"** — the fixtures row documents an exhaustive
 //!   inventory of `tests/fixtures/`, and descriptions throughout the
 //!   table name test files and fixtures that must keep existing.
@@ -51,7 +52,8 @@
 //! corrupted stock cell, a mutated `Cargo.toml` bin set, a drifted CI musl
 //! triple, a mis-attributed locator example, a stale or undocumented
 //! fixtures-row entry, an unlisted member directory or mismatched `-p`
-//! selector, a renamed member package or `[[bin]]`, and an example `--bin`
+//! selector, a renamed member package or `[[bin]]`, a drifted or jq-spelled
+//! target-dir snippet, and an example `--bin`
 //! name Cargo.toml no longer builds — and require the owning check to
 //! panic naming the drift. Attempt 2 of the parent bead proved those
 //! failures only in discarded scratch runs; committing them makes the
@@ -708,14 +710,24 @@ fn documented_musl_build_command_matches_the_ci_toolchain() {
     check_musl_build_command(&agents_md(), &ci_musl_triple());
 }
 
-#[test]
-fn target_dir_snippet_derives_the_artifact_it_names() {
-    let doc = agents_md();
-    let scoped = section(&doc, OUTPUT_LANDS_HEADING);
+/// The target-dir derivation contract, checkable against caller-supplied
+/// section text (live file for the always-on test, mutated text for the
+/// negative meta-test). Panics on drift.
+fn check_target_dir_snippet(scoped: &str) {
+    // The jq spelling the lookup was deliberately freed from (bead
+    // claudepr-307fc854) may not return — not alongside the sed one, and
+    // not instead of it: no prerequisite section names `jq`, so the
+    // documented lookup must stay runnable in a stock Cargo environment.
+    assert!(
+        !scoped.contains("jq -r"),
+        "AGENTS.md {OUTPUT_LANDS_HEADING} spells the target-dir lookup with \
+         `jq -r` again — the lookup is POSIX `sed` precisely because no stock \
+         Cargo environment guarantees `jq`; fix the drift, don't pin it"
+    );
     // The documented derivation, verbatim: cargo reports the target dir and
     // the artifact is addressed relative to it.
     for fragment in [
-        "cargo metadata --no-deps --format-version 1 | jq -r .target_directory",
+        "cargo metadata --no-deps --format-version 1 | sed -n 's/.*\"target_directory\":\"\\([^\"]*\\)\".*/\\1/p'",
         "\"$TARGET/debug/claude-print\" --check",
     ] {
         assert!(
@@ -725,6 +737,12 @@ fn target_dir_snippet_derives_the_artifact_it_names() {
              must stay the cargo-derived one, never a written-out path"
         );
     }
+}
+
+#[test]
+fn target_dir_snippet_derives_the_artifact_it_names() {
+    let doc = agents_md();
+    check_target_dir_snippet(section(&doc, OUTPUT_LANDS_HEADING));
     // The snippet's example artifact is the table's stock debug row.
     let stock_debug = "target/debug/claude-print";
     assert!(
@@ -1296,6 +1314,31 @@ fn negative_meta_drifted_ci_musl_triple_fails_the_musl_claims() {
     assert_drift(
         || check_musl_build_command(&doc, &drifted),
         &[drifted.as_str(), "musl release CI actually publishes"],
+    );
+}
+
+/// A drifted target-dir snippet fails the derivation check that owns the
+/// lookup line — the jq spelling returning (claudepr-307fc854's whole
+/// point) and the sed program losing its key are two different drift
+/// shapes, each named by the failing check.
+#[test]
+fn negative_meta_drifted_target_dir_snippet_fails_the_derivation_check() {
+    let doc = agents_md();
+
+    let jq_returned = replaced_once(
+        &doc,
+        "sed -n 's/.*\"target_directory\":\"\\([^\"]*\\)\".*/\\1/p'",
+        "jq -r .target_directory",
+    );
+    assert_drift(
+        || check_target_dir_snippet(&section(&jq_returned, OUTPUT_LANDS_HEADING)),
+        &["jq -r", "spells the target-dir lookup with"],
+    );
+
+    let key_lost = replaced_once(&doc, "target_directory", "root_directory");
+    assert_drift(
+        || check_target_dir_snippet(&section(&key_lost, OUTPUT_LANDS_HEADING)),
+        &["lost the target-dir derivation", "sed -n"],
     );
 }
 
