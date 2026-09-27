@@ -557,6 +557,73 @@ fn install_fails_closed_on_a_tampered_checksum_entry_in_the_manifest() {
 }
 
 #[test]
+fn install_fails_closed_when_the_manifest_digest_is_malformed() {
+    // The unparseable-entry shape, sibling of the tampered entry above: the
+    // manifest carries a line for the binary in the canonical
+    // "<digest>␠␠<name>" layout, but the digest token is not a sha256 digest
+    // at all — eight hex characters, the truncated-publish shape. install.sh
+    // performs no shape validation: checksum_entry_for extracts the token
+    // and verify_artifact compares it exactly against the digest of the
+    // downloaded bytes, so ANY malformed value — truncated, non-hex, garbage
+    // — lands in the same fail-closed mismatch as the well-formed tampered
+    // entry. That test pins the case no parseability check could reject;
+    // this one pins the other half — an entry being present and line-shaped
+    // is never enough to verify, and a malformed digest can never pass as
+    // one. The binary carries the execution probe, so the run also pins the
+    // ordering: the artifact is neither run nor placed.
+    let release = build_release_with_binary_body(
+        &[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET],
+        &probing_binary_body(),
+    );
+    let malformed_manifest: String = fs::read_to_string(release.path().join(CHECKSUMS_ASSET))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (_, name) = line
+                .split_once("  ")
+                .unwrap_or_else(|| panic!("malformed manifest line: {line:?}"));
+            if name == BINARY_ASSET {
+                format!("deadbeef  {name}")
+            } else {
+                line.to_string()
+            }
+        })
+        .fold(String::new(), |mut manifest, line| {
+            manifest.push_str(&line);
+            manifest.push('\n');
+            manifest
+        });
+    fs::write(release.path().join(CHECKSUMS_ASSET), malformed_manifest).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
+
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[("EXECUTION_PROBE", execution_probe.to_str().unwrap())],
+    );
+
+    assert!(
+        !output.status.success(),
+        "a malformed digest entry must abort the install"
+    );
+    assert!(
+        !installed_path(home.path(), BINARY_INSTALL_NAME).exists(),
+        "nothing may be installed against a malformed digest entry"
+    );
+    assert!(!installed_path(home.path(), MOCK_INSTALL_NAME).exists());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("sha256 mismatch") && stderr.contains(BINARY_ASSET),
+        "stderr must report the malformed entry as a mismatch: {stderr}"
+    );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
+    );
+}
+
+#[test]
 fn install_fails_closed_on_a_partially_transferred_artifact() {
     // The interrupted-transfer shape: the manifest was published over the
     // COMPLETE artifact, but the host delivered only a prefix of those bytes
@@ -663,19 +730,71 @@ fn install_fails_closed_when_an_asset_has_no_checksum_entry() {
 }
 
 #[test]
-fn a_failed_verification_leaves_no_scratch_files_behind() {
-    // The cleanup half of the fail-closed contract (install.sh's scratch-file
-    // comment): the three mktemp scratch files exist for the whole download +
-    // verification window, and the EXIT trap "removes them on every exit
-    // path, including a verification failure". Pinned on the tampered-
-    // artifact abort with TMPDIR pointed at a fresh directory — a trap that
-    // stopped firing would leave download debris in the installing user's
-    // temp space on exactly the runs this suite is about. The pin is wired
-    // non-vacuously: the control below proves the host's mktemp places its
-    // file inside TMPDIR, so an empty directory after the run can only mean
-    // the trap removed what mktemp created there — an mktemp that ignored
-    // TMPDIR fails the control loudly instead of letting this pin pass on a
-    // directory nothing ever touched.
+fn install_fails_closed_when_the_manifest_is_empty() {
+    // The truncated-publish shape of a malformed manifest: sha256sums.txt
+    // exists — its URL resolves and curl exits 0, so the download leg cannot
+    // be the guard — but the file arrived zero bytes long, leaving nothing
+    // in the release verifiable. The binary downloads normally and carries
+    // the execution probe, so the run pins both the abort (every asset is
+    // unlisted against a manifest that describes nothing — the same no-entry
+    // abort as install_fails_closed_when_an_asset_has_no_checksum_entry,
+    // reached from the malformed side) and the ordering: the artifact is
+    // neither run nor placed. The cleanup half rides along: the EXIT trap
+    // must clear the download window's mktemp scratch files on this abort
+    // path too, proven against a scratch dir the mktemp control below
+    // validated.
+    let scratch = scratch_dir_with_mktemp_control();
+    let release = tempfile::tempdir().unwrap();
+    fs::write(release.path().join(BINARY_ASSET), probing_binary_body()).unwrap();
+    fs::write(release.path().join(MOCK_ASSET), MOCK_BODY).unwrap();
+    fs::write(release.path().join(CHECKSUMS_ASSET), "").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let execution_probe = home.path().join("artifact-was-executed");
+
+    let output = run_install_with_env(
+        home.path(),
+        release.path(),
+        &[
+            ("EXECUTION_PROBE", execution_probe.to_str().unwrap()),
+            ("TMPDIR", scratch.path().to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !output.status.success(),
+        "an empty manifest must abort the install"
+    );
+    assert!(
+        !installed_path(home.path(), BINARY_INSTALL_NAME).exists(),
+        "nothing may be installed against an empty manifest"
+    );
+    assert!(!installed_path(home.path(), MOCK_INSTALL_NAME).exists());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("no entry") && stderr.contains(BINARY_ASSET),
+        "stderr must report the binary as unverifiable against the empty \
+         manifest: {stderr}"
+    );
+    assert_aborted_before_execution_or_check(
+        &String::from_utf8_lossy(&output.stdout),
+        &execution_probe,
+    );
+    assert!(
+        fs::read_dir(scratch.path()).unwrap().next().is_none(),
+        "the EXIT trap must remove the mktemp scratch files on an \
+         empty-manifest abort — debris left in {:?}",
+        scratch.path()
+    );
+}
+
+/// A fresh scratch directory usable for pinning EXIT-trap cleanup: mktemp is
+/// run against it once as a control, proving the host's mktemp places its
+/// files inside TMPDIR. Without that proof an empty directory after a run
+/// means nothing — an mktemp that ignored TMPDIR would leave the dir empty
+/// with the trap never having fired — so the control fails loudly instead of
+/// letting a cleanup pin pass on a directory nothing ever touched. The
+/// control file is removed before the directory is handed out.
+fn scratch_dir_with_mktemp_control() -> TempDir {
     let scratch = tempfile::tempdir().unwrap();
     let control = Command::new("mktemp")
         .env("TMPDIR", scratch.path())
@@ -693,7 +812,20 @@ fn a_failed_verification_leaves_no_scratch_files_behind() {
          meaningful (created {control_path:?})"
     );
     fs::remove_file(&control_path).unwrap();
+    scratch
+}
 
+#[test]
+fn a_failed_verification_leaves_no_scratch_files_behind() {
+    // The cleanup half of the fail-closed contract (install.sh's scratch-file
+    // comment): the three mktemp scratch files exist for the whole download +
+    // verification window, and the EXIT trap "removes them on every exit
+    // path, including a verification failure". Pinned on the tampered-
+    // artifact abort with TMPDIR pointed at a fresh directory — a trap that
+    // stopped firing would leave download debris in the installing user's
+    // temp space on exactly the runs this suite is about. Non-vacuous via
+    // [`scratch_dir_with_mktemp_control`].
+    let scratch = scratch_dir_with_mktemp_control();
     let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
     fs::write(release.path().join(BINARY_ASSET), probing_binary_body()).unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -1653,6 +1785,21 @@ const INSTALL_GUARANTEES: &[(&str, &str)] = &[
         "a partially transferred artifact (only a prefix of the bytes the \
          manifest digests)",
         "install_fails_closed_on_a_partially_transferred_artifact",
+    ),
+    // The malformed-manifest shapes, slice finer than the clauses above: an
+    // entry present and line-shaped but carrying a digest that is not a
+    // sha256 digest at all (no shape validation exists to slip it past — it
+    // lands in the same exact-comparison mismatch), and a manifest truncated
+    // to zero bytes (the download succeeds, nothing is verifiable — the same
+    // no-entry abort as the unlisted-asset row).
+    (
+        "a manifest entry whose digest is not a sha256 digest (truncated or \
+         non-hex) mismatches like any tampered entry",
+        "install_fails_closed_when_the_manifest_digest_is_malformed",
+    ),
+    (
+        "a manifest truncated to zero bytes leaves the asset with no entry",
+        "install_fails_closed_when_the_manifest_is_empty",
     ),
     // The fixture is the sole optional asset: its manifest entry is the skip
     // decision, so the same omission that is fatal for the binary is a skip
