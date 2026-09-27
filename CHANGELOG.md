@@ -9,6 +9,21 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Consolidated `claude -p` compatibility contract.**
+  `docs/notes/claude-p-compat-contract.md` (bead claudepr-10f4ffa5) is the
+  single normative definition of the drop-in claim: the complete accepted flag
+  surface with each flag's child-argv forwarding class (never / verbatim /
+  always / becomes / entry point), prompt-source precedence and its
+  pre-emitter rejection shapes, the output modes, the exit-code and signal
+  mapping, the child argv construction order, and the forced/scrubbed child
+  environment. `tests/claude_p_compat_contract.rs` holds the document against
+  the implementation in both directions — the flag table as the closed world
+  of the built `Cli` tree, the exit table equal to `ClaudePrintError`'s
+  mapping, the child argv replayed through `Session::build_child_argv` and
+  observed end-to-end through `MOCK_RECORD_ARGS`/`MOCK_RECORD_ENV`, and the
+  prompt precedence observed through `MOCK_ECHO_PROMPT` — so a change to any
+  axis must update the contract, the implementation, and the specialized
+  suites together.
 - **Documentation link-integrity guard.** `tests/docs_link_integrity.rs`
   (bead claudepr-a7754a8e) resolves every local cross-reference the
   documentation corpus makes: every markdown link in README.md, AGENTS.md,
