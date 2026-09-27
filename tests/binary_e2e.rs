@@ -25,7 +25,7 @@
 //!   * **--version** — exit 0, output names `claude-print` and `wrapping`.
 
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
 /// A captured subprocess outcome: exit code (or `None` if killed on timeout),
@@ -1592,5 +1592,290 @@ fn mcp_config_without_a_value_is_a_usage_error_before_the_config_step() {
         !out.stderr.contains("invalid config:"),
         "the poisoned discovered config must NOT be reached: {}",
         out.stderr
+    );
+}
+
+// ── --check --clean: orphaned temp-dir sweep (claudepr-591cd6c1) ────────────
+//
+// The orphan contract is docs/notes/clean-contract.md: a crashed session
+// leaves its `claude-print-<pid>-<rand>` temp dir behind, check mode scans
+// the process temp dir for such directories aged ≥ 1 hour (mtime), warns —
+// and only with `--clean` removes them, failing the check when a *requested*
+// removal fails. These tests drive the compiled binary against a controlled
+// `TMPDIR` so the scan sees exactly the fixture, not the host's real temp
+// dir. `TMPDIR` also relocates the probe table's mkfifo row harmlessly; the
+// automatic ordinary-invocation sweep is suppressed on `--check` runs, so
+// the report is the single description of what happened to the fixture.
+
+/// Set a path's mtime to `target` (futimens through an owned fd — works on
+/// directories the test process owns; same helper shape as the `src/check.rs`
+/// and `src/hook.rs` unit tests).
+fn set_mtime(path: &std::path::Path, target: SystemTime) {
+    let f = std::fs::File::open(path).expect("open for set_times");
+    let times = std::fs::FileTimes::new().set_modified(target);
+    f.set_times(times).expect("set_times");
+}
+
+/// Two hours ago: comfortably past the one-hour scan threshold, and stale
+/// enough that `{:.1}h` formatting renders the pinned `2.0h`.
+fn two_hours_ago() -> SystemTime {
+    SystemTime::now() - Duration::from_secs(2 * 3600)
+}
+
+/// Create a stale orphan with payload — a nested dir and a file inside, both
+/// of which must go with the directory (§6 "Partial contents").
+fn stale_orphan(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let orphan = dir.join(name);
+    std::fs::create_dir_all(orphan.join("inner")).expect("create orphan");
+    std::fs::write(orphan.join("inner/stop.fifo"), b"stale").expect("write payload");
+    set_mtime(&orphan, two_hours_ago());
+    orphan
+}
+
+/// Run the binary with this fixture as its whole process temp dir.
+fn run_check_clean(extra_args: &[&str], dir: &std::path::Path) -> Outcome {
+    let mut cmd = claude_print();
+    cmd.args(["--check"]).args(extra_args);
+    cmd.env("TMPDIR", dir);
+    run(&mut cmd, BUDGET)
+}
+
+#[test]
+fn check_clean_removes_stale_orphans_and_preserves_everything_else() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let orphan = stale_orphan(dir, "claude-print-111-stale");
+    let fresh = dir.join("claude-print-222-fresh");
+    std::fs::create_dir(&fresh).unwrap();
+    std::fs::write(fresh.join("settings.json"), b"{}").unwrap();
+    let unrelated = dir.join("unrelated-old");
+    std::fs::create_dir(&unrelated).unwrap();
+    set_mtime(&unrelated, two_hours_ago());
+    let stale_file = dir.join("claude-print-999-stale-file");
+    std::fs::write(&stale_file, b"not a directory").unwrap();
+    set_mtime(&stale_file, two_hours_ago());
+
+    let out = run_check_clean(&["--clean"], dir);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "removal of the one stale orphan must pass\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    let cleaned = format!(
+        "CLEANED: removed orphaned temp dir {} (2.0h old)",
+        orphan.display()
+    );
+    assert!(
+        out.stdout.contains(&cleaned),
+        "the CLEANED line must name the path and age; stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("All checks passed."),
+        "a successful clean must not flip the verdict; stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        !orphan.exists(),
+        "the stale orphan must be removed with its contents"
+    );
+    assert!(
+        fresh.exists() && fresh.join("settings.json").exists(),
+        "a fresh claude-print dir is never a candidate"
+    );
+    assert!(
+        unrelated.exists(),
+        "an old dir without the prefix is never a candidate"
+    );
+    assert!(
+        stale_file.exists(),
+        "a claude-print-* FILE is not a directory, so never a candidate"
+    );
+}
+
+#[test]
+fn check_without_clean_warns_and_preserves_the_orphan() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let orphan = stale_orphan(dir, "claude-print-111-stale");
+
+    let out = run_check_clean(&[], dir);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "warn-only findings never fail the check\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    let warned = format!(
+        "WARNING: found orphaned temp dir {} (2.0h old) — run rm -rf to clean up",
+        orphan.display()
+    );
+    assert!(
+        out.stdout.contains(&warned),
+        "plain --check must warn with the cleanup hint; stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("CLEANED:"),
+        "without --clean nothing is removed, so nothing is CLEANED; stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        orphan.exists() && orphan.join("inner/stop.fifo").exists(),
+        "plain --check preserves the orphan"
+    );
+}
+
+#[test]
+fn check_clean_rerun_is_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let orphan = stale_orphan(dir, "claude-print-111-stale");
+
+    let first = run_check_clean(&["--clean"], dir);
+    assert_eq!(
+        first.code,
+        Some(0),
+        "first run removes the orphan\nstdout:\n{}\nstderr:\n{}",
+        first.stdout,
+        first.stderr
+    );
+    assert!(
+        first.stdout.contains("CLEANED:"),
+        "first run reports the removal; stdout:\n{}",
+        first.stdout
+    );
+
+    let second = run_check_clean(&["--clean"], dir);
+    assert_eq!(
+        second.code,
+        Some(0),
+        "second run finds nothing and passes\nstdout:\n{}\nstderr:\n{}",
+        second.stdout,
+        second.stderr
+    );
+    assert!(
+        !second.stdout.contains("CLEANED:") && !second.stdout.contains("WARNING:"),
+        "second run must be a silent no-op; stdout:\n{}",
+        second.stdout
+    );
+    assert!(
+        !orphan.exists(),
+        "the orphan removed by the first run stays gone"
+    );
+}
+
+#[test]
+fn check_clean_failed_removal_fails_the_check() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Root removes through mode 500, so the scenario cannot be built
+        // (same posture as the permission scenarios in
+        // tests/pretrust_cwd_contract.rs).
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let orphan = stale_orphan(dir, "claude-print-111-locked");
+    // Deny write on the orphan AFTER its mtime is set (futimens needs the
+    // owner's access) so the child's remove_dir_all fails on the contents.
+    std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let out = run_check_clean(&["--clean"], dir);
+
+    // Restore before the TempDir drop — a 0o500 dir cannot be removed, and
+    // an assert below may yet fail.
+    std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "a failed *requested* removal is a failed check\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.contains(&format!(
+            "WARNING: failed to remove orphaned temp dir {}",
+            orphan.display()
+        )),
+        "the failure line must name the path; stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("One or more checks FAILED."),
+        "the verdict flips on stderr; stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        orphan.exists(),
+        "a failed removal leaves the directory in place for the next run"
+    );
+}
+
+#[test]
+fn check_clean_with_no_orphans_is_silent() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+
+    let out = run_check_clean(&["--clean"], dir);
+
+    assert_eq!(
+        out.code,
+        Some(0),
+        "no findings, no failure\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("CLEANED:") && !out.stdout.contains("WARNING:"),
+        "silence is the no-findings signal; stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("All checks passed."),
+        "the verdict is unchanged; stdout:\n{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn clean_without_check_is_a_usage_error_removing_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let orphan = stale_orphan(dir, "claude-print-111-stale");
+
+    let mut cmd = claude_print();
+    cmd.arg("--clean");
+    cmd.env("TMPDIR", dir);
+    let out = run(&mut cmd, BUDGET);
+
+    assert_eq!(
+        out.code,
+        Some(2),
+        "clap rejects --clean without --check with a usage exit 2\nstdout:\n{}\nstderr:\n{}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "the rejection is a parse error: no report, no scan; stdout:\n{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("required arguments were not provided")
+            && out.stderr.contains("--check"),
+        "the usage error must name the --check requirement; stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        orphan.exists(),
+        "nothing is removed: the parse error answers before any scan runs"
     );
 }

@@ -9,6 +9,24 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **`--clean` orphaned-temp-dir contract.**
+  `docs/notes/clean-contract.md` (bead claudepr-591cd6c1) is the normative
+  definition behind the compat contract's one-line summary: the two orphan
+  sweeps (the check-mode scan behind `--check`/`--check --clean` and the
+  ordinary-invocation sweep with its PID-liveness gate), the shared
+  name/type/age predicate with its exactly-at-threshold boundary and
+  future-mtime skip, the safe-scope guarantees (top level only, prefix-scoped,
+  directories only, symlinks never followed), the `WARNING:`/`CLEANED:`
+  output shapes, the exit codes — a failed *requested* removal fails the
+  check — and idempotency. `src/check.rs`'s unit tests pin the scan and
+  removal semantics against an injected directory and clock,
+  `tests/cli.rs` pins the parser combinations (order independence, the
+  parse-time `MissingRequiredArgument` rejection of `--clean` without
+  `--check`), and `tests/binary_e2e.rs` §"--check --clean" drives the
+  compiled binary against a controlled `TMPDIR`: removal with fresh,
+  unrelated, and non-directory survivors, warn-only preservation, a blocked
+  removal failing the check, no-orphan silence, rerun idempotency, and the
+  usage error removing nothing.
 - **`--pretrust-cwd` trust pre-grant contract.**
   `docs/notes/pretrust-cwd-contract.md` (bead claudepr-bd36930d) is the
   normative definition behind the compat contract's one-line summary: the

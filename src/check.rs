@@ -535,6 +535,199 @@ mod tests {
     }
 
     #[test]
+    fn orphan_boundary_exactly_at_threshold_is_a_candidate() {
+        // find_orphans_in uses `age >= threshold`: exactly one hour old
+        // counts as aged. Pinning the inclusive boundary — an exclusive
+        // comparison here would silently reclassify the oldest real
+        // orphans as fresh every run that lands on the boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let orphan = dir.join("claude-print-777-boundary");
+        std::fs::create_dir(&orphan).unwrap();
+        set_mtime(&orphan, now - Duration::from_secs(3600));
+
+        let orphans = find_orphans_in(dir, now, Duration::from_secs(3600));
+        assert_eq!(orphans.len(), 1, "exactly-1h-old must be a candidate");
+        assert_eq!(orphans[0].path, orphan);
+    }
+
+    #[test]
+    fn future_mtime_is_never_a_candidate() {
+        // `now.duration_since(mtime)` errors for a future mtime (clock
+        // skew, an mtime set by another host); the scan must skip the
+        // entry rather than panic or clamp it into candidacy.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let skewed = dir.join("claude-print-888-clock-skew");
+        std::fs::create_dir(&skewed).unwrap();
+        set_mtime(&skewed, now + Duration::from_secs(3600));
+
+        let orphans = find_orphans_in(dir, now, Duration::from_secs(3600));
+        assert!(orphans.is_empty(), "future mtime must be skipped");
+        assert!(skewed.exists(), "and never removed");
+    }
+
+    #[test]
+    fn orphan_scan_is_scoped_to_the_top_level_of_dir() {
+        // The scan is one non-recursive read_dir: a matching directory
+        // nested inside a non-matching one is not discovered on its own,
+        // and its parent (old but unrelated) is never a candidate either.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+
+        let outer = dir.join("unrelated-old-wrapper");
+        std::fs::create_dir(&outer).unwrap();
+        set_mtime(&outer, now - Duration::from_secs(2 * 3600));
+        let nested = outer.join("claude-print-999-nested");
+        std::fs::create_dir(&nested).unwrap();
+        set_mtime(&nested, now - Duration::from_secs(2 * 3600));
+
+        let orphans = find_orphans_in(dir, now, Duration::from_secs(3600));
+        assert!(orphans.is_empty(), "nested matches are not scan candidates");
+        assert!(nested.exists() && outer.exists(), "nothing was touched");
+    }
+
+    #[test]
+    fn orphan_scan_never_follows_or_claims_a_symlink() {
+        // DirEntry::metadata does not follow symlinks, so a claude-print-*
+        // symlink is neither a scan candidate nor followed (§2/§3 of
+        // docs/notes/clean-contract.md). The fixture's only claude-print-*
+        // directory is stale but nested — undiscoverable except THROUGH the
+        // link — so if the scan ever followed symlinks, it would claim the
+        // link and remove the nested contents through it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+
+        let outer = dir.join("unrelated-old");
+        std::fs::create_dir(&outer).unwrap();
+        set_mtime(&outer, now - Duration::from_secs(2 * 3600));
+        let nested = outer.join("claude-print-444-nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("payload.txt"), b"keep").unwrap();
+        set_mtime(&nested, now - Duration::from_secs(2 * 3600));
+        let link = dir.join("claude-print-555-link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        set_mtime(&link, now - Duration::from_secs(2 * 3600));
+
+        let orphans = find_orphans_in(dir, now, Duration::from_secs(3600));
+        let found: Vec<String> = orphans
+            .iter()
+            .map(|o| o.path.display().to_string())
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "a symlinked entry is not a scan candidate: {found:?}"
+        );
+
+        let report = process_orphans_in(dir, now, Duration::from_secs(3600), true);
+        assert!(
+            report.messages.is_empty(),
+            "nothing matched, so nothing is reported: {:?}",
+            report.messages
+        );
+        assert!(report.all_removed, "nothing matched, so nothing can fail");
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "the link itself survives a --clean pass"
+        );
+        assert!(
+            nested.join("payload.txt").exists(),
+            "nothing is removed through the link"
+        );
+    }
+
+    #[test]
+    fn missing_scan_dir_yields_an_empty_non_failing_report() {
+        // A vanished/unreadable temp dir is an empty scan, not an error:
+        // check mode degrades to "no findings" instead of failing the run.
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("claude-print-no-such-dir");
+        assert!(find_orphans_in(&gone, SystemTime::now(), Duration::from_secs(3600)).is_empty());
+
+        let report = process_orphans_in(&gone, SystemTime::now(), Duration::from_secs(3600), true);
+        assert!(report.messages.is_empty());
+        assert!(
+            report.all_removed,
+            "no findings must not fail a --clean run"
+        );
+    }
+
+    #[test]
+    fn clean_removal_is_idempotent() {
+        // A second --clean pass over the same directory finds nothing:
+        // no messages, no failure. The shape a cron/timer caller relies on.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let orphan = dir.join("claude-print-12345-idem");
+        std::fs::create_dir(&orphan).unwrap();
+        set_mtime(&orphan, now - Duration::from_secs(2 * 3600));
+
+        let first = process_orphans_in(dir, now, Duration::from_secs(3600), true);
+        assert!(first.all_removed && first.messages.len() == 1);
+        let second = process_orphans_in(dir, now, Duration::from_secs(3600), true);
+        assert!(
+            second.all_removed && second.messages.is_empty(),
+            "second pass must be a silent no-op, got {:?}",
+            second.messages
+        );
+    }
+
+    #[test]
+    fn clean_removal_failure_is_reported_and_flags_the_report() {
+        // A matched directory whose contents cannot be removed (write
+        // permission denied on the directory itself) stays in place, is
+        // reported with the failed-removal WARNING, and clears
+        // all_removed — the flag main() turns into exit 2. Skipped under
+        // root, where mode bits do not deny (same posture as the
+        // permission scenarios in tests/pretrust_cwd_contract.rs).
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root removes through mode 500, the scenario cannot be built");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let orphan = dir.join("claude-print-12345-locked");
+        std::fs::create_dir(&orphan).unwrap();
+        std::fs::write(orphan.join("stop.fifo"), b"fixture").unwrap();
+        set_mtime(&orphan, now - Duration::from_secs(2 * 3600));
+        // Deny write on the directory AFTER the mtime is set (futimens
+        // needs the owner's access) so removing the inner entry fails.
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let report = process_orphans_in(dir, now, Duration::from_secs(3600), true);
+
+        // Restore before the TempDir drop — a 0o500 dir cannot be removed.
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            orphan.exists(),
+            "a failed removal must leave the dir in place"
+        );
+        assert!(!report.all_removed, "a failed removal must flag the report");
+        assert_eq!(report.messages.len(), 1, "one line for the one failure");
+        assert!(
+            report.messages[0].starts_with(&format!(
+                "WARNING: failed to remove orphaned temp dir {}",
+                orphan.display()
+            )),
+            "failed-removal shape: {:?}",
+            report.messages[0]
+        );
+        assert!(
+            !report.messages[0].contains("run rm -rf"),
+            "the warn-only cleanup hint is the warn-only line's, not this one's"
+        );
+    }
+
+    #[test]
     fn clean_scan_removes_only_old_matching_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();

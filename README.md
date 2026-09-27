@@ -253,7 +253,7 @@ claude-print --timeout 30 "quick question"
 | `--show-child-stderr` | | off | Surface the child's captured PTY output to stderr when startup is slow or stalls (watchdog first-output timeout, or the prompt was never injected) — useful for diagnosing MCP/init wedges |
 | `--verbose` | | | Write timing traces to stderr |
 | `--check` | | | Run installation self-test and exit |
-| `--clean` | | | With `--check`, remove orphaned temp directories older than one hour |
+| `--clean` | | | With `--check`, remove orphaned temp directories older than one hour — see the [--clean contract](docs/notes/clean-contract.md) |
 | `--version` | `-V` | | Print version and exit |
 | `--help` | `-h` | | Print help |
 

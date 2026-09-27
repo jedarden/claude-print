@@ -145,8 +145,42 @@ fn cli_check_clean_flags() {
 
 #[test]
 fn cli_clean_requires_check() {
+    use clap::error::ErrorKind;
+
     let result = Cli::try_parse_from(["claude-print", "--clean"]);
     assert!(result.is_err(), "--clean without --check must be rejected");
+    // Pin the rejection kind: a parse-time usage error, not a runtime
+    // condition — `main` never dispatches, so no scan runs and nothing is
+    // removed (docs/notes/clean-contract.md §5).
+    assert_eq!(
+        result.unwrap_err().kind(),
+        ErrorKind::MissingRequiredArgument
+    );
+}
+
+#[test]
+fn cli_check_clean_flags_in_either_order_and_alongside_other_flags() {
+    // --clean is a modifier of --check, not an entry point of its own, so
+    // the pair is order-independent and other flags ride along
+    // (docs/notes/clean-contract.md §5).
+    let cli = Cli::try_parse_from(["claude-print", "--clean", "--check", "--verbose"]).unwrap();
+    assert!(cli.check);
+    assert!(cli.clean);
+    assert!(cli.verbose);
+}
+
+#[test]
+fn cli_clean_with_positional_prompt_still_requires_check() {
+    use clap::error::ErrorKind;
+
+    // --clean takes no value, so a following positional is the prompt; the
+    // requirement still rejects the invocation and names --check on stderr.
+    let err = Cli::try_parse_from(["claude-print", "--clean", "say hi"]).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    assert!(
+        err.to_string().contains("--check"),
+        "the usage error must name the requirement: {err}"
+    );
 }
 
 #[test]
