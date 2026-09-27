@@ -85,6 +85,14 @@ three exit windows that dump it, the exact stderr block, how the output modes
 and the pool/fallback paths treat it, and the end-to-end coverage that this
 table's one-line summary compresses.
 
+`--clean` has a dedicated contract:
+`docs/notes/clean-contract.md` defines the two orphan sweeps behind the flag
+(the check-mode scan it drives and the ordinary-invocation sweep it suppresses,
+with the latter's PID-liveness gate), the shared name/type/age predicate with
+its exactly-at-threshold boundary, the safe-scope guarantees, the
+`WARNING:`/`CLEANED:` output shapes and exit codes, and the idempotency and
+end-to-end coverage that this table's one-line summary compresses.
+
 The `serve` subcommand is claude-print's own daemon entry point — real `claude`
 has nothing like it, so it is not part of the compatibility surface, but its
 flags are part of the parser and listed for completeness:
