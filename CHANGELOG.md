@@ -9,6 +9,27 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **`--show-child-stderr` child-PTY-capture contract.**
+  `docs/notes/show-child-stderr-contract.md` (bead claudepr-8b4aa030) is the
+  normative definition behind the compat contract's one-line summary: what
+  the capture holds (every non-empty PTY chunk on both the stateless and
+  pooled paths, PTY echo included, raw, capped at a 64 KiB ring tail), the
+  three mutually exclusive exit windows that dump it (any watchdog deadline —
+  unconditional, even post-injection; child death or an interrupt before the
+  prompt was injected), the closed complement that never dumps (success,
+  post-Stop errors, the EC-7 leak, trust-dialog refusal, empty capture), the
+  exact stderr block and its ordering relative to the deadline diagnostics
+  and the mode-shaped error report (stdout never carries dump bytes in any
+  mode), the pooled window (the flag applies, the capture starts at
+  acquisition, warmup bytes never appear) and the stateless fallback, and
+  the scope limits (claude-print-local, inert off the session paths, bounded
+  and once). `tests/show_child_stderr_contract.rs` holds the document
+  against the implementation in both directions — source pins for the flag
+  wiring, the two feeds, the six dump sites and their guards, the render
+  template and cap, and the doc cross-links; binary e2e against mock-claude
+  for default-off silence, the enabled block across text/json/stream-json,
+  the empty-capture no-op, pre-injection child death in an A/B against the
+  flag-off run, the pooled drive-time echo, and the stateless fallback.
 - **`--clean` orphaned-temp-dir contract.**
   `docs/notes/clean-contract.md` (bead claudepr-591cd6c1) is the normative
   definition behind the compat contract's one-line summary: the two orphan

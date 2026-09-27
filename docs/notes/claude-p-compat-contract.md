@@ -79,6 +79,12 @@ merge and idempotency semantics, the failure taxonomy, and the
 trusted/untrusted-directory e2e coverage that this table's one-line summary
 compresses.
 
+`--show-child-stderr` has a dedicated contract:
+`docs/notes/show-child-stderr-contract.md` defines what the capture holds, the
+three exit windows that dump it, the exact stderr block, how the output modes
+and the pool/fallback paths treat it, and the end-to-end coverage that this
+table's one-line summary compresses.
+
 The `serve` subcommand is claude-print's own daemon entry point — real `claude`
 has nothing like it, so it is not part of the compatibility surface, but its
 flags are part of the parser and listed for completeness:
