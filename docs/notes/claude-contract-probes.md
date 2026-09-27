@@ -510,11 +510,16 @@ Versions move in two ways; either should trigger the check:
 - the dev host auto-updates the native install
   (`~/.local/share/claude/versions/`, repointing `~/.local/bin/claude`) —
   a manual upgrade lands the same way;
-- CI records the version it saw into `target/last-claude-version.txt` via
+- CI records the version it saw into `last-claude-version.txt` via
   `test_claude_version_recorded` (`tests/version_compat.rs`), and the release
   WorkflowTemplate uploads it as a release asset — diffing consecutive
-  artifacts is the fleet-visible drift signal (claudepr-777d3056). The gate
-  refreshes the same file on every run, in the same full-line format
+  artifacts is the fleet-visible drift signal (claudepr-777d3056). The test
+  and the gate resolve the artifact dir the same way —
+  `$CLAUDE_PRINT_VERSION_ARTIFACT_DIR` when set, else the `cargo metadata`
+  `target_directory` (the checkout's `target/` under stock cargo, the fleet
+  wrapper's redirect under the wrapper), else the stock `target/` — so the
+  two writers always land on one file however the host lays out build output.
+  The gate refreshes the same file on every run, in the same full-line format
   `test_claude_version_recorded` writes, so the release asset stays real and
   consistently formatted even when cargo did not run first.
 
@@ -525,7 +530,7 @@ mode alike: it installs the claude binary first (native installer —
 `claude --version` needs no auth) so detection compares the *installed*
 version instead of recording `unknown`, then invokes
 `scripts/contract-maintenance-gate.sh --file-follow-up`. On drift the gate
-re-anchors `target/last-claude-version.txt`, files or updates a GitHub
+re-anchors the last-claude-version artifact (same resolution as above), files or updates a GitHub
 follow-up issue (idempotent per installed version — searched by a
 `claude-contract-drift live=<version>` marker before create), and leaves the
 evidence bundle under `target/contract-maintenance/` (`detection.txt`,

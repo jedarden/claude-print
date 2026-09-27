@@ -24,9 +24,10 @@
 //!   pins against a skeleton repo without consulting any `claude` at all;
 //! - the gate's contract against a stubbed `claude`/`gh`/`cargo` (hermetic —
 //!   a single stub-bin PATH, so unstubbed binaries are genuinely absent):
-//!   exit code, evidence-bundle shape, the refreshed
-//!   `target/last-claude-version.txt`, and `--file-follow-up` idempotency
-//!   (marker search before issue create);
+//!   exit code, evidence-bundle shape, the refreshed version artifact (an
+//!   explicit `--version-file`, and the default resolution it shares with
+//!   `tests/version_compat.rs` across both cargo layouts), and
+//!   `--file-follow-up` idempotency (marker search before issue create);
 //! - real-environment self-consistency — the same path CI exercises, with no
 //!   PATH override: the gate's verdict mirrors the detector's, and the
 //!   version file matches the real `claude --version` (or records `unknown`);
@@ -156,14 +157,14 @@ fn bumped(pin: &str) -> String {
 }
 
 /// Symlink the real core utilities the bash scripts need (bash, grep, head,
-/// cat, mkdir, dirname, sort, wc, tr) into the stub bin dir, so a
+/// cat, mkdir, dirname, sort, wc, tr, sed) into the stub bin dir, so a
 /// single-entry PATH is self-contained. `printf`/`command`/`cd` are bash
 /// builtins and need no link. Idempotent: existing links (and stubs) are
 /// left alone.
 fn link_coreutils(bin: &Path) {
     fs::create_dir_all(bin).unwrap();
     for tool in [
-        "bash", "grep", "head", "cat", "mkdir", "dirname", "sort", "wc", "tr",
+        "bash", "grep", "head", "cat", "mkdir", "dirname", "sort", "wc", "tr", "sed",
     ] {
         let dest = bin.join(tool);
         if dest.symlink_metadata().is_ok() {
@@ -238,11 +239,18 @@ esac
 
 /// A `cargo` that records its arguments and passes, standing in for the
 /// cheap live-contract run (`cargo test --test claude_contracts -- --ignored`).
+/// A `metadata` invocation is answered from `$CARGO_METADATA_JSON` instead —
+/// that is the target-dir lookup the gate's default version-artifact
+/// resolution makes, and it must stay out of the live-test transcript.
 fn stub_cargo(dir: &Path) {
     write_stub(
         dir,
         "cargo",
         r#"set -u
+if [ "${1:-}" = "metadata" ]; then
+    printf '%s\n' "${CARGO_METADATA_JSON:-}"
+    exit 0
+fi
 printf '%s\n' "$*" >> "${CARGO_ARGS_FILE:?CARGO_ARGS_FILE not set}"
 echo 'stub cargo: test claude_contracts ... ok'
 exit 0
@@ -281,6 +289,19 @@ fn gate_args(dir: &Path, skip_live: bool, extra: &[&str]) -> Vec<String> {
     }
     args.extend(extra.iter().map(|s| s.to_string()));
     args
+}
+
+/// Gate args with the version file left to the script's own default
+/// resolution — the surface the stock/fleet layout tests below exercise.
+/// `--skip-live-tests` always, so the stub cargo is never invoked for the
+/// live contracts either and the only cargo call a default-resolution run
+/// can make is the metadata lookup under test.
+fn gate_args_without_version_file(dir: &Path) -> Vec<String> {
+    vec![
+        "--evidence-dir".to_string(),
+        dir.join("evidence").display().to_string(),
+        "--skip-live-tests".to_string(),
+    ]
 }
 
 fn read_text(path: &Path) -> String {
@@ -1158,6 +1179,108 @@ fn gate_live_tests_skip_flag_leaves_no_transcript() {
     assert_eq!(
         status_value(&evidence, "live-tests"),
         "skipped (--skip-live-tests)"
+    );
+}
+
+// ── Version-artifact location: stock and fleet layouts (no --version-file) ───
+//
+// The default version file must follow the same resolution
+// tests/version_compat.rs applies — explicit $CLAUDE_PRINT_VERSION_ARTIFACT_DIR
+// dir, else the `cargo metadata` target_directory, else the stock <repo>/target
+// — so the gate's refresh and the test's write land on one file however the
+// host lays out build output (bead claudepr-ec9e7480): a redirect-following
+// write paired with a stock-path read (or the reverse) would strand the
+// release's version artifact on every fleet host while CI stayed green.
+
+/// A scratch root playing the wrapper's shared redirect base in the
+/// fleet-layout shapes (its real value is a fleet-environment fact these
+/// tests deliberately do not write out).
+#[test]
+fn gate_default_version_file_prefers_the_explicit_env_dir() {
+    let pin = doc_pin();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    stub_claude(&bin, &format!("{pin} (Claude Code)"));
+    let redirect = dir.path().join("redirect");
+
+    let out = run_script(
+        "scripts/contract-maintenance-gate.sh",
+        Some(&bin),
+        &gate_args_without_version_file(dir.path()),
+        &[(
+            "CLAUDE_PRINT_VERSION_ARTIFACT_DIR",
+            redirect.display().to_string(),
+        )],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        read_text(&redirect.join("last-claude-version.txt")),
+        format!("{pin} (Claude Code)\n"),
+        "the explicit CI-provided dir is authoritative"
+    );
+    // No cargo stub: under the hermetic PATH cargo is genuinely unreachable,
+    // so landing in the redirect proves the explicit dir short-circuited the
+    // metadata lookup entirely (a consult would have fallen back to the
+    // stock layout instead).
+}
+
+#[test]
+fn gate_default_version_file_follows_cargo_metadata_target_dir() {
+    let pin = doc_pin();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    stub_claude(&bin, &format!("{pin} (Claude Code)"));
+    stub_cargo(&bin);
+    let redirect = dir.path().join("redirect");
+    let metadata_json = format!(
+        "{{\"target_directory\":\"{}\",\"workspace_root\":\"/otherwise\"}}",
+        redirect.display()
+    );
+
+    let out = run_script(
+        "scripts/contract-maintenance-gate.sh",
+        Some(&bin),
+        &gate_args_without_version_file(dir.path()),
+        &[
+            // Blank beats unset as the under-test shape: blank must count as
+            // unset so the metadata lookup runs at all.
+            ("CLAUDE_PRINT_VERSION_ARTIFACT_DIR", String::new()),
+            ("CARGO_METADATA_JSON", metadata_json),
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    assert_eq!(
+        read_text(&redirect.join("last-claude-version.txt")),
+        format!("{pin} (Claude Code)\n"),
+        "without an explicit dir the artifact must follow the target dir \
+         cargo itself reports — the fleet redirect shape"
+    );
+}
+
+#[test]
+fn gate_default_version_file_falls_back_to_the_stock_layout_without_cargo() {
+    let pin = doc_pin();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    stub_claude(&bin, &format!("{pin} (Claude Code)"));
+    // No cargo stub: the fallback's own premise (cargo metadata unavailable).
+
+    let out = run_script(
+        "scripts/contract-maintenance-gate.sh",
+        Some(&bin),
+        &gate_args_without_version_file(dir.path()),
+        &[("CLAUDE_PRINT_VERSION_ARTIFACT_DIR", String::new())],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr_of(&out));
+    let repo_target = repo_path("target").join("last-claude-version.txt");
+    assert_eq!(
+        read_text(&repo_target),
+        format!("{pin} (Claude Code)\n"),
+        "without cargo metadata the artifact must land in the stock-checkout \
+         target dir the other resolvers fall back to"
     );
 }
 

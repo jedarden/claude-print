@@ -27,9 +27,14 @@
 #               `claude-contract-drift live=<version>` body marker searched
 #               before create) a GitHub issue via the gh CLI
 #
-# Every run also refreshes the CI drift artifact target/last-claude-version.txt
-# — the same file, in the same full-line format, that
-# tests/version_compat.rs::test_claude_version_recorded writes — so the
+# Every run also refreshes the CI drift artifact last-claude-version.txt in
+# the resolved artifact dir — --version-file when given, else
+# $CLAUDE_PRINT_VERSION_ARTIFACT_DIR, else the target directory `cargo
+# metadata` reports (the checkout's ./target under stock cargo, the fleet
+# wrapper's redirect under the wrapper — AGENTS.md §"Where the build output
+# lands"), else the stock ./target fallback — the same resolution
+# tests/version_compat.rs::test_claude_version_recorded applies, and the same
+# full-line format that test writes, so both writers land on one file and the
 # release asset stays real and consistently formatted even when cargo did not
 # run first. "unknown" is recorded only when the version cannot be determined.
 #
@@ -76,7 +81,7 @@ GH_REPO="jedarden/claude-print"
 PROBES="probe-claude-contracts.sh probe-stop-toolallowed.sh probe-tui-second-turn.sh probe-stop-edge-contracts.sh"
 
 EVIDENCE_DIR="$REPO_ROOT/target/contract-maintenance"
-VERSION_FILE="$REPO_ROOT/target/last-claude-version.txt"
+VERSION_FILE=""
 FILE_FOLLOW_UP=0
 SKIP_LIVE_TESTS=0
 RUN_PROBES=0
@@ -87,7 +92,9 @@ usage: scripts/contract-maintenance-gate.sh [options]
   --evidence-dir DIR   where to write the evidence bundle
                        (default: target/contract-maintenance)
   --version-file PATH  CI drift artifact to refresh
-                       (default: target/last-claude-version.txt)
+                       (default: $CLAUDE_PRINT_VERSION_ARTIFACT_DIR when set,
+                       else the cargo-metadata target directory, else
+                       target/last-claude-version.txt)
   --file-follow-up     file/update a GitHub follow-up issue on drift (gh CLI)
   --skip-live-tests    do not run cargo test --test claude_contracts -- --ignored
   --run-probes         also run the four model-turn probe scripts (API auth +
@@ -110,6 +117,37 @@ while [ $# -gt 0 ]; do
         *) echo "ERROR: unknown argument: $1 (see --help)" >&2; exit 2 ;;
     esac
 done
+
+# ── Version-artifact location (AGENTS.md §"Where the build output lands") ────
+#
+# The same resolution tests/version_compat.rs applies, so the gate's refresh
+# and the test's write land on one file whichever layout the host has —
+# ./target/ is correct on a stock checkout and never created on fleet hosts,
+# where the cargo wrapper redirects build output. Precedence:
+#   1. --version-file PATH — the explicit flag, authoritative when given;
+#   2. $CLAUDE_PRINT_VERSION_ARTIFACT_DIR — the explicit CI-provided dir;
+#   3. the target directory `cargo metadata` reports (cargo metadata runs
+#      through the same wrapper, so it reports the redirected dir on fleet
+#      hosts and ./target on a stock one) — the documented jq-free sed
+#      extraction;
+#   4. $REPO_ROOT/target — the stock-checkout fallback when cargo metadata
+#      is unavailable.
+resolve_default_version_file() {
+    if [ -n "${CLAUDE_PRINT_VERSION_ARTIFACT_DIR:-}" ]; then
+        printf '%s\n' "${CLAUDE_PRINT_VERSION_ARTIFACT_DIR%/}/last-claude-version.txt"
+        return
+    fi
+    if command -v cargo >/dev/null 2>&1; then
+        meta_dir="$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' || true)"
+        if [ -n "$meta_dir" ]; then
+            printf '%s\n' "$meta_dir/last-claude-version.txt"
+            return
+        fi
+    fi
+    printf '%s\n' "$REPO_ROOT/target/last-claude-version.txt"
+}
+[ -n "$VERSION_FILE" ] || VERSION_FILE="$(resolve_default_version_file)"
 
 version_token() {
     # First x.y.z-looking token in the given text, empty if none.
@@ -146,7 +184,7 @@ case "$DET_EXIT" in
     *) VERDICT=INDETERMINATE; ALERT=indeterminate; GATE_EXIT=2 ;;
 esac
 
-# ── 2. Refresh the CI drift artifact (target/last-claude-version.txt) ────────
+# ── 2. Refresh the CI drift artifact (the resolved version artifact) ─────────
 
 PIN_VERSION="$(version_token "$(grep -m1 '^\*\*Measured against:\*\*' "$DOC" || true)")"
 [ -n "$PIN_VERSION" ] || PIN_VERSION="unknown"

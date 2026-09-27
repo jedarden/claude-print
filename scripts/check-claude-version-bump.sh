@@ -42,8 +42,11 @@
 # Read-only: runs `claude --version` only — no sandbox, no HOME writes, no
 # model turns. Safe to run on a schedule or from CI (exit 1 = alert), which
 # is the R-2 "CI alert on version change" signal the plan asks for, alongside
-# the `target/last-claude-version.txt` artifact written by
-# tests/version_compat.rs::test_claude_version_recorded.
+# the last-claude-version.txt artifact written by
+# tests/version_compat.rs::test_claude_version_recorded into the resolved
+# artifact dir ($CLAUDE_PRINT_VERSION_ARTIFACT_DIR, else the cargo-metadata
+# target directory, else the stock target/) — the same resolution
+# contract-maintenance-gate.sh applies when it refreshes the artifact.
 
 set -u
 

@@ -96,6 +96,86 @@ fn is_repo_root(p: &Path) -> bool {
 
 // ── Claude version format tracking ───────────────────────────────────────────
 
+/// The CI artifact file name, relative to the resolved artifact directory.
+const ARTIFACT_FILE: &str = "last-claude-version.txt";
+
+/// Explicit artifact-directory override — the "CI-provided path" escape
+/// hatch. When set (non-blank) it is authoritative: CI or an operator pins
+/// exactly where the artifact lands, and neither the cargo-metadata lookup
+/// nor the stock fallback may second-guess it. The contract-maintenance gate
+/// applies the same precedence (`scripts/contract-maintenance-gate.sh`), so
+/// the two writers — this suite and the gate — always land on one file.
+const ARTIFACT_DIR_ENV: &str = "CLAUDE_PRINT_VERSION_ARTIFACT_DIR";
+
+/// Where [`ARTIFACT_FILE`] is written, resolved at runtime — never a
+/// written-out build-output path, which is exactly the drift AGENTS.md
+/// §"Where the build output lands" forbids: `./target/` is correct on a
+/// stock checkout and never created on fleet hosts, where the cargo wrapper
+/// redirects output to one shared per-repo dir. Precedence, mirroring the
+/// contract-maintenance gate's shell resolution:
+///
+/// 1. `$CLAUDE_PRINT_VERSION_ARTIFACT_DIR` — the explicit CI-provided dir,
+///    authoritative when set (blank/whitespace counts as unset);
+/// 2. the target directory `cargo metadata` reports — the same dir the
+///    build itself used (the checkout's `target/` under stock cargo, the
+///    wrapper's redirect under fleet cargo), because `cargo metadata` runs
+///    through the same wrapper;
+/// 3. `<repo>/target` — the stock-checkout fallback when no explicit dir is
+///    given and `cargo metadata` is unavailable (direct binary runs, cargo
+///    absent), so the artifact never silently disappears.
+fn resolve_artifact_dir(
+    explicit: Option<&str>,
+    metadata_dir: Option<&str>,
+    repo_root: &Path,
+) -> PathBuf {
+    for candidate in [explicit, metadata_dir] {
+        if let Some(dir) = candidate.map(str::trim).filter(|d| !d.is_empty()) {
+            return PathBuf::from(dir);
+        }
+    }
+    repo_root.join("target")
+}
+
+/// The `target_directory` the host's `cargo metadata` reports, or None when
+/// cargo is absent, fails, or omits the key. Parsed with the serde the crate
+/// already carries — the shell side of this resolution (the gate, and the
+/// documented lookup in AGENTS.md) reads the same one key jq-free.
+fn cargo_metadata_target_dir() -> Option<String> {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    metadata
+        .get("target_directory")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The repo root for the artifact fallback — [`repo_path`]'s chain without
+/// the join.
+fn repo_root() -> PathBuf {
+    resolve_repo_root(
+        std::env::var("CLAUDE_PRINT_TEST_REPO").ok().as_deref(),
+        std::env::var("CARGO_MANIFEST_DIR").ok().as_deref(),
+        env!("CARGO_MANIFEST_DIR"),
+    )
+    .unwrap_or_else(|e| panic!("locating the repo root for the version artifact: {e}"))
+}
+
+/// [`resolve_artifact_dir`] over this process's real environment — the
+/// writer-side glue [`test_claude_version_recorded`] uses.
+fn version_artifact_dir() -> PathBuf {
+    resolve_artifact_dir(
+        std::env::var(ARTIFACT_DIR_ENV).ok().as_deref(),
+        cargo_metadata_target_dir().as_deref(),
+        &repo_root(),
+    )
+}
+
 /// CI artifact: record the current claude binary version for regression
 /// tracking.  If the version changes between CI runs, the operator is alerted
 /// via a diff in the `last-claude-version.txt` artifact.
@@ -123,14 +203,126 @@ fn test_claude_version_recorded() {
         first_line.contains("Claude Code") || first_line.contains("claude"),
         "unexpected claude --version format: {first_line:?}"
     );
-    // Write to CI artifact for diff-based regression tracking.  Failure is
-    // non-fatal (e.g., read-only filesystem) — the assertion above is the real gate.
-    let artifact_dir = repo_path("target");
-    let _ = std::fs::create_dir_all(&artifact_dir);
-    let _ = std::fs::write(
-        artifact_dir.join("last-claude-version.txt"),
-        first_line.as_bytes(),
+    // Write to the CI artifact for diff-based regression tracking, at the
+    // resolved location — the same file, in the same dir, the
+    // contract-maintenance gate refreshes, so release collection reads one
+    // artifact however the host lays out its build output. Failure is
+    // non-fatal (e.g., read-only filesystem) — the assertion above is the
+    // real gate — but a successful write is read back, so a silent
+    // mis-location cannot pass.
+    let artifact_path = version_artifact_dir().join(ARTIFACT_FILE);
+    let _ = std::fs::create_dir_all(artifact_path.parent().expect("the artifact dir"));
+    if std::fs::write(&artifact_path, first_line.as_bytes()).is_ok() {
+        assert_eq!(
+            std::fs::read_to_string(&artifact_path).unwrap_or_default(),
+            first_line,
+            "the version artifact must read back from {artifact_path:?} exactly \
+             as written"
+        );
+    }
+}
+
+// ── Version artifact location: pinned for both cargo layouts ────────────────
+//
+// The same claudepr-4d967120 spirit as the repo-root pins at the bottom of
+// this file: the resolution is a pure chain tested without racing the
+// process-wide environment, plus one live test proving the writer-side glue
+// agrees with it on the real host — whichever layout the host has.
+
+/// The explicit CI-provided dir outranks everything — including a
+/// fleet-shaped cargo report (the redirect base is simulated by a scratch
+/// root; its real value is a fleet-environment fact this suite deliberately
+/// does not write out).
+#[test]
+fn version_artifact_dir_prefers_the_explicit_ci_path() {
+    let repo = tempfile::tempdir().unwrap();
+    let redirect = tempfile::tempdir().unwrap();
+    let pinned = redirect.path().join("artifacts");
+    // Fleet-shaped input: cargo reports the redirect base, yet the explicit
+    // CI-provided dir must win.
+    assert_eq!(
+        resolve_artifact_dir(
+            Some(pinned.to_str().unwrap()),
+            Some(redirect.path().to_str().unwrap()),
+            repo.path(),
+        ),
+        pinned
     );
+}
+
+#[test]
+fn version_artifact_dir_ignores_a_blank_explicit_path() {
+    let repo = tempfile::tempdir().unwrap();
+    let reported = repo.path().join("target");
+    for blank in ["", "   "] {
+        assert_eq!(
+            resolve_artifact_dir(Some(blank), Some(reported.to_str().unwrap()), repo.path()),
+            reported,
+            "a blank {ARTIFACT_DIR_ENV} must count as unset, not as an empty \
+             path to create"
+        );
+    }
+}
+
+#[test]
+fn version_artifact_dir_fleet_layout_writes_where_cargo_reports() {
+    let repo = tempfile::tempdir().unwrap();
+    let redirect = tempfile::tempdir().unwrap();
+    assert_eq!(
+        resolve_artifact_dir(None, Some(redirect.path().to_str().unwrap()), repo.path()),
+        redirect.path(),
+        "under a redirected target dir the artifact must follow the redirect, \
+         not the checkout's never-created target/"
+    );
+}
+
+#[test]
+fn version_artifact_dir_stock_layout_and_fallback() {
+    let repo = tempfile::tempdir().unwrap();
+    let stock = repo.path().join("target");
+    // Stock checkout: cargo reports the checkout's own target dir.
+    assert_eq!(
+        resolve_artifact_dir(None, Some(stock.to_str().unwrap()), repo.path()),
+        stock
+    );
+    // No working cargo metadata (direct binary run, cargo absent): the
+    // stock-checkout fallback, blank metadata counting as unavailable.
+    assert_eq!(resolve_artifact_dir(None, None, repo.path()), stock);
+    assert_eq!(resolve_artifact_dir(None, Some(""), repo.path()), stock);
+}
+
+/// The writer-side glue against its parts on the live host: the artifact dir
+/// must be exactly what the chain picks from the real environment, absolute,
+/// and — absent an explicit override — the dir cargo itself reports (the
+/// stock `target/` or the fleet redirect). Writes nothing: the recording
+/// test owns the artifact's content. Skipped when `cargo metadata` cannot
+/// run at all, the same silent-skip shape as the `claude` probe above.
+#[test]
+fn version_artifact_dir_tracks_the_host_cargo_layout() {
+    let explicit = std::env::var(ARTIFACT_DIR_ENV).ok();
+    let metadata = cargo_metadata_target_dir();
+    let expected = resolve_artifact_dir(explicit.as_deref(), metadata.as_deref(), &repo_root());
+    assert_eq!(version_artifact_dir(), expected);
+    assert!(
+        expected.is_absolute(),
+        "the artifact dir must be absolute under both layouts, got {expected:?}"
+    );
+    let non_blank_explicit = explicit
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .is_some();
+    let Some(reported) = metadata else {
+        return; // no cargo metadata to agree with; precedence is unit-tested
+    };
+    if !non_blank_explicit {
+        assert_eq!(
+            expected,
+            PathBuf::from(&reported),
+            "without an explicit override the artifact must follow the dir \
+             cargo itself reports, whichever layout this host has"
+        );
+    }
 }
 
 // ── Stop payload with 50 unknown extra fields ─────────────────────────────────

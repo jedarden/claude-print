@@ -104,7 +104,7 @@ A release carries exactly four assets:
 |-------|------------|-------------|
 | `claude-print-x86_64-linux` | The main binary, statically linked musl (HR-1) | `cargo build --release --target x86_64-unknown-linux-musl --bin claude-print` |
 | `mock_claude-x86_64-linux` | The mock-claude test-fixture binary, same static build | `cargo build --release --target … --manifest-path test-fixtures/mock-claude/Cargo.toml` |
-| `last-claude-version.txt` | The Claude Code version this release was built and contract-tested against | copied from the contract-maintenance gate's `target/last-claude-version.txt` (`unknown` only when the gate could not detect a version) |
+| `last-claude-version.txt` | The Claude Code version this release was built and contract-tested against | copied from the contract-maintenance gate's version artifact — `target/last-claude-version.txt` on a stock checkout; the gate resolves the same dir cargo reports (or `$CLAUDE_PRINT_VERSION_ARTIFACT_DIR`) — (`unknown` only when the gate could not detect a version) |
 | `sha256sums.txt` | The checksum manifest of everything above | [sha256sums.txt generation](#sha256sumstxt-generation) |
 
 The two suffixed names are derived, not hardcoded in the publisher: CI
