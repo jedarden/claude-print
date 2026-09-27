@@ -1624,6 +1624,60 @@ fn push_sensor_wires_every_push_to_the_gate_template() {
     );
 }
 
+/// The clone-auth half of "invokes the gate on every push" (claudepr-
+/// b3ac3625): the gate only runs if the pod first CLONES the repo, and
+/// Forgejo requires auth fleet-wide — the first live run of the wired
+/// push path (claude-print-ci-ltlxs, 2026-09-27) died exit 128 at an
+/// anonymous clone before the gate was ever reached. The clone therefore
+/// authenticates through a URL-scoped git credential helper over the
+/// already-wired FORGEJO_TOKEN secret, and that helper must stay defined
+/// BEFORE the generic GitHub helper: git stops at the first complete
+/// credential a helper returns, so a generic-first order would answer
+/// every git.ardenone.com request with GH_TOKEN and fail the clone as
+/// surely as no helper at all.
+#[test]
+fn workflowtemplate_authenticates_the_forgejo_clone() {
+    let template = fs::read_to_string(repo_path("claude-print-ci-workflowtemplate.yml")).unwrap();
+
+    for fragment in [
+        "GIT_CONFIG_COUNT",
+        "credential.https://git.ardenone.com.helper",
+        "username=x-token",
+        "password=$FORGEJO_TOKEN",
+        "name: forgejo-webhook-token",
+    ] {
+        assert!(
+            template.contains(fragment),
+            "WorkflowTemplate lost the Forgejo clone-auth fragment: {fragment}"
+        );
+    }
+
+    // Order is the correctness-bearing part: the URL-scoped Forgejo helper
+    // must precede the generic GitHub helper in the env list.
+    let forgejo_at = template
+        .find("credential.https://git.ardenone.com.helper")
+        .unwrap();
+    let generic_at = template
+        .find("value: credential.helper\n")
+        .expect("the generic GitHub credential helper must exist");
+    assert!(
+        forgejo_at < generic_at,
+        "the Forgejo-scoped helper must precede the generic GitHub helper — \
+         git stops at the first complete answer"
+    );
+
+    // Both clone arms keep the bare Forgejo URL: the token travels through
+    // the helper's pipe at run time, never baked into the manifest.
+    let clone_arms = template
+        .matches("\"https://git.ardenone.com/jedarden/claude-print.git\" /workspace")
+        .count();
+    assert_eq!(
+        clone_arms, 2,
+        "both the release-mode and verify-only clone arms must keep the bare \
+         Forgejo URL the helper authenticates (found {clone_arms})"
+    );
+}
+
 #[test]
 fn maintenance_docs_still_name_the_gate() {
     let doc = fs::read_to_string(repo_path("docs/notes/claude-contract-probes.md")).unwrap();
