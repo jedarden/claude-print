@@ -11,6 +11,12 @@ transcript, and emits clean output — all without `--print` or `--output-format
 ## Build commands
 
 ```bash
+# Formatting check (required; read-only)
+cargo fmt --check
+
+# Lint check (required; all targets, warnings are errors)
+cargo clippy --all-targets -- -D warnings
+
 # Debug build
 cargo build
 
@@ -32,6 +38,19 @@ cargo test --doc
 # Smoke check (verifies PTY, FIFO, and billing env prerequisites; credential-free)
 cargo run --bin claude-print -- --check
 ```
+
+Formatting and lint are required quality gates, not optional cleanup. Use
+`cargo fmt` to apply rustfmt's changes, then rerun `cargo fmt --check`; the
+check must be clean before the commit. A complete repository verification
+includes both quality gates and both test legs above — `cargo test` alone is
+not complete.
+
+The Cargo wrapper applies the shared target-directory and cgroup limits to
+these commands, but only `cargo test` is submitted to the `rust-verify`
+WorkflowTemplate. `cargo fmt --check` and `cargo clippy --all-targets -- -D
+warnings` therefore run locally even from a clean checkout. CI installs the
+`rustfmt` and `clippy` components and runs these exact commands before the
+test legs, failing fast on any non-zero status.
 
 **Never use `cargo test --test '*'`** — use `cargo test --tests`. Quoted, the
 wildcard does resolve on stock Cargo (glob target selection), but it cannot
@@ -195,6 +214,8 @@ a remote. It falls back to a cgroup-limited local run otherwise.
 | `tests/output_format_contracts.rs` | Output-format contract pin (bead claudepr-1a89e5b4): loads `tests/fixtures/output_format_examples_v1.json` and checks three layers — every fixture case replayed through `emit_success`/`emit_error`/the stream-json reader with stdout/stderr byte-compared against the expected examples, the fixture's error table (variant → `subtype()`/`exit_code()`/`message()`) asserted against `ClaudePrintError`'s accessors, and every `documented: true` example required to appear verbatim in `docs/notes/output-format-contracts.md` — so implementation, fixture, and doc change together in one commit or the test fails |
 | `tests/fixtures/` | Version-pinned hermetic fixtures: `claude_contracts_v2.1.283.json` (the pinned measured-hook-contracts fixture — `tests/claude_contracts.rs` loads this one; original measurement `claude_contracts_v2.1.270.json`, bead claudepr-6ef2541c, re-pinned to 2.1.282 by claudepr-3094ab2e and to 2.1.283 by claudepr-5dd33e57 with `claude_contracts_v2.1.281.json` and `claude_contracts_v2.1.282.json` retained as per-version history per `docs/notes/claude-contract-probes.md`), `terminal_probes_v2.1.282.json` (DEC probe traffic, via `scripts/probe-tui-terminal-probes.py`; the prior `terminal_probes_v2.1.270.json` capture is retained as the compatibility baseline — `tests/terminal.rs` asserts the recognized probe inventory is identical across the two), `slug_vectors_v2.1.263.json` (live-verified `cwd_to_slug` vectors), `startup_trust_dialog_v2.1.263.txt` (trust-dialog shape), `transcript_v2.1.{168,233}.jsonl` (print-mode transcript shapes), `output_format_examples_v1.json` (claude-print's own output-format contract — version-stamped by contract version `v1`, not by the Claude version; pinned by `tests/output_format_contracts.rs`), `config_contract_examples_v1.json` (claude-print's own config-file contract, stamped by contract version `v1` — pinned by `tests/config_contract.rs`), and the `stream_json_golden_v2.1.283.{input,expected,errors}.jsonl` triple (golden stream-json replay, re-measured against live 2.1.283 on 2026-09-26 — claudepr-72d0ba4c — with the `stream_json_golden_v2.1.270.{input,expected,errors}.jsonl` and `stream_json_golden_v2.1.282.{input,expected,errors}.jsonl` triples retained as measurement history; pinned by `tests/stream_json_contract.rs`). Re-pin version-stamped fixtures through the probe scripts after a Claude Code update; never hand-edit one — and every active family plus the doc stamp must move to one version together, enforced always-on by `tests/contract_maintenance.rs::active_fixture_families_share_one_pinned_version` |
 
+| `tests/docs_quality_gates.rs` | Documentation-drift guard for the required `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` workflow (bead claudepr-373e38da): pins the exact commands in the AGENTS.md fence, the wrapper's local-only quality-gate expectation, and the CI WorkflowTemplate's explicit `rustfmt`/`clippy` installation, command order, and uncommented gate lines; negative meta-tests remove or comment each requirement in memory. Library-level; reads AGENTS.md and the CI WorkflowTemplate; spawns nothing |
+
 ### Execution requirements
 
 Which targets run under a plain `cargo test`, and what each additionally
@@ -287,6 +308,7 @@ tree, and the §"Test structure" table against the target list.
 | `docs_test_classification` | library-level | this guard — reads AGENTS.md and the `tests/` tree; spawns nothing |
 | `docs_build_layout` | library-level | AGENTS.md build-docs guard — reads AGENTS.md, Cargo.toml, the CI WorkflowTemplate, and the tests/ tree; resolves built artifacts through cargo's real locators; spawns nothing |
 | `docs_build_commands` | library-level | AGENTS.md build-commands guard — reads AGENTS.md, README.md, docs/, scripts/, and the vendored CI WorkflowTemplate; spawns nothing |
+| `docs_quality_gates` | library-level | AGENTS.md formatting/lint guard — reads AGENTS.md and the CI WorkflowTemplate; spawns nothing |
 | `docs_link_integrity` | library-level | documentation link-integrity guard — reads README.md, AGENTS.md, and docs/, resolving link targets, anchors, and citations against the checkout; spawns nothing |
 | `home_env_guard` | library-level | scans `src/` and the HOME strategy doc; spawns nothing |
 | `target_path_guard` | library-level | scans `tests/`, `scripts/`, `build.rs`, and the CI WorkflowTemplate (for the musl needle); spawns nothing |
