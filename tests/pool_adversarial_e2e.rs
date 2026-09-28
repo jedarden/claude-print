@@ -42,6 +42,7 @@
 //! `scripts/billing-canary.sh`, not here.
 
 use std::io::{BufRead, Read};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -515,19 +516,35 @@ fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
 #[test]
 fn pty_master_fd_count_accepts_both_ptmx_spellings() {
     let _process = process_lock();
-    let before = daemon_pty_fd_count(std::process::id());
+    let pid = std::process::id();
+    let before = daemon_pty_fd_count(pid);
+    let legacy_before = literal_ptmx_fd_count(pid);
     let host_spelling = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/ptmx")
         .expect("/dev/ptmx must open — every test in this binary spawns PTYs");
+    let host_link = std::fs::read_link(format!("/proc/{pid}/fd/{}", host_spelling.as_raw_fd()))
+        .expect("the host-spelling fd must be visible through /proc");
     let container_spelling = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/pts/ptmx")
         .expect("/dev/pts/ptmx must open — the devpts mount every PTY here is allocated from");
+    let container_link =
+        std::fs::read_link(format!("/proc/{pid}/fd/{}", container_spelling.as_raw_fd()))
+            .expect("the container-spelling fd must be visible through /proc");
+    assert_eq!(host_link, Path::new("/dev/ptmx"));
+    assert_eq!(container_link, Path::new("/dev/pts/ptmx"));
     assert_eq!(
-        daemon_pty_fd_count(std::process::id()),
+        literal_ptmx_fd_count(pid),
+        legacy_before + 1,
+        "the legacy literal matcher must count only /dev/ptmx; the container \
+         spelling must contribute zero (fd link: {})",
+        container_link.display()
+    );
+    assert_eq!(
+        daemon_pty_fd_count(pid),
         before + 2,
         "an opened master must count through both spellings: /dev/ptmx \
          (char-device hosts) and /dev/pts/ptmx (symlinked /dev/ptmx, the \
@@ -535,6 +552,17 @@ fn pty_master_fd_count_accepts_both_ptmx_spellings() {
     );
     drop(host_spelling);
     drop(container_spelling);
+}
+
+/// The pre-fix matcher from claudepr-bcb6beab, retained only as a diagnostic
+/// oracle so the container spelling's zero-count failure stays reproducible.
+fn literal_ptmx_fd_count(daemon_pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{daemon_pid}/fd"))
+        .unwrap_or_else(|e| panic!("read /proc/{daemon_pid}/fd: {e}"))
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter(|target| target == Path::new("/dev/ptmx"))
+        .count()
 }
 
 /// Extract the (worker id, worker pid) a pooled drive traced. The trace only
