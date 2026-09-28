@@ -52,6 +52,19 @@ fn run_fixture(name: &str) -> Output {
     run_file(&fixture(name))
 }
 
+fn run_content(label: &str, content: &str) -> Output {
+    let directory = tempfile::tempdir().expect("evidence tempdir");
+    let path = directory.path().join(format!("{label}.txt"));
+    fs::write(&path, content).expect("evidence content");
+    run_file(&path)
+}
+
+fn complete_evidence(site: &str, cargo_output: &str) -> String {
+    format!(
+        "Complete, both legs, {site}.\n\n```verified:\ncargo test --tests\ncargo test --doc\n```\n\n```cargo-output\n{cargo_output}\n```\n"
+    )
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -223,6 +236,113 @@ fn four_execution_mode_corners_validate() {
         assert!(result.status.success(), "{name}: {}", text(&result.stderr));
         assert_eq!(text(&result.stdout), expected, "{name} summary");
         assert!(result.stderr.is_empty(), "{name}: unexpected stderr");
+    }
+}
+
+#[test]
+fn provenance_branches_are_derived_from_captured_output() {
+    let cases = [
+        (
+            "remote-success",
+            "remote on iad-ci",
+            "[cargo-remote] submitting to iad-ci\n[cargo-remote] workflow: rust-verify-abc\n[cargo-remote] streaming logs from the run\ntest result: ok. 2 passed; 0 failed; 0 ignored\n[cargo-remote] PASSED",
+            Some("evidence valid: remote, complete\n"),
+        ),
+        (
+            "remote-failure",
+            "remote on iad-ci",
+            "[cargo-remote] submitting to iad-ci\n[cargo-remote] workflow: rust-verify-abc\n[cargo-remote] streaming logs from the run\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n[cargo-remote] FAILED",
+            Some("FAIL remote-outcome:"),
+        ),
+        (
+            "remote-timeout",
+            "remote on iad-ci",
+            "[cargo-remote] submitting to iad-ci\n[cargo-remote] workflow: rust-verify-abc\n[cargo-remote] streaming logs from the run\ntest result: ok. 2 passed; 0 failed; 0 ignored\n[cargo-remote] timed out waiting for the workflow",
+            Some("FAIL remote-outcome:"),
+        ),
+        (
+            "local-fallback",
+            "local fallback",
+            "[cargo-remote] uncommitted changes detected\n[cargo-remote] falling back to local (cgroup-limited run)\ntest result: ok. 2 passed; 0 failed; 0 ignored",
+            Some("evidence valid: local, complete\n"),
+        ),
+        (
+            "local-submit-fallback",
+            "local fallback",
+            "[cargo-remote] submit failed: workflow API unavailable\n[cargo-remote] falling back to local (cgroup-limited run)\ntest result: ok. 2 passed; 0 failed; 0 ignored",
+            Some("evidence valid: local, complete\n"),
+        ),
+        (
+            "extraction-local",
+            "local extraction",
+            "   Compiling claude-print v0.3.3\n    Finished test [unoptimized + debuginfo] in 1.02s\ntest result: ok. 2 passed; 0 failed; 0 ignored",
+            Some("evidence valid: local, complete\n"),
+        ),
+    ];
+
+    for (label, site, output, expected) in cases {
+        let result = run_content(label, &complete_evidence(site, output));
+        let combined = format!("{}{}", text(&result.stdout), text(&result.stderr));
+        match expected {
+            Some(expected) if expected.starts_with("evidence valid") => {
+                assert!(result.status.success(), "{label}: {combined}");
+                assert_eq!(text(&result.stdout), expected, "{label}");
+                assert!(result.stderr.is_empty(), "{label}: {combined}");
+            }
+            Some(expected) => {
+                assert_eq!(result.status.code(), Some(1), "{label}: {combined}");
+                assert!(
+                    text(&result.stderr).contains(expected),
+                    "{label}: {combined}"
+                );
+            }
+            None => unreachable!("every provenance case has an expectation"),
+        }
+    }
+}
+
+#[test]
+fn unsupported_or_contradictory_provenance_fails_closed() {
+    let cases = [
+        (
+            "partial-remote",
+            "remote on iad-ci",
+            "[cargo-remote] submitting to iad-ci\ntest result: ok. 2 passed; 0 failed; 0 ignored",
+        ),
+        (
+            "remote-and-fallback",
+            "local fallback",
+            "[cargo-remote] submitting to iad-ci\n[cargo-remote] workflow: rust-verify-abc\n[cargo-remote] streaming logs from the run\n[cargo-remote] uncommitted changes detected\n[cargo-remote] falling back to local\ntest result: ok. 2 passed; 0 failed; 0 ignored\n[cargo-remote] PASSED",
+        ),
+        (
+            "two-terminal-outcomes",
+            "remote on iad-ci",
+            "[cargo-remote] submitting to iad-ci\n[cargo-remote] workflow: rust-verify-abc\n[cargo-remote] streaming logs from the run\ntest result: ok. 2 passed; 0 failed; 0 ignored\n[cargo-remote] PASSED\n[cargo-remote] FAILED",
+        ),
+        (
+            "extraction-without-result",
+            "local extraction",
+            "    Compiling claude-print v0.3.3\n     Finished test [unoptimized + debuginfo] in 1.02s",
+        ),
+    ];
+
+    for (label, site, output) in cases {
+        let result = run_content(label, &complete_evidence(site, output));
+        assert_eq!(
+            result.status.code(),
+            Some(1),
+            "{label}: {}",
+            text(&result.stderr)
+        );
+        assert!(
+            text(&result.stderr).contains("FAIL output-tells:"),
+            "{label}: {}",
+            text(&result.stderr)
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "{label}: unsupported evidence accepted"
+        );
     }
 }
 

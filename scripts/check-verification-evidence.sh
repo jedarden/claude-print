@@ -7,8 +7,10 @@
 #   2 = usage error or malformed evidence
 #
 # Both axes are derived from captured output. Remote output has the
-# submitting/workflow/streaming prelude and a terminal PASSED or FAILED line;
-# local output has a fallback banner preceded by a wrapper reason line.
+# submitting/workflow/streaming prelude and exactly one terminal PASSED,
+# FAILED, or timed-out line; local fallback output has a fallback banner
+# preceded by a wrapper reason line. A clean extraction has no wrapper output
+# at all, so its ordinary green cargo result is the local provenance shape.
 # The accepted vocabulary is `[cargo-remote] submitting`,
 # `[cargo-remote] workflow:`, `streaming logs from`, `[cargo-remote] PASSED`,
 # `[cargo-remote] FAILED`, and `[cargo-remote] falling back to local`, with local reasons
@@ -98,34 +100,52 @@ if grep -Eq '(^|[[:space:]])exit=[0-9]+|\((remote|local|complete|targeted)(,|\))
 fi
 
 # Derive the execution site from the wrapper's output vocabulary. Remote
-# requires the complete prelude and terminal outcome; local requires the
-# fallback line and one wrapper reason line.
+# requires the complete prelude and exactly one terminal outcome; local
+# fallback requires the fallback line and one wrapper reason line. A clean
+# git-archive extraction never invokes cargo-remote, and is therefore local
+# only when the captured cargo output contains a green test result. A partial
+# or contradictory wrapper transcript is never guessed into either class.
 tell_file=$tmp_dir/tells
 awk '
-BEGIN { submit=workflow=stream=passed=failed=timed=fall=reason=0 }
-/\[cargo-remote\] submitting/ { submit=1 }
-/\[cargo-remote\] workflow:/ { workflow=1 }
-/streaming logs from/ { stream=1 }
-/\[cargo-remote\] PASSED/ { passed=1 }
-/\[cargo-remote\] FAILED/ { failed=1 }
-/\[cargo-remote\].*timed out|timed out/ { timed=1 }
-/\[cargo-remote\] falling back to local/ { fall=1 }
-/(no git remote|uncommitted changes detected|push failed|submit failed)/ { reason=1 }
+BEGIN { submit=workflow=stream=passed=failed=timed=fall=reason=reason_before_fall=wrapper=0 }
+{ if ($0 ~ /\[cargo-remote\]/) wrapper=1 }
+/\[cargo-remote\][[:space:]]+submitting([[:space:]]|$)/ { submit=1 }
+/\[cargo-remote\][[:space:]]+workflow:/ { workflow=1 }
+/\[cargo-remote\][[:space:]]+streaming logs from/ { stream=1 }
+/\[cargo-remote\][[:space:]]+PASSED([[:space:]]|$)/ { passed++ }
+/\[cargo-remote\][[:space:]]+FAILED([[:space:]]|$)/ { failed++ }
+/\[cargo-remote\][[:space:]]+timed([ -])out([[:space:]]|$)/ { timed++ }
+/\[cargo-remote\][[:space:]]+falling back to local([[:space:]]|$)/ { fall=1 }
+/\[cargo-remote\][[:space:]]+(no git remote|uncommitted changes detected|push failed|submit failed)([[:space:]:]|$)/ {
+    reason=1
+    if (!fall) reason_before_fall=1
+}
 END {
-    remote = submit && workflow && stream && (passed || failed || timed)
-    local = fall && reason
-    if (remote && local) site="ambiguous"
+    terminal = passed + failed + timed
+    remote_prelude = submit && workflow && stream
+    remote_tells = submit || workflow || stream || terminal
+    remote = remote_prelude && terminal == 1
+    local = fall && reason && reason_before_fall
+    contradictory = (terminal > 1) || (local && remote_tells)
+    if (contradictory) site="ambiguous"
     else if (remote) site="remote"
     else if (local) site="local"
+    else if (!wrapper) site="extraction"
     else site="unknown"
-    printf "site=%s\nremote_failed=%d\n", site, (failed || timed)
+    printf "site=%s\nremote_failed=%d\nextraction=%d\n", site, (failed || timed), (!wrapper)
 }' "$output" >"$tell_file"
 
 site=$(sed -n 's/^site=//p' "$tell_file")
 remote_failed=$(sed -n 's/^remote_failed=//p' "$tell_file")
 case $site in
     remote|local) ;;
-    *) fail output-tells 'the cargo-output fence has no unambiguous remote or local wrapper tell set' ;;
+    extraction)
+        grep -Eiq 'test result:[[:space:]]+ok([[:space:].]|$)|test result:.*[[:space:]]+[0-9]+ passed;[[:space:]]+0 failed' "$output" ||
+            fail output-tells 'a no-banner capture is not a green cargo extraction transcript'
+        site=local
+        ;;
+    ambiguous) fail output-tells 'the cargo-output fence contains contradictory remote and local provenance tells' ;;
+    *) fail output-tells 'the cargo-output fence has no unambiguous remote, fallback, or extraction provenance' ;;
 esac
 [[ $remote_failed == 0 ]] || fail remote-outcome 'the captured run ended in failure or timed out'
 

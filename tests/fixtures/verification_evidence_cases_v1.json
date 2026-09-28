@@ -142,9 +142,9 @@
       "id": "reject-output-tells-unbacked",
       "file": "verification_evidence_misleading_mode_unbacked.txt",
       "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
-      "cargo_output_shape": "green-without-wrapper-tells",
+      "cargo_output_shape": "unsupported-without-wrapper-tells",
       "expected": {"outcome": "reject", "exit_code": 1, "rule": "output-tells"},
-      "rationale": "Compiler and test-result lines alone do not establish remote or local execution; the wrapper provenance tells are required."
+      "rationale": "Compiler lines without a green cargo test result establish neither the no-banner extraction shape nor a wrapper-backed site, so the validator rejects the unsupported capture."
     },
     {
       "id": "reject-missing-output-fence",

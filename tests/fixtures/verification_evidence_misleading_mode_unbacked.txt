@@ -8,7 +8,4 @@ cargo test --doc
 ```cargo-output
     Compiling claude-print v0.3.3
      Finished test [unoptimized + debuginfo] in 41.34s
-test result: ok. 812 passed; 0 failed; 0 ignored
-   Doc-tests claude_print
-test result: ok. 84 passed; 0 failed; 0 ignored
 ```

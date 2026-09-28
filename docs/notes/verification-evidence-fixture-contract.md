@@ -53,8 +53,11 @@ The validator derives the axes from the recording as follows:
 - **Local** requires `falling back to local` and one wrapper reason: `no git
   remote`, `uncommitted changes detected`, `push failed`, or `submit failed`.
   The phrase `no git remote` is a reason, not a second site claim.
-- An output that matches neither site, or matches both, is rejected. Output
-  tells always outrank prose or the caller's intent.
+- A capture with no `[cargo-remote]` output is the extraction-local shape: it
+  is accepted only when the ordinary cargo output contains a green `test
+  result`. A partial wrapper transcript, contradictory site tells, or a
+  no-banner capture without a green cargo result is rejected. Output tells
+  always outrank prose or the caller's intent.
 - **Complete** means the verified region contains both bare command lines
   `cargo test --tests` and `cargo test --doc`. `--tests` alone is not
   complete because it skips doctests.
@@ -90,7 +93,7 @@ The negative fixtures deliberately exercise independent rejection rules:
 | `reject-targeted-selector-unnamed` | [`verification_evidence_misleading_unnamed_selector.txt`](../../tests/fixtures/verification_evidence_misleading_unnamed_selector.txt) | targeted selector not named in prose | reject, `selector-unnamed`, exit 1 |
 | `reject-annotation-on-executed-line` | [`verification_evidence_misleading_annotated_verified_line.txt`](../../tests/fixtures/verification_evidence_misleading_annotated_verified_line.txt) | annotation on an executable verified line | reject, `annotation-on-executed-line`, exit 1 |
 | `reject-complete-one-leg` | [`verification_evidence_misleading_complete_one_leg.txt`](../../tests/fixtures/verification_evidence_misleading_complete_one_leg.txt) | prose says complete but only one leg ran | reject, `coverage-mismatch`, exit 1 |
-| `reject-output-tells-unbacked` | [`verification_evidence_misleading_mode_unbacked.txt`](../../tests/fixtures/verification_evidence_misleading_mode_unbacked.txt) | no site-provenance wrapper tells | reject, `output-tells`, exit 1 |
+| `reject-output-tells-unbacked` | [`verification_evidence_misleading_mode_unbacked.txt`](../../tests/fixtures/verification_evidence_misleading_mode_unbacked.txt) | no wrapper tells and no green extraction result | reject, `output-tells`, exit 1 |
 | `reject-missing-output-fence` | [`verification_evidence_malformed_missing_output_fence.txt`](../../tests/fixtures/verification_evidence_malformed_missing_output_fence.txt) | missing captured-output fence | reject, `fence`, exit 2 |
 
 The manifest is the exhaustive list. Adding, removing, or renaming a
