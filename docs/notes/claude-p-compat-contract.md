@@ -79,6 +79,14 @@ merge and idempotency semantics, the failure taxonomy, and the
 trusted/untrusted-directory e2e coverage that this table's one-line summary
 compresses.
 
+`--mcp-config` has a dedicated contract:
+`docs/notes/mcp-config-contract.md` defines the flag's own API around this
+table's one-line transformation — the accepted syntax and the pure lexical
+comma split (empty and whitespace entries included), accumulation across
+repeated occurrences, the validation boundary (claude-print checks argv shape
+only; the child is the content validator), and the per-output-mode error
+shapes a rejected value surfaces through.
+
 `--show-child-stderr` has a dedicated contract:
 `docs/notes/show-child-stderr-contract.md` defines what the capture holds, the
 three exit windows that dump it, the exact stderr block, how the output modes

@@ -279,7 +279,10 @@ closed-world rejection, and the pool leg are pinned by mock-child argv
 recordings (`MOCK_RECORD_ARGS`) in `tests/binary_e2e.rs` and
 `tests/pool_socket_e2e.rs` (bead claudepr-af36fc41); the argv shapes are
 additionally unit-tested at the source in `src/session.rs`
-(`build_child_argv_*`).
+(`build_child_argv_*`). The flag's own API surface around that forwarding —
+accepted syntax, delimiting edges, the validation boundary, and the
+per-output-mode error shapes — is defined in
+`docs/notes/mcp-config-contract.md` (bead claudepr-d000e48b).
 
 ## Missing file
 
