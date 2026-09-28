@@ -21,7 +21,7 @@
 //! the commands fence above it — including the prohibition — had no
 //! stated pin.
 //!
-//! Three surfaces, all pinned here:
+//! Four surfaces, all pinned here:
 //!
 //! - **§"Build commands" presence** — the bolded prohibition sentence,
 //!   the `cargo test --tests` alternative it prescribes in the same
@@ -52,6 +52,20 @@
 //!   `--doc` leg (claudepr-adaad914) — otherwise CI could drop the
 //!   doctest run and stay green, the silent omission a presence pin is
 //!   for.
+//! - **§"Verification execution modes"** (claudepr-39f53ae4) — the
+//!   subsection that defines how a verification run's *mode* is
+//!   identified and recorded. Workspace guidance already distinguishes
+//!   remote iad-ci verification from the local fallback and requires
+//!   evidence to report targeted vs complete coverage; the subsection is
+//!   the repository's operational half of that requirement — the mode is
+//!   identified from the wrapper's own `[cargo-remote]` output lines
+//!   (never intent), and recorded in evidence *prose* (never annotated
+//!   onto the shell-executed `verified:` block lines, where a
+//!   parenthetical is a parse error that fails the gate). Complete is
+//!   pinned as the same two-leg split the fence prescribes: `--tests`
+//!   *and* `--doc` — and the silent local shape a no-git-repo tree
+//!   (a `git archive` extraction) runs as, which prints no banner and is
+//!   identified by context plus the absence of every remote tell.
 //!
 //! The guard's own failure behavior is pinned the same way as
 //! `tests/docs_build_layout.rs` (claudepr-4d967120): always-on negative
@@ -95,6 +109,70 @@ const ALL_TARGETS_COMMAND: &str = "cargo test --tests";
 /// verification workflow that never runs the doc examples — the same
 /// two-leg split the CI template executes (claudepr-adaad914).
 const DOC_TEST_COMMAND: &str = "cargo test --doc";
+
+/// The heading of the §"Build commands" subsection pinning the
+/// verification execution-mode contract (bead claudepr-39f53ae4).
+/// Workspace guidance already distinguishes remote iad-ci verification
+/// from the local cgroup-limited fallback and requires evidence to report
+/// whether a verification was targeted or complete; the subsection is
+/// where the repository defines the operational halves of that
+/// requirement — how to *identify* the mode a run took (the wrapper's own
+/// `[cargo-remote]` output lines, never intent) and how to *record* it
+/// (evidence prose, never the shell-executed `verified:` block lines).
+const VERIFICATION_MODES_HEADING: &str = "### Verification execution modes";
+
+/// The execution-axis lead: the bullet that names the where-did-it-run
+/// axis. Without a named axis the remote/local reporting requirement has
+/// no hook to hang identification guidance on.
+const REMOTE_AXIS_LEAD: &str = "**Remote or local — where the run executed.**";
+
+/// The one line every local fallback prints — `~/.local/bin/cargo-remote`
+/// routes *every* fallback reason (no remote, uncommitted changes, failed
+/// push, failed submission) through a single `local_limited` that emits
+/// this first. It is therefore the identification tell for the local half
+/// of the mode axis: present in the output, the run executed locally under
+/// the cgroup limits.
+const LOCAL_FALLBACK_TELL: &str = "[cargo-remote] falling back to local";
+
+/// The remote success line — the terminal `[cargo-remote] PASSED` (or
+/// `FAILED`) only a run that actually submitted to the `rust-verify`
+/// WorkflowTemplate on iad-ci and streamed its logs can print. The
+/// identification tell for the remote half of the mode axis.
+const REMOTE_PASSED_TELL: &str = "[cargo-remote] PASSED";
+
+/// The coverage-axis lead: the bullet that names the what-did-it-cover
+/// axis — targeted selectors vs the complete two-leg split.
+const COVERAGE_AXIS_LEAD: &str = "**Targeted or complete — what the run covered.**";
+
+/// The definition of complete verification, as one joined fragment: both
+/// fence legs, conjunctively. Pinning the *join* (not just each command
+/// separately, which the §"Build commands" pins above already cover) is
+/// what makes "complete" unfakeable — degrade the conjunction to a single
+/// leg and this fragment is gone even though both commands still appear
+/// somewhere in the section.
+const COMPLETE_SPLIT: &str = "`cargo test --tests` *and* `cargo test --doc`";
+
+/// The recording requirement for targeted verification: the evidence must
+/// name every selector it ran, so "targeted" is a verifiable claim, not a
+/// euphemism for "partial".
+const TARGETED_NAMING_RULE: &str = "must name every selector it ran";
+
+/// The recording rule's anchor: mode and coverage travel in the prose
+/// around a fenced `verified:` block, never inside its lines — those
+/// lines are shell-executed verbatim by the close gate, so an annotation
+/// like `exit=0 (remote, complete)` on a command line is a parse error
+/// that fails the gate, not evidence.
+const RECORDING_RULE: &str = "lines of a fenced `verified:` block";
+
+/// The silent-local shape's identification rule: a tree with no git repo
+/// at all (a `git archive` extraction — the close gate's own verification
+/// shape) never attempts submission, so no fallback banner prints and the
+/// local mode there is identified from the invocation context plus the
+/// absence of every remote tell. Without this rule the four fallback
+/// banners read as exhaustive, and a banner-less local run looks
+/// unidentifiable — or worse, misreported as remote.
+const EXTRACTION_LOCAL_RULE: &str =
+    "from the invocation context and the absence of every remote tell";
 
 /// Glob metacharacters that make a `--test` selector fragile: each crosses
 /// the fleet's TEST_ARGS flatten as a literal and glob-expands in the
@@ -225,22 +303,22 @@ fn agents_md() -> String {
     repo_file("AGENTS.md")
 }
 
-/// The §"Build commands" slice of `doc`: from the heading line up to the
-/// next markdown heading *outside any fenced code block*. The section's
-/// own bash fence is full of `#`-comment lines, so a fence-blind heading
-/// cut would end the section at the first fence comment; the fence state
-/// is tracked here for exactly that reason. Pure over `doc` so the
-/// negative meta-tests can mutate it in memory. Panics when the heading is
-/// gone — a missing section is drift, not a pass.
-fn build_commands_section(doc: &str) -> String {
+/// The slice of `doc` from the `heading` line up to the next markdown
+/// heading *outside any fenced code block*. The sections pinned here carry
+/// bash fences full of `#`-comment lines, so a fence-blind heading cut
+/// would end a section at the first fence comment; the fence state is
+/// tracked for exactly that reason. Pure over `doc` so the negative
+/// meta-tests can mutate it in memory. Panics when the heading is gone —
+/// a missing section is drift, not a pass.
+fn section_after_heading(doc: &str, heading: &str) -> String {
     let lines: Vec<&str> = doc.lines().collect();
     let start = lines
         .iter()
-        .position(|l| l.trim() == BUILD_COMMANDS_HEADING)
+        .position(|l| l.trim() == heading)
         .unwrap_or_else(|| {
             panic!(
-                "AGENTS.md must keep the {BUILD_COMMANDS_HEADING:?} heading — this \
-                 guard scopes its test-invocation pins to that section"
+                "AGENTS.md must keep the {heading:?} heading — this guard \
+                 scopes its pins to that section"
             )
         });
     let mut in_fence = false;
@@ -260,6 +338,18 @@ fn build_commands_section(doc: &str) -> String {
         }
     }
     lines[start..end].join("\n")
+}
+
+/// The §"Build commands" slice of `doc`, located by heading so the guard
+/// stays immune to surrounding edits.
+fn build_commands_section(doc: &str) -> String {
+    section_after_heading(doc, BUILD_COMMANDS_HEADING)
+}
+
+/// The §"Verification execution modes" slice of `doc` — the subsection
+/// this guard's mode pins (claudepr-39f53ae4) scope to.
+fn verification_modes_section(doc: &str) -> String {
+    section_after_heading(doc, VERIFICATION_MODES_HEADING)
 }
 
 /// The lines inside `text`'s fenced code blocks, in order (delimiters
@@ -373,6 +463,76 @@ fn check_build_commands_section(section: &str) {
             );
         }
     }
+}
+
+/// The §"Verification execution modes" contract, checkable against
+/// caller-supplied section text (the live section for the always-on test,
+/// mutated text for the negative meta-tests). Panics on drift. Every
+/// fragment is load-bearing: the two axis leads name what must be
+/// reported, the two `[cargo-remote]` tells are how the mode is
+/// identified from output, the joined split defines "complete", and the
+/// recording rules say where the report goes (evidence prose) and what a
+/// targeted report must carry (every selector, by name).
+fn check_verification_modes_section(section: &str) {
+    assert!(
+        section.contains(REMOTE_AXIS_LEAD),
+        "the modes section must keep its execution-axis lead {REMOTE_AXIS_LEAD:?} — \
+         without the axis named, the remote/local reporting requirement has no \
+         hook to hang the identification tells on"
+    );
+    assert!(
+        section.contains(LOCAL_FALLBACK_TELL),
+        "the modes section must keep the local-fallback tell {LOCAL_FALLBACK_TELL:?} — \
+         it is the one line every cgroup-limited fallback prints, so it is how a \
+         reader identifies the local mode from the run's output instead of \
+         assuming intent (a clean tree that merely *should* have gone remote can \
+         still fall back, e.g. on a failed push)"
+    );
+    assert!(
+        section.contains(REMOTE_PASSED_TELL),
+        "the modes section must keep the remote success tell {REMOTE_PASSED_TELL:?} — \
+         only a run that actually submitted to rust-verify on iad-ci and streamed \
+         its logs can print it, so it is how a reader identifies the remote mode"
+    );
+    assert!(
+        section.contains(COVERAGE_AXIS_LEAD),
+        "the modes section must keep its coverage-axis lead {COVERAGE_AXIS_LEAD:?} — \
+         without the axis named, the targeted-vs-complete reporting requirement \
+         has no hook to hang the split definition on"
+    );
+    assert!(
+        section.contains(COMPLETE_SPLIT),
+        "the modes section must keep complete verification defined as \
+         {COMPLETE_SPLIT:?}, joined — both legs, conjunctively. The §\"Build \
+         commands\" pins establish that each command stays in the fence; this \
+         fragment is what the mode definition itself cannot lose: degrade the \
+         conjunction to a single leg and \"complete\" silently redefines as \
+         `--tests` alone, which skips doctests and has not run the suite"
+    );
+    assert!(
+        section.contains(TARGETED_NAMING_RULE),
+        "the modes section must keep the targeted-recording rule \
+         ({TARGETED_NAMING_RULE:?}) — without it a targeted report can claim \
+         \"targeted\" while naming nothing, and the coverage axis becomes \
+         unverifiable"
+    );
+    assert!(
+        section.contains(RECORDING_RULE),
+        "the modes section must keep the recording rule anchored on \
+         {RECORDING_RULE:?} — the verified-block lines are shell-executed \
+         verbatim, so the mode must travel in the surrounding prose, never as \
+         an annotation on an executed command line (an annotation there is a \
+         parse error that fails the gate, not evidence)"
+    );
+    assert!(
+        section.contains(EXTRACTION_LOCAL_RULE),
+        "the modes section must keep the extraction-local rule \
+         ({EXTRACTION_LOCAL_RULE:?}) — a `git archive` extraction has no git \
+         repo, so the wrapper never attempts submission and none of the four \
+         fallback banners print; without the rule those banners read as \
+         exhaustive and a banner-less local run looks unidentifiable or gets \
+         misreported as remote"
+    );
 }
 
 /// The repo-wide reintroduction contract, checkable against
@@ -545,6 +705,11 @@ fn operational_docs_and_scripts_never_prescribe_a_wildcard_test_selector() {
 }
 
 #[test]
+fn verification_modes_section_defines_identification_and_recording() {
+    check_verification_modes_section(&verification_modes_section(&agents_md()));
+}
+
+#[test]
 fn ci_workflowtemplate_test_commands_follow_the_selector_contract() {
     check_ci_workflow_test_commands(&repo_file(CI_WORKFLOW_FILE));
     // The template is scan scope too, not just pinned in isolation: a
@@ -566,6 +731,120 @@ fn ci_workflowtemplate_test_commands_follow_the_selector_contract() {
 // disk — and requires the owning check to panic naming the drift, the
 // committed non-vacuity pattern of `tests/docs_build_layout.rs`
 // (claudepr-4d967120).
+
+/// Stripping any pinned fragment of the §"Verification execution modes"
+/// contract fails the owning presence check — as does every drift shape
+/// the mode definition specifically exists to prevent: the complete-split
+/// conjunction degraded to a single leg (both commands still present, the
+/// *definition* quietly redefined), the recording rule pointed into the
+/// executed block lines, and the heading renamed away (a missing section
+/// is drift, not a pass — the extractor itself must panic).
+#[test]
+fn negative_meta_stripped_mode_fragments_fail_the_modes_pin() {
+    let section = verification_modes_section(&agents_md());
+
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                REMOTE_AXIS_LEAD,
+                "**Where the run executed.**",
+            ))
+        },
+        &["execution-axis lead"],
+    );
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                LOCAL_FALLBACK_TELL,
+                "[cargo-remote] running locally",
+            ))
+        },
+        &["local-fallback tell"],
+    );
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                REMOTE_PASSED_TELL,
+                "[cargo-remote] OK",
+            ))
+        },
+        &["remote success tell"],
+    );
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                COVERAGE_AXIS_LEAD,
+                "**What the run covered.**",
+            ))
+        },
+        &["coverage-axis lead"],
+    );
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                TARGETED_NAMING_RULE,
+                "may run any selectors it likes",
+            ))
+        },
+        &["targeted-recording rule"],
+    );
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                RECORDING_RULE,
+                "lines of the executed block",
+            ))
+        },
+        &["recording rule"],
+    );
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                EXTRACTION_LOCAL_RULE,
+                "proven by a falling-back banner",
+            ))
+        },
+        &["extraction-local rule"],
+    );
+
+    // The conjunction degraded to a single leg: both commands still appear
+    // in the section (each is pinned elsewhere in the fence), yet the
+    // *definition* of complete now stops at `--tests` — which skips
+    // doctests. Exactly the drift the joined fragment exists to catch.
+    assert_drift(
+        || {
+            check_verification_modes_section(&replaced_once(
+                &section,
+                COMPLETE_SPLIT,
+                "`cargo test --tests`",
+            ))
+        },
+        &["joined", "both legs"],
+    );
+
+    // The heading renamed away: the extractor must fail loudly rather than
+    // let the pins silently pass vacuously off a section that no longer
+    // exists. (replaced_once over the whole document, since the heading is
+    // what the extractor searches for.)
+    let doc = agents_md();
+    assert_drift(
+        || {
+            verification_modes_section(&replaced_once(
+                &doc,
+                VERIFICATION_MODES_HEADING,
+                "### Verification modes",
+            ));
+        },
+        &["must keep", "Verification execution modes"],
+    );
+}
 
 /// Run `check` and require it to panic with every fragment of `expected`
 /// in the message — the failure must be the drift the mutation plants, not

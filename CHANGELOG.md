@@ -9,6 +9,27 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Verification execution-mode guidance and drift guard.** AGENTS.md's
+  §"Build commands" gains a §"Verification execution modes" subsection
+  (bead claudepr-39f53ae4) defining the two axes every `cargo test`
+  verification report must state, each identified from the run's own
+  output rather than intent: remote vs local (the wrapper's
+  `[cargo-remote] submitting` / `workflow:` / `streaming logs from`
+  pre-lines ending at `PASSED` / `FAILED` / `timed out`, versus
+  `falling back to local` behind one of its four reason lines — plus the
+  silent local shape a no-git-repo tree (a `git archive` extraction) runs
+  as, printing none of them, identified by context and the absence of
+  every remote tell) and
+  targeted vs complete (complete being the two-leg `--tests` plus
+  `--doc` split, targeted requiring every selector it ran to be named).
+  The recording rule is pinned alongside them: the mode travels in the
+  evidence's prose, never annotated onto the shell-executed lines of a
+  fenced `verified:` block, where a parenthetical is a parse error that
+  fails the gate rather than evidence. `tests/docs_build_commands.rs`
+  presence-pins every fragment of the subsection, with negative
+  meta-tests stripping each fragment, degrading the complete-split
+  conjunction to a single leg, and renaming the heading away.
+
 - **Musl artifact verification on every push.** CI now builds the
   documented release target and runs its artifact gates in verify-only
   mode as well as release mode (bead claudepr-40878fa4): the musl
