@@ -313,10 +313,10 @@ fn template_ref_moves_off_forgejo(template: &str) -> Vec<String> {
             .strip_prefix('#')
             .map(str::trim_start)
             .unwrap_or(trimmed);
-        if opens_invocation(effective, "push") {
-            if !line.contains("git.ardenone.com") || line.to_ascii_lowercase().contains("github") {
-                violations.push(format!("line {}: {trimmed}", i + 1));
-            }
+        if opens_invocation(effective, "push")
+            && (!line.contains("git.ardenone.com") || line.to_ascii_lowercase().contains("github"))
+        {
+            violations.push(format!("line {}: {trimmed}", i + 1));
         }
         if opens_invocation(effective, "clone") {
             if line.to_ascii_lowercase().contains("github") {
