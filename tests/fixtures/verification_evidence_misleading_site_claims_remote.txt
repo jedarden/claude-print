@@ -1,0 +1,13 @@
+Complete, both legs, remote on iad-ci.
+
+```verified:
+cargo test --tests
+cargo test --doc
+```
+
+```cargo-output
+[cargo-remote] uncommitted changes detected
+[cargo-remote] falling back to local (cgroup-limited run)
+test result: ok. 813 passed; 0 failed; 0 ignored
+test result: ok. 84 passed; 0 failed; 0 ignored
+```

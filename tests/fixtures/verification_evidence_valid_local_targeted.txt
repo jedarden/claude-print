@@ -1,0 +1,13 @@
+Targeted: `--test watchdog`, local fallback — the checkout had no git remote,
+so the wrapper ran it cgroup-limited.
+
+```verified:
+cargo test --test watchdog
+```
+
+```cargo-output
+[cargo-remote] no git remote
+[cargo-remote] falling back to local (cgroup-limited run)
+     Running tests/watchdog.rs
+test result: ok. 6 passed; 0 failed; 0 ignored
+```

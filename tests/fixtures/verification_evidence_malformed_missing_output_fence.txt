@@ -1,0 +1,6 @@
+Complete, both legs, remote on iad-ci — the output capture went missing when the report was assembled.
+
+```verified:
+cargo test --tests
+cargo test --doc
+```

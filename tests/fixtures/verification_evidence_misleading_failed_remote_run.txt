@@ -1,0 +1,17 @@
+Complete, both legs, remote on iad-ci.
+
+```verified:
+cargo test --tests
+cargo test --doc
+```
+
+```cargo-output
+[cargo-remote] submitting to iad-ci (rust-verify)
+[cargo-remote] workflow: rust-verify-v6y0t
+[cargo-remote] streaming logs from the run
+test result: FAILED. 810 passed; 2 failed; 0 ignored
+failures:
+    docs_build_commands::wildcard_scan
+test result: FAILED. 84 passed; 0 failed; 0 ignored
+[cargo-remote] FAILED
+```

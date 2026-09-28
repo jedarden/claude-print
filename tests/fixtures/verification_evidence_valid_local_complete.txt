@@ -1,0 +1,17 @@
+Complete, both legs, run under the local fallback — the wrapper reported
+uncommitted changes detected in the tree.
+
+```verified:
+cargo test --tests
+cargo test --doc
+```
+
+```cargo-output
+[cargo-remote] uncommitted changes detected
+[cargo-remote] falling back to local (cgroup-limited run)
+    Compiling claude-print v0.3.3
+     Finished test [unoptimized + debuginfo] in 41.47s
+test result: ok. 812 passed; 0 failed; 0 ignored
+   Doc-tests claude_print
+test result: ok. 84 passed; 0 failed; 0 ignored
+```

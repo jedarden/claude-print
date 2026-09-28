@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# Validate the provenance and coverage claims in a recorded cargo test report.
+#
+# Exit contract:
+#   0 = evidence valid
+#   1 = invalid, misleading, or incomplete evidence
+#   2 = usage error or malformed evidence
+#
+# Both axes are derived from captured output. Remote output has the
+# submitting/workflow/streaming prelude and a terminal PASSED or FAILED line;
+# local output has a fallback banner preceded by a wrapper reason line.
+# The accepted vocabulary is `[cargo-remote] submitting`,
+# `[cargo-remote] workflow:`, `streaming logs from`, `[cargo-remote] PASSED`,
+# `[cargo-remote] FAILED`, and `[cargo-remote] falling back to local`, with local reasons
+# `no git remote`, `uncommitted changes detected`, `push failed`, or `submit
+# failed`. Complete coverage is exactly `--tests` plus `--doc`.
+
+set -euo pipefail
+
+fail() {
+    local rule=$1
+    shift
+    printf 'FAIL %s: %s\n' "$rule" "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf 'usage: %s EVIDENCE_FILE|-\n' "$0" >&2
+    exit 2
+}
+
+malformed() {
+    printf 'FAIL fence: %s\n' "$*" >&2
+    exit 2
+}
+
+[[ $# -eq 1 ]] || usage
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-print-verification.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT
+input=$tmp_dir/evidence.txt
+prose=$tmp_dir/prose.txt
+verified=$tmp_dir/verified.txt
+output=$tmp_dir/output.txt
+
+if [[ $1 == - ]]; then
+    cat >"$input" || {
+        printf 'usage: could not read evidence from stdin\n' >&2
+        exit 2
+    }
+else
+    [[ -f $1 && -r $1 ]] || usage
+    cp -- "$1" "$input" || usage
+fi
+
+# Split the markdown-shaped recording and enforce its deliberately small
+# grammar: prose plus exactly one verified command fence and one captured
+# output fence.
+if ! awk -v prose="$prose" -v verified="$verified" -v output="$output" '
+BEGIN { region = "prose"; verified_open = 0; output_open = 0; closes = 0 }
+{
+    if ($0 == "```verified:") {
+        if (region != "prose" || ++verified_open > 1) exit 10
+        region = "verified"
+        next
+    }
+    if ($0 == "```cargo-output") {
+        if (region != "prose" || ++output_open > 1) exit 11
+        region = "output"
+        next
+    }
+    if ($0 == "```") {
+        if (region == "prose") exit 12
+        region = "prose"
+        closes++
+        next
+    }
+    if ($0 ~ /^```/) exit 13
+
+    if (region == "prose") print > prose
+    else if (region == "verified") print > verified
+    else print > output
+}
+END {
+    if (region != "prose" || verified_open != 1 || output_open != 1 || closes != 2)
+        exit 20
+}
+' "$input"; then
+    malformed 'expected exactly one ```verified: fence and one ```cargo-output fence'
+fi
+
+# Executed lines are shell input, not a place to record result or mode.
+if grep -Eq '(^|[[:space:]])exit=[0-9]+|\((remote|local|complete|targeted)(,|\))' "$verified"; then
+    if grep -Eq '(^|[[:space:]])exit=[1-9][0-9]*([[:space:]]|$)' "$verified"; then
+        fail leg-outcome 'an executed command records a nonzero exit status'
+    fi
+    fail annotation-on-executed-line 'mode or exit annotations belong in prose, not the verified command block'
+fi
+
+# Derive the execution site from the wrapper's output vocabulary. Remote
+# requires the complete prelude and terminal outcome; local requires the
+# fallback line and one wrapper reason line.
+tell_file=$tmp_dir/tells
+awk '
+BEGIN { submit=workflow=stream=passed=failed=timed=fall=reason=0 }
+/\[cargo-remote\] submitting/ { submit=1 }
+/\[cargo-remote\] workflow:/ { workflow=1 }
+/streaming logs from/ { stream=1 }
+/\[cargo-remote\] PASSED/ { passed=1 }
+/\[cargo-remote\] FAILED/ { failed=1 }
+/\[cargo-remote\].*timed out|timed out/ { timed=1 }
+/\[cargo-remote\] falling back to local/ { fall=1 }
+/(no git remote|uncommitted changes detected|push failed|submit failed)/ { reason=1 }
+END {
+    remote = submit && workflow && stream && (passed || failed || timed)
+    local = fall && reason
+    if (remote && local) site="ambiguous"
+    else if (remote) site="remote"
+    else if (local) site="local"
+    else site="unknown"
+    printf "site=%s\nremote_failed=%d\n", site, (failed || timed)
+}' "$output" >"$tell_file"
+
+site=$(sed -n 's/^site=//p' "$tell_file")
+remote_failed=$(sed -n 's/^remote_failed=//p' "$tell_file")
+case $site in
+    remote|local) ;;
+    *) fail output-tells 'the cargo-output fence has no unambiguous remote or local wrapper tell set' ;;
+esac
+[[ $remote_failed == 0 ]] || fail remote-outcome 'the captured run ended in failure or timed out'
+
+# Local captures have no remote terminal line, so a green cargo result must be
+# visible. This also catches a failed local leg without a wrapper banner.
+if grep -Eq '(^|[^[:alnum:]])(FAILED|timed out)([^[:alnum:]]|$)|test result:.*[1-9][0-9]* failed' "$output"; then
+    fail remote-outcome 'the captured cargo output is not green'
+fi
+grep -Eiq 'test result:[[:space:]]+ok|test result:.*[[:space:]]+[0-9]+ passed' "$output" ||
+    fail leg-outcome 'the captured cargo output contains no green test result'
+
+# Extract the test commands from the verified fence. --tests and --doc are
+# the complete split; --test NAME and --lib are targeted selectors. Other
+# verification commands (fmt, clippy, build) do not affect this axis.
+selectors=$tmp_dir/selectors
+awk '
+/^cargo[[:space:]]+test([[:space:]]|$)/ {
+    if ($0 ~ /^cargo[[:space:]]+test[[:space:]]+--tests[[:space:]]*$/) print "--tests"
+    else if ($0 ~ /^cargo[[:space:]]+test[[:space:]]+--doc[[:space:]]*$/) print "--doc"
+    else if ($0 ~ /^cargo[[:space:]]+test[[:space:]]+--lib[[:space:]]*$/) print "--lib"
+    else if (match($0, /^cargo[[:space:]]+test[[:space:]]+--test(=|[[:space:]])([^[:space:]]+)[[:space:]]*$/, m)) print "--test " m[2]
+    else print "--unnamed"
+}' "$verified" >"$selectors"
+
+grep -Eq '^--(tests|doc|lib)|^--test ' "$selectors" ||
+    fail coverage-mismatch 'the verified fence contains no cargo test selector'
+
+has_tests=0
+has_doc=0
+has_unnamed=0
+while IFS= read -r selector; do
+    case $selector in
+        --tests) has_tests=1 ;;
+        --doc) has_doc=1 ;;
+        --unnamed) has_unnamed=1 ;;
+    esac
+done <"$selectors"
+[[ $has_unnamed == 0 ]] || fail selector-unnamed 'a cargo test command has no named selector'
+
+if (( has_tests && has_doc )); then
+    coverage=complete
+else
+    coverage=targeted
+    while IFS= read -r selector; do
+        [[ $selector == --tests || $selector == --doc ]] && continue
+        if [[ $selector == --lib ]]; then
+            [[ $(grep -Eic '(^|[^[:alnum:]_-])--lib([^[:alnum:]_-]|$)' "$prose") -gt 0 ]] ||
+                fail selector-unnamed 'the targeted --lib selector is absent from the prose'
+        else
+            name=${selector#--test }
+            grep -Eiq -- "(^|[^[:alnum:]_.-])--test(=|[[:space:]])${name}([^[:alnum:]_.-]|$)" "$prose" ||
+                fail selector-unnamed "the targeted --test ${name} selector is absent from the prose"
+        fi
+    done <"$selectors"
+fi
+
+# Count claims in prose, excluding "no git remote", which is a fallback
+# reason rather than a remote execution claim.
+claims=$tmp_dir/claims
+awk '
+function count_word(text, word,    n, pos, rest, left, right) {
+    n=0; rest=text
+    while ((pos = index(tolower(rest), word)) != 0) {
+        left = (pos == 1 ? " " : substr(rest, pos - 1, 1))
+        right = (pos + length(word) > length(rest) ? " " : substr(rest, pos + length(word), 1))
+        if (left !~ /[[:alnum:]_]/ && right !~ /[[:alnum:]_]/) n++
+        rest = substr(rest, pos + length(word))
+    }
+    return n
+}
+{
+    line=$0
+    gsub(/[Nn][Oo][[:space:]]+[Gg][Ii][Tt][[:space:]]+[Rr][Ee][Mm][Oo][Tt][Ee]/, "", line)
+    text = text " " line
+}
+END {
+    print "remote=" count_word(text, "remote")
+    print "local=" count_word(text, "local")
+    print "complete=" count_word(text, "complete")
+    print "targeted=" count_word(text, "targeted")
+}' "$prose" >"$claims"
+
+remote_claim=$(sed -n 's/^remote=//p' "$claims")
+local_claim=$(sed -n 's/^local=//p' "$claims")
+complete_claim=$(sed -n 's/^complete=//p' "$claims")
+targeted_claim=$(sed -n 's/^targeted=//p' "$claims")
+
+if (( remote_claim + local_claim == 0 )); then
+    fail axis-unstated 'the prose does not state remote or local execution'
+elif (( remote_claim + local_claim != 1 )); then
+    fail site-mismatch 'the prose states remote/local execution more than once or both ways'
+elif [[ $site == remote && $remote_claim != 1 ]] || [[ $site == local && $local_claim != 1 ]]; then
+    fail site-mismatch "the prose claims a site different from the captured $site run"
+fi
+
+if (( complete_claim + targeted_claim == 0 )); then
+    fail axis-unstated 'the prose does not state complete or targeted coverage'
+elif (( complete_claim + targeted_claim != 1 )); then
+    fail coverage-mismatch 'the prose states complete and targeted coverage ambiguously'
+elif [[ $coverage == complete && $complete_claim != 1 ]] || [[ $coverage == targeted && $targeted_claim != 1 ]]; then
+    fail coverage-mismatch "the prose claims $complete_claim/$targeted_claim coverage for a $coverage run"
+fi
+
+printf 'evidence valid: %s, %s\n' "$site" "$coverage"

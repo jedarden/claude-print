@@ -1,0 +1,13 @@
+Complete, both legs, remote on iad-ci.
+
+```verified:
+cargo test --tests
+```
+
+```cargo-output
+[cargo-remote] submitting to iad-ci (rust-verify)
+[cargo-remote] workflow: rust-verify-p1t6v
+[cargo-remote] streaming logs from the run
+test result: ok. 813 passed; 0 failed; 0 ignored
+[cargo-remote] PASSED
+```

@@ -1,0 +1,16 @@
+Targeted re-run of the touched suite only: `cargo test --test docs_build_commands`
+and `cargo test --lib`, remote on iad-ci.
+
+```verified:
+cargo test --test docs_build_commands
+cargo test --lib
+```
+
+```cargo-output
+[cargo-remote] submitting to iad-ci (rust-verify)
+[cargo-remote] workflow: rust-verify-q9z4k
+[cargo-remote] streaming logs from the run
+test result: ok. 96 passed; 0 failed; 0 ignored
+test result: ok. 215 passed; 0 failed; 0 ignored
+[cargo-remote] PASSED
+```

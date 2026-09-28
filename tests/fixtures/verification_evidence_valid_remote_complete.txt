@@ -1,0 +1,17 @@
+Verification for this change ran complete, both legs, remote on iad-ci.
+
+```verified:
+cargo test --tests
+cargo test --doc
+```
+
+```cargo-output
+[cargo-remote] submitting to iad-ci (rust-verify)
+[cargo-remote] workflow: rust-verify-m7x2q
+[cargo-remote] streaming logs from the run
+   Compiling claude-print v0.3.3
+test result: ok. 812 passed; 0 failed; 0 ignored
+   Doc-tests claude_print
+test result: ok. 84 passed; 0 failed; 0 ignored
+[cargo-remote] PASSED
+```

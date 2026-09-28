@@ -1,0 +1,15 @@
+Targeted, remote on iad-ci — just the two suites this change touched.
+
+```verified:
+cargo test --test docs_build_commands
+cargo test --lib
+```
+
+```cargo-output
+[cargo-remote] submitting to iad-ci (rust-verify)
+[cargo-remote] workflow: rust-verify-k8d3f
+[cargo-remote] streaming logs from the run
+test result: ok. 97 passed; 0 failed; 0 ignored
+test result: ok. 214 passed; 0 failed; 0 ignored
+[cargo-remote] PASSED
+```

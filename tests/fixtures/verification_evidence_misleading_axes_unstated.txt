@@ -1,0 +1,14 @@
+Everything green, the suite is done, nothing further to check for this
+change — only the summary line was kept.
+
+```verified:
+cargo test --tests
+cargo test --doc
+```
+
+```cargo-output
+[cargo-remote] uncommitted changes detected
+[cargo-remote] falling back to local (cgroup-limited run)
+test result: ok. 812 passed; 0 failed; 0 ignored
+test result: ok. 84 passed; 0 failed; 0 ignored
+```
