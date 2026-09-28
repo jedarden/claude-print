@@ -9,6 +9,25 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **Musl artifact verification on every push.** CI now builds the
+  documented release target and runs its artifact gates in verify-only
+  mode as well as release mode (bead claudepr-40878fa4): the musl
+  builds, the `verify_static` static-linkage check, and the 10 MiB size
+  cap moved onto the shared path after the quality gates, while the
+  release-only prelude (tag push + draft/publish idempotency) stays
+  guarded by `[ -n "$TAG" ]` and still runs ahead of the build — so a
+  re-run of an already-published release exits before rebuilding, and a
+  plain push that breaks the musl build or the static linkage is red
+  instead of green until release day. `tests/musl_artifact_verification.rs`
+  pins the change from both sides: it executes the WorkflowTemplate's own
+  `verify_static` body under `bash -e` against a stubbed `ldd` (both
+  static markers accepted on stdout and stderr, dynamic and empty output
+  rejected with the HR-1 error, ldd's exit status never deciding — ldd
+  exits 0 for dynamic binaries too), and it holds the both-modes
+  placement, the guarded prelude, and the README/runbook claims about the
+  gates; negative meta-tests mutate every guarded input in memory and
+  require the owning check to fail naming the drift.
+
 - **README drop-in-claim drift guard.** The README's compatibility promises
   are now pinned to the normative contract the same way the contract is
   pinned to the implementation (bead claudepr-5c893388):

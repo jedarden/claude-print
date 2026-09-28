@@ -157,37 +157,47 @@ spec:
             cargo audit
             echo "audit OK (no known vulnerabilities)"
 
-            # In verify-only mode (TAG empty), skip release creation after quality gates
-            if [ -z "$TAG" ]; then
-              echo "Verify-only mode: all quality gates passed, exiting without release"
-              exit 0
+            # Release-only prelude (claudepr-40878fa4): verify-only runs (TAG
+            # empty) never push a tag or touch GitHub, so the whole
+            # tag/idempotency block is guarded. Release-mode behavior is
+            # unchanged — the verify-only exit used to sit here — but the
+            # guard lets the artifact build and gates below run in BOTH
+            # modes while keeping idempotency BEFORE build time (the
+            # runbook's ordering: a re-run of an already-published release
+            # exits without rebuilding).
+            if [ -n "$TAG" ]; then
+              # Tag-to-Forgejo (draft-revert root-cause fix, 2026-08-16): the
+              # GitHub repo is a Forgejo push mirror, and every mirror sync
+              # PRUNES refs that exist only on GitHub. GitHub demotes a
+              # published release to draft when its tag is deleted, so the tag
+              # must exist on Forgejo BEFORE any GitHub release references it.
+              git tag "v${VERSION}" 2>/dev/null || [ "$(git rev-parse "refs/tags/v${VERSION}^{commit}")" = "$(git rev-parse HEAD)" ]
+              echo "Pushing tag v${VERSION} to Forgejo"
+              set +x
+              git push "https://x-token:${FORGEJO_TOKEN}@git.ardenone.com/jedarden/claude-print.git" "refs/tags/v${VERSION}"
+              set -x
+
+              # Skip only if the version is genuinely PUBLISHED (not a draft) —
+              # a drafted release must be published in place, not skipped.
+              IS_DRAFT=$(gh release view "v${VERSION}" --repo jedarden/claude-print --json isDraft --jq '.isDraft' 2>/dev/null || echo "absent")
+              if [ "$IS_DRAFT" = "false" ]; then
+                echo "Release v${VERSION} already published — skipping"
+                exit 0
+              fi
+              if [ "$IS_DRAFT" = "true" ]; then
+                echo "Release v${VERSION} exists as a DRAFT — publishing it in place"
+                gh release edit "v${VERSION}" --repo jedarden/claude-print --draft=false
+                echo "Release v${VERSION} published"
+                exit 0
+              fi
             fi
 
-            # Tag-to-Forgejo (draft-revert root-cause fix, 2026-08-16): the
-            # GitHub repo is a Forgejo push mirror, and every mirror sync
-            # PRUNES refs that exist only on GitHub. GitHub demotes a
-            # published release to draft when its tag is deleted, so the tag
-            # must exist on Forgejo BEFORE any GitHub release references it.
-            git tag "v${VERSION}" 2>/dev/null || [ "$(git rev-parse "refs/tags/v${VERSION}^{commit}")" = "$(git rev-parse HEAD)" ]
-            echo "Pushing tag v${VERSION} to Forgejo"
-            set +x
-            git push "https://x-token:${FORGEJO_TOKEN}@git.ardenone.com/jedarden/claude-print.git" "refs/tags/v${VERSION}"
-            set -x
-
-            # Skip only if the version is genuinely PUBLISHED (not a draft) —
-            # a drafted release must be published in place, not skipped.
-            IS_DRAFT=$(gh release view "v${VERSION}" --repo jedarden/claude-print --json isDraft --jq '.isDraft' 2>/dev/null || echo "absent")
-            if [ "$IS_DRAFT" = "false" ]; then
-              echo "Release v${VERSION} already published — skipping"
-              exit 0
-            fi
-            if [ "$IS_DRAFT" = "true" ]; then
-              echo "Release v${VERSION} exists as a DRAFT — publishing it in place"
-              gh release edit "v${VERSION}" --repo jedarden/claude-print --draft=false
-              echo "Release v${VERSION} published"
-              exit 0
-            fi
-
+            # Build the documented release target on EVERY invocation —
+            # verify-only pushes included (claudepr-40878fa4). Until this
+            # block ran only in release mode, so a change that broke the
+            # musl build (a dependency that will not cross-compile, a
+            # target-specific cfg mistake) was green on every push and
+            # surfaced only at release time.
             ARCH=$(uname -m)
             TARGET="${ARCH}-linux"
             MUSL_TARGET="${ARCH}-unknown-linux-musl"
@@ -227,6 +237,14 @@ spec:
             if [ "$BINARY_SIZE_BYTES" -gt "$MAX_SIZE_BYTES" ]; then
               echo "ERROR: Binary size ${BINARY_SIZE_BYTES} bytes exceeds ${MAX_SIZE_BYTES} byte limit" >&2
               exit 1
+            fi
+
+            # In verify-only mode (TAG empty), skip release creation after
+            # quality gates AND artifact gates: the documented target has
+            # been built and statically verified, nothing is uploaded.
+            if [ -z "$TAG" ]; then
+              echo "Verify-only mode: all quality gates passed, exiting without release"
+              exit 0
             fi
 
             # The contract-maintenance gate recorded the claude version it

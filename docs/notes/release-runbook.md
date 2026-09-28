@@ -45,8 +45,13 @@ The `claude-print-ci` WorkflowTemplate takes one parameter, `tag`:
 
 - **empty (default) — verify-only mode**: the workflow clones `main` from
   Forgejo, runs every quality gate (contract-maintenance, fmt, clippy,
-  `cargo test`, `cargo audit`), and exits *without* creating a release.
-  Every push runs this mode.
+  `cargo test`, `cargo audit`), then builds the release artifacts for the
+  documented target and runs the artifact gates on them (`verify_static`
+  and the size cap) *without* uploading anything, and exits *without*
+  creating a release. Every push runs this mode — which means every push
+  proves the musl target still builds and still links statically
+  (claudepr-40878fa4; before that change the artifact gates ran only in
+  release mode, so a musl-breaking commit was green until release day).
 - **`vX.Y.Z` — release mode**: the workflow clones exactly that tag from
   Forgejo (`git clone --depth 1 --branch "$TAG" --single-branch`), runs the
   same gates, and continues into publication.
@@ -122,7 +127,16 @@ architecture fails the build until all three agree.
 Two further build gates run before anything is uploadable: `verify_static`
 (ldd must report `statically linked` / `not a dynamic executable` for both
 binaries — HR-1) and the size gate (the main binary must not exceed
-10 MiB).
+10 MiB). Since claudepr-40878fa4 the musl builds and both gates run in
+verify-only mode too — the release-only prelude (tag push and the
+draft/publish idempotency check) stays ahead of the build, so a re-run of
+an already-published release still exits before rebuilding.
+`tests/musl_artifact_verification.rs` pins the gate's decision logic
+directly: it executes the template's own `verify_static` body under `bash`
+against a stubbed `ldd` (both static markers accepted, dynamic output and
+empty output rejected, ldd's exit status ignored — ldd exits 0 for dynamic
+binaries too) and holds the both-modes placement and the docs' claims
+about it.
 
 [Supported platforms]: ../../README.md#supported-platforms
 
@@ -250,6 +264,7 @@ credential hygiene — and this section's wiring — are pinned by
 |-------|-----------|
 | WorkflowTemplate ↔ README matrix ↔ installer mapping agreement; asset names derived from the toolchain set | `tests/platform_matrix_docs.rs` |
 | Per-row installer behavior for the matrix (refusal before download, nothing placed) | `tests/install_sh_arch.rs` |
+| The static-linkage gate's decision logic — the template's own `verify_static` body executed under `bash` against a stubbed `ldd` (both static markers pass, dynamic and empty output fail, the exit status never decides) — and the musl build + gates running in both workflow modes with the release-only prelude still ahead of the build | `tests/musl_artifact_verification.rs` |
 | Fail-closed verification (missing manifest / unlisted asset / digest mismatch), rollback copy semantics | `tests/install_sh.rs` |
 | The default release source the override redirects: the tag-less `releases/latest/download` base over the publisher's repo slug (workflow `--repo` flags and Forgejo clone URL agree), manifest-first fetch order, and the x86_64 asset names requested from the default | `tests/install_sh_release_source.rs` |
 | This runbook ↔ the WorkflowTemplate: asset names and the toolchain claim, publication order (tag→Forgejo before `gh release create`, draft/publish idempotency before the build, manifest generation before upload), manifest coverage of exactly the uploaded assets, bare-name generation, mode/version wiring; the README's pointers back to this note (the runbook link on both release-facing surfaces, and the one-directional publication claims — canonical Forgejo repo, read-only push mirror, GitHub Releases artifact host, nothing flows back, the `CLAUDE_PRINT_RELEASE_URL` override — agreed between the two docs) | `tests/release_runbook_docs.rs` |
