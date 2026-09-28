@@ -434,16 +434,61 @@ fn proc_state(pid: u32) -> Option<String> {
     rest.split_whitespace().next().map(str::to_owned)
 }
 
-/// Count the daemon's open PTY masters (`/dev/ptmx` readlinks). At rest with
-/// one ready worker this is exactly 1 — a leaked assignment would read 2.
+/// Count the daemon's open PTY masters. An opened master's fd readlink names
+/// the path open(2) resolved, and `/dev/ptmx` has two live spellings: a char
+/// device (bare-metal hosts — the fd readlinks to `/dev/ptmx`) or a symlink
+/// into devpts (the kubelet/container `/dev` every CI pod mounts — the open
+/// resolves through it and the fd readlinks to `/dev/pts/ptmx`). Matching
+/// only the first read 0 in every CI pod while the daemon demonstrably held
+/// its workers (claudepr-bcb6beab — this binary's identical assertions were
+/// simply never reached there, `cargo test --tests` stops at the first
+/// failing target), so both spellings count; the pin test below opens one
+/// master through each path. At rest with one ready worker this is exactly
+/// 1 — a leaked assignment would read 2.
 fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
     let fd_dir = format!("/proc/{daemon_pid}/fd");
     std::fs::read_dir(&fd_dir)
         .unwrap_or_else(|e| panic!("read {fd_dir}: {e}"))
         .filter_map(|e| e.ok())
         .filter_map(|e| std::fs::read_link(e.path()).ok())
-        .filter(|t| t.to_string_lossy() == "/dev/ptmx")
+        .filter(|t| matches!(t.to_string_lossy().as_ref(), "/dev/ptmx" | "/dev/pts/ptmx"))
         .count()
+}
+
+/// The helper-contract pin behind this binary's at-rest PTY-master
+/// assertions (INV-14): `daemon_pty_fd_count` must count a master opened
+/// through EITHER `/dev/ptmx` spelling. On a bare host opening `/dev/ptmx`
+/// (a char device) readlinks to `/dev/ptmx`, while opening `/dev/pts/ptmx`
+/// directly produces exactly the fd link the daemon's masters carry on the
+/// kubelet CI layout, where `/dev/ptmx` is a symlink and the open resolves
+/// through it — so the two opens exercise both spellings on any host. A
+/// helper matching only one spelling counts 1 here, not 2, and reads 0 for
+/// every real daemon in a CI container (claudepr-bcb6beab). No daemon, no
+/// worker — this pins the /proc readlink contract alone; no test in this
+/// binary opens a PTY in process, so the exact `before + 2` delta cannot
+/// race a sibling thread.
+#[test]
+fn pty_master_fd_count_accepts_both_ptmx_spellings() {
+    let before = daemon_pty_fd_count(std::process::id());
+    let host_spelling = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/ptmx")
+        .expect("/dev/ptmx must open — every test in this binary spawns PTYs");
+    let container_spelling = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/pts/ptmx")
+        .expect("/dev/pts/ptmx must open — the devpts mount every PTY here is allocated from");
+    assert_eq!(
+        daemon_pty_fd_count(std::process::id()),
+        before + 2,
+        "an opened master must count through both spellings: /dev/ptmx \
+         (char-device hosts) and /dev/pts/ptmx (symlinked /dev/ptmx, the \
+         kubelet CI layout)"
+    );
+    drop(host_spelling);
+    drop(container_spelling);
 }
 
 /// Count EVERY descriptor the daemon holds open. The generic counterpart to
