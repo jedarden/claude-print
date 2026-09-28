@@ -64,6 +64,18 @@ fn check_failing_body(marker: &str) -> String {
     )
 }
 
+/// The success-path companion to [`check_failing_body`]: a binary that exits
+/// 0 in every mode and prints the flag it was invoked with, so a successful
+/// run's captured stdout records each smoke leg as it executes — the
+/// outside-visible evidence that the installer runs the placed binary with
+/// `--check` and then `--version`. The failure-side ordering (no leg after a
+/// failed check) is pinned with [`check_failing_body`]; until this body
+/// nothing pinned that the success path executes either leg, so an installer
+/// that simply dropped the smoke kept every existing test green.
+fn smoke_echoing_body() -> String {
+    "#!/bin/sh\nprintf 'smoke leg: %s\\n' \"$1\"\n".to_string()
+}
+
 /// Execution evidence planted inside the downloaded artifact by every
 /// fail-closed verification test: run in any mode, the artifact prints a
 /// distinctive line and touches `$EXECUTION_PROBE`. The fail-closed rule
@@ -416,6 +428,61 @@ fn install_succeeds_when_artifacts_match_the_published_checksums() {
 }
 
 #[test]
+fn a_successful_install_smokes_the_installed_binary_with_check_then_version_before_completing() {
+    // The success-path half of the --check contract (README Install: the
+    // installer "runs `--check` to verify the setup"). Every fail-closed
+    // test pins what must NOT run after a failure, and the failed-check test
+    // pins the abort itself — but no test asserted that a *successful*
+    // install executes the placed binary: the `--check` smoke and then the
+    // `--version` leg, in that order, placement first, banner last. The
+    // `--version` leg in particular is referenced by no other test, so an
+    // installer that dropped it (or dropped the whole smoke) kept the suite
+    // green. The binary here echoes the flag it was invoked with, so each
+    // leg's execution lands in the captured stdout as it happens.
+    let release = build_release_with_binary_body(
+        &[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET],
+        &smoke_echoing_body(),
+    );
+    let home = tempfile::tempdir().unwrap();
+
+    let output = run_install(home.path(), release.path());
+
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Running claude-print --check"),
+        "a successful install must announce the smoke: {stdout}"
+    );
+    let check_leg = stdout
+        .find("smoke leg: --check")
+        .unwrap_or_else(|| panic!("the placed binary must be executed with --check: {stdout}"));
+    let version_leg = stdout
+        .find("smoke leg: --version")
+        .unwrap_or_else(|| panic!("the --version leg must run after a passing --check: {stdout}"));
+    let placed = stdout
+        .find(&format!(
+            "Installed {}",
+            installed_path(home.path(), BINARY_INSTALL_NAME).display()
+        ))
+        .unwrap_or_else(|| {
+            panic!("the binary must be recorded as placed before the smoke runs: {stdout}")
+        });
+    let banner = stdout.find("Installation complete").unwrap_or_else(|| {
+        panic!("a successful install must print the completion banner: {stdout}")
+    });
+    assert!(
+        placed < check_leg && check_leg < version_leg && version_leg < banner,
+        "the smoke legs must run the placed binary in order — placement, \
+         --check, --version, banner: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(installed_path(home.path(), BINARY_INSTALL_NAME)).unwrap(),
+        smoke_echoing_body(),
+        "the executed binary is the verified artifact, installed verbatim"
+    );
+}
+
+#[test]
 fn install_fails_closed_when_the_checksum_manifest_is_missing() {
     // Assets exist but the publisher published no manifest at all. The
     // binary carries the execution probe so the run pins the ordering as
@@ -450,6 +517,100 @@ fn install_fails_closed_when_the_checksum_manifest_is_missing() {
     assert_aborted_before_execution_or_check(
         &String::from_utf8_lossy(&output.stdout),
         &execution_probe,
+    );
+}
+
+#[test]
+fn install_fails_closed_when_the_binary_cannot_be_downloaded() {
+    // The download-failure abort for the main binary — the leg between the
+    // two already-pinned download failures: the manifest's own
+    // (install_fails_closed_when_the_checksum_manifest_is_missing) and the
+    // fixture's listed-but-unserved shape
+    // (tests/install_sh_release_source.rs::the_fetch_log_records_requests_not_successes).
+    // Here the manifest downloads and lists every asset, but the binary's
+    // bytes are not served — curl exits nonzero against the file:// release
+    // with the file simply omitted, the mirror/host-outage shape. The abort
+    // must strike at the download itself, before verification, backup, or
+    // placement: nothing new is placed, and a pre-existing installation —
+    // live binary and rollback copy alike — is left exactly as it was, the
+    // no-partial-install guarantee on the earliest possible failure.
+    let release = build_release(&[BINARY_ASSET, MOCK_ASSET, VERSION_ASSET]);
+    // The manifest (already written over the complete asset list) stays;
+    // the binary's bytes go missing from the served release.
+    fs::remove_file(release.path().join(BINARY_ASSET)).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    preplace_prior_install(
+        home.path(),
+        &generation_body("v1"),
+        Some(&generation_body("v0")),
+    );
+
+    let output = run_install(home.path(), release.path());
+
+    assert!(
+        !output.status.success(),
+        "an undownloadable binary must abort the install"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("could not be downloaded") && stderr.contains(BINARY_ASSET),
+        "stderr must name the undownloadable asset: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The abort struck at the binary's own download leg: the manifest leg
+    // before it completed, the binary's download started, and nothing after
+    // it ran — no verification line, no backup, no smoke, no banner.
+    assert!(
+        stdout.contains(&format!("Downloading {CHECKSUMS_ASSET}")),
+        "the manifest must have downloaded first: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Downloading {BINARY_ASSET}")),
+        "the binary's download leg must have started: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("Verified {BINARY_ASSET}")),
+        "nothing can be verified against bytes that never arrived: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Backing up existing binary"),
+        "the backup must not precede a failed download: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Running claude-print --check")
+            && !stdout.contains("Installation complete"),
+        "no leg after the failed download may run: {stdout}"
+    );
+    // Nothing was placed and nothing disturbed: the install dir holds
+    // exactly the pre-existing live binary and rollback copy, verbatim.
+    assert_eq!(
+        fs::read_to_string(installed_path(home.path(), BINARY_INSTALL_NAME)).unwrap(),
+        generation_body("v1"),
+        "the live binary must be untouched by a failed download"
+    );
+    assert_eq!(
+        fs::read_to_string(installed_path(home.path(), PREV_INSTALL_NAME)).unwrap(),
+        generation_body("v0"),
+        "an existing rollback copy must not be replaced by a failed download"
+    );
+    assert!(
+        !installed_path(home.path(), MOCK_INSTALL_NAME).exists(),
+        "no leg after the failed download may place anything"
+    );
+    let bin_dir = home.path().join(".local/bin");
+    let mut entries: Vec<_> = fs::read_dir(&bin_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            BINARY_INSTALL_NAME.to_string(),
+            PREV_INSTALL_NAME.to_string(),
+        ],
+        "the install dir must hold exactly the prior installation — no \
+         partial install left behind, got {entries:?}"
     );
 }
 
