@@ -559,9 +559,17 @@ the same pinned stamp. The `tests/contract_maintenance.rs` suite pins this
 wiring (the push trigger that submits the template — the Sensor's
 push/`refs/heads/main` filters and its `workflowTemplateRef` hand-off, fed
 by the vendored EventSource stanza's push subscription — template fragments
-including the fatal wrapper, gate exit-code contract against a stubbed
-claude, and the doc/plan mentions) so the automation cannot silently detach
-from this page again.
+including the fatal wrapper, the execution pin of that wrapper
+(claudepr-3f4aefad): the invocation must sit on an *uncommented* line
+inside the `if ! … exit 1 … fi` — a commented-out gate, an `exit 0`
+failure branch, or a `|| true` neuter fails the suite, as does a gate
+demoted below any quality gate or the verify-only green exit, a dropped
+claude install, or a lost `set -ex` — gate exit-code contract against a
+stubbed claude, and the doc/plan mentions) so the automation cannot
+silently detach from this page again. When that enforcement goes red on a
+version bump, the way through is the procedure below — the §Re-run and
+§Re-pin steps (or §File follow-ups when a contract moved) — never
+commenting the gate out of the template.
 
 **Scheduled watch.** CI fires only on a push, and Claude Code auto-updates
 on its own schedule — the 2026-09-24 re-pin was itself superseded hours

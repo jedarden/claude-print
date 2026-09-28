@@ -39,7 +39,14 @@
 //!   submits that template stays attached (the Sensor's push +
 //!   refs/heads/main filters and its workflowTemplateRef hand-off, fed by
 //!   the EventSource stanza's push subscription — claudepr-b3ac3625), and
-//!   the maintenance doc / plan R-2 / README / AGENTS.md still name it.
+//!   the maintenance doc / plan R-2 / README / AGENTS.md still name it;
+//! - gate execution (claudepr-3f4aefad) — the same WorkflowTemplate pinned
+//!   comment- and token-aware, because a *commented-out* gate block
+//!   satisfies every raw-text fragment above: the invocation must run on
+//!   an uncommented line inside the fatal `if ! … exit 1 … fi` wrapper,
+//!   before every quality gate and the verify-only green exit, after the
+//!   claude install, on top of `set -ex`, with negative meta-tests
+//!   planting each drift shape in memory.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -1675,6 +1682,419 @@ fn workflowtemplate_authenticates_the_forgejo_clone() {
         clone_arms, 2,
         "both the release-mode and verify-only clone arms must keep the bare \
          Forgejo URL the helper authenticates (found {clone_arms})"
+    );
+}
+
+// ── Gate execution: comment-aware, which the fragment pin above is not ────────
+//
+// `ci_workflowtemplate_wires_the_gate_on_every_push` pins the wiring with
+// raw-text fragments — and a *commented-out* gate block satisfies every
+// one of them: `contains`/`find` cannot tell an executing line from a `#`
+// line, and commenting the gate out is exactly the move a version bump
+// tempts ("temporarily unblock CI, re-pin later" — the re-pin that never
+// comes). The guard below re-pins the same template comment-aware, in the
+// legs the wiring contract names (claudepr-3f4aefad):
+//
+//   presence   an UNCOMMENTED line invokes the gate, inside the fatal
+//              `if ! … then … exit 1 … fi` wrapper, with
+//              `--evidence-dir` and `--file-follow-up` on executed
+//              continuation lines;
+//   ordering   that invocation precedes every quality gate (fmt, clippy,
+//              both test legs, audit — each itself required
+//              uncommented) and the verify-only green exit, so no path
+//              passes the run before the gate has judged the pins, with
+//              claude installed first so detection compares a real
+//              version, on top of `set -ex`;
+//   execution  a `#`-prefixed line does not run and satisfies nothing —
+//              the leg the fragment pin lacks;
+//   failure    the wrapper's failure branch exits non-zero — `exit 1`,
+//              not `exit 0`, not commented out, no `|| true` neuter —
+//              the wiring that turns gate exit 1 (drift) and 2 (cannot
+//              determine) into a red build, the red only the §Re-pin
+//              commit clears.
+//
+// Comment- AND token-aware by need, not taste: the template's own `#`
+// comments name `cargo audit`, and its `echo "Running cargo audit..."`
+// announcements carry the same substrings an executing command does —
+// only consecutive-whitespace-token matching separates command from
+// announcement, and only comment-skipping keeps a `#` line from
+// satisfying presence or anchoring an ordering comparison.
+
+/// A line is a comment when `#` is its first non-blank character — the
+/// YAML comments and the `#` lines of the bash embedded in the
+/// WorkflowTemplate's args alike. A commented-out command does not
+/// execute and satisfies no presence pin.
+fn is_comment_line(line: &str) -> bool {
+    line.trim_start().starts_with('#')
+}
+
+/// Index of the first uncommented line containing `needle`, if any.
+fn uncommented_line_with(lines: &[&str], needle: &str) -> Option<usize> {
+    lines
+        .iter()
+        .position(|line| !is_comment_line(line) && line.contains(needle))
+}
+
+/// Index of the first uncommented line whose whitespace tokens carry
+/// `tokens` consecutively — the executing-command match that neither a
+/// comment naming the command nor an `echo` announcing it (whose quoted
+/// text often glues punctuation onto the last token) can satisfy.
+fn uncommented_cmd_line(lines: &[&str], tokens: &[&str]) -> Option<usize> {
+    lines.iter().position(|line| {
+        if is_comment_line(line) {
+            return false;
+        }
+        let ts: Vec<&str> = line.split_whitespace().collect();
+        ts.windows(tokens.len()).any(|w| w == tokens)
+    })
+}
+
+/// The quality gates the contract gate must precede, as consecutive
+/// whitespace-token sequences — token matching (not substring) so the
+/// template's `#` comments and `echo` announcements naming the same
+/// commands cannot satisfy or anchor them.
+const QUALITY_GATES: [&[&str]; 5] = [
+    &["cargo", "fmt", "--check"],
+    &["cargo", "clippy", "--all-targets"],
+    &["cargo", "test", "--tests"],
+    &["cargo", "test", "--doc"],
+    &["cargo", "audit"],
+];
+
+/// The gate-execution contract over the WorkflowTemplate's text, pure so
+/// the negative meta-tests below can mutate it in memory (the committed
+/// non-vacuity pattern of `tests/docs_build_commands.rs`,
+/// claudepr-4d967120). Panics naming the drifted leg.
+fn check_ci_workflowtemplate_executes_the_gate(content: &str) {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // The fail-fast foundation: with `set -e` gone no plain failure in
+    // the embedded script — gate or quality gate — is fatal.
+    assert!(
+        uncommented_line_with(&lines, "set -ex").is_some(),
+        "the CI script must keep `set -ex` — the fail-fast mode the gate's fatal \
+         wrapper and every quality gate's plain failure rest on; without it a \
+         failed gate leaves the run green"
+    );
+
+    // Presence, on an executing line: the gate invocation itself.
+    let invocation = uncommented_line_with(&lines, "scripts/contract-maintenance-gate.sh").expect(
+        "the CI WorkflowTemplate must invoke `bash scripts/contract-maintenance-gate.sh` \
+             on an UNCOMMENTED line — a `#`-prefixed invocation does not run, yet it \
+             satisfies every raw-text fragment the wiring pin above checks, which is \
+             the hole this guard exists to close (claudepr-3f4aefad): commenting the \
+             gate out is exactly how a version bump gets 'temporarily unblocked'. The \
+             way back to a green build is the re-pin procedure — docs/notes/\
+             claude-contract-probes.md §Re-pin — never disabling the gate",
+    );
+
+    // The invocation must stay inside the fatal wrapper: the `if !` on its
+    // own line routes a non-zero gate exit into the failure branch.
+    assert!(
+        lines[invocation].trim_start().starts_with("if ! "),
+        "the gate invocation must stay inside the fatal `if ! … then … exit 1 … fi` \
+         wrapper — a bare invocation drops the named ERROR hand-off and the explicit \
+         non-zero exit the §Wiring contract documents (line: {:?})",
+        lines[invocation].trim()
+    );
+
+    // The wrapper's window: the invocation through its closing `fi`.
+    let fi = lines[invocation + 1..]
+        .iter()
+        .position(|l| !is_comment_line(l) && l.trim() == "fi")
+        .map(|at| invocation + 1 + at)
+        .expect("the gate's `if !` wrapper must close with an uncommented `fi`");
+    let window = &lines[invocation..fi];
+
+    // The executed flags: the evidence bundle and the follow-up hand-off
+    // ride the invocation's own continuation lines (the invocation line
+    // included — a one-line refactor carries them there instead).
+    for flag in [
+        "--evidence-dir target/contract-maintenance",
+        "--file-follow-up",
+    ] {
+        assert!(
+            window
+                .iter()
+                .any(|l| !is_comment_line(l) && l.contains(flag)),
+            "the gate invocation must keep `{flag}` on an executed (uncommented) line — \
+             a commented-out flag changes what runs: without --file-follow-up drift \
+             files no hand-off issue, without --evidence-dir it leaves no evidence bundle"
+        );
+    }
+
+    // Failure on a Claude version bump: nothing in the wrapper may neuter
+    // the gate's non-zero exit…
+    for neuter in ["exit 0", "|| true"] {
+        assert!(
+            !window
+                .iter()
+                .any(|l| !is_comment_line(l) && l.contains(neuter)),
+            "the gate's failure branch must not carry `{neuter}` — that is the \
+             silent-unwire shape: drift detected, announced, and the run stays green"
+        );
+    }
+    // …and it must still exit non-zero, on an executing line.
+    assert!(
+        window[1..]
+            .iter()
+            .any(|l| !is_comment_line(l) && l.trim() == "exit 1"),
+        "the gate's failure branch must keep its `exit 1` on an UNCOMMENTED line — \
+         that exit is the wiring that turns gate exit 1 (drift) and 2 (cannot \
+         determine) into a red build; the re-pin commit (docs/notes/\
+         claude-contract-probes.md §Re-pin) is what turns it green again, so the red \
+         must not be removable by commenting one line"
+    );
+
+    // Ordering: the gate judges the pins before anything can pass the run.
+    for tokens in QUALITY_GATES {
+        let gate_line = uncommented_cmd_line(&lines, tokens).unwrap_or_else(|| {
+            panic!(
+                "the CI WorkflowTemplate must run `{:?}` on an UNCOMMENTED line — a \
+                 commented-out quality gate silently stops running while every \
+                 fragment pin stays green (the same hole the gate's own invocation \
+                 had before this guard)",
+                tokens.join(" ")
+            )
+        });
+        assert!(
+            invocation < gate_line,
+            "the contract-maintenance gate must run BEFORE `{:?}` — the gate is the \
+             FIRST quality gate (§Wiring): a version bump must fail the run before \
+             any other gate can pass it",
+            tokens.join(" ")
+        );
+    }
+
+    // …including the verify-only green exit: no green path precedes the gate.
+    let verify = uncommented_line_with(&lines, "Verify-only mode: all quality gates passed")
+        .expect("the verify-only green exit must exist — the path this ordering leg anchors on");
+    let green = lines[verify + 1..]
+        .iter()
+        .position(|l| !is_comment_line(l) && l.trim() == "exit 0")
+        .map(|at| verify + 1 + at)
+        .expect("the verify-only branch must keep its `exit 0` — the green path this ordering leg anchors on");
+    assert!(
+        invocation < verify && invocation < green,
+        "the contract-maintenance gate must run BEFORE the verify-only green exit — \
+         otherwise a push can pass CI without the gate ever judging its pins"
+    );
+
+    // And detection must see a real version: claude is installed first.
+    let install = uncommented_line_with(&lines, "https://claude.ai/install.sh")
+        .expect("CI must install the claude binary before the gate runs");
+    assert!(
+        install < invocation,
+        "CI must install claude BEFORE invoking the gate — `claude --version` needs \
+         no auth, and without the install the gate cannot compare the installed \
+         version against the pins"
+    );
+}
+
+#[test]
+fn ci_workflowtemplate_executes_the_gate_uncommented_first_and_fatal_on_bump() {
+    let template = fs::read_to_string(repo_path("claude-print-ci-workflowtemplate.yml")).unwrap();
+    check_ci_workflowtemplate_executes_the_gate(&template);
+}
+
+// ── Negative meta-tests: the execution pin must FAIL when its input rots ──────
+
+/// Run `check` and require it to panic with every fragment of `expected`
+/// in the message — the failure must be the drift the mutation plants,
+/// not an incidental one. The panic hook is silenced for the caught
+/// unwind so expected-failure output never pollutes the log (the same
+/// shape as `tests/docs_build_commands.rs`).
+fn assert_drift<F>(check: F, expected: &[&str])
+where
+    F: FnOnce() + std::panic::UnwindSafe,
+{
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(check);
+    std::panic::set_hook(prev_hook);
+    let message = match outcome {
+        Ok(()) => panic!(
+            "the mutated template PASSED the check — the execution guard is vacuous \
+             for this mutation"
+        ),
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+    };
+    for fragment in expected {
+        assert!(
+            message.contains(fragment),
+            "the check failed, but not for the planted drift — panic message:\n\
+             {message}\nmissing fragment: {fragment:?}"
+        );
+    }
+}
+
+/// `text` with the single occurrence of `from` replaced by `to`. Panics on
+/// any count but one, so a meta-test can never "mutate" an input the live
+/// template no longer carries (or carries twice) and silently test
+/// something else.
+fn replaced_once(text: &str, from: &str, to: &str) -> String {
+    let count = text.matches(from).count();
+    assert_eq!(
+        count, 1,
+        "the negative meta-tests mutate {from:?} in the live template — \
+         expected exactly one occurrence, found {count}"
+    );
+    text.replacen(from, to, 1)
+}
+
+/// Every leg of the execution pin fails on the drift shape it exists to
+/// catch — each mutation edits the live template in memory (nothing is
+/// written to disk) and the owning check must panic naming the planted
+/// drift.
+#[test]
+fn negative_meta_gate_execution_drift_fails_the_execution_pin() {
+    let template = fs::read_to_string(repo_path("claude-print-ci-workflowtemplate.yml")).unwrap();
+    // Sanity for the live state: the committed template passes.
+    check_ci_workflowtemplate_executes_the_gate(&template);
+
+    // The invocation commented out — the "temporarily unblock CI" move
+    // that satisfies every raw-text fragment pin; only the comment-aware
+    // presence leg sees it.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "if ! bash scripts/contract-maintenance-gate.sh \\",
+                "# if ! bash scripts/contract-maintenance-gate.sh \\",
+            ))
+        },
+        &["UNCOMMENTED", "contract-maintenance-gate.sh"],
+    );
+
+    // The wrapper stripped down to a bare invocation.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "if ! bash scripts/contract-maintenance-gate.sh \\",
+                "bash scripts/contract-maintenance-gate.sh \\",
+            ))
+        },
+        &["if !", "wrapper"],
+    );
+
+    // The failure branch's exit 1 commented out: drift still detected and
+    // announced, the run no longer fails.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "              exit 1\n            fi\n            echo \"contract-maintenance gate OK",
+                "              # exit 1\n            fi\n            echo \"contract-maintenance gate OK",
+            ))
+        },
+        &["exit 1", "red build"],
+    );
+
+    // The failure branch demoted to exit 0: the gate "fails", CI stays
+    // green — the silent-unwire shape the neuter leg exists to catch.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "              exit 1\n            fi\n            echo \"contract-maintenance gate OK",
+                "              exit 0\n            fi\n            echo \"contract-maintenance gate OK",
+            ))
+        },
+        &["exit 0"],
+    );
+
+    // A `|| true` neuter glued onto the invocation line.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "if ! bash scripts/contract-maintenance-gate.sh \\",
+                "if ! bash scripts/contract-maintenance-gate.sh || true \\",
+            ))
+        },
+        &["|| true"],
+    );
+
+    // The follow-up flag commented out on its continuation line.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "              --file-follow-up; then",
+                "              # --file-follow-up; then",
+            ))
+        },
+        &["--file-follow-up"],
+    );
+
+    // The fmt gate hoisted above the contract gate: another gate now
+    // passes the run before the pins are judged.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "if ! bash scripts/contract-maintenance-gate.sh \\",
+                "cargo fmt --check\n            if ! bash scripts/contract-maintenance-gate.sh \\",
+            ))
+        },
+        &["BEFORE", "cargo fmt --check"],
+    );
+
+    // The audit gate commented out: an uncommented occurrence must exist
+    // or the ordering leg would compare against nothing — and the
+    // template's own `# cargo audit` comment proves comment-skipping is
+    // what keeps the pin honest here.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "\n            cargo audit\n",
+                "\n            # cargo audit\n",
+            ))
+        },
+        &["cargo audit", "UNCOMMENTED"],
+    );
+
+    // A green path hoisted above the gate: the verify-only exit now
+    // passes pushes the gate never judged.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "if ! bash scripts/contract-maintenance-gate.sh \\",
+                "echo \"Verify-only mode: all quality gates passed\"\n              exit 0\n            if ! bash scripts/contract-maintenance-gate.sh \\",
+            ))
+        },
+        &["verify-only green exit"],
+    );
+
+    // The claude install commented out: detection compares nothing.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "if curl -fsSL https://claude.ai/install.sh | bash",
+                "# if curl -fsSL https://claude.ai/install.sh | bash",
+            ))
+        },
+        &["install", "claude"],
+    );
+
+    // The fail-fast foundation dropped.
+    assert_drift(
+        || {
+            check_ci_workflowtemplate_executes_the_gate(&replaced_once(
+                &template,
+                "set -ex\n",
+                "set -x\n",
+            ))
+        },
+        &["set -ex"],
     );
 }
 

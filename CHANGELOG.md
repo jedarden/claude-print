@@ -254,6 +254,29 @@ static musl build) against the tagged commit before publishing.
 
 ### Changed
 
+- **CI contract-gate wiring made comment-aware and pinned end to end.**
+  The contract-maintenance wiring guard (`tests/contract_maintenance.rs`,
+  bead claudepr-3f4aefad) previously pinned the `claude-print-ci`
+  WorkflowTemplate's gate invocation with raw-text fragments — which a
+  commented-out gate block satisfies exactly as well as a live one, and
+  commenting the gate out is precisely the move a Claude version bump
+  tempts when someone wants CI "temporarily" unblocked. The new execution
+  pin parses the template comment- and token-aware (its own `#` comments
+  and `echo "Running cargo audit..."` announcements name the same commands
+  as the executing lines) and requires: the gate invocation on an
+  uncommented line inside the fatal `if ! … exit 1 … fi` wrapper with
+  `--evidence-dir`/`--file-follow-up` on executed continuation lines, no
+  `exit 0`/`|| true` neuter in the failure branch, `set -ex` underneath,
+  claude installed before detection, and the invocation before every
+  quality gate (fmt, clippy, both test legs, audit — each itself required
+  uncommented) and the verify-only green exit — so a version bump fails
+  CI until the documented re-pin lands. Negative meta-tests plant every
+  drift shape in memory (commented invocation, commented `exit 1`,
+  `exit 0` branch, `|| true`, stripped wrapper, hoisted quality gate,
+  hoisted green exit, dropped install, dropped `set -ex`) and require the
+  pin to fail naming the drift. §Wiring in
+  `docs/notes/claude-contract-probes.md` now documents the enforced
+  wiring and the re-pin procedure that clears it side by side.
 - **Startup-overhead benchmark evidence made machine-independent and
   guarded.** `scripts/bench_startup_overhead.py` no longer needs
   `--bin-dir`: it derives the build directory from `cargo metadata` (the
