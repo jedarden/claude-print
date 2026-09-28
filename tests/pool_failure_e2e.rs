@@ -441,12 +441,36 @@ impl Drop for Daemon {
     }
 }
 
+/// Total wall clock `reap_all` will spend waiting for orphaned workers to
+/// vanish, however much visible progress they are making. The ceiling only
+/// absorbs a loaded CI box — the same role [`WARMUP`] plays — and bounds how
+/// long a genuine leak takes to fail.
+const REAP_TOTAL: Duration = Duration::from_secs(90);
+
+/// How long `reap_all` tolerates a survivor set that is FROZEN — no pid has
+/// left the set and no pid's state letter has changed. A worker that is
+/// converging always shows progress: its hangup lands (`S` → `Z`) and then
+/// its `/proc` entry goes. Nothing but a leaked or wedged worker sits at one
+/// state that long, so this fires early instead of burning the full ceiling.
+const REAP_STALL: Duration = Duration::from_secs(30);
+
 /// Poll until every pid in `workers` has vanished from /proc. The daemon reaps
 /// a released worker before it answers the release, so a normal teardown
 /// converges fast; the window also absorbs init reaping an orphaned worker
 /// that a PTY hangup (daemon death, client exit) already terminated.
+///
+/// The two deadlines exist because on the crash paths (a SIGKILLed daemon)
+/// the wait measures environment as much as product: the worker's death is
+/// kernel-driven, and its final reap is whoever inherited the orphan's job —
+/// under fleet-level load both have been observed to lag past a fixed 10 s
+/// bound while the worker sat in `S` (claudepr-49aabf78). What the contract
+/// forbids is a worker that never converges, so the assert fires on a frozen
+/// survivor set ([`REAP_STALL`]) or on total expiry ([`REAP_TOTAL`]), and a
+/// merely slow convergence keeps waiting.
 fn reap_all(workers: Vec<u32>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let start = Instant::now();
+    let mut last_change = start;
+    let mut last_survivors: Vec<(u32, String)> = Vec::new();
     loop {
         let survivors: Vec<(u32, String)> = workers
             .iter()
@@ -456,9 +480,21 @@ fn reap_all(workers: Vec<u32>) {
         if survivors.is_empty() {
             return;
         }
+        if survivors != last_survivors {
+            last_survivors.clone_from(&survivors);
+            last_change = Instant::now();
+        }
+        let stalled = last_change.elapsed() >= REAP_STALL;
+        let expired = start.elapsed() >= REAP_TOTAL;
         assert!(
-            Instant::now() < deadline,
-            "worker processes survived the daemon's exit (leaked or unreaped): {survivors:?}"
+            !(stalled || expired),
+            "worker processes survived the daemon's exit (leaked or unreaped): \
+             {survivors:?} — {}",
+            if expired {
+                format!("still not converged after {:?}", start.elapsed())
+            } else {
+                format!("frozen at one state for {REAP_STALL:?}")
+            }
         );
         std::thread::sleep(Duration::from_millis(25));
     }
