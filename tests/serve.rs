@@ -2149,6 +2149,10 @@ fn assert_pid_gone(pid: u32, grace: Duration) {
     }
 }
 
+fn is_pty_master_target(target: &Path) -> bool {
+    target == Path::new("/dev/ptmx") || target == Path::new("/dev/pts/ptmx")
+}
+
 /// Count the daemon's open PTY masters. An opened master's fd readlink names
 /// the path open(2) resolved, and `/dev/ptmx` has two live spellings: a char
 /// device (bare-metal hosts — the fd readlinks to `/dev/ptmx`) or a symlink
@@ -2167,7 +2171,7 @@ fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
         .unwrap_or_else(|e| panic!("read {fd_dir}: {e}"))
         .filter_map(|e| e.ok())
         .filter_map(|e| std::fs::read_link(e.path()).ok())
-        .filter(|t| matches!(t.to_string_lossy().as_ref(), "/dev/ptmx" | "/dev/pts/ptmx"))
+        .filter(|t| is_pty_master_target(t))
         .count()
 }
 
@@ -2180,11 +2184,26 @@ fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
 /// so the two opens exercise both spellings on any host. A helper matching
 /// only one spelling counts 1 here, not 2, and reads 0 for every real daemon
 /// in a CI container (claudepr-bcb6beab). No daemon, no worker — this pins
-/// the /proc readlink contract alone; no test in this binary opens a PTY in
-/// process, so the exact `before + 2` delta cannot race a sibling thread.
+/// the /proc readlink contract alone. The unrelated descriptor held below
+/// proves that the count is not a broad path match.
 #[test]
 fn pty_master_fd_count_accepts_both_ptmx_spellings() {
+    assert!(is_pty_master_target(Path::new("/dev/ptmx")));
+    assert!(is_pty_master_target(Path::new("/dev/pts/ptmx")));
+    for unrelated in [
+        "/dev/ptmx-extra",
+        "/dev/pts/ptmx-extra",
+        "/dev/tty",
+        "/tmp/ptmx",
+    ] {
+        assert!(
+            !is_pty_master_target(Path::new(unrelated)),
+            "arbitrary readlink target must not count as a PTY master: {unrelated}"
+        );
+    }
+
     let before = daemon_pty_fd_count(std::process::id());
+    let unrelated = tempfile::NamedTempFile::new().expect("unrelated descriptor must open");
     let host_spelling = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2200,8 +2219,9 @@ fn pty_master_fd_count_accepts_both_ptmx_spellings() {
         before + 2,
         "an opened master must count through both spellings: /dev/ptmx \
          (char-device hosts) and /dev/pts/ptmx (symlinked /dev/ptmx, the \
-         kubelet CI layout)"
+         kubelet CI layout); unrelated descriptors must not count"
     );
+    drop(unrelated);
     drop(host_spelling);
     drop(container_spelling);
 }
