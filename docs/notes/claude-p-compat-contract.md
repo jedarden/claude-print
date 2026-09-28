@@ -194,8 +194,8 @@ exit 2 with clap's own usage message.
 
 | Signal | Mapping |
 |--------|---------|
-| SIGINT (session) | Intercepted — the default kill is replaced by a handler. The session aborts, the child is torn down (SIGTERM, 2 s grace, then SIGKILL), and claude-print exits `130` with the `interrupted` error shape (`subtype: "interrupted"`). |
-| SIGTERM (session) | Same handler, same outcome: teardown and exit `130`. |
+| SIGINT (session) | Intercepted — the default kill is replaced by a handler. The session aborts, the child is torn down (SIGTERM, 2 s grace, then SIGKILL), and claude-print exits `130` with the `interrupted` error shape (`subtype: "interrupted"`). Behaviorally pinned by `tests/session_signal_teardown_e2e.rs`. |
+| SIGTERM (session) | Same handler, same outcome: teardown and exit `130`. Behaviorally pinned by `tests/session_signal_teardown_e2e.rs`. |
 | SIGWINCH | The library's PTY relay (`PtySpawner::relay`, used by `--check`'s PTY probe and by library callers) re-applies the controlling terminal's window size to the child PTY via `TIOCSWINSZ`; the same relay forwards SIGINT to the child as SIGINT and returns 130. Signal-forwarding behavior is pinned by `tests/sigint_forwarding_e2e.rs` and `tests/sigwinch_forwarding_e2e.rs`. |
 | SIGINT/SIGTERM (serve) | The pool daemon shuts down gracefully: every worker torn down, the socket removed, exit `0` — a supervisor stop is not a failure. |
 

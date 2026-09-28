@@ -174,6 +174,7 @@ annotation placed on a shell-executed line.
 
 | Location | What it tests |
 |----------|---------------|
+| `tests/session_signal_teardown_e2e.rs` | Compiled-binary behavioral pin for the §5 session SIGINT/SIGTERM rows: mock-claude records the teardown SIGTERM before SIGKILL, the binary exits 130 with the interrupted error, the child is gone from `/proc`, and isolated relay artifacts are gone |
 | `src/*.rs` inline (`#[cfg(test)]`) | Unit tests — pure logic, no I/O |
 | `tests/integration.rs` | High-level integration; uses `mock_claude` |
 | `tests/integration/` | Sub-module helpers for integration tests |
@@ -292,6 +293,7 @@ tree, and the §"Test structure" table against the target list.
 | `stop_sparse_payloads_e2e` | compiled-binaries | mock-claude (`MOCK_OMIT_*`) |
 | `stop_delayed_payload_e2e` | compiled-binaries | mock-claude (`MOCK_DELAY_STOP`) |
 | `sigint_forwarding_e2e` | compiled-binaries | mock-claude child under a real PTY |
+| `session_signal_teardown_e2e` | compiled-binaries | compiled `claude-print` + mock-claude; SIGINT/SIGTERM session teardown, child cleanup, and relay-artifact cleanup |
 | `watchdog` | compiled-binaries | mock child with silent output |
 | `home_unset` | compiled-binaries | binary cases; the rest is lib-level |
 | `home_provisioning_recipes` | compiled-binaries | every test drives `CARGO_BIN_EXE_claude-print`; the chroot matrix additionally needs `unshare`/`chroot`/`ldd` (`mount` + `sh` for the read-only-tmpfs leg) and skips with a reason where user namespaces are unavailable |

@@ -26,7 +26,8 @@
 //!     empty prompt, exit 2 NUL byte, oversize stdin, missing binary, usage
 //!     error) driven against the compiled binary;
 //!   * **signals** — §5's session rows presence-pinned against the handler and
-//!     teardown wiring in `src/session.rs`, the relay rows citing the two
+//!     teardown wiring in `src/session.rs` and behaviorally pinned by the
+//!     compiled-binary teardown suite, the relay rows citing the two
 //!     forwarding suites that pin them behaviorally;
 //!   * **README claim** — the README is held to this contract the same way
 //!     the implementation is (claudepr-5c893388): the tagline's
@@ -1199,6 +1200,12 @@ fn exit_code_table_matches_the_error_type() {
 
 // ── §5: signals ──────────────────────────────────────────────────────────────
 
+/// The behavioral suite that drives §5's session rows end to end against the
+/// compiled binary (claudepr-f49a9797): sends SIGINT/SIGTERM to a live
+/// session and verifies child forwarding, exit 130, the interrupted error
+/// shape, child cleanup, and temp-artifact cleanup.
+const SESSION_SIGNAL_SUITE: &str = "tests/session_signal_teardown_e2e.rs";
+
 #[test]
 fn signal_section_matches_the_wiring_and_cites_live_suites() {
     let doc = contract_doc();
@@ -1215,6 +1222,36 @@ fn signal_section_matches_the_wiring_and_cites_live_suites() {
         assert!(
             session.contains(marker),
             "src/session.rs must carry the §5 teardown wiring ({marker})"
+        );
+    }
+
+    // The session rows must cite a behavioral suite as well as the source
+    // wiring (claudepr-f49a9797): names and handlers alone cannot prove the
+    // child was signaled, exit 130 was preserved, and artifacts were cleaned.
+    let rows = table_rows(section);
+    for label in ["SIGINT (session)", "SIGTERM (session)"] {
+        let mapping = rows
+            .iter()
+            .find(|cells| cells.first().map(String::as_str) == Some(label))
+            .unwrap_or_else(|| panic!("§5 must keep a {label} row"))
+            .get(1)
+            .unwrap_or_else(|| panic!("§5's {label} row must carry a Mapping cell"));
+        assert!(
+            mapping.contains(SESSION_SIGNAL_SUITE),
+            "§5's {label} row must cite {SESSION_SIGNAL_SUITE} — wiring alone must not \
+             satisfy the signal pin"
+        );
+    }
+    assert!(
+        repo_root().join(SESSION_SIGNAL_SUITE).exists(),
+        "§5 cites {SESSION_SIGNAL_SUITE}; the suite must exist"
+    );
+    let suite_src = src_source(SESSION_SIGNAL_SUITE);
+    for marker in ["Signal::SIGINT", "Signal::SIGTERM"] {
+        assert!(
+            suite_src.contains(marker),
+            "{SESSION_SIGNAL_SUITE} must deliver {marker} — the §5 session rows cite it as \
+             their behavioral pin"
         );
     }
 

@@ -290,6 +290,43 @@ fn main() {
         }
     }
 
+    // MOCK_TRAP_TERM_REPORT=<path> (claudepr-f49a9797): the session-teardown
+    // counterpart of MOCK_TRAP_SIGINT_REPORT. Installs a SIGTERM trap, reports
+    // `ready` to <path>, and blocks forever. When SIGTERM arrives, the handler
+    // appends `sigterm` to the same file and returns — the mock deliberately
+    // survives the signal, so positive in-child evidence exists that the
+    // session driver's teardown (SIGTERM, 2 s grace, then SIGKILL) delivered
+    // the signal. A driver that SIGKILLs without the grace kills the mock with
+    // the marker absent; one that never signals at all leaves it alive.
+    if let Ok(path) = std::env::var("MOCK_TRAP_TERM_REPORT") {
+        // Pre-open the report file so the signal handler only ever needs
+        // write(2): open(2) is not async-signal-safe, so the fd must exist —
+        // and `ready` must be written — before the trap is armed.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("mock-claude: cannot create {path}: {e}"));
+        let fd = file.into_raw_fd();
+        TERM_REPORT_FD.store(fd, Ordering::Relaxed);
+        // SAFETY: signal(2) installs the trap above; nothing else runs first.
+        unsafe {
+            libc::signal(
+                libc::SIGTERM,
+                term_trap_handler as *const () as libc::sighandler_t,
+            );
+        }
+        let ready = b"ready\n";
+        // SAFETY: plain write(2) to the fd just opened.
+        unsafe {
+            libc::write(fd, ready.as_ptr() as *const libc::c_void, ready.len());
+        }
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
     // MOCK_SILENT: block forever without firing Stop (tests timeout path)
     if mock_silent {
         loop {
@@ -782,6 +819,28 @@ extern "C" fn sigint_trap_handler(_: libc::c_int) {
     }
     // SAFETY: _exit(2) is async-signal-safe.
     unsafe { libc::_exit(130) };
+}
+
+/// Raw fd of the MOCK_TRAP_TERM_REPORT file, pre-opened on the normal path
+/// so the signal handler below only touches the async-signal-safe write(2).
+/// -1 means the knob is unset and the handler can never run.
+static TERM_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// SIGTERM trap for MOCK_TRAP_TERM_REPORT (see the knob's block in main).
+///
+/// Appends `sigterm` to the report file via write(2) and returns. Returning is
+/// intentional: it forces the session driver's two-second grace and SIGKILL
+/// escalation to do the final cleanup, while the marker proves SIGTERM was
+/// delivered to the child first.
+extern "C" fn term_trap_handler(_: libc::c_int) {
+    let fd = TERM_REPORT_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let marker = b"sigterm\n";
+        // SAFETY: write(2) is async-signal-safe; fd was opened before install.
+        unsafe {
+            libc::write(fd, marker.as_ptr() as *const libc::c_void, marker.len());
+        }
+    }
 }
 
 /// Raw fd of the MOCK_APPEND_ON_TERM transcript, append-mode, pre-opened on
