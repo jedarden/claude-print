@@ -16,6 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 
 const SCRIPT: &str = "scripts/check-verification-evidence.sh";
 const FIXTURES: &str = "tests/fixtures";
+const FIXTURE_MANIFEST: &str = "tests/fixtures/verification_evidence_cases_v1.json";
 
 fn repo_root() -> PathBuf {
     std::env::var_os("CLAUDE_PRINT_TEST_REPO")
@@ -29,6 +30,13 @@ fn repo_path(relative: &str) -> PathBuf {
 
 fn fixture(name: &str) -> PathBuf {
     repo_path(FIXTURES).join(name)
+}
+
+fn fixture_manifest() -> serde_json::Value {
+    serde_json::from_str(
+        &fs::read_to_string(repo_path(FIXTURE_MANIFEST)).expect("fixture manifest"),
+    )
+    .expect("fixture manifest JSON")
 }
 
 fn run_file(path: &Path) -> Output {
@@ -45,6 +53,115 @@ fn run_fixture(name: &str) -> Output {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn fixture_manifest_is_exhaustive_and_executable() {
+    let manifest = fixture_manifest();
+    assert_eq!(manifest["contract"], "verification-evidence-fixtures");
+    assert_eq!(manifest["contract_version"], 1);
+    assert_eq!(manifest["fixture_glob"], "verification_evidence_*.txt");
+
+    let cases = manifest["cases"].as_array().expect("manifest cases array");
+    assert_eq!(cases.len(), 13, "the v1 fixture inventory changed shape");
+
+    let expected_ids = [
+        "valid-remote-complete",
+        "valid-remote-targeted",
+        "valid-local-complete",
+        "valid-local-targeted",
+        "reject-failed-remote",
+        "reject-site-claims-local",
+        "reject-site-claims-remote",
+        "reject-axes-unstated",
+        "reject-targeted-selector-unnamed",
+        "reject-annotation-on-executed-line",
+        "reject-complete-one-leg",
+        "reject-output-tells-unbacked",
+        "reject-missing-output-fence",
+    ];
+    let actual_ids: Vec<&str> = cases
+        .iter()
+        .map(|case| case["id"].as_str().expect("case id"))
+        .collect();
+    assert_eq!(actual_ids, expected_ids);
+
+    let fixture_files: std::collections::BTreeSet<String> = fs::read_dir(repo_path(FIXTURES))
+        .expect("fixture directory")
+        .map(|entry| {
+            entry
+                .expect("fixture entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.starts_with("verification_evidence_") && name.ends_with(".txt"))
+        .collect();
+    let manifest_files: std::collections::BTreeSet<String> = cases
+        .iter()
+        .map(|case| case["file"].as_str().expect("case fixture file").to_owned())
+        .collect();
+    assert_eq!(manifest_files, fixture_files);
+
+    let expected_valid = [
+        (
+            "valid-remote-complete",
+            0,
+            "evidence valid: remote, complete",
+        ),
+        (
+            "valid-remote-targeted",
+            0,
+            "evidence valid: remote, targeted",
+        ),
+        ("valid-local-complete", 0, "evidence valid: local, complete"),
+        ("valid-local-targeted", 0, "evidence valid: local, targeted"),
+    ];
+    for (id, expected_exit, expected_summary) in expected_valid {
+        let case = cases
+            .iter()
+            .find(|case| case["id"] == id)
+            .expect("positive case in manifest");
+        assert_eq!(case["expected"]["outcome"], "accept");
+        assert_eq!(case["expected"]["exit_code"], expected_exit);
+        assert_eq!(case["expected"]["summary"], expected_summary);
+    }
+
+    for case in cases {
+        let id = case["id"].as_str().expect("case id");
+        let file = case["file"].as_str().expect("case fixture file");
+        let expected = &case["expected"];
+        let rationale = case["rationale"].as_str().expect("case rationale");
+        assert!(rationale.len() >= 20, "{id} needs a useful rationale");
+        assert!(fixture(file).is_file(), "{id} points at a missing fixture");
+
+        let result = run_fixture(file);
+        let expected_exit = expected["exit_code"].as_i64().expect("expected exit code");
+        assert_eq!(result.status.code(), Some(expected_exit as i32), "{id}");
+        match expected["outcome"].as_str().expect("expected outcome") {
+            "accept" => {
+                assert_eq!(
+                    text(&result.stdout),
+                    format!("{}\n", expected["summary"].as_str().expect("summary")),
+                    "{id} summary"
+                );
+                assert!(result.stderr.is_empty(), "{id}: unexpected stderr");
+            }
+            "reject" => {
+                let rule = expected["rule"].as_str().expect("rejection rule");
+                assert!(
+                    text(&result.stderr).contains(&format!("FAIL {rule}:")),
+                    "{id} should name {rule}: {}",
+                    text(&result.stderr)
+                );
+                assert!(
+                    result.stdout.is_empty(),
+                    "{id}: rejected evidence printed valid output"
+                );
+            }
+            outcome => panic!("{id}: unsupported manifest outcome {outcome:?}"),
+        }
+    }
 }
 
 #[test]

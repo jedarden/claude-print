@@ -1,0 +1,158 @@
+{
+  "contract": "verification-evidence-fixtures",
+  "contract_version": 1,
+  "fixture_glob": "verification_evidence_*.txt",
+  "format": {
+    "encoding": "UTF-8",
+    "sections": [
+      {
+        "name": "prose",
+        "opening": null,
+        "closing": null,
+        "meaning": "Human evidence claims. The site and coverage axes must each be stated exactly once here."
+      },
+      {
+        "name": "verified",
+        "opening": "```verified:",
+        "closing": "```",
+        "meaning": "Shell commands that were executed. Lines are commands only; exit-status and mode annotations are not allowed."
+      },
+      {
+        "name": "cargo_output",
+        "opening": "```cargo-output",
+        "closing": "```",
+        "meaning": "The captured cargo wrapper transcript used to derive the execution site and run outcome."
+      }
+    ],
+    "ordering": "prose, verified, cargo_output; exactly one verified section and one cargo_output section",
+    "fence_rule": "Only the exact openings and closing fence are accepted; malformed or missing fences are a usage/shape error."
+  },
+  "semantics": {
+    "site": {
+      "remote": "The output contains submitting, workflow, and streaming prelude tells and a terminal PASSED, FAILED, or timed-out tell.",
+      "local": "The output contains falling back to local and at least one reason: no git remote, uncommitted changes detected, push failed, or submit failed.",
+      "precedence": "The output, not prose or invocation intent, determines the site. Ambiguous or absent tell sets are invalid."
+    },
+    "coverage": {
+      "complete": "The verified section contains both cargo test --tests and cargo test --doc as separate bare command lines.",
+      "targeted": "Any test selection other than that exact pair, including cargo test --test NAME or cargo test --lib. Every targeted selector must be named in prose.",
+      "other_commands": "cargo fmt, cargo clippy, cargo build, and other non-test commands do not affect the coverage axis."
+    },
+    "outcome": {
+      "accepted": "The captured run is green, the derived axes agree with prose, and every targeted selector is named.",
+      "rejected": "The evidence is misleading, incomplete, or contradictory; reject with exit 1 and the declared rule.",
+      "malformed": "The recording shape cannot be parsed; reject with exit 2 and the declared malformed rule."
+    },
+    "exit_codes": {
+      "0": "accepted evidence",
+      "1": "parsed evidence that is invalid, misleading, incomplete, failed, or contradictory",
+      "2": "usage error or malformed recording shape"
+    }
+  },
+  "cases": [
+    {
+      "id": "valid-remote-complete",
+      "file": "verification_evidence_valid_remote_complete.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "accept", "exit_code": 0, "summary": "evidence valid: remote, complete"},
+      "rationale": "Both complete-test legs are recorded, the remote prelude and PASSED terminal tell are present, and the prose states the same two axes."
+    },
+    {
+      "id": "valid-remote-targeted",
+      "file": "verification_evidence_valid_remote_targeted.txt",
+      "prose_claim": {"site": "remote", "coverage": "targeted", "selectors": ["docs_build_commands", "lib"]},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "accept", "exit_code": 0, "summary": "evidence valid: remote, targeted"},
+      "rationale": "The remote run is green and the prose names both targeted selectors executed in the verified section."
+    },
+    {
+      "id": "valid-local-complete",
+      "file": "verification_evidence_valid_local_complete.txt",
+      "prose_claim": {"site": "local", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "local-green",
+      "expected": {"outcome": "accept", "exit_code": 0, "summary": "evidence valid: local, complete"},
+      "rationale": "Both complete-test legs are green, the fallback banner has a recognized local reason, and the prose states local complete coverage."
+    },
+    {
+      "id": "valid-local-targeted",
+      "file": "verification_evidence_valid_local_targeted.txt",
+      "prose_claim": {"site": "local", "coverage": "targeted", "selectors": ["watchdog"]},
+      "cargo_output_shape": "local-green",
+      "expected": {"outcome": "accept", "exit_code": 0, "summary": "evidence valid: local, targeted"},
+      "rationale": "The local fallback is green and the prose names the single targeted watchdog test."
+    },
+    {
+      "id": "reject-failed-remote",
+      "file": "verification_evidence_misleading_failed_remote_run.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-failed",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "remote-outcome"},
+      "rationale": "A remote FAILED terminal tell and failed test result cannot support a successful complete claim."
+    },
+    {
+      "id": "reject-site-claims-local",
+      "file": "verification_evidence_misleading_site_claims_local.txt",
+      "prose_claim": {"site": "local", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "site-mismatch"},
+      "rationale": "The prose says local, but the captured submitting/workflow/streaming/PASSED tells prove a remote run."
+    },
+    {
+      "id": "reject-site-claims-remote",
+      "file": "verification_evidence_misleading_site_claims_remote.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "local-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "site-mismatch"},
+      "rationale": "The prose says remote, but the captured fallback banner and uncommitted-changes reason prove a local run."
+    },
+    {
+      "id": "reject-axes-unstated",
+      "file": "verification_evidence_misleading_axes_unstated.txt",
+      "prose_claim": {"site": null, "coverage": null, "selectors": []},
+      "cargo_output_shape": "local-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "axis-unstated"},
+      "rationale": "Green output and commands are not enough: the prose omits both required reporting axes."
+    },
+    {
+      "id": "reject-targeted-selector-unnamed",
+      "file": "verification_evidence_misleading_unnamed_selector.txt",
+      "prose_claim": {"site": "remote", "coverage": "targeted", "selectors": ["docs_build_commands", "lib"]},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "selector-unnamed"},
+      "rationale": "The verified section executes docs_build_layout, but prose names docs_build_commands instead; a targeted selector is unnamed."
+    },
+    {
+      "id": "reject-annotation-on-executed-line",
+      "file": "verification_evidence_misleading_annotated_verified_line.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "annotation-on-executed-line"},
+      "rationale": "The verified fence is executable shell input, so an exit or mode annotation on a command line is invalid evidence syntax."
+    },
+    {
+      "id": "reject-complete-one-leg",
+      "file": "verification_evidence_misleading_complete_one_leg.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "coverage-mismatch"},
+      "rationale": "Complete coverage requires both --tests and --doc; one leg is targeted/incomplete even when prose says complete."
+    },
+    {
+      "id": "reject-output-tells-unbacked",
+      "file": "verification_evidence_misleading_mode_unbacked.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "green-without-wrapper-tells",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "output-tells"},
+      "rationale": "Compiler and test-result lines alone do not establish remote or local execution; the wrapper provenance tells are required."
+    },
+    {
+      "id": "reject-missing-output-fence",
+      "file": "verification_evidence_malformed_missing_output_fence.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "missing",
+      "expected": {"outcome": "reject", "exit_code": 2, "rule": "fence"},
+      "rationale": "A recording without exactly one cargo-output fence has no captured transcript and is malformed before semantic validation."
+    }
+  ]
+}
