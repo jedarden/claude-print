@@ -20,6 +20,7 @@ const FIXTURE_MANIFEST: &str = "tests/fixtures/verification_evidence_cases_v1.js
 
 fn repo_root() -> PathBuf {
     std::env::var_os("CLAUDE_PRINT_TEST_REPO")
+        .or_else(|| std::env::var_os("CARGO_MANIFEST_DIR"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
