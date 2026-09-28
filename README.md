@@ -20,7 +20,8 @@ classification Claude Code chose. The full vocabulary and causal chain are in
 What "drop-in, wire-compatible" means across the whole CLI surface — the
 accepted flags and how each one reaches (or never reaches) the child argv,
 prompt-source precedence, the output modes, the exit codes, the signal
-mapping, and the exact child environment — is defined in one place:
+mapping, and the exact child environment — is defined in one place: the
+compatibility contract, version v1,
 [`docs/notes/claude-p-compat-contract.md`](docs/notes/claude-p-compat-contract.md),
 held against the implementation by `tests/claude_p_compat_contract.rs`.
 

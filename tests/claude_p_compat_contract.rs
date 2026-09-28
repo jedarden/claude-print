@@ -27,7 +27,14 @@
 //!     error) driven against the compiled binary;
 //!   * **signals** — §5's session rows presence-pinned against the handler and
 //!     teardown wiring in `src/session.rs`, the relay rows citing the two
-//!     forwarding suites that pin them behaviorally.
+//!     forwarding suites that pin them behaviorally;
+//!   * **README claim** — the README is held to this contract the same way
+//!     the implementation is (claudepr-5c893388): the tagline's
+//!     drop-in/wire-compatible claims, the definition paragraph's contract
+//!     link, cited version, and pinning-suite citation are checked against
+//!     the contract's own metadata rows, and the paragraph's
+//!     supported-surface summary must cover every axis the contract's intro
+//!     names.
 //!
 //! Hermetic: compiled `claude-print` + mock-claude; every run gets a throwaway
 //! `HOME` and a unique mock session id, so transcripts and trust state land in
@@ -1236,5 +1243,405 @@ fn doc_names_this_suite_as_its_pin() {
     assert!(
         doc.contains("tests/claude_p_compat_contract.rs"),
         "the contract doc's Pinned-by row must name this suite"
+    );
+}
+
+// ── the README's drop-in claim names this contract (claudepr-5c893388) ───────
+//
+// Everything above holds the contract against the *implementation*; this
+// section holds the README against the *contract*. The tagline's drop-in
+// claim and the paragraph that defines it via this document are what a
+// reader relies on, and none of the pins above fail when they drift: a
+// renamed or retargeted contract link, a bumped version the README still
+// cites as current, a mis-cited pinning suite, or a summary that drops an
+// axis all passed while the README promised something the normative
+// document no longer said. Each check re-derives its expectation from the
+// contract's own metadata — the version row, the Pinned-by row, the
+// "six observable axes" sentence — so the README is held to what the
+// contract says today, never to a second copy of it embedded here.
+
+/// The contract's repo-relative path: the README link's display text and
+/// target, and the file the link must resolve to.
+const CONTRACT_PATH: &str = "docs/notes/claude-p-compat-contract.md";
+
+fn readme_source() -> String {
+    let path = repo_root().join("README.md");
+    fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("README missing at {}: {e}", path.display()))
+}
+
+/// `text` with every whitespace run collapsed to a single space, so
+/// fragment checks survive the paragraph's own line wrapping (the live
+/// paragraph wraps "signal / mapping" across two lines).
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The README paragraph carrying the drop-in definition: the one naming the
+/// contract's path, wherever in the README it sits. Located by the bare
+/// path rather than the full link so the link-form check below stays
+/// independent of the locator.
+fn readme_claim_paragraph(readme: &str) -> &str {
+    readme
+        .split("\n\n")
+        .find(|p| p.contains(CONTRACT_PATH))
+        .unwrap_or_else(|| {
+            panic!(
+                "README must carry a paragraph naming {CONTRACT_PATH} — the \
+             drop-in definition paragraph is gone"
+            )
+        })
+}
+
+/// The last cell of the contract's metadata-table row whose first cell is
+/// `name` (e.g. `| **Contract version** | v1 |` → `v1`), trimmed. `None`
+/// when the row is absent or its cell empty.
+fn metadata_cell(doc: &str, name: &str) -> Option<String> {
+    let lead = format!("| {name} |");
+    doc.lines()
+        .find(|l| l.trim_start().starts_with(&lead))
+        .and_then(|l| {
+            l.trim().strip_suffix('|').and_then(|row| {
+                row.rsplit_once('|')
+                    .map(|(_, cell)| cell.trim().to_string())
+            })
+        })
+        .filter(|cell| !cell.is_empty())
+}
+
+/// The contract's `**Contract version**` cell (e.g. `v1`).
+fn contract_version(doc: &str) -> String {
+    metadata_cell(doc, "**Contract version**")
+        .unwrap_or_else(|| panic!("contract doc must carry a **Contract version** row"))
+}
+
+/// The axes the contract's intro says the drop-in claim spans, parsed from
+/// the em-dash-delimited list in "spans six observable axes — … — which".
+/// The sentence's own line wrapping is collapsed first, and the list's
+/// `and` and each article are stripped, so every entry arrives as its bare
+/// noun phrase (`the accepted flags` → `accepted flags`).
+fn contract_axes(doc: &str) -> Vec<String> {
+    let (_, rest) = doc
+        .split_once("spans six observable axes")
+        .unwrap_or_else(|| {
+            panic!(
+                "the contract's axis sentence (\"spans six observable axes — …\") \
+             is gone or reworded; update the README summary and this parse \
+             together"
+            )
+        });
+    let list = rest
+        .split_once('—')
+        .and_then(|(_, tail)| tail.split_once('—').map(|(list, _)| list))
+        .unwrap_or_else(|| {
+            panic!(
+                "the contract's axis list must stay em-dash delimited \
+                 (\"spans six observable axes — … — which\"); when the \
+                 sentence changes, this parse changes with it"
+            )
+        });
+    normalized(list)
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .trim_start_matches("and ")
+                .trim_start_matches("the ")
+                .trim()
+                .to_string()
+        })
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// The fragments each contract axis must appear as in the README's claim
+/// paragraph, keyed by the bare phrase `contract_axes` yields — the README
+/// summarizes each axis in its own words, so the mapping is per-axis. An
+/// unknown key means the contract's axis list changed; the README summary
+/// and this map update together, in the same change.
+fn readme_fragments_for_axis(axis: &str) -> &'static [&'static str] {
+    match axis {
+        "accepted flags" => &["accepted flags"],
+        "prompt input handling" => &["prompt"],
+        "output modes" => &["output modes"],
+        "exit codes" => &["exit codes"],
+        "signal mapping" => &["signal mapping"],
+        "child argv/environment" => &["child argv", "child environment"],
+        other => panic!(
+            "unknown contract axis {other:?} — the contract's axis list \
+             changed; update the README summary and this map together"
+        ),
+    }
+}
+
+/// The two headline promises: the tagline's drop-in claim and the
+/// why-section's wire-compatibility claim.
+fn check_readme_headline_claims(readme: &str) {
+    for fragment in [
+        "Drop-in replacement for `claude -p`",
+        "wire-compatible output",
+    ] {
+        assert!(
+            readme.contains(fragment),
+            "README must keep the drop-in headline claim {fragment:?} — the \
+             claim's meaning is owned by the contract, so rewording it is a \
+             contract change, not just a README edit"
+        );
+    }
+}
+
+/// The claim paragraph must link the normative contract as a relative
+/// markdown link whose display text and target are both the repo-relative
+/// path.
+fn check_claim_paragraph_links_the_contract(paragraph: &str) {
+    let link = format!("[`{CONTRACT_PATH}`]({CONTRACT_PATH})");
+    assert!(
+        paragraph.contains(&link),
+        "the README claim paragraph must link the contract as {link:?} — \
+         display text and target both the repo-relative path"
+    );
+}
+
+/// The version the README cites must be the contract's current version: a
+/// contract bump that leaves the README citing the old version fails here.
+fn check_claim_paragraph_cites_the_contract_version(paragraph: &str, doc: &str) {
+    let version = contract_version(doc);
+    let cited = format!("version {version}");
+    assert!(
+        paragraph.contains(&cited),
+        "the README claim paragraph must cite the contract as {cited:?} — the \
+         contract's version row says {version:?}; a version bump must update \
+         the README in the same change"
+    );
+}
+
+/// The suite the README names as holding the contract must be the one the
+/// contract's own Pinned-by row names, and that suite must exist.
+fn check_claim_paragraph_names_the_pinning_suite(paragraph: &str, doc: &str) {
+    let pinned_by = metadata_cell(doc, "**Pinned by**")
+        .unwrap_or_else(|| panic!("contract doc must carry a **Pinned by** row"));
+    assert!(
+        paragraph.contains(&pinned_by),
+        "the README claim paragraph must name the pinning suite {pinned_by:?} \
+         — the contract's Pinned-by row names it"
+    );
+    let suite = pinned_by.trim_matches('`');
+    assert!(
+        repo_root().join(suite).exists(),
+        "the contract's Pinned-by row names {suite:?}; that suite must exist"
+    );
+}
+
+/// Every axis the contract says the claim spans must be summarized in the
+/// README paragraph: the README may not drop a surface the contract
+/// defines, and the contract may not grow one the README doesn't promise.
+fn check_claim_paragraph_covers_every_contract_axis(paragraph: &str, doc: &str) {
+    let axes = contract_axes(doc);
+    assert_eq!(
+        axes.len(),
+        6,
+        "the contract says the claim spans six observable axes — the parsed \
+         list is {axes:?}; an axis change must update the README summary and \
+         readme_fragments_for_axis together"
+    );
+    for axis in &axes {
+        for fragment in readme_fragments_for_axis(axis) {
+            assert!(
+                paragraph.contains(fragment),
+                "the README claim paragraph must summarize the {axis:?} axis \
+                 (expected a {fragment:?} fragment) — the contract says the \
+                 drop-in claim spans it, so the README summary may not drop it"
+            );
+        }
+    }
+}
+
+#[test]
+fn readme_drop_in_claim_matches_the_normative_contract() {
+    let readme = readme_source();
+    let doc = contract_doc();
+    let paragraph = normalized(readme_claim_paragraph(&readme));
+
+    check_readme_headline_claims(&readme);
+    check_claim_paragraph_links_the_contract(&paragraph);
+    check_claim_paragraph_cites_the_contract_version(&paragraph, &doc);
+    check_claim_paragraph_names_the_pinning_suite(&paragraph, &doc);
+    check_claim_paragraph_covers_every_contract_axis(&paragraph, &doc);
+
+    // The link's target is the normative file itself.
+    assert!(
+        repo_root().join(CONTRACT_PATH).exists(),
+        "the README links {CONTRACT_PATH}; the contract file must exist there"
+    );
+}
+
+// ── negative meta-tests: the README guard must FAIL when its inputs rot ──────
+//
+// The tests/docs_build_layout.rs meta-test pattern: every leg mutates the
+// LIVE document in memory — nothing is written to disk — and requires the
+// owning check to panic naming the planted drift. A mutation that passes
+// means the guard is vacuous for it; a panic missing the expected fragments
+// means it failed for an unrelated reason. Both fail the meta-test.
+
+/// Run `check` and require it to panic with every fragment of `expected`
+/// in the message.
+fn assert_drift<F>(check: F, expected: &[&str])
+where
+    F: FnOnce() + std::panic::UnwindSafe,
+{
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(check);
+    std::panic::set_hook(prev_hook);
+    let message = match outcome {
+        Ok(()) => panic!(
+            "the mutated input PASSED the check — the drift guard is vacuous \
+             for this mutation"
+        ),
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string()),
+    };
+    for fragment in expected {
+        assert!(
+            message.contains(fragment),
+            "the check failed, but not for the planted drift — panic message:\n\
+             {message}\nmissing fragment: {fragment:?}"
+        );
+    }
+}
+
+/// `text` with the single occurrence of `from` replaced by `to`. Panics on
+/// any count but one, so a meta-test can never "mutate" an input the live
+/// document no longer carries (or carries twice) and silently test
+/// something else.
+fn replaced_once(text: &str, from: &str, to: &str) -> String {
+    let count = text.matches(from).count();
+    assert_eq!(
+        count, 1,
+        "the negative meta-tests mutate {from:?} in the live document — \
+         expected exactly one occurrence, found {count}"
+    );
+    text.replacen(from, to, 1)
+}
+
+/// Each planted drift — a reworded headline claim, a renamed or retargeted
+/// link, a stale version citation on either side, a mis-cited pinning suite
+/// on either side, a dropped axis, an added axis, a deleted definition
+/// paragraph — fails the owning check: the committed non-vacuity claim for
+/// the README guard, one leg per pinned promise.
+#[test]
+fn negative_meta_drifted_readme_claim_fails_the_owning_check() {
+    let readme = readme_source();
+    let doc = contract_doc();
+    let paragraph = normalized(readme_claim_paragraph(&readme));
+    let version = contract_version(&doc);
+    let pinned_by =
+        metadata_cell(&doc, "**Pinned by**").expect("contract doc carries a Pinned-by row");
+
+    // The headline claims, reworded away.
+    let mutated = replaced_once(
+        &readme,
+        "Drop-in replacement for `claude -p`",
+        "Replacement for `claude -p`",
+    );
+    assert_drift(
+        || check_readme_headline_claims(&mutated),
+        &["Drop-in replacement for `claude -p`"],
+    );
+    let mutated = replaced_once(&readme, "wire-compatible output", "compatible output");
+    assert_drift(
+        || check_readme_headline_claims(&mutated),
+        &["wire-compatible output"],
+    );
+
+    // The link: display text renamed, then the target retargeted.
+    let link = format!("[`{CONTRACT_PATH}`]({CONTRACT_PATH})");
+    let mutated = replaced_once(
+        &paragraph,
+        &link,
+        &format!("[`the contract`]({CONTRACT_PATH})"),
+    );
+    assert_drift(
+        || check_claim_paragraph_links_the_contract(&mutated),
+        &[CONTRACT_PATH],
+    );
+    let mutated = replaced_once(
+        &paragraph,
+        &link,
+        &format!("[`{CONTRACT_PATH}`](docs/notes/claude-p-compat-moved.md)"),
+    );
+    assert_drift(
+        || check_claim_paragraph_links_the_contract(&mutated),
+        &[CONTRACT_PATH],
+    );
+
+    // The version citation, staled in the README and bumped in the contract.
+    let cited = format!("version {version}");
+    let mutated = replaced_once(&paragraph, &cited, "version v0");
+    assert_drift(
+        || check_claim_paragraph_cites_the_contract_version(&mutated, &doc),
+        &[cited.as_str()],
+    );
+    let mutated = replaced_once(
+        &doc,
+        &format!("| **Contract version** | {version} |"),
+        "| **Contract version** | v99 |",
+    );
+    assert_drift(
+        || check_claim_paragraph_cites_the_contract_version(&paragraph, &mutated),
+        &["version v99"],
+    );
+
+    // The pinning suite, mis-cited in the README and renamed in the contract.
+    let mutated = replaced_once(&paragraph, pinned_by.as_str(), "`tests/flag_compat.rs`");
+    assert_drift(
+        || check_claim_paragraph_names_the_pinning_suite(&mutated, &doc),
+        &[pinned_by.as_str()],
+    );
+    let mutated = replaced_once(
+        &doc,
+        &format!("| **Pinned by** | {pinned_by} |"),
+        "| **Pinned by** | `tests/flag_compat.rs` |",
+    );
+    assert_drift(
+        || check_claim_paragraph_names_the_pinning_suite(&paragraph, &mutated),
+        &["tests/flag_compat.rs"],
+    );
+
+    // The supported-surface summary: an axis dropped from the README…
+    let mutated = replaced_once(&paragraph, "signal mapping", "signal routing");
+    assert_drift(
+        || check_claim_paragraph_covers_every_contract_axis(&mutated, &doc),
+        &["signal mapping"],
+    );
+    let mutated = replaced_once(&paragraph, "child environment", "child surroundings");
+    assert_drift(
+        || check_claim_paragraph_covers_every_contract_axis(&mutated, &doc),
+        &["child environment"],
+    );
+    // …and one added to the contract's closed world. The axis sentence
+    // wraps across lines in the live document, so the mutation plants on
+    // the normalized text the parser itself normalizes.
+    let mutated = replaced_once(
+        &normalized(&doc),
+        "the signal mapping, and the child argv/environment",
+        "the signal mapping, the plugin surface, and the child argv/environment",
+    );
+    assert_drift(
+        || check_claim_paragraph_covers_every_contract_axis(&paragraph, &mutated),
+        &["six observable axes"],
+    );
+
+    // The definition paragraph itself, deleted. The locator panics before
+    // returning, so the would-be return value is discarded by the block.
+    let raw = readme_claim_paragraph(&readme);
+    let mutated = replaced_once(&readme, raw, "");
+    assert_drift(
+        || {
+            readme_claim_paragraph(&mutated);
+        },
+        &["drop-in definition paragraph"],
     );
 }

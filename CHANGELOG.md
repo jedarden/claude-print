@@ -9,6 +9,19 @@ static musl build) against the tagged commit before publishing.
 
 ### Added
 
+- **README drop-in-claim drift guard.** The README's compatibility promises
+  are now pinned to the normative contract the same way the contract is
+  pinned to the implementation (bead claudepr-5c893388):
+  `tests/claude_p_compat_contract.rs` holds the tagline's
+  drop-in/wire-compatible claims, the definition paragraph's contract link
+  (display text and target both the repo-relative path), its cited contract
+  version, and its pinning-suite citation against the contract document's
+  own metadata rows, and requires the paragraph's supported-surface summary
+  to cover every axis the contract's intro names — so a renamed contract, a
+  bumped version, a moved pin, or a dropped axis fails the build instead of
+  leaving the README promising something the contract no longer says.
+  Negative meta-tests mutate each pinned input in memory and require the
+  owning check to fail naming the planted drift.
 - **`--show-child-stderr` child-PTY-capture contract.**
   `docs/notes/show-child-stderr-contract.md` (bead claudepr-8b4aa030) is the
   normative definition behind the compat contract's one-line summary: what
