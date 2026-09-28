@@ -451,8 +451,12 @@ fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
         .unwrap_or_else(|e| panic!("read {fd_dir}: {e}"))
         .filter_map(|e| e.ok())
         .filter_map(|e| std::fs::read_link(e.path()).ok())
-        .filter(|t| matches!(t.to_string_lossy().as_ref(), "/dev/ptmx" | "/dev/pts/ptmx"))
+        .filter(|t| is_pty_master_target(t))
         .count()
+}
+
+fn is_pty_master_target(target: &std::path::Path) -> bool {
+    matches!(target.to_str(), Some("/dev/ptmx" | "/dev/pts/ptmx"))
 }
 
 /// The helper-contract pin behind this binary's at-rest PTY-master
@@ -469,6 +473,15 @@ fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
 /// race a sibling thread.
 #[test]
 fn pty_master_fd_count_accepts_both_ptmx_spellings() {
+    assert!(is_pty_master_target(std::path::Path::new("/dev/ptmx")));
+    assert!(is_pty_master_target(std::path::Path::new("/dev/pts/ptmx")));
+    assert!(!is_pty_master_target(std::path::Path::new(
+        "/dev/ptmx-extra"
+    )));
+    assert!(!is_pty_master_target(std::path::Path::new(
+        "/dev/pts/ptmx-extra"
+    )));
+
     let before = daemon_pty_fd_count(std::process::id());
     let host_spelling = std::fs::OpenOptions::new()
         .read(true)
@@ -480,15 +493,17 @@ fn pty_master_fd_count_accepts_both_ptmx_spellings() {
         .write(true)
         .open("/dev/pts/ptmx")
         .expect("/dev/pts/ptmx must open — the devpts mount every PTY here is allocated from");
+    let unrelated_descriptor = std::fs::File::open("/dev/null").expect("/dev/null must open");
     assert_eq!(
         daemon_pty_fd_count(std::process::id()),
         before + 2,
-        "an opened master must count through both spellings: /dev/ptmx \
+        "an opened master must count through both spellings and exclude unrelated descriptors: /dev/ptmx \
          (char-device hosts) and /dev/pts/ptmx (symlinked /dev/ptmx, the \
          kubelet CI layout)"
     );
     drop(host_spelling);
     drop(container_spelling);
+    drop(unrelated_descriptor);
 }
 
 /// Count EVERY descriptor the daemon holds open. The generic counterpart to
