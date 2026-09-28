@@ -60,6 +60,11 @@ fn run_content(label: &str, content: &str) -> Output {
 }
 
 fn complete_evidence(site: &str, cargo_output: &str) -> String {
+    let cargo_output = if cargo_output.contains("test result: ok") {
+        format!("{cargo_output}\ntest result: ok. 1 passed; 0 failed; 0 ignored")
+    } else {
+        cargo_output.to_owned()
+    };
     format!(
         "Complete, both legs, {site}.\n\n```verified:\ncargo test --tests\ncargo test --doc\n```\n\n```cargo-output\n{cargo_output}\n```\n"
     )
@@ -77,7 +82,7 @@ fn fixture_manifest_is_exhaustive_and_executable() {
     assert_eq!(manifest["fixture_glob"], "verification_evidence_*.txt");
 
     let cases = manifest["cases"].as_array().expect("manifest cases array");
-    assert_eq!(cases.len(), 13, "the v1 fixture inventory changed shape");
+    assert_eq!(cases.len(), 16, "the v1 fixture inventory changed shape");
 
     let expected_ids = [
         "valid-remote-complete",
@@ -91,6 +96,9 @@ fn fixture_manifest_is_exhaustive_and_executable() {
         "reject-targeted-selector-unnamed",
         "reject-annotation-on-executed-line",
         "reject-complete-one-leg",
+        "reject-duplicate-complete-leg",
+        "reject-commented-complete-leg",
+        "reject-insufficient-leg-results",
         "reject-output-tells-unbacked",
         "reject-missing-output-fence",
     ];
@@ -240,6 +248,15 @@ fn four_execution_mode_corners_validate() {
 }
 
 #[test]
+fn targeted_test_equals_form_and_lib_are_named_selectors() {
+    let evidence = "Targeted, local fallback: `--test=docs_build_commands` and `--lib` were run.\n\n```verified:\ncargo test --test=docs_build_commands\ncargo test --lib\n```\n\n```cargo-output\n[cargo-remote] uncommitted changes detected\n[cargo-remote] falling back to local (cgroup-limited run)\ntest result: ok. 96 passed; 0 failed; 0 ignored\ntest result: ok. 215 passed; 0 failed; 0 ignored\n```\n";
+    let result = run_content("targeted-test-equals", evidence);
+    assert!(result.status.success(), "{}", text(&result.stderr));
+    assert_eq!(text(&result.stdout), "evidence valid: local, targeted\n");
+    assert!(result.stderr.is_empty(), "{}", text(&result.stderr));
+}
+
+#[test]
 fn provenance_branches_are_derived_from_captured_output() {
     let cases = [
         (
@@ -360,6 +377,18 @@ fn misleading_fixtures_fail_with_a_rule() {
         (
             "verification_evidence_misleading_complete_one_leg.txt",
             "coverage-mismatch",
+        ),
+        (
+            "verification_evidence_misleading_duplicate_complete.txt",
+            "coverage-duplicate",
+        ),
+        (
+            "verification_evidence_misleading_commented_leg.txt",
+            "coverage-commented",
+        ),
+        (
+            "verification_evidence_misleading_insufficient_results.txt",
+            "leg-outcome",
         ),
         (
             "verification_evidence_misleading_annotated_verified_line.txt",

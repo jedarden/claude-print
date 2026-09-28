@@ -58,13 +58,17 @@ The validator derives the axes from the recording as follows:
   result`. A partial wrapper transcript, contradictory site tells, or a
   no-banner capture without a green cargo result is rejected. Output tells
   always outrank prose or the caller's intent.
-- **Complete** means the verified region contains both bare command lines
-  `cargo test --tests` and `cargo test --doc`. `--tests` alone is not
-  complete because it skips doctests.
-- Any other test selection is **targeted**. `cargo test --test NAME` and
-  `cargo test --lib` are targeted selectors; every such selector must be
-  named in prose. Non-test commands such as fmt, clippy, and build do not
-  change the coverage axis.
+- **Complete** means the verified region contains exactly one bare command
+  line for each of `cargo test --tests` and `cargo test --doc`, and the
+  captured output contains at least one green cargo test result for each
+  recorded leg. `--tests` alone is not complete because it skips doctests.
+- **Targeted** means the verified region contains one or more unique
+  `cargo test --test NAME` or `cargo test --lib` selectors and neither
+  complete leg. Every such selector must be named in prose. A missing
+  complete leg, duplicate leg or selector, commented-out test command, mixed
+  complete/targeted selection, or bare `cargo test` command is rejected.
+  Non-test commands such as fmt, clippy, and build do not change the coverage
+  axis.
 - Accepted evidence is green, has output-backed axes matching prose, and has
   no unnamed targeted selector. Semantic, misleading, incomplete, or
   contradictory evidence is rejected with exit 1. A malformed recording or
@@ -93,6 +97,9 @@ The negative fixtures deliberately exercise independent rejection rules:
 | `reject-targeted-selector-unnamed` | [`verification_evidence_misleading_unnamed_selector.txt`](../../tests/fixtures/verification_evidence_misleading_unnamed_selector.txt) | targeted selector not named in prose | reject, `selector-unnamed`, exit 1 |
 | `reject-annotation-on-executed-line` | [`verification_evidence_misleading_annotated_verified_line.txt`](../../tests/fixtures/verification_evidence_misleading_annotated_verified_line.txt) | annotation on an executable verified line | reject, `annotation-on-executed-line`, exit 1 |
 | `reject-complete-one-leg` | [`verification_evidence_misleading_complete_one_leg.txt`](../../tests/fixtures/verification_evidence_misleading_complete_one_leg.txt) | prose says complete but only one leg ran | reject, `coverage-mismatch`, exit 1 |
+| `reject-duplicate-complete-leg` | [`verification_evidence_misleading_duplicate_complete.txt`](../../tests/fixtures/verification_evidence_misleading_duplicate_complete.txt) | duplicate `--tests` leg | reject, `coverage-duplicate`, exit 1 |
+| `reject-commented-complete-leg` | [`verification_evidence_misleading_commented_leg.txt`](../../tests/fixtures/verification_evidence_misleading_commented_leg.txt) | commented-out `--doc` leg | reject, `coverage-commented`, exit 1 |
+| `reject-insufficient-leg-results` | [`verification_evidence_misleading_insufficient_results.txt`](../../tests/fixtures/verification_evidence_misleading_insufficient_results.txt) | one green result cannot prove two legs | reject, `leg-outcome`, exit 1 |
 | `reject-output-tells-unbacked` | [`verification_evidence_misleading_mode_unbacked.txt`](../../tests/fixtures/verification_evidence_misleading_mode_unbacked.txt) | no wrapper tells and no green extraction result | reject, `output-tells`, exit 1 |
 | `reject-missing-output-fence` | [`verification_evidence_malformed_missing_output_fence.txt`](../../tests/fixtures/verification_evidence_malformed_missing_output_fence.txt) | missing captured-output fence | reject, `fence`, exit 2 |
 

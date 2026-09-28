@@ -34,8 +34,9 @@
       "precedence": "The output, not prose or invocation intent, determines the site. Ambiguous or absent tell sets are invalid."
     },
     "coverage": {
-      "complete": "The verified section contains both cargo test --tests and cargo test --doc as separate bare command lines.",
-      "targeted": "Any test selection other than that exact pair, including cargo test --test NAME or cargo test --lib. Every targeted selector must be named in prose.",
+      "complete": "The verified section contains exactly one cargo test --tests and exactly one cargo test --doc bare command, with at least one green cargo test result for each leg; --tests alone excludes doctests and is not complete.",
+      "targeted": "The verified section contains one or more unique cargo test --test NAME or cargo test --lib selectors and neither complete leg. Every targeted selector must be named in prose.",
+      "contradictions": "A missing complete leg, duplicate leg or selector, commented-out cargo test, mixed complete and targeted selection, or unnamed cargo test command is rejected.",
       "other_commands": "cargo fmt, cargo clippy, cargo build, and other non-test commands do not affect the coverage axis."
     },
     "outcome": {
@@ -137,6 +138,30 @@
       "cargo_output_shape": "remote-green",
       "expected": {"outcome": "reject", "exit_code": 1, "rule": "coverage-mismatch"},
       "rationale": "Complete coverage requires both --tests and --doc; one leg is targeted/incomplete even when prose says complete."
+    },
+    {
+      "id": "reject-duplicate-complete-leg",
+      "file": "verification_evidence_misleading_duplicate_complete.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "coverage-duplicate"},
+      "rationale": "A repeated --tests leg is not additional proof of completeness; every complete leg must be recorded exactly once."
+    },
+    {
+      "id": "reject-commented-complete-leg",
+      "file": "verification_evidence_misleading_commented_leg.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "coverage-commented"},
+      "rationale": "A commented-out --doc line is shell commentary, not an executed doctest leg, so it cannot complete the pair."
+    },
+    {
+      "id": "reject-insufficient-leg-results",
+      "file": "verification_evidence_misleading_insufficient_results.txt",
+      "prose_claim": {"site": "remote", "coverage": "complete", "selectors": []},
+      "cargo_output_shape": "remote-green",
+      "expected": {"outcome": "reject", "exit_code": 1, "rule": "leg-outcome"},
+      "rationale": "A green wrapper terminal with only one cargo result cannot establish that both recorded test legs completed successfully."
     },
     {
       "id": "reject-output-tells-unbacked",

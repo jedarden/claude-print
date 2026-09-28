@@ -149,6 +149,86 @@ case $site in
 esac
 [[ $remote_failed == 0 ]] || fail remote-outcome 'the captured run ended in failure or timed out'
 
+# Extract the test commands from the verified fence. --tests and --doc are
+# the complete split; --test NAME and --lib are targeted selectors. Other
+# verification commands (fmt, clippy, build) do not affect this axis. The
+# command region is executable shell, so a commented-out cargo test is not a
+# leg and is called out explicitly instead of silently disappearing.
+selectors=$tmp_dir/selectors
+
+: >"$selectors"
+while IFS= read -r command; do
+    if [[ $command =~ ^[[:space:]]*#[[:space:]]*cargo[[:space:]]+test([[:space:]]|$) ]]; then
+        printf '%s\n' '--commented' >>"$selectors"
+    elif [[ $command =~ ^cargo[[:space:]]+test([[:space:]]|$) ]]; then
+        if [[ $command =~ ^cargo[[:space:]]+test[[:space:]]+--tests[[:space:]]*$ ]]; then
+            printf '%s\n' '--tests' >>"$selectors"
+        elif [[ $command =~ ^cargo[[:space:]]+test[[:space:]]+--doc[[:space:]]*$ ]]; then
+            printf '%s\n' '--doc' >>"$selectors"
+        elif [[ $command =~ ^cargo[[:space:]]+test[[:space:]]+--lib[[:space:]]*$ ]]; then
+            printf '%s\n' '--lib' >>"$selectors"
+        elif [[ $command =~ ^cargo[[:space:]]+test[[:space:]]+--test(=|[[:space:]])([^[:space:]]+)[[:space:]]*$ ]]; then
+            printf '%s\n' "--test ${BASH_REMATCH[2]}" >>"$selectors"
+        else
+            printf '%s\n' '--unnamed' >>"$selectors"
+        fi
+    fi
+done <"$verified"
+
+tests_count=0
+doc_count=0
+has_unnamed=0
+has_commented=0
+test_command_count=0
+while IFS= read -r selector; do
+    case $selector in
+        --tests) ((tests_count += 1)); ((test_command_count += 1)) ;;
+        --doc) ((doc_count += 1)); ((test_command_count += 1)) ;;
+        --lib|--test\ *) ((test_command_count += 1)) ;;
+        --unnamed) has_unnamed=1 ;;
+        --commented) has_commented=1 ;;
+    esac
+done <"$selectors"
+(( has_commented == 0 )) ||
+    fail coverage-commented 'a commented-out cargo test is not an executed verification leg'
+[[ $has_unnamed == 0 ]] || fail selector-unnamed 'a cargo test command has no named selector'
+
+if (( tests_count > 1 || doc_count > 1 )); then
+    fail coverage-duplicate 'the complete --tests and --doc legs may each appear only once'
+fi
+
+duplicate_selector=$(awk '/^--(tests|doc|lib)$|^--test / { if (++seen[$0] == 2) { print $0; exit } }' "$selectors")
+[[ -z $duplicate_selector ]] ||
+    fail coverage-duplicate "the verification selector ${duplicate_selector#--} is recorded more than once"
+
+if (( tests_count == 1 && doc_count == 1 && test_command_count == 2 )); then
+    coverage=complete
+    required_results=2
+elif (( tests_count == 0 && doc_count == 0 && test_command_count > 0 )); then
+    coverage=targeted
+    required_results=$test_command_count
+else
+    if (( tests_count || doc_count )); then
+        fail coverage-mismatch 'complete coverage requires exactly one cargo test --tests leg and one cargo test --doc leg'
+    fi
+    fail coverage-mismatch 'the verified fence contains no cargo test selector'
+fi
+
+if [[ $coverage == targeted ]]; then
+    while IFS= read -r selector; do
+        if [[ $selector == --lib ]]; then
+            [[ $(grep -Eic '(^|[^[:alnum:]_-])--lib([^[:alnum:]_-]|$)' "$prose") -gt 0 ]] ||
+                fail selector-unnamed 'the targeted --lib selector is absent from the prose'
+        else
+            name=${selector#--test }
+            [[ $name =~ ^[[:alnum:]_.-]+$ ]] ||
+                fail selector-invalid "the targeted --test selector name ${name@Q} is not a cargo target name"
+            grep -Eiq -- "(^|[^[:alnum:]_.-])--test(=|[[:space:]])${name}([^[:alnum:]_.-]|$)" "$prose" ||
+                fail selector-unnamed "the targeted --test ${name} selector is absent from the prose"
+        fi
+    done < <(grep -E '^--lib$|^--test ' "$selectors")
+fi
+
 # Local captures have no remote terminal line, so a green cargo result must be
 # visible. This also catches a failed local leg without a wrapper banner.
 if grep -Eq '(^|[^[:alnum:]])(FAILED|timed out)([^[:alnum:]]|$)|test result:.*[1-9][0-9]* failed' "$output"; then
@@ -157,50 +237,13 @@ fi
 grep -Eiq 'test result:[[:space:]]+ok|test result:.*[[:space:]]+[0-9]+ passed' "$output" ||
     fail leg-outcome 'the captured cargo output contains no green test result'
 
-# Extract the test commands from the verified fence. --tests and --doc are
-# the complete split; --test NAME and --lib are targeted selectors. Other
-# verification commands (fmt, clippy, build) do not affect this axis.
-selectors=$tmp_dir/selectors
-awk '
-/^cargo[[:space:]]+test([[:space:]]|$)/ {
-    if ($0 ~ /^cargo[[:space:]]+test[[:space:]]+--tests[[:space:]]*$/) print "--tests"
-    else if ($0 ~ /^cargo[[:space:]]+test[[:space:]]+--doc[[:space:]]*$/) print "--doc"
-    else if ($0 ~ /^cargo[[:space:]]+test[[:space:]]+--lib[[:space:]]*$/) print "--lib"
-    else if (match($0, /^cargo[[:space:]]+test[[:space:]]+--test(=|[[:space:]])([^[:space:]]+)[[:space:]]*$/, m)) print "--test " m[2]
-    else print "--unnamed"
-}' "$verified" >"$selectors"
-
-grep -Eq '^--(tests|doc|lib)|^--test ' "$selectors" ||
-    fail coverage-mismatch 'the verified fence contains no cargo test selector'
-
-has_tests=0
-has_doc=0
-has_unnamed=0
-while IFS= read -r selector; do
-    case $selector in
-        --tests) has_tests=1 ;;
-        --doc) has_doc=1 ;;
-        --unnamed) has_unnamed=1 ;;
-    esac
-done <"$selectors"
-[[ $has_unnamed == 0 ]] || fail selector-unnamed 'a cargo test command has no named selector'
-
-if (( has_tests && has_doc )); then
-    coverage=complete
-else
-    coverage=targeted
-    while IFS= read -r selector; do
-        [[ $selector == --tests || $selector == --doc ]] && continue
-        if [[ $selector == --lib ]]; then
-            [[ $(grep -Eic '(^|[^[:alnum:]_-])--lib([^[:alnum:]_-]|$)' "$prose") -gt 0 ]] ||
-                fail selector-unnamed 'the targeted --lib selector is absent from the prose'
-        else
-            name=${selector#--test }
-            grep -Eiq -- "(^|[^[:alnum:]_.-])--test(=|[[:space:]])${name}([^[:alnum:]_.-]|$)" "$prose" ||
-                fail selector-unnamed "the targeted --test ${name} selector is absent from the prose"
-        fi
-    done <"$selectors"
-fi
+# A green wrapper terminal is not enough to prove every recorded leg ran to
+# completion. Cargo emits one `test result: ok` line per test command (and may
+# emit additional lines for the targets behind --tests), so require at least
+# one result for each command in the verified fence.
+green_results=$(grep -Eic 'test result:[[:space:]]+ok([[:space:].]|$)' "$output" || true)
+(( green_results >= required_results )) ||
+    fail leg-outcome "the captured cargo output has ${green_results} green test result(s) for ${required_results} recorded test command(s)"
 
 # Count claims in prose, excluding "no git remote", which is a fallback
 # reason rather than a remote execution claim.
