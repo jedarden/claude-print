@@ -519,6 +519,19 @@ fn pty_master_fd_count_accepts_both_ptmx_spellings() {
     let pid = std::process::id();
     let before = daemon_pty_fd_count(pid);
     let legacy_before = literal_ptmx_fd_count(pid);
+    let unrelated_before = daemon_pty_fd_count(pid);
+    let unrelated = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/null")
+        .expect("/dev/null must open for the unrelated-descriptor boundary check");
+    let unrelated_link = std::fs::read_link(format!("/proc/{pid}/fd/{}", unrelated.as_raw_fd()))
+        .expect("the unrelated fd must be visible through /proc");
+    assert_eq!(unrelated_link, Path::new("/dev/null"));
+    assert_eq!(
+        daemon_pty_fd_count(pid),
+        unrelated_before,
+        "unrelated fd targets must not count as PTY masters"
+    );
     let host_spelling = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
