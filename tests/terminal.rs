@@ -17,7 +17,7 @@
 //! baseline and its probe inventory is asserted identical to the pinned one
 //! (see `retained_prior_capture_probe_inventory_matches_the_pinned_shape`).
 //! Re-run the script after any Claude Code update and re-pin fixture + tests +
-//! doc together, exactly like `tests/fixtures/claude_contracts_v2.1.283.json`
+//! doc together, exactly like `tests/fixtures/claude_contracts_v2.1.284.json`
 //! (docs/notes/claude-contract-probes.md §Maintenance).
 
 use std::collections::HashSet;
