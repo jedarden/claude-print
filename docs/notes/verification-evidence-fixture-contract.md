@@ -6,7 +6,7 @@
 | **Machine-readable inventory** | [`tests/fixtures/verification_evidence_cases_v1.json`](../../tests/fixtures/verification_evidence_cases_v1.json) |
 | **Literal recordings** | [`tests/fixtures/verification_evidence_*.txt`](../../tests/fixtures/) |
 | **Current pin** | `tests/verification_evidence.rs` |
-| **Provenance** | bead claudepr-e105aa87 (2026-09-28) |
+| **Provenance** | bead claudepr-e105aa87 (fixture contract); bead claudepr-36618852 (validator integration, file/stdin wiring; 2026-09-28) |
 
 This note defines the input contract for recorded verification evidence. The
 text fixtures are complete recordings: each one contains the evidence prose,
@@ -15,6 +15,28 @@ JSON inventory gives every recording an id, its expected result, and the
 rationale for that result. A parser or validator consumes the literal `.txt`
 file and uses the inventory as the test oracle; it must not infer semantics
 from a filename or invent a different meaning for a missing field.
+
+## Supported entry points
+
+The validator is a credential-free repository script. Validate a recording from
+a file or from standard input:
+
+```bash
+bash scripts/check-verification-evidence.sh path/to/evidence.txt
+cat path/to/evidence.txt | bash scripts/check-verification-evidence.sh -
+```
+
+The integration target drives the complete manifest, including all four
+remote/local × complete/targeted acceptance corners, every misleading or
+malformed rejection, and file/stdin parity:
+
+```bash
+cargo test --test verification_evidence
+```
+
+The validator's exit contract is stable: `0` accepts evidence, `1` rejects
+parsed but misleading or incomplete evidence, and `2` reports usage or a
+malformed recording.
 
 ## Recording format
 

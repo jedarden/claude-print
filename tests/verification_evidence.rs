@@ -59,6 +59,24 @@ fn run_content(label: &str, content: &str) -> Output {
     run_file(&path)
 }
 
+fn run_stdin(content: &str) -> Output {
+    let mut child = Command::new("bash")
+        .arg(repo_path(SCRIPT))
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stdin validator");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(content.as_bytes())
+        .expect("write stdin evidence");
+    child.wait_with_output().expect("wait for stdin validator")
+}
+
 fn complete_evidence(site: &str, cargo_output: &str) -> String {
     let cargo_output = if cargo_output.contains("test result: ok") {
         format!("{cargo_output}\ntest result: ok. 1 passed; 0 failed; 0 ignored")
@@ -179,6 +197,20 @@ fn fixture_manifest_is_exhaustive_and_executable() {
                 assert!(
                     result.stdout.is_empty(),
                     "{id}: rejected evidence printed valid output"
+                );
+                let repeat = run_fixture(file);
+                assert_eq!(
+                    repeat.status.code(),
+                    Some(expected_exit as i32),
+                    "{id} status changed on repeat"
+                );
+                assert_eq!(
+                    repeat.stdout, result.stdout,
+                    "{id} stdout changed on repeat"
+                );
+                assert_eq!(
+                    repeat.stderr, result.stderr,
+                    "{id} stderr changed on repeat"
                 );
             }
             outcome => panic!("{id}: unsupported manifest outcome {outcome:?}"),
@@ -449,25 +481,22 @@ fn malformed_or_missing_evidence_is_exit_two() {
 
 #[test]
 fn stdin_is_an_equivalent_evidence_source() {
-    let content = fs::read_to_string(fixture("verification_evidence_valid_local_targeted.txt"))
-        .expect("read stdin fixture");
-    let mut child = Command::new("bash")
-        .arg(repo_path(SCRIPT))
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn stdin validator");
-    child
-        .stdin
-        .take()
-        .expect("stdin pipe")
-        .write_all(content.as_bytes())
-        .expect("write stdin evidence");
-    let result = child.wait_with_output().expect("wait for stdin validator");
-    assert!(result.status.success(), "{}", text(&result.stderr));
-    assert_eq!(text(&result.stdout), "evidence valid: local, targeted\n");
+    for name in [
+        "verification_evidence_valid_local_targeted.txt",
+        "verification_evidence_misleading_failed_remote_run.txt",
+        "verification_evidence_malformed_missing_output_fence.txt",
+    ] {
+        let content = fs::read_to_string(fixture(name)).expect("read stdin fixture");
+        let from_file = run_fixture(name);
+        let from_stdin = run_stdin(&content);
+        assert_eq!(
+            from_stdin.status.code(),
+            from_file.status.code(),
+            "{name} status"
+        );
+        assert_eq!(from_stdin.stdout, from_file.stdout, "{name} stdout");
+        assert_eq!(from_stdin.stderr, from_file.stderr, "{name} stderr");
+    }
 }
 
 fn validate_mutation(label: &str, content: String, expected_rule: &str) {
