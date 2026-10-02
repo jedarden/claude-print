@@ -1,0 +1,160 @@
+{
+  "claude_version": "2.1.288",
+  "measured_at": "2026-10-02",
+  "version_guard": {
+    "start": "2.1.288",
+    "end": "2.1.288",
+    "provenance": "All four probes (scripts/probe-claude-contracts.sh, scripts/probe-stop-toolallowed.sh, scripts/probe-tui-second-turn.sh, scripts/probe-stop-edge-contracts.sh) ran against the concrete Claude Code 2.1.288 binary on 2026-10-02. Each probe stamped version-guard: verdict=single-version start=2.1.288 end=2.1.288 with start == end == claude_version. One authenticated claude-print stream-json PTY capture used the same pinned binary; its 34-record stdout was byte-identical to its transcript."
+  },
+  "probe_scripts": [
+    "scripts/probe-claude-contracts.sh",
+    "scripts/probe-stop-toolallowed.sh",
+    "scripts/probe-tui-second-turn.sh",
+    "scripts/probe-stop-edge-contracts.sh"
+  ],
+  "evidence": "docs/notes/claude-contract-probes.md",
+  "resolves": [
+    "PO-1",
+    "PO-2",
+    "OQ-1",
+    "OQ-2",
+    "Stop-poller assumption (plan §7)",
+    "relay-hook timeout (hook-design.md Relay Hook)"
+  ],
+  "contracts": {
+    "settings_flag_merges_not_replaces": true,
+    "all_loaded_sources_hooks_fire": true,
+    "cross_source_hook_order_guaranteed": false,
+    "setting_sources_empty_accepted": true,
+    "setting_sources_empty_suppresses_standard_sources": true,
+    "settings_file_loads_despite_setting_sources_empty": true,
+    "setting_sources_none_accepted": false,
+    "stop_firings_single_turn_completed_run_per_loaded_source": 1,
+    "stop_firings_multi_round_tool_use_completed_turn": 1,
+    "stop_firings_tui_per_turn": 1,
+    "stop_firings_max_turns_cutoff": 0,
+    "stop_firings_max_turns_cutoff_exit_code": 1,
+    "hook_timeout_kills_overrun_hook": true,
+    "hook_timeout_overrun_session_proceeds": true
+  },
+  "notes": {
+    "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host's real ~/.claude files were never read or written. Auth traveled by inherited environment or a file-to-file copy into the sandbox only.",
+    "cross_source_order_evidence": "2.1.288 Arm S: project hook sleeping 300 ms and relay hook 0 ms ran concurrently in 12/12 event pairs; the relay started first in 5/12. The result is concurrency, not a contractual source order: claude-print must not depend on which hook starts first.",
+    "tui_per_turn_evidence": "The dedicated probe-tui-second-turn.sh run on 2.1.288 completed two TUI turns: turn 1 fired 1 Stop with its reply rendered in 0.9 s, and turn 2 fired 1 Stop with SECOND-OK rendered in 0.9 s. The allowed-tool probe completed one Stop per turn (29.5 s and 26.0 s); its earlier multi-round arm was a documented re-run case, not a contract finding.",
+    "degraded_path_hazard": "Arm D on 2.1.288 ran 5 completed permission-denied turns; all exited 0 and each fired exactly one Stop. The historical 2.1.270 extra-Stop hazard did not reproduce. The poller keeps first-payload tolerance for degraded runs.",
+    "print_mode_tool_use_evidence": "Arm P on 2.1.288 permitted two sequential Bash rounds in one -p run and fired exactly 1 Stop at the completed turn's end, exit 0. The independent max-turns probe exited 1 with 0 new Stop firings when --max-turns 2 cut off the four-round task.",
+    "cutoff_evidence": "The focused 2.1.288 -p run with --max-turns 2 exited 1 and logged zero new Stop firings; the cutoff remains owned by the --stop-hook-timeout watchdog, not the Stop poller.",
+    "hook_timeout_evidence": "Arm T on 2.1.288 configured a relay-position hook with timeout 5 s and sleep 30 s: all 8 event firings were killed, all 4 sessions exited 0 with replies rendered, and each Stop hook was cut off at 5.0 s. This confirms the per-hook timeout field used by the relay."
+  },
+  "doc_evidence": {
+    "active_version": "2.1.288",
+    "cross_source": {
+      "concurrent_pairs": {
+        "observed": 12,
+        "total": 12
+      },
+      "relay_first_pairs": {
+        "observed": 5,
+        "total": 12
+      },
+      "earlier_concurrent_pairs": {
+        "observed": 12,
+        "total": 12
+      },
+      "earlier_relay_first_pairs": [
+        {
+          "observed": 6,
+          "total": 12
+        },
+        {
+          "observed": 4,
+          "total": 12
+        },
+        {
+          "observed": 5,
+          "total": 12
+        }
+      ]
+    },
+    "permission_denied_runs": {
+      "observed": 5,
+      "total": 5
+    },
+    "hook_timeout": {
+      "killed_firings": {
+        "observed": 8,
+        "total": 8
+      },
+      "successful_sessions": {
+        "observed": 4,
+        "total": 4
+      },
+      "rendered_replies": {
+        "observed": 4,
+        "total": 4
+      },
+      "rendered_per_invocation": {
+        "observed": 4,
+        "total": 4
+      },
+      "elapsed_seconds": 5.0
+    },
+    "stop_counts": {
+      "single_turn_per_loaded_source": 1,
+      "multi_round": 1,
+      "permission_denied": 1,
+      "tui_turn_1": 1,
+      "tui_turn_2": 1,
+      "max_turns_cutoff": 0
+    },
+    "active_tui_seconds": [
+      0.9,
+      0.9
+    ],
+    "historical": [
+      {
+        "version": "2.1.270",
+        "cross_source_relay_first_runs": {
+          "observed": 1,
+          "total": 4
+        },
+        "permission_denied_extra_stop_runs": {
+          "observed": 1,
+          "total": 2
+        },
+        "tui_seconds": [
+          22.6,
+          15.1
+        ]
+      },
+      {
+        "version": "2.1.281",
+        "arm_t_seconds": [
+          48.0,
+          60.0
+        ],
+        "tui_seconds": [
+          48.0,
+          60.0,
+          13.0,
+          9.1
+        ]
+      },
+      {
+        "version": "2.1.282",
+        "arm_t_seconds": [
+          62.5,
+          32.5,
+          60.5
+        ],
+        "tui_seconds": [
+          62.5,
+          32.5,
+          60.5,
+          41.6,
+          3.3
+        ]
+      }
+    ]
+  }
+}
