@@ -450,9 +450,18 @@ fn script_is_wired_and_documents_its_safety_contract() {
 #[test]
 fn repo_root_resolution_prefers_the_runtime_manifest() {
     let baked = env!("CARGO_MANIFEST_DIR");
+    // The test binary can be reused from a deleted git-archive extraction by
+    // the shared Cargo target directory, so the compile-time manifest is not
+    // necessarily a live checkout. Build a minimal runtime candidate instead
+    // of assuming that the baked path still exists.
+    let runtime = tempfile::tempdir().expect("tempdir for a runtime repo root");
+    for probe in ROOT_PROBES {
+        fs::write(runtime.path().join(probe), "").expect("writing runtime root probe");
+    }
+    let runtime_str = runtime.path().display().to_string();
     // Runtime value wins when it differs and is a real checkout.
-    let resolved = resolve_repo_root(None, Some(baked), "/nonexistent/baked").unwrap();
-    assert!(resolved.ends_with("claude-print") || is_repo_root(&resolved));
+    let resolved = resolve_repo_root(None, Some(&runtime_str), "/nonexistent/baked").unwrap();
+    assert_eq!(resolved, runtime.path());
     // An override that is not a checkout is authoritative and loud.
     let err = resolve_repo_root(Some("/tmp"), None, baked).unwrap_err();
     assert!(err.contains("CLAUDE_PRINT_TEST_REPO"));
