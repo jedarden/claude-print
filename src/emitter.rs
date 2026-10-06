@@ -11,6 +11,33 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The one caller-supplied input to the opaque record handoff.
+///
+/// The outer slice fixes the sequence boundary at intake. Its records remain
+/// opaque byte strings: intake does not inspect, copy, normalize, or add to
+/// them, and the private field prevents downstream code from discovering a
+/// second source or changing the supplied sequence after handoff.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SuppliedRecordSequence(Box<[Vec<u8>]>);
+
+impl SuppliedRecordSequence {
+    fn new(records: Vec<Vec<u8>>) -> Self {
+        Self(records.into_boxed_slice())
+    }
+
+    fn into_records(self) -> Box<[Vec<u8>]> {
+        self.0
+    }
+}
+
+/// Accept exactly one finite, caller-supplied sequence of opaque records.
+///
+/// This is deliberately a move-only handoff. No record is synthesized,
+/// normalized, framed, or read from another source.
+pub fn intake_records(records: Vec<Vec<u8>>) -> SuppliedRecordSequence {
+    SuppliedRecordSequence::new(records)
+}
+
 /// Emit a successful response.
 ///
 /// `text`: writes `{response_text}\n` to stdout.
@@ -91,8 +118,11 @@ pub fn emit_success(
 /// In particular, an empty record is consumed just like any other record and a
 /// zero-length sequence emits zero bytes. The function only uses `writer` and
 /// `records`; it does not discover or read any other source.
-pub fn emit_records(writer: &mut dyn Write, records: Vec<Vec<u8>>) -> std::io::Result<()> {
-    for record in records {
+pub fn emit_records(
+    writer: &mut dyn Write,
+    records: SuppliedRecordSequence,
+) -> std::io::Result<()> {
+    for record in records.into_records() {
         writer.write_all(&record)?;
     }
     Ok(())
@@ -809,7 +839,7 @@ fn tail_loop(
                     // emitter adds no separators, wrappers, or other bytes.
                     let mut record = trimmed.as_bytes().to_vec();
                     record.push(b'\n');
-                    let _ = emit_records(&mut *writer, vec![record]);
+                    let _ = emit_records(&mut *writer, intake_records(vec![record]));
                 }
             }
             Err(_) => {
