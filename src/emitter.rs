@@ -802,7 +802,14 @@ fn tail_loop(
                     if let Some(flag) = first_output.take() {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                    let _ = writeln!(writer, "{}", trimmed);
+                    // The reader owns stream framing; once the output record is
+                    // formed, hand exactly that bounded sequence to the
+                    // byte-preserving emitter.  Keeping the framing here
+                    // preserves the stream contract while ensuring the
+                    // emitter adds no separators, wrappers, or other bytes.
+                    let mut record = trimmed.as_bytes().to_vec();
+                    record.push(b'\n');
+                    let _ = emit_records(&mut *writer, vec![record]);
                 }
             }
             Err(_) => {

@@ -387,6 +387,31 @@ fn test_stream_json_each_line_parses_as_json() {
 }
 
 #[test]
+fn test_stream_json_public_boundary_preserves_order_and_multiplicity() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("transcript.jsonl");
+    std::fs::write(
+        &path,
+        b"first\n\nfirst\n {\"unusual\":true}  \r\nunicode \xE2\x98\x83\n",
+    )
+    .unwrap();
+
+    let (output_buf, writer) = capture();
+    let handle = spawn_stream_json_reader_to(path, 0, Box::new(writer));
+    handle.signal_drain();
+    drop(handle);
+
+    // The reader's documented framing drops the blank record and normalizes
+    // only the line terminator. The remaining records must stay in order,
+    // including the duplicate and unusual content; the emitter contributes
+    // no additional bytes.
+    assert_eq!(
+        output_buf.lock().unwrap().as_slice(),
+        b"first\nfirst\n {\"unusual\":true}  \nunicode \xE2\x98\x83\n"
+    );
+}
+
+#[test]
 fn test_stream_json_disconnect_exits_immediately() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("transcript.jsonl");
