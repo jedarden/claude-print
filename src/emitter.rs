@@ -501,7 +501,16 @@ fn bind_with_retry(
             return Some((path, offset));
         }
         match drain_rx.try_recv() {
-            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return None,
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                // Stop sends the authoritative path before drain. It can land
+                // between the retarget check above and this receive, so give
+                // it one final chance before ending an unbound reader.
+                if let Some(path) = take_retarget(retarget_rx, None) {
+                    let offset = snapshot_offset(&path, pre_existing);
+                    return Some((path, offset));
+                }
+                return None;
+            }
             Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(50)),
         }
     }
@@ -956,6 +965,63 @@ mod tests {
             forwarded(&buf).trim().is_empty(),
             "bytes appeared without any positive bind"
         );
+    }
+
+    /// A Stop retarget can arrive after the bind poll checked the retarget
+    /// channel but before it observes the drain channel. The final retarget
+    /// check must win that race even when discovery is refusing an ambiguous
+    /// pair of candidates.
+    #[test]
+    fn bind_accepts_retarget_queued_before_drain_during_identity_poll() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::io::Write as _;
+
+        let dir = TempDir::new().unwrap();
+        let projects_dir = dir.path().join("projects").join("shared-cwd");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        append_markers(
+            &projects_dir.join("sibling-a.jsonl"),
+            &["SIBLING-A MUST NOT FORWARD"],
+        );
+        append_markers(
+            &projects_dir.join("sibling-b.jsonl"),
+            &["SIBLING-B MUST NOT FORWARD"],
+        );
+
+        let identity_path = dir.path().join("session-identity.fifo");
+        mkfifo(&identity_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let target = projects_dir.join("stop-session.jsonl");
+        let pre_existing = snapshot_jsonl_sizes(&projects_dir);
+        let (drain_tx, drain_rx) = mpsc::sync_channel(1);
+        let (retarget_tx, retarget_rx) = mpsc::sync_channel(1);
+
+        // Opening the FIFO unblocks the bind loop's identity read. Queue the
+        // authoritative Stop path and drain while that read is in progress;
+        // the bind loop then reaches its drain receive with the retarget
+        // already waiting, exactly the interleaving that used to lose it.
+        let writer_target = target.clone();
+        let writer_identity = identity_path.clone();
+        let sender = thread::spawn(move || {
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(writer_identity)
+                .unwrap();
+            retarget_tx.send(writer_target).unwrap();
+            drain_tx.send(()).unwrap();
+            fifo.write_all(b"not json").unwrap();
+        });
+
+        let result = bind_with_retry(
+            &identity_path,
+            &projects_dir,
+            &pre_existing,
+            &drain_rx,
+            &retarget_rx,
+        );
+        sender.join().unwrap();
+
+        assert_eq!(result, Some((target, 0)));
     }
 
     /// The binding must follow the identity payload's EXACT transcript_path —
