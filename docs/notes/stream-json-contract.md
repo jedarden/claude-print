@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Pinned by** | `tests/stream_json_contract.rs` against the `tests/fixtures/stream_json_golden_v2.1.289.{input,expected,errors}.jsonl` triple |
+| **Pinned by** | `tests/stream_json_contract.rs` against the `tests/fixtures/stream_json_golden_v2.1.290.{input,expected,errors}.jsonl` triple |
 | **Implementation** | `src/emitter.rs` (the reader thread: `spawn_stream_json_reader_bound_to`, `tail_loop`, `StreamJsonHandle`), spawned and drained by `src/session.rs`; error objects by `emit_error` |
 | **Summarized by** | `docs/notes/output-format-contracts.md` §`stream-json` mode and the README — this document is the normative deep-dive; where they differ, this document wins |
-| **Provenance** | bead claudepr-6b587922 (2026-09-25); binding design bead claudepr-a927ec0c; first-output credit bead claudepr-33fdf4ed; re-measured and re-pinned to 2.1.282 by claudepr-b590e46d; re-measured and re-pinned to 2.1.288 by claudepr-cb9dcf25 (2026-10-02); re-measured and re-pinned to 2.1.289 by claudepr-9e054b3d (2026-10-04; authenticated PTY capture completed with 40 records, and its stdout was byte-identical to the transcript; sanitized captured records were replayed through the real reader/emitter path) |
+| **Provenance** | bead claudepr-6b587922 (2026-09-25); binding design bead claudepr-a927ec0c; first-output credit bead claudepr-33fdf4ed; re-measured and re-pinned to 2.1.282 by claudepr-b590e46d; re-measured and re-pinned to 2.1.288 by claudepr-cb9dcf25 (2026-10-02); re-measured and re-pinned to 2.1.289 by claudepr-9e054b3d (2026-10-04); re-measured and re-pinned to 2.1.290 by claudepr-c02f9cfc (2026-10-06; authenticated PTY capture completed with 40 records, and its stdout was byte-identical to the transcript; sanitized captured records were replayed through the real reader/emitter path) |
 
 This note is the normative definition of what `--output-format stream-json`
 writes to stdout: the framing of each line, which records are forwarded and
@@ -17,14 +17,14 @@ against a committed file, so any re-serialization, reorder, drop, duplicate,
 or synthesized byte surfaces as a diff in review, not as silent drift.
 
 The golden fixtures are version-pinned like the transcript captures
-(`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.289` in the filename
+(`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.290` in the filename
 names the Claude Code capture family whose record shapes the fixtures model,
 and the `claude_version` stamped into the golden error objects is
-`2.1.289 (Claude Code)`. The envelopes were re-measured against live
-claude 2.1.289 on 2026-10-04 (the active capture was an authenticated,
+`2.1.290 (Claude Code)`. The envelopes were re-measured against live
+claude 2.1.290 on 2026-10-06 (the active capture was an authenticated,
 sandboxed PTY session driven through claude-print itself and replayed
 byte-identically to its transcript file; the capture completed with 40
-records, no `result` record, compact JSON, and no CR or blank lines. The
+records, no `result` record, compact JSON, and no CR or blank records. The
 assistant tool-use envelope carried `requestId`, `message.input_transformations`,
 and `wireToolInputs`; `permission-mode`, `atis-latch`,
 `file-history-snapshot`, `attachment`, `last-prompt`, `ai-title`, and
@@ -100,10 +100,10 @@ parsing, validating, filtering by record type, or inspecting fields.
 Consequences, each pinned:
 
 - **Every record type flows.** `summary`, `user`, `assistant`, `system`,
-  `result` — and every record type 2.1.282/2.1.287/2.1.288/2.1.289 additionally write to
+  `result` — and every record type 2.1.282/2.1.287/2.1.288/2.1.289/2.1.290 additionally write to
   PTY transcripts (`mode`, `permission-mode`, `attachment`, `last-prompt`,
   `ai-title`, `cost-state`, `atis-latch`, and `file-history-snapshot`, …) —
-  2.1.289 assistant records also carry `requestId`,
+  2.1.290 assistant records also carry `requestId`,
   `message.input_transformations`, and `wireToolInputs` on the sampled
   assistant tool-use record; the reader has no type-aware behavior on this
   path. A `result` record, when the transcript holds one (the
@@ -268,7 +268,7 @@ stream-json path ever *writes* rather than forwards. It has five fields
 (lexicographic serialization order): `claude_version`, `error_message`,
 `is_error` (always `true`), `subtype`, and `type: "result"`. Both golden
 error lines — the session error and the config error — are pinned
-byte-for-byte in `stream_json_golden_v2.1.289.errors.jsonl`.
+byte-for-byte in `stream_json_golden_v2.1.290.errors.jsonl`.
 
 - **Session errors after injection** (watchdog timeout, interrupt,
   assistant error, child exit, internal failure): the object is **appended

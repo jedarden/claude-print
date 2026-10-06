@@ -3,10 +3,10 @@
 //! The contract these fixtures pin is specified in
 //! `docs/notes/stream-json-contract.md`; each test names the section it pins.
 //! Golden fixtures are version-pinned like the transcript captures
-//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.289` in the filename
+//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.290` in the filename
 //! is the pinned Claude Code version from
 //! `docs/notes/claude-contract-probes.md`. The record envelopes were
-//! re-measured against live claude 2.1.289 on 2026-10-04: an authenticated,
+//! re-measured against live claude 2.1.290 on 2026-10-06: an authenticated,
 //! sandboxed claude-print PTY capture completed with 40 records, no `result`
 //! record, no CR or blank lines, and stdout byte-identical to its transcript.
 //! The captured assistant tool-use envelope also carried `wireToolInputs`;
@@ -18,7 +18,7 @@
 //! `file-history-snapshot`, `attachment`, `last-prompt`, `ai-title`, and
 //! `cost-state` records flowing; the fixture carries representative samples.
 //! The `thinking` block remains a type-agnostic forwarding case retained from
-//! earlier live captures; it did not occur in the 2.1.289 capture.
+//! earlier live captures; it did not occur in the 2.1.290 capture.
 //! The envelope set was previously re-measured against 2.1.282 on 2026-09-25
 //! (claudepr-b590e46d: `thinking` blocks and split assistant records sharing a
 //! `message.id` observed live); the prior `v2.1.270`, `v2.1.282`, and
@@ -26,18 +26,18 @@
 //!
 //! What the golden pairs pin, and why each file exists:
 //!
-//! * `stream_json_golden_v2.1.289.input.jsonl` — a PTY-shaped transcript (the
+//! * `stream_json_golden_v2.1.290.input.jsonl` — a PTY-shaped transcript (the
 //!   shape `claude-print` actually tails: `mode`/`summary`/`user`/`assistant`/
 //!   `system` records, NO `result` record) carrying one instance of every
-//!   byte-level case the contract calls out: a 2.1.289 `mode` record (the
+//!   byte-level case the contract calls out: a 2.1.290 `mode` record (the
 //!   minimal record type introduced in 2.1.282), compact JSON, spaced JSON (no
 //!   re-serialization), unicode text, a retained `thinking` block, split assistant
 //!   records sharing a `message.id` (forwarded verbatim, no dedup), a blank
 //!   line (dropped), and a CRLF-terminated line (CR trimmed).
-//! * `stream_json_golden_v2.1.289.expected.jsonl` — the exact stdout bytes a
+//! * `stream_json_golden_v2.1.290.expected.jsonl` — the exact stdout bytes a
 //!   full replay must produce: input minus the blank line, CR removed, every
 //!   line LF-terminated.
-//! * `stream_json_golden_v2.1.289.errors.jsonl` — the exact bytes of the two
+//! * `stream_json_golden_v2.1.290.errors.jsonl` — the exact bytes of the two
 //!   synthesized `result` error objects: the session-error line written to
 //!   stdout (line 1) and the config-error line written to stderr (line 2).
 //!
@@ -59,15 +59,15 @@ use claude_print::emitter::{
 };
 use claude_print::error::ClaudePrintError;
 
-const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.289.input.jsonl");
-const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.289.expected.jsonl");
-const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.289.errors.jsonl");
+const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.290.input.jsonl");
+const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.290.expected.jsonl");
+const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.290.errors.jsonl");
 const CAPTURE_V233: &str = include_str!("fixtures/transcript_v2.1.233.jsonl");
 
 /// The claude version stamped into the golden error objects — the pinned
 /// version from `docs/notes/claude-contract-probes.md`, in the same
 /// `<x.y.z> (Claude Code)` form `resolve_claude_version` records.
-const GOLDEN_CLAUDE_VERSION: &str = "2.1.289 (Claude Code)";
+const GOLDEN_CLAUDE_VERSION: &str = "2.1.290 (Claude Code)";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 

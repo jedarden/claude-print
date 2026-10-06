@@ -24,11 +24,14 @@
 #   execution — the property the read-race note depends on)?
 #
 # Arm D (degraded path — permission-denied tools): the multi-round sequential
-#   tool prompt with NO allowlist, headless `-p`, `--max-turns 6`; N runs.
-#   Counts Stop firings per run and classifies each run: completed (exit 0)
-#   vs cut off by --max-turns (exit 1, zero firings — the measured cutoff
-#   contract, a re-run shape, not a finding) — an extra Stop would be >1
-#   firing per loaded source on a completed run.
+#   tool prompt with no allowlist, headless `-p`, and a project permission
+#   rule that denies the first Bash command; N runs. Each run is verified from
+#   its transcript to contain an errored Bash tool result, so a Claude Code
+#   change to the default headless permission policy cannot silently turn this
+#   into a permitted-tools measurement. Counts Stop firings per run and
+#   classifies each run: completed (exit 0) vs cut off by --max-turns (exit 1,
+#   zero firings — the measured cutoff contract, a re-run shape, not a
+#   finding) — an extra Stop would be >1 firing per loaded source.
 #
 # Arm T (relay-hook timeout enforcement): the `--settings` hook — the relay
 #   position, run with `--setting-sources=` (empty) so it is the ONLY loaded
@@ -77,7 +80,12 @@ mkdir -p "$PROJ/.claude" "$SANDBOX_HOME/.claude"
 : >"$LOG"
 
 cleanup() {
+    local status=$?
     rm -rf "$PROBE_ROOT"
+    if [ "$status" -eq 0 ] && [ "${ARM_D_INVALID:-0}" -ne 0 ]; then
+        printf 'ERROR: Arm D did not verify a completed, permission-denied Bash run.\n' >&2
+        exit 1
+    fi
 }
 trap cleanup EXIT
 
@@ -239,11 +247,11 @@ done
 rm -f "$SETTINGS_FILE"
 
 # ---------------------------------------------------------------------------
-# Arm D — degraded path: multi-round tool prompt, NO allowlist (permission-
-# denied), headless print mode
+# Arm D — degraded path: multi-round tool prompt with a command-specific Bash
+# deny rule, headless print mode
 # ---------------------------------------------------------------------------
 echo
-echo "===== Arm D: degraded runs (no allowlist, headless -p), Stop counts per run"
+echo "===== Arm D: degraded runs (explicit Bash deny, headless -p), Stop counts per run"
 
 write_payload_hook "$PROJ/log-project.sh"
 cat >"$PROJ/.claude/settings.json" <<EOF
@@ -259,11 +267,31 @@ echo "step-one-done"
 EOF
 chmod +x "$PROJ/toolwork.sh"
 
-summarize_arm_d_run() { # <base-line-count>
-    python3 - "$LOG" "$1" <<'EOF'
+# Headless Claude 2.1.290 no longer reliably denies an unlisted Bash command
+# by default. Deny the scripted command explicitly while leaving Bash
+# available, so the model still attempts the tool and the transcript carries
+# a permission-denied tool_result for this degraded-path measurement.
+python3 - "$PROJ/.claude/settings.json" "$PROJ/toolwork.sh" <<'PY'
+import json, sys
+
+settings_path, tool_path = sys.argv[1:]
+with open(settings_path) as fh:
+    settings = json.load(fh)
+permissions = settings.setdefault("permissions", {})
+deny = permissions.setdefault("deny", [])
+rule = f"Bash(*{tool_path}*)"
+if rule not in deny:
+    deny.append(rule)
+with open(settings_path, "w") as fh:
+    json.dump(settings, fh)
+PY
+
+summarize_arm_d_run() { # <base-line-count> <exit-code>
+    python3 - "$LOG" "$1" "$2" <<'EOF'
 import json, sys
 
 base = int(sys.argv[2])
+exit_code = int(sys.argv[3])
 rows = []
 with open(sys.argv[1]) as fh:
     for i, line in enumerate(fh, 1):
@@ -273,25 +301,64 @@ with open(sys.argv[1]) as fh:
         try:
             p = json.loads(payload)
         except json.JSONDecodeError:
-            rows.append((ts, "?", "", ""))
+            rows.append((ts, "?", "", "", {}))
             continue
         rows.append((
             ts,
             p.get("hook_event_name") or "?",
             str(p.get("stop_hook_active")),
             (p.get("last_assistant_message") or "").replace("\n", " ")[:60],
+            p,
         ))
-for ts, ev, sha, lam in rows:
+for ts, ev, sha, lam, _ in rows:
     print(f"  ts={ts} event={ev} stop_hook_active={sha}")
     if lam:
         print(f"      last_msg: {lam}")
 print(f"  firings this run: {len(rows)} "
       f"(Stop: {sum(1 for r in rows if r[1] == 'Stop')}, "
       f"SessionStart: {sum(1 for r in rows if r[1] == 'SessionStart')})")
+
+if exit_code != 0:
+    print(f"  INVALID: completed-run permission probe exited {exit_code}")
+    raise SystemExit(1)
+
+stop_payloads = [r[4] for r in rows if r[1] == "Stop"]
+transcript = next((p.get("transcript_path") for p in stop_payloads
+                   if p.get("transcript_path")), None)
+if not transcript:
+    print("  INVALID: Stop payload did not identify its transcript")
+    raise SystemExit(1)
+try:
+    with open(transcript) as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"  INVALID: could not read probe transcript ({type(exc).__name__})")
+    raise SystemExit(1)
+
+bash_ids = set()
+errored_bash_ids = set()
+for record in records:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        continue
+    for block in message.get("content", []) or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use" and block.get("name") == "Bash":
+            bash_ids.add(block.get("id"))
+        elif (block.get("type") == "tool_result"
+              and block.get("is_error") is True):
+            errored_bash_ids.add(block.get("tool_use_id"))
+denied = bash_ids & errored_bash_ids
+print(f"  verified errored Bash tool results: {len(denied)}")
+if not denied:
+    print("  INVALID: this run did not exercise a denied Bash tool call")
+    raise SystemExit(1)
 EOF
 }
 
 i=1
+ARM_D_INVALID=0
 while [ "$i" -le "$ARM_D_RUNS" ]; do
     BASE="$(loglines)"
     out="$( cd "$PROJ" && HOME="$SANDBOX_HOME" timeout 240 env "${SCRUB_ENV[@]}" "${FORCED_ENV[@]}" \
@@ -303,7 +370,9 @@ while [ "$i" -le "$ARM_D_RUNS" ]; do
     if [ "$rc" -ne 0 ]; then
         printf '  [D%d] output tail: %s\n' "$i" "$(printf '%s' "$out" | tail -c 300 | tr '\n' ' ')"
     fi
-    summarize_arm_d_run "$BASE"
+    if ! summarize_arm_d_run "$BASE" "$rc"; then
+        ARM_D_INVALID=1
+    fi
     i=$((i + 1))
 done
 
