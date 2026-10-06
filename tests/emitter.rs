@@ -1,5 +1,5 @@
 use claude_print::cli::OutputFormat;
-use claude_print::emitter::{emit_error, emit_success, spawn_stream_json_reader_to};
+use claude_print::emitter::{emit_error, emit_records, emit_success, spawn_stream_json_reader_to};
 use claude_print::error::ClaudePrintError;
 use claude_print::transcript::{AggregatedUsage, TranscriptResult};
 use std::io::Write;
@@ -38,6 +38,39 @@ fn capture() -> (Arc<Mutex<Vec<u8>>>, CaptureWriter) {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let writer = CaptureWriter(Arc::clone(&buf));
     (buf, writer)
+}
+
+// ── bounded opaque-record handoff ────────────────────────────────────────────
+
+#[test]
+fn test_emit_records_preserves_the_supplied_sequence_without_framing() {
+    let records = vec![
+        Vec::new(),
+        b"first\nsecond".to_vec(),
+        vec![0, 0xff, b'\n', b'\r'],
+        b"first\nsecond".to_vec(),
+        Vec::new(),
+    ];
+    let expected = [
+        b"first\nsecond".as_slice(),
+        &[0, 0xff, b'\n', b'\r'],
+        b"first\nsecond",
+    ]
+    .concat();
+    let (buf, mut writer) = capture();
+
+    emit_records(&mut writer, records).unwrap();
+
+    assert_eq!(buf.lock().unwrap().as_slice(), expected.as_slice());
+}
+
+#[test]
+fn test_emit_records_with_no_records_emits_nothing() {
+    let (buf, mut writer) = capture();
+
+    emit_records(&mut writer, Vec::new()).unwrap();
+
+    assert!(buf.lock().unwrap().is_empty());
 }
 
 // ── text format ──────────────────────────────────────────────────────────────

@@ -84,6 +84,20 @@ pub fn emit_success(
     Ok(())
 }
 
+/// Emit the caller-owned bounded sequence of opaque records exactly as supplied.
+///
+/// The handoff is the complete input: records are written once, in order, with
+/// no parsing, normalization, framing, or synthesized material between them.
+/// In particular, an empty record is consumed just like any other record and a
+/// zero-length sequence emits zero bytes. The function only uses `writer` and
+/// `records`; it does not discover or read any other source.
+pub fn emit_records(writer: &mut dyn Write, records: Vec<Vec<u8>>) -> std::io::Result<()> {
+    for record in records {
+        writer.write_all(&record)?;
+    }
+    Ok(())
+}
+
 /// Emit an error result.
 ///
 /// `text`: message to stderr only.
