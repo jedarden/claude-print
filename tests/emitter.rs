@@ -1,6 +1,6 @@
 use claude_print::cli::OutputFormat;
 use claude_print::emitter::{
-    emit_error, emit_records, emit_success, forward_records, intake_records,
+    capture_records, emit_error, emit_records, emit_success, forward_records,
     spawn_stream_json_reader_to,
 };
 use claude_print::error::ClaudePrintError;
@@ -78,7 +78,7 @@ fn test_emit_records_preserves_the_supplied_sequence_without_framing() {
     .concat();
     let (buf, mut writer) = capture();
 
-    emit_records(&mut writer, forward_records(intake_records(records))).unwrap();
+    emit_records(&mut writer, forward_records(capture_records(records))).unwrap();
 
     assert_eq!(buf.lock().unwrap().as_slice(), expected.as_slice());
 }
@@ -87,7 +87,7 @@ fn test_emit_records_preserves_the_supplied_sequence_without_framing() {
 fn test_emit_records_with_no_records_emits_nothing() {
     let (buf, mut writer) = capture();
 
-    emit_records(&mut writer, forward_records(intake_records(Vec::new()))).unwrap();
+    emit_records(&mut writer, forward_records(capture_records(Vec::new()))).unwrap();
 
     assert!(buf.lock().unwrap().is_empty());
 }
@@ -101,7 +101,7 @@ fn test_forward_records_preserves_boundaries_identity_and_multiplicity() {
         b"same\nrecord".to_vec(),
         Vec::new(),
     ];
-    let forwarded = forward_records(intake_records(records.clone()));
+    let forwarded = forward_records(capture_records(records.clone()));
 
     assert_eq!(forwarded.len(), records.len());
     assert!(!forwarded.is_empty());
@@ -113,7 +113,7 @@ fn test_forward_records_preserves_boundaries_identity_and_multiplicity() {
 
 #[test]
 fn test_forward_records_keeps_an_empty_sequence_empty() {
-    let forwarded = forward_records(intake_records(Vec::new()));
+    let forwarded = forward_records(capture_records(Vec::new()));
 
     assert!(forwarded.is_empty());
     assert_eq!(forwarded.len(), 0);
@@ -133,7 +133,7 @@ fn test_exact_sequence_handoff_acceptance_contract() {
         Vec::new(),
     ];
 
-    let forwarded = forward_records(intake_records(records.clone()));
+    let forwarded = forward_records(capture_records(records.clone()));
     let forwarded_records = forwarded
         .iter()
         .map(|record| record.to_vec())

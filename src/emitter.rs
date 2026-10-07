@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 /// them, and the private field prevents downstream code from discovering a
 /// second source or changing the supplied sequence after handoff.
 #[derive(Debug, PartialEq, Eq)]
-pub struct SuppliedRecordSequence(Box<[Vec<u8>]>);
+pub struct CapturedRecordSequence(Box<[Vec<u8>]>);
 
-impl SuppliedRecordSequence {
+impl CapturedRecordSequence {
     fn new(records: Vec<Vec<u8>>) -> Self {
         Self(records.into_boxed_slice())
     }
@@ -30,15 +30,15 @@ impl SuppliedRecordSequence {
     }
 }
 
-/// Accept exactly one finite, caller-supplied sequence of opaque records.
+/// Capture exactly one finite, caller-supplied sequence of opaque records.
 ///
 /// This is deliberately a move-only handoff. No record is synthesized,
 /// normalized, framed, or read from another source.
-pub fn intake_records(records: Vec<Vec<u8>>) -> SuppliedRecordSequence {
-    SuppliedRecordSequence::new(records)
+pub fn capture_records(records: Vec<Vec<u8>>) -> CapturedRecordSequence {
+    CapturedRecordSequence::new(records)
 }
 
-/// The record sequence passed from intake to the next handoff step.
+/// The record sequence passed from capture to the next handoff step.
 ///
 /// This is an outer boundary marker only: each record remains its original
 /// owned byte vector. Keeping the sequence as separate items makes empty and
@@ -73,7 +73,7 @@ impl ForwardedRecordSequence {
 /// No record is read, parsed, copied, normalized, deduplicated, reordered, or
 /// framed here. In particular, the move preserves one item per supplied
 /// record, including empty and duplicate-looking records.
-pub fn forward_records(records: SuppliedRecordSequence) -> ForwardedRecordSequence {
+pub fn forward_records(records: CapturedRecordSequence) -> ForwardedRecordSequence {
     ForwardedRecordSequence(records.into_records())
 }
 
@@ -879,7 +879,7 @@ fn tail_loop(
                     let mut record = trimmed.as_bytes().to_vec();
                     record.push(b'\n');
                     let _ =
-                        emit_records(&mut *writer, forward_records(intake_records(vec![record])));
+                        emit_records(&mut *writer, forward_records(capture_records(vec![record])));
                 }
             }
             Err(_) => {
