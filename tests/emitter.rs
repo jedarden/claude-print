@@ -43,6 +43,22 @@ fn capture() -> (Arc<Mutex<Vec<u8>>>, CaptureWriter) {
     (buf, writer)
 }
 
+#[derive(Default)]
+struct WriteLedger {
+    writes: Vec<Vec<u8>>,
+}
+
+impl Write for WriteLedger {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes.push(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // ── bounded opaque-record handoff ────────────────────────────────────────────
 
 #[test]
@@ -102,6 +118,50 @@ fn test_forward_records_keeps_an_empty_sequence_empty() {
     assert!(forwarded.is_empty());
     assert_eq!(forwarded.len(), 0);
     assert_eq!(forwarded.iter().count(), 0);
+}
+
+#[test]
+fn test_exact_sequence_handoff_acceptance_contract() {
+    let records = vec![
+        Vec::new(),
+        b"first".to_vec(),
+        b"repeat".to_vec(),
+        b"line one\nline two\r\nline three".to_vec(),
+        vec![0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, b'\n', 0x00],
+        b"repeat".to_vec(),
+        b" \t\r\n\x0b\x0c\x1b\xff".to_vec(),
+        Vec::new(),
+    ];
+
+    let forwarded = forward_records(intake_records(records.clone()));
+    let forwarded_records = forwarded
+        .iter()
+        .map(|record| record.to_vec())
+        .collect::<Vec<_>>();
+
+    // Keeping the outer sequence and each item exact catches drops,
+    // duplicates, reordering, and mutation, including for empty records that
+    // would be invisible after concatenation.
+    assert_eq!(forwarded_records, records);
+
+    let expected_output = records.iter().flatten().copied().collect::<Vec<_>>();
+    let expected_writes = records
+        .iter()
+        .filter(|record| !record.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut writer = WriteLedger::default();
+
+    emit_records(&mut writer, forwarded).unwrap();
+
+    // The output is exactly one bounded sequence: no separators, wrappers,
+    // normalization, or synthesized material, and one write for each
+    // non-empty supplied record.
+    assert_eq!(writer.writes, expected_writes);
+    assert_eq!(
+        writer.writes.iter().flatten().copied().collect::<Vec<_>>(),
+        expected_output
+    );
 }
 
 // ── text format ──────────────────────────────────────────────────────────────
