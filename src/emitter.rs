@@ -38,6 +38,45 @@ pub fn intake_records(records: Vec<Vec<u8>>) -> SuppliedRecordSequence {
     SuppliedRecordSequence::new(records)
 }
 
+/// The record sequence passed from intake to the next handoff step.
+///
+/// This is an outer boundary marker only: each record remains its original
+/// owned byte vector. Keeping the sequence as separate items makes empty and
+/// duplicate-looking records observable to the next step without inspecting
+/// or changing their contents.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ForwardedRecordSequence(Box<[Vec<u8>]>);
+
+impl ForwardedRecordSequence {
+    /// Return the records without flattening their boundaries.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> + '_ {
+        self.0.iter().map(Vec::as_slice)
+    }
+
+    /// Return the number of supplied records, including empty records.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return whether the supplied sequence contained no records.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn into_records(self) -> Box<[Vec<u8>]> {
+        self.0
+    }
+}
+
+/// Move the supplied sequence to the next handoff step unchanged.
+///
+/// No record is read, parsed, copied, normalized, deduplicated, reordered, or
+/// framed here. In particular, the move preserves one item per supplied
+/// record, including empty and duplicate-looking records.
+pub fn forward_records(records: SuppliedRecordSequence) -> ForwardedRecordSequence {
+    ForwardedRecordSequence(records.into_records())
+}
+
 /// Emit a successful response.
 ///
 /// `text`: writes `{response_text}\n` to stdout.
@@ -120,7 +159,7 @@ pub fn emit_success(
 /// `records`; it does not discover or read any other source.
 pub fn emit_records(
     writer: &mut dyn Write,
-    records: SuppliedRecordSequence,
+    records: ForwardedRecordSequence,
 ) -> std::io::Result<()> {
     for record in records.into_records() {
         writer.write_all(&record)?;
@@ -839,7 +878,8 @@ fn tail_loop(
                     // emitter adds no separators, wrappers, or other bytes.
                     let mut record = trimmed.as_bytes().to_vec();
                     record.push(b'\n');
-                    let _ = emit_records(&mut *writer, intake_records(vec![record]));
+                    let _ =
+                        emit_records(&mut *writer, forward_records(intake_records(vec![record])));
                 }
             }
             Err(_) => {
