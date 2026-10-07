@@ -1,6 +1,6 @@
 use claude_print::cli::OutputFormat;
 use claude_print::emitter::{
-    capture_records, emit_error, emit_records, emit_success, forward_records,
+    capture_records, emit_error, emit_records, emit_success, forward_records, handoff_records,
     spawn_stream_json_reader_to,
 };
 use claude_print::error::ClaudePrintError;
@@ -153,7 +153,7 @@ fn test_exact_sequence_handoff_acceptance_contract() {
         .collect::<Vec<_>>();
     let mut writer = WriteLedger::default();
 
-    emit_records(&mut writer, forwarded).unwrap();
+    handoff_records(&mut writer, records).unwrap();
 
     // The output is exactly one bounded sequence: no separators, wrappers,
     // normalization, or synthesized material, and one write for each

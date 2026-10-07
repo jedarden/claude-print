@@ -77,6 +77,17 @@ pub fn forward_records(records: CapturedRecordSequence) -> ForwardedRecordSequen
     ForwardedRecordSequence(records.into_records())
 }
 
+/// Complete the bounded record handoff from caller input to the writer.
+///
+/// This is the single entry point for the opaque-record path: it captures one
+/// supplied sequence, forwards that same sequence, and emits it once in order.
+/// The boundary is intentionally pure with respect to its inputs. It performs
+/// no filesystem, repository, or unrelated-source reads and contributes no
+/// bytes of its own.
+pub fn handoff_records(writer: &mut dyn Write, records: Vec<Vec<u8>>) -> std::io::Result<()> {
+    emit_records(writer, forward_records(capture_records(records)))
+}
+
 /// Emit a successful response.
 ///
 /// `text`: writes `{response_text}\n` to stdout.
@@ -878,8 +889,7 @@ fn tail_loop(
                     // emitter adds no separators, wrappers, or other bytes.
                     let mut record = trimmed.as_bytes().to_vec();
                     record.push(b'\n');
-                    let _ =
-                        emit_records(&mut *writer, forward_records(capture_records(vec![record])));
+                    let _ = handoff_records(&mut *writer, vec![record]);
                 }
             }
             Err(_) => {
