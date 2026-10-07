@@ -42,6 +42,11 @@ the capture path, never hand-edit), and the active families' versions must
 stay reconciled with each other and the doc stamp
 (`tests/contract_maintenance.rs::active_fixture_families_share_one_pinned_version`).
 
+The lower-level handoff of a supplied ordered record sequence is defined
+separately in [`supplied-record-handoff-contract.md`](supplied-record-handoff-contract.md).
+That contract governs the exact sequence boundary and opaque record bytes;
+this note governs the stream-json reader's transcript framing adjustments.
+
 ## 1. Scope
 
 In `stream-json` mode, claude-print's stdout is a **live JSONL replay of
