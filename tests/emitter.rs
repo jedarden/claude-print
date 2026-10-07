@@ -130,6 +130,7 @@ fn test_exact_sequence_handoff_acceptance_contract() {
         vec![0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, b'\n', 0x00],
         b"repeat".to_vec(),
         b" \t\r\n\x0b\x0c\x1b\xff".to_vec(),
+        "  café\t🦀\u{2028}  ".as_bytes().to_vec(),
         Vec::new(),
     ];
 
