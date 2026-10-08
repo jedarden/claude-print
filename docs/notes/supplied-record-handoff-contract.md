@@ -1,9 +1,25 @@
-# Supplied-Record Handoff Contract
+# Supplied-Capture Record Handoff Contract
 
-This note defines the bounded handoff of one caller-supplied ordered record
-sequence. It is self-contained: the contract is about the supplied sequence
-and the destination writer only. It does not infer a sequence from a file,
-transcript, repository, stream, or any other source.
+This note defines the bounded handoff of one caller-supplied, validated,
+ordered record sequence. It is self-contained: the contract is about the
+supplied capture and the destination writer only. It does not infer a sequence
+from a file, transcript, repository, stream, or any other source.
+
+## Freeze-stage input
+
+The caller supplies the complete capture directly as an in-memory sequence;
+the freeze stage has no other data input. In `src/emitter.rs`,
+`capture_records(records)` wraps that supplied sequence as a
+`CapturedRecordSequence`, and `forward_records(capture)` consumes that
+capture. `handoff_records(writer, records)` is the convenience composition:
+`writer` is only the output destination, and `records` is the one supplied
+capture. No pathname, file handle, repository root, source selector, stream,
+or fallback source is accepted; no filesystem lookup or scan is performed.
+
+Validation is a caller-side precondition. The freeze stage does not revalidate
+or reinterpret the capture, and it does not discover replacement content. In
+this contract, each sequence element is one supplied block (called a record
+in the Rust API); its position and boundary are part of the capture.
 
 ## Input boundary
 
