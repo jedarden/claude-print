@@ -59,6 +59,52 @@ impl Write for WriteLedger {
     }
 }
 
+struct BoundedOutput {
+    expected: Vec<u8>,
+    offset: usize,
+    write_calls: usize,
+}
+
+impl BoundedOutput {
+    fn new(expected: Vec<u8>) -> Self {
+        Self {
+            expected,
+            offset: 0,
+            write_calls: 0,
+        }
+    }
+
+    fn assert_complete(&self) {
+        assert_eq!(
+            self.offset,
+            self.expected.len(),
+            "handoff stopped before the supplied byte sequence was emitted"
+        );
+    }
+}
+
+impl Write for BoundedOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = self.offset + buf.len();
+        assert!(
+            end <= self.expected.len(),
+            "handoff emitted bytes beyond its supplied sequence: {buf:?}"
+        );
+        assert_eq!(
+            buf,
+            &self.expected[self.offset..end],
+            "handoff reordered, changed, or framed the supplied bytes"
+        );
+        self.offset = end;
+        self.write_calls += 1;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // ── bounded opaque-record handoff ────────────────────────────────────────────
 
 #[test]
@@ -90,6 +136,18 @@ fn test_emit_records_with_no_records_emits_nothing() {
     emit_records(&mut writer, forward_records(capture_records(Vec::new()))).unwrap();
 
     assert!(buf.lock().unwrap().is_empty());
+}
+
+#[test]
+fn test_handoff_records_emits_no_material_for_empty_supplied_records() {
+    for records in [Vec::new(), vec![Vec::new()], vec![Vec::new(), Vec::new()]] {
+        let mut writer = BoundedOutput::new(Vec::new());
+
+        handoff_records(&mut writer, records).unwrap();
+
+        writer.assert_complete();
+        assert_eq!(writer.write_calls, 0);
+    }
 }
 
 #[test]
@@ -163,6 +221,30 @@ fn test_exact_sequence_handoff_acceptance_contract() {
         writer.writes.iter().flatten().copied().collect::<Vec<_>>(),
         expected_output
     );
+}
+
+#[test]
+fn test_handoff_records_is_bounded_and_source_independent() {
+    // These values deliberately resemble paths, repository metadata, and a
+    // second source. They are still only opaque supplied bytes: the handoff
+    // must not open, infer, or append anything based on their spelling.
+    let records = vec![
+        b"/not-a-source/README.md".to_vec(),
+        Vec::new(),
+        b".git/HEAD\n".to_vec(),
+        b"unrelated-source\0\xff".to_vec(),
+        b".git/HEAD\n".to_vec(),
+        Vec::new(),
+    ];
+    let expected = records.iter().flatten().copied().collect::<Vec<_>>();
+    let expected_non_empty = records.iter().filter(|record| !record.is_empty()).count();
+    let mut writer = BoundedOutput::new(expected.clone());
+
+    handoff_records(&mut writer, records).unwrap();
+
+    writer.assert_complete();
+    assert_eq!(writer.write_calls, expected_non_empty);
+    assert_eq!(writer.expected, expected);
 }
 
 // ── text format ──────────────────────────────────────────────────────────────
