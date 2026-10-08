@@ -1,7 +1,7 @@
 use claude_print::cli::OutputFormat;
 use claude_print::emitter::{
-    capture_records, emit_error, emit_records, emit_success, forward_records, handoff_records,
-    spawn_stream_json_reader_to,
+    capture_records, emit_error, emit_records, emit_success, forward_records, freeze_records,
+    handoff_records, spawn_stream_json_reader_to, MissingCapture,
 };
 use claude_print::error::ClaudePrintError;
 use claude_print::transcript::{AggregatedUsage, TranscriptResult};
@@ -106,6 +106,32 @@ impl Write for BoundedOutput {
 }
 
 // ── bounded opaque-record handoff ────────────────────────────────────────────
+
+#[test]
+fn test_freeze_stage_uses_only_the_supplied_capture() {
+    let supplied = vec![
+        b"/not-a-source/README.md".to_vec(),
+        Vec::new(),
+        b".git/HEAD\n".to_vec(),
+        b"alternate-source\0\xff".to_vec(),
+        b".git/HEAD\n".to_vec(),
+    ];
+
+    let frozen = freeze_records(Some(capture_records(supplied.clone()))).unwrap();
+
+    assert_eq!(frozen.len(), supplied.len());
+    assert_eq!(
+        frozen.iter().collect::<Vec<_>>(),
+        supplied.iter().map(Vec::as_slice).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_freeze_stage_rejects_missing_capture_without_another_source() {
+    let result = freeze_records(None);
+
+    assert_eq!(result, Err(MissingCapture));
+}
 
 #[test]
 fn test_emit_records_preserves_the_supplied_sequence_without_framing() {

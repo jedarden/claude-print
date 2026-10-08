@@ -11,6 +11,18 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The freeze stage could not be given its sole input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingCapture;
+
+impl std::fmt::Display for MissingCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("freeze stage requires a caller-supplied capture")
+    }
+}
+
+impl std::error::Error for MissingCapture {}
+
 /// The one caller-supplied input to the opaque record handoff.
 ///
 /// The outer slice fixes the sequence boundary at intake. Its records remain
@@ -36,6 +48,20 @@ impl CapturedRecordSequence {
 /// normalized, framed, or read from another source.
 pub fn capture_records(records: Vec<Vec<u8>>) -> CapturedRecordSequence {
     CapturedRecordSequence::new(records)
+}
+
+/// Freeze the one caller-supplied capture for the next handoff stage.
+///
+/// `None` is a missing input, not permission to discover another source. The
+/// explicit error keeps a caller from accidentally turning an absent capture
+/// into a filesystem, repository, or fallback lookup. A present capture is
+/// moved through without inspecting or changing any record or boundary.
+pub fn freeze_records(
+    capture: Option<CapturedRecordSequence>,
+) -> Result<ForwardedRecordSequence, MissingCapture> {
+    capture
+        .map(|capture| ForwardedRecordSequence(capture.into_records()))
+        .ok_or(MissingCapture)
 }
 
 /// The record sequence passed from capture to the next handoff step.
@@ -74,7 +100,11 @@ impl ForwardedRecordSequence {
 /// framed here. In particular, the move preserves one item per supplied
 /// record, including empty and duplicate-looking records.
 pub fn forward_records(records: CapturedRecordSequence) -> ForwardedRecordSequence {
-    ForwardedRecordSequence(records.into_records())
+    // A CapturedRecordSequence can only reach this compatibility helper when
+    // the caller supplied it, so the explicit freeze-stage absence check is
+    // unreachable here. Keeping the check in `freeze_records` makes the
+    // optional boundary explicit for callers that model a missing capture.
+    freeze_records(Some(records)).expect("a supplied capture cannot be missing")
 }
 
 /// Complete the bounded record handoff from caller input to the writer.

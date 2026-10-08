@@ -10,11 +10,15 @@ from a file, transcript, repository, stream, or any other source.
 The caller supplies the complete capture directly as an in-memory sequence;
 the freeze stage has no other data input. In `src/emitter.rs`,
 `capture_records(records)` wraps that supplied sequence as a
-`CapturedRecordSequence`, and `forward_records(capture)` consumes that
-capture. `handoff_records(writer, records)` is the convenience composition:
-`writer` is only the output destination, and `records` is the one supplied
-capture. No pathname, file handle, repository root, source selector, stream,
-or fallback source is accepted; no filesystem lookup or scan is performed.
+`CapturedRecordSequence`. The freeze stage is `freeze_records(capture)`:
+`Some(capture)` consumes that exact sequence, while `None` returns
+`MissingCapture`. A missing capture is an error, never a request to consult a
+fallback source. `forward_records(capture)` is the non-optional compatibility
+helper for an already-present capture. `handoff_records(writer, records)` is
+the convenience composition: `writer` is only the output destination, and
+`records` is the one supplied capture. No pathname, file handle, repository
+root, source selector, stream, or fallback source is accepted; no filesystem
+lookup or scan is performed.
 
 Validation is a caller-side precondition. The freeze stage does not revalidate
 or reinterpret the capture, and it does not discover replacement content. In
