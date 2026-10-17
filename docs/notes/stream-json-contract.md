@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Pinned by** | `tests/stream_json_contract.rs` against the `tests/fixtures/stream_json_golden_v2.1.301.{input,expected,errors}.jsonl` triple |
+| **Pinned by** | `tests/stream_json_contract.rs` against the `tests/fixtures/stream_json_golden_v2.1.302.{input,expected,errors}.jsonl` triple |
 | **Implementation** | `src/emitter.rs` (the reader thread: `spawn_stream_json_reader_bound_to`, `tail_loop`, `StreamJsonHandle`), spawned and drained by `src/session.rs`; error objects by `emit_error` |
 | **Summarized by** | `docs/notes/output-format-contracts.md` §`stream-json` mode and the README — this document is the normative deep-dive; where they differ, this document wins |
-| **Provenance** | bead claudepr-6b587922 (2026-09-25); binding design bead claudepr-a927ec0c; first-output credit bead claudepr-33fdf4ed; re-measured and re-pinned to 2.1.282 by claudepr-b590e46d; re-measured and re-pinned to 2.1.288 by claudepr-cb9dcf25 (2026-10-02); re-measured and re-pinned to 2.1.289 by claudepr-9e054b3d (2026-10-04); re-measured and re-pinned to 2.1.290 by claudepr-c02f9cfc (2026-10-06); re-measured and re-pinned to 2.1.292 by claudepr-1558810f (2026-10-07; 39-record authenticated capture); re-measured and re-pinned to 2.1.294 by claudepr-49259380 (2026-10-08; prior pin); re-measured and re-pinned to 2.1.296 by claudepr-0548e0e4 (2026-10-09; prior pin); re-measured and re-pinned to 2.1.299 by claudepr-7ef1382c (2026-10-14; historical 41-record authenticated capture); re-measured and re-pinned to 2.1.300 by claudepr-05a74d6c (2026-10-15; historical 34-record authenticated capture); re-measured and re-pinned to 2.1.301 by claudepr-7b323468 (2026-10-16; 30-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path) |
+| **Provenance** | bead claudepr-6b587922 (2026-09-25); binding design bead claudepr-a927ec0c; first-output credit bead claudepr-33fdf4ed; re-measured and re-pinned to 2.1.282 by claudepr-b590e46d; re-measured and re-pinned to 2.1.288 by claudepr-cb9dcf25 (2026-10-02); re-measured and re-pinned to 2.1.289 by claudepr-9e054b3d (2026-10-04); re-measured and re-pinned to 2.1.290 by claudepr-c02f9cfc (2026-10-06); re-measured and re-pinned to 2.1.292 by claudepr-1558810f (2026-10-07; 39-record authenticated capture); re-measured and re-pinned to 2.1.294 by claudepr-49259380 (2026-10-08; prior pin); re-measured and re-pinned to 2.1.296 by claudepr-0548e0e4 (2026-10-09; prior pin); re-measured and re-pinned to 2.1.299 by claudepr-7ef1382c (2026-10-14; historical 41-record authenticated capture); re-measured and re-pinned to 2.1.300 by claudepr-05a74d6c (2026-10-15; historical 34-record authenticated capture); re-measured and re-pinned to 2.1.301 by claudepr-7b323468 (2026-10-16; historical 30-record authenticated capture); re-measured and re-pinned to 2.1.302 by claudepr-fa11b4f7 (2026-10-17; 39-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path) |
 
 This note is the normative definition of what `--output-format stream-json`
 writes to stdout: the framing of each line, which records are forwarded and
@@ -17,14 +17,14 @@ against a committed file, so any re-serialization, reorder, drop, duplicate,
 or synthesized byte surfaces as a diff in review, not as silent drift.
 
 The golden fixtures are version-pinned like the transcript captures
-(`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.301` in the filename
+(`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.302` in the filename
 names the Claude Code capture family whose record shapes the fixtures model,
 and the `claude_version` stamped into the golden error objects is
-`2.1.301 (Claude Code)`. The envelopes were re-measured against live
-claude 2.1.301 on 2026-10-16 in an authenticated, sandboxed PTY session driven
-through claude-print itself. The capture completed with 30 records, no
+`2.1.302 (Claude Code)`. The envelopes were re-measured against live
+claude 2.1.302 on 2026-10-17 in an authenticated, sandboxed PTY session driven
+through claude-print itself. The capture completed with 39 records, no
 `result` record, no CR or blank lines, and stdout byte-identical to the
-transcript. The capture included `permission-mode`, `atis-latch`,
+transcript. The capture again included `permission-mode`, `atis-latch`,
 `file-history-snapshot`, `last-prompt`, `ai-title`, `cost-state`, a
 `turn_duration` system record, and attachment types such as
 `agent_listing_delta`, `session_context`, `date`, `remote_session_change`,
@@ -35,7 +35,7 @@ The input golden uses sanitized representative records from that live
 transcript, with a retained thinking/split assistant case carrying
 `wireToolInputs` from earlier live
 evidence and retained spaced-JSON/Unicode and blank/CRLF framing cases. The
-2.1.300 capture family and earlier families are retained beside the active
+2.1.301 capture family and earlier families are retained beside the active
 one as measurement history. Re-pins follow the same maintenance workflow as
 the other version-stamped fixtures (`docs/notes/claude-contract-probes.md`
 §Maintenance), and the active families' versions must stay reconciled with
@@ -106,12 +106,12 @@ Consequences, each pinned:
 - **Every record type flows.** `summary`, `user`, `assistant`, `system`,
   `result` — and every record type measured PTY versions additionally write
   (`mode`, `permission-mode`, `attachment`, `last-prompt`, `ai-title`,
-  `cost-state`, `atis-latch`, and `file-history-snapshot`, …). The 2.1.301
-  capture also included a `turn_duration` system record and the `date` and
-  `remote_session_change` attachment types. Earlier 2.1.300, 2.1.299 and 2.1.294 captures carried a sampled
+  `cost-state`, `atis-latch`, and `file-history-snapshot`, …). The 2.1.302
+  capture again included a `turn_duration` system record and the `date` and
+  `remote_session_change` attachment types. Earlier 2.1.301, 2.1.300, 2.1.299 and 2.1.294 captures carried a sampled
   `permissionDecision` tool-result record;
   earlier 2.1.294 and 2.1.296 tool-use records carried `wireToolInputs`,
-  absent from the 2.1.301 sample. The reader has no type-aware behavior on this
+  absent from the 2.1.302 sample. The reader has no type-aware behavior on this
   path. A `result` record, when the transcript holds one (the
   print/SDK-shaped captures, e.g. `tests/fixtures/transcript_v2.1.233.jsonl`),
   is forwarded like any other line, verbatim.
@@ -274,7 +274,7 @@ stream-json path ever *writes* rather than forwards. It has five fields
 (lexicographic serialization order): `claude_version`, `error_message`,
 `is_error` (always `true`), `subtype`, and `type: "result"`. Both golden
 error lines — the session error and the config error — are pinned
-byte-for-byte in `stream_json_golden_v2.1.301.errors.jsonl`.
+byte-for-byte in `stream_json_golden_v2.1.302.errors.jsonl`.
 
 - **Session errors after injection** (watchdog timeout, interrupt,
   assistant error, child exit, internal failure): the object is **appended
