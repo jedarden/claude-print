@@ -3,11 +3,11 @@
 //! The contract these fixtures pin is specified in
 //! `docs/notes/stream-json-contract.md`; each test names the section it pins.
 //! Golden fixtures are version-pinned like the transcript captures
-//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.302` in the filename
+//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.307` in the filename
 //! is the pinned Claude Code version from
 //! `docs/notes/claude-contract-probes.md`. The record envelopes were
-//! re-measured against live claude 2.1.302 on 2026-10-17: an authenticated,
-//! sandboxed claude-print PTY capture completed with 39 records, no `result`
+//! re-measured against live claude 2.1.307 on 2026-10-22: an authenticated,
+//! sandboxed claude-print PTY capture completed with 32 records, no `result`
 //! record, no CR or blank lines, and stdout byte-identical to its transcript.
 //! No tool-use or thinking record occurred in this capture; the assistant
 //! record carried `requestRef`. A sanitized thinking/tool-use pair with that
@@ -15,32 +15,33 @@
 //! 2.1.282 envelope shapes carried over with `requestId` and
 //! `message.input_transformations` on the sampled assistant record. The new
 //! capture again observed `permission-mode`, `atis-latch`,
-//! `file-history-snapshot`, `attachment` (including `date` and
-//! `remote_session_change`), `last-prompt`, `ai-title`, and `cost-state`
-//! records flowing, matching the 2.1.301 coverage; the fixture carries
+//! `file-history-snapshot`, `attachment` (including `date`,
+//! `remote_session_change`, and `auto_mode`), `last-prompt`, and `cost-state`
+//! records flowing, and newly observed a `deferred_tools_delta` attachment.
+//! An `ai-title` record occurred live again (twice, as on the 2.1.302 pin;
+//! the 2.1.303 capture had none); a sanitized thinking/split record case is
+//! retained from an earlier live capture. The fixture carries
 //! representative samples.
-//! A sanitized thinking/split
-//! record case is retained from an earlier live capture.
 //! The envelope set was previously re-measured against 2.1.282 on 2026-09-25
 //! (claudepr-b590e46d: `thinking` blocks and split assistant records sharing a
 //! `message.id` observed live); the prior `v2.1.270`, `v2.1.282`, `v2.1.288`,
-//! and `v2.1.301` families are retained in `tests/fixtures/` as measurement
-//! history.
+//! `v2.1.301`, `v2.1.302`, and `v2.1.303` families are retained in
+//! `tests/fixtures/` as measurement history.
 //!
 //! What the golden pairs pin, and why each file exists:
 //!
-//! * `stream_json_golden_v2.1.302.input.jsonl` — a PTY-shaped transcript (the
+//! * `stream_json_golden_v2.1.307.input.jsonl` — a PTY-shaped transcript (the
 //!   shape `claude-print` actually tails: `mode`/`user`/`assistant`/`system`/
 //!   auxiliary records, NO `result` record) carrying one instance of every
-//!   byte-level case the contract calls out: a 2.1.302 `mode` record (introduced
+//!   byte-level case the contract calls out: a 2.1.307 `mode` record (introduced
 //!   in 2.1.282), a live `turn_duration` record, compact JSON, spaced JSON (no
 //!   re-serialization), unicode text, a retained `thinking` block, split assistant
 //!   records sharing a `message.id` (forwarded verbatim, no dedup), a blank
 //!   line (dropped), and a CRLF-terminated line (CR trimmed).
-//! * `stream_json_golden_v2.1.302.expected.jsonl` — the exact stdout bytes a
+//! * `stream_json_golden_v2.1.307.expected.jsonl` — the exact stdout bytes a
 //!   full replay must produce: input minus the blank line, CR removed, every
 //!   line LF-terminated.
-//! * `stream_json_golden_v2.1.302.errors.jsonl` — the exact bytes of the two
+//! * `stream_json_golden_v2.1.307.errors.jsonl` — the exact bytes of the two
 //!   synthesized `result` error objects: the session-error line written to
 //!   stdout (line 1) and the config-error line written to stderr (line 2).
 //!
@@ -62,15 +63,15 @@ use claude_print::emitter::{
 };
 use claude_print::error::ClaudePrintError;
 
-const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.302.input.jsonl");
-const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.302.expected.jsonl");
-const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.302.errors.jsonl");
+const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.307.input.jsonl");
+const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.307.expected.jsonl");
+const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.307.errors.jsonl");
 const CAPTURE_V233: &str = include_str!("fixtures/transcript_v2.1.233.jsonl");
 
 /// The claude version stamped into the golden error objects — the pinned
 /// version from `docs/notes/claude-contract-probes.md`, in the same
 /// `<x.y.z> (Claude Code)` form `resolve_claude_version` records.
-const GOLDEN_CLAUDE_VERSION: &str = "2.1.302 (Claude Code)";
+const GOLDEN_CLAUDE_VERSION: &str = "2.1.307 (Claude Code)";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
