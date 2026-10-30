@@ -1,0 +1,247 @@
+{
+  "claude_version": "2.1.314",
+  "measured_at": "2026-10-30",
+  "version_guard": {
+    "start": "2.1.314",
+    "end": "2.1.314",
+    "provenance": "All four guarded probes ran against concrete Claude Code 2.1.314 on 2026-10-30; each ended version-guard: verdict=single-version start=2.1.314 end=2.1.314 binary=/home/coding/.local/share/claude/versions/2.1.314. Arm S observed concurrent hook execution in 24/24 event pairs across two invocations with relay-first in 10/24 (5 of 12 in each invocation). Arm D's first invocation completed 5/5 explicit-deny runs with every run exiting 0 and firing exactly one Stop, all 5 verifying an errored Bash result; a second invocation was cut off mid-arm by the documented --max-turns shape (its fifth run exited 1 with zero Stops - the cutoff re-run shape, not a completed-run deviation; that invocation's four completed runs also exited 0 at exactly one Stop with verified errored Bash results, noted as corroboration only). Arm T killed all 16 overrun firings while all 8 sessions exited 0 with replies at 5.1 s after Stop-hook start. The dedicated TUI probe observed one Stop per turn at 12.9 s / 3.8 s. Arm P completed both sequential Bash rounds with --allowedTools=Bash, final message DONE, exit 0, one Stop; the allowed-tool TUI arm's first prompt hit a zero-firing driver window (205.1 s, the documented incomplete-turn re-run shape, not a finding) and its second prompt completed at one Stop (39.5 s). probe-claude-contracts T2 completed both turns with two Stops per turn for its two loaded sources (47.5 s / 31.5 s), and T1/T3 retained the one-Stop/completed and zero-Stop/cutoff shapes. A same-session authenticated claude-print stream-json PTY capture used the same pinned binary; its 36-record stdout was byte-identical to the transcript, with no result, CR, or blank records. The sanitized family uses representatives from that live capture (including its two live ai-title records) and retains the historical thinking/tool-use and framing cases. Replay bytes and error objects were produced and verified against the production reader and emitter."
+  },
+  "probe_scripts": [
+    "scripts/probe-claude-contracts.sh",
+    "scripts/probe-stop-toolallowed.sh",
+    "scripts/probe-tui-second-turn.sh",
+    "scripts/probe-stop-edge-contracts.sh"
+  ],
+  "evidence": "docs/notes/claude-contract-probes.md",
+  "resolves": [
+    "PO-1",
+    "PO-2",
+    "OQ-1",
+    "OQ-2",
+    "Stop-poller assumption (plan \u00a77)",
+    "relay-hook timeout (hook-design.md Relay Hook)"
+  ],
+  "contracts": {
+    "settings_flag_merges_not_replaces": true,
+    "all_loaded_sources_hooks_fire": true,
+    "cross_source_hook_order_guaranteed": false,
+    "setting_sources_empty_accepted": true,
+    "setting_sources_empty_suppresses_standard_sources": true,
+    "settings_file_loads_despite_setting_sources_empty": true,
+    "setting_sources_none_accepted": false,
+    "stop_firings_single_turn_completed_run_per_loaded_source": 1,
+    "stop_firings_multi_round_tool_use_completed_turn": 1,
+    "stop_firings_tui_per_turn": 1,
+    "stop_firings_max_turns_cutoff": 0,
+    "stop_firings_max_turns_cutoff_exit_code": 1,
+    "hook_timeout_kills_overrun_hook": true,
+    "hook_timeout_overrun_session_proceeds": true
+  },
+  "notes": {
+    "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host real settings and .claude.json were not read or modified. The host credentials file, when present, was copied file-to-file into the sandbox and never printed.",
+    "cross_source_order_evidence": "2.1.314 Arm S: across twelve runs and both hook events, all 24/24 pairs were concurrent over two invocations; the relay started first in 10/24. The result is concurrency, not a contractual source order: claude-print must not depend on order.",
+    "tui_per_turn_evidence": "The dedicated probe-tui-second-turn.sh run on 2.1.314 completed two TUI turns: turn 1 fired 1 Stop with its reply rendered in 12.9 s, and turn 2 fired 1 Stop with its reply rendered in 3.8 s. The allowed-tool TUI arm's first prompt hit a zero-firing driver window (205.1 s - the re-run shape, not a finding); its second prompt completed at one Stop (39.5 s).",
+    "degraded_path_hazard": "Arm D on 2.1.314: 5 of 5 explicit-deny runs in its first invocation verified an errored Bash result, every run exited 0 and fired exactly one Stop. A second invocation was cut off mid-arm by the --max-turns shape (exit 1, zero Stops - the documented cutoff re-run); its four completed runs each verified an errored Bash result at exactly one Stop, exit 0. The historical 2.1.270 extra-Stop hazard did not reproduce.",
+    "print_mode_tool_use_evidence": "Arm P on 2.1.314 used --allowedTools=Bash. Both sequential Bash rounds completed in order, the final message was DONE, stop_hook_active was false, exit was 0, and exactly 1 Stop fired.",
+    "cutoff_evidence": "The focused 2.1.314 -p run with --max-turns 2 exited 1 and fired zero own Stops (the probe's per-arm print is the shared log's cumulative project count, 4, of which P1/P2/P6/T1 own one each); the cutoff remains owned by the --stop-hook-timeout watchdog, not the Stop Poller.",
+    "hook_timeout_evidence": "Arm T on 2.1.314 configured a relay-position hook with timeout 5 s and sleep 30 s across eight runs in two invocations: all 16 event firings were killed, all 8 sessions exited 0 with replies, and each Stop hook-to-process completion was 5.1 s."
+  },
+  "doc_evidence": {
+    "active_version": "2.1.314",
+    "cross_source": {
+      "concurrent_pairs": {
+        "observed": 24,
+        "total": 24
+      },
+      "relay_first_pairs": {
+        "observed": 10,
+        "total": 24
+      },
+      "earlier_concurrent_pairs": {
+        "observed": 24,
+        "total": 24
+      },
+      "earlier_relay_first_pairs": [
+        {
+          "observed": 5,
+          "total": 12
+        },
+        {
+          "observed": 1,
+          "total": 12
+        },
+        {
+          "observed": 4,
+          "total": 24
+        },
+        {
+          "observed": 3,
+          "total": 12
+        },
+        {
+          "observed": 6,
+          "total": 12
+        },
+        {
+          "observed": 4,
+          "total": 12
+        },
+        {
+          "observed": 5,
+          "total": 12
+        }
+      ]
+    },
+    "permission_denied_runs": {
+      "observed": 5,
+      "total": 5
+    },
+    "hook_timeout": {
+      "killed_firings": {
+        "observed": 16,
+        "total": 16
+      },
+      "successful_sessions": {
+        "observed": 8,
+        "total": 8
+      },
+      "rendered_replies": {
+        "observed": 8,
+        "total": 8
+      },
+      "rendered_per_invocation": {
+        "observed": 4,
+        "total": 4
+      },
+      "elapsed_seconds": 5.1
+    },
+    "stop_counts": {
+      "single_turn_per_loaded_source": 1,
+      "multi_round": 1,
+      "permission_denied": 1,
+      "tui_turn_1": 1,
+      "tui_turn_2": 1,
+      "max_turns_cutoff": 0
+    },
+    "active_tui_seconds": [
+      12.9,
+      3.8
+    ],
+    "historical": [
+      {
+        "version": "2.1.270",
+        "cross_source_relay_first_runs": {
+          "observed": 1,
+          "total": 4
+        },
+        "permission_denied_extra_stop_runs": {
+          "observed": 1,
+          "total": 2
+        },
+        "tui_seconds": [
+          22.6,
+          15.1
+        ]
+      },
+      {
+        "version": "2.1.281",
+        "arm_t_seconds": [
+          48.0,
+          60.0
+        ],
+        "tui_seconds": [
+          48.0,
+          60.0,
+          13.0,
+          9.1
+        ]
+      },
+      {
+        "version": "2.1.282",
+        "arm_t_seconds": [
+          62.5,
+          32.5,
+          60.5
+        ],
+        "tui_seconds": [
+          62.5,
+          32.5,
+          60.5,
+          41.6,
+          3.3
+        ]
+      },
+      {
+        "version": "2.1.307",
+        "cross_source_relay_first_runs": null,
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": null,
+        "tui_seconds": [
+          9.4,
+          2.8
+        ]
+      },
+      {
+        "version": "2.1.308",
+        "cross_source_relay_first_runs": null,
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": [
+          10.1,
+          6.7
+        ],
+        "tui_seconds": [
+          10.1,
+          6.7,
+          48.5
+        ]
+      },
+      {
+        "version": "2.1.309",
+        "arm_t_seconds": [
+          3.6,
+          10.3
+        ],
+        "tui_seconds": [
+          3.6,
+          10.3,
+          52.5,
+          27.0
+        ]
+      },
+      {
+        "version": "2.1.311",
+        "arm_t_seconds": [
+          2.2,
+          2.1
+        ],
+        "tui_seconds": [
+          2.2,
+          2.1,
+          31.5,
+          26.5
+        ]
+      },
+      {
+        "version": "2.1.312",
+        "arm_t_seconds": [
+          7.8,
+          2.1
+        ],
+        "tui_seconds": [
+          7.8,
+          2.1,
+          205.1
+        ]
+      }
+    ],
+    "notes": {
+      "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host real settings and .claude.json were not read or modified. The host credentials file, when present, was copied file-to-file into the sandbox and never printed.",
+      "cross_source_order_evidence": "2.1.314 Arm S: across twelve runs and both hook events over two invocations, all 24/24 pairs were concurrent; the relay started first in 10/24. The result is concurrency, not a contractual source order: claude-print must not depend on order.",
+      "tui_per_turn_evidence": "The dedicated probe-tui-second-turn.sh run on 2.1.314 completed two TUI turns: turn 1 fired 1 Stop with its reply rendered in 12.9 s, and turn 2 fired 1 Stop with its reply rendered in 3.8 s. The allowed-tool TUI arm's first prompt hit a zero-firing driver window instead (205.1 s - the re-run shape, not a finding); its second prompt completed at one Stop (39.5 s).",
+      "degraded_path_hazard": "Arm D on 2.1.314: 5 of 5 explicit-deny runs across its first invocation verified an errored Bash result, every run exited 0 and fired exactly one Stop; a second invocation was cut off mid-arm by the --max-turns shape. The historical 2.1.270 extra-Stop hazard did not reproduce.",
+      "print_mode_tool_use_evidence": "Arm P on 2.1.314 used --allowedTools=Bash. Both sequential Bash rounds completed in order, the final message was DONE, stop_hook_active was false, exit was 0, and exactly 1 Stop fired.",
+      "cutoff_evidence": "The focused 2.1.314 -p run with --max-turns 2 exited 1 and fired zero own Stops; the cutoff remains owned by the --stop-hook-timeout watchdog, not the Stop Poller.",
+      "hook_timeout_evidence": "Arm T on 2.1.314 configured a relay-position hook with timeout 5 s and sleep 30 s across eight runs in two invocations: all 16 event firings were killed, all 8 sessions exited 0 with replies, and each Stop hook-to-process completion was 5.1 s."
+    }
+  }
+}
