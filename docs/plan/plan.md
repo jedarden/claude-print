@@ -1282,6 +1282,7 @@ CI stores `last-claude-version.txt` as a build artifact. On the next run, if the
 
 **Token count regression test:**
 - Fixture: `tests/fixtures/transcript_v2.1.168.jsonl` — a real captured transcript
+- Fixture: `tests/fixtures/transcript_v2.1.317.jsonl` — a real authenticated claude-print PTY session under Claude Code 2.1.317 (captured 2026-11-03, claudepr-3d431853), sanitized: synthetic ids/paths, account email and claude.ai connector roster genericized, bulky attachment/`api-request-*` payloads redacted; pins the 16-record-type PTY census, the no-`result`-record shape, the `entrypoint: cli` stamp, and the new-in-2.1.317 usage fields (`output_tokens_details`, `inference_geo`, `iterations`, `fallback_credit`)
 - Assert: token sum matches hardcoded expected values
 - When a new Claude version produces transcripts with a different schema, add a new fixture and assert on the new values. Both old and new fixtures must pass simultaneously (the parser handles both)
 

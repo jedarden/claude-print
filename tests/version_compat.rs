@@ -757,6 +757,203 @@ fn fixture_v233_unknown_usage_fields_ignored() {
     );
 }
 
+// ── Token count regression: real session transcript_v2.1.317.jsonl ────────────
+//
+// A real authenticated claude-print PTY session under the pinned Claude
+// 2.1.317 binary (claudepr-3d431853, 2026-11-03), sanitized: every uuid /
+// msg_* / req_* / toolu_* id replaced with a stable synthetic value, the
+// sandbox capture path generalized, the capturing account's email
+// genericized to user@example.com and its real claude.ai connector roster
+// to a synthetic mcp__example_* namespace, the beta-id array replaced with
+// a count-preserving marker (its real ids juxtapose into the JSON shape
+// gitleaks' generic-api-key rule flags), and the bulky attachment /
+// api-request-shape / api-request-blob payloads (>3 KiB records) replaced
+// with compact redaction markers that keep the record's type and top-level
+// key set. 50 records, 16 distinct record types — the record-type census of
+// a full 2.1.317 PTY session, most of which the parser must skip silently.
+
+#[test]
+fn token_regression_fixture_v2_1_317() {
+    let path = repo_path("tests/fixtures/transcript_v2.1.317.jsonl");
+    let r = parse_transcript(&path).expect("parse fixture failed");
+    // Turn 1: msg_2_1_317_01 — tool_use turn, in=2, out=83,
+    //         cache_create=38538, cache_read=0
+    // Turn 2: msg_2_1_317_04 — final text turn, in=2, out=9,
+    //         cache_create=462, cache_read=38538
+    assert_eq!(r.num_turns, 2, "fixture has 2 unique assistant turns");
+    assert_eq!(r.usage.input_tokens, 4, "input_tokens mismatch (2 + 2)");
+    assert_eq!(r.usage.output_tokens, 92, "output_tokens mismatch (83 + 9)");
+    assert_eq!(
+        r.usage.cache_creation_input_tokens, 39000,
+        "cache_creation mismatch (38538 + 462)"
+    );
+    assert_eq!(
+        r.usage.cache_read_input_tokens, 38538,
+        "cache_read mismatch (0 + 38538)"
+    );
+    // Last turn's text
+    assert_eq!(r.text, "capture-217-ok", "last turn text mismatch");
+    assert!(!r.is_error, "a completed session must not be an error");
+    // The session id comes from an ordinary record's sessionId (here a
+    // `mode` record — a type the parser otherwise skips), not from a
+    // `type:"result"` event: a PTY transcript has none.
+    assert_eq!(
+        r.session_id.as_deref(),
+        Some("00000000-0000-4000-8000-000000000001"),
+        "session id must be picked up from the first record carrying one"
+    );
+    assert!(!r.used_fallback, "a readable transcript must not fall back");
+}
+
+// ── Fixture 2.1.317: PTY-session schema facts ─────────────────────────────────
+
+#[test]
+fn fixture_v2_1_317_pty_session_schema() {
+    let path = repo_path("tests/fixtures/transcript_v2.1.317.jsonl");
+    let raw = std::fs::read_to_string(&path).expect("reading fixture");
+    let mut saw_assistant = 0usize;
+    let mut saw_user = 0usize;
+    let mut last_assistant: Option<serde_json::Value> = None;
+    let mut record_types = std::collections::BTreeSet::new();
+    for line in raw.lines() {
+        let rec: serde_json::Value =
+            serde_json::from_str(line).expect("every fixture line is valid JSON");
+        let kind = rec
+            .get("type")
+            .and_then(|t| t.as_str())
+            .expect("every record carries type")
+            .to_owned();
+        record_types.insert(kind.clone());
+        match kind.as_str() {
+            "assistant" => {
+                saw_assistant += 1;
+                last_assistant = Some(rec.clone());
+                // Schema facts of a 2.1.317 PTY assistant record: the
+                // billing entrypoint and the writer version ride on every
+                // ordinary record; the message carries the real API shape.
+                assert_eq!(
+                    rec.get("entrypoint").and_then(|v| v.as_str()),
+                    Some("cli"),
+                    "assistant records must carry the cli entrypoint (AS-4)"
+                );
+                assert_eq!(
+                    rec.get("version").and_then(|v| v.as_str()),
+                    Some("2.1.317"),
+                    "assistant records must stamp the writer version"
+                );
+                let msg = rec.get("message").expect("assistant message");
+                let usage = msg.get("usage").expect("assistant usage");
+                // New in 2.1.317 relative to the synthetic v2.1.233 fixture:
+                // these fields must stay ignored by the parser (checked by
+                // the token regression above); pin them so a future fixture
+                // re-capture notices the day they change again.
+                for field in [
+                    "output_tokens_details",
+                    "inference_geo",
+                    "iterations",
+                    "fallback_credit",
+                ] {
+                    assert!(
+                        usage.get(field).is_some(),
+                        "2.1.317 usage carries {field}; if a re-capture dropped \
+                         it, update this fixture pin"
+                    );
+                }
+            }
+            "user" => saw_user += 1,
+            "result" => panic!(
+                "a PTY/TUI transcript must not contain a type:\"result\" event — \
+                 that is a print/SDK-mode construct (see SessionIdProbe)"
+            ),
+            _ => {}
+        }
+    }
+    assert_eq!(saw_assistant, 2, "two assistant turns");
+    assert_eq!(saw_user, 2, "the prompt and its tool_result");
+    // The session ends on an end_turn assistant message; the first turn (a
+    // tool_use round-trip) ends on stop_reason "tool_use".
+    let last = last_assistant.expect("the fixture has assistant records");
+    assert_eq!(
+        last.get("message")
+            .and_then(|m| m.get("stop_reason"))
+            .and_then(|v| v.as_str()),
+        Some("end_turn"),
+        "the final assistant turn ends the session"
+    );
+    // The record-type census of the session: everything here parses as
+    // Event::Unknown and must be skipped without error (the token regression
+    // proves the skips are silent and the four known fields still sum).
+    for expected in [
+        "mode",
+        "permission-mode",
+        "session-owner",
+        "atis-latch",
+        "file-history-snapshot",
+        "attachment",
+        "api-request-shape",
+        "api-request-blob",
+        "api-request",
+        "last-prompt",
+        "ai-title",
+        "tools-used",
+        "system",
+        "cost-state",
+    ] {
+        assert!(
+            record_types.contains(expected),
+            "fixture must contain a {expected} record (2.1.317 census); \
+             found {record_types:?}"
+        );
+    }
+}
+
+// ── Fixture 2.1.317: sanitized — no capture provenance may leak ───────────────
+
+#[test]
+fn fixture_v2_1_317_is_sanitized() {
+    let path = repo_path("tests/fixtures/transcript_v2.1.317.jsonl");
+    let raw = std::fs::read_to_string(&path).expect("reading fixture");
+    // The capture sandbox's real identifiers must never ship in the repo.
+    for leak in [
+        "cap217",
+        "/home/coding",
+        "ardenone",
+        // Personal data: the capturing account's real email address and its
+        // actual claude.ai connector roster (the `mcp__claude_ai_*` tool
+        // namespace) are genericized — everything surviving sanitization is
+        // user@example.com / mcp__example_* / the synthetic 00000000-… and
+        // msg_2_1_317_… namespaces pinned by the regression test above.
+        "jedarden",
+        "mcp__claude_ai",
+        // The capture's ids were uuids and msg_01… API ids.
+        "msg_011",
+    ] {
+        assert!(
+            !raw.contains(leak),
+            "fixture must not leak capture provenance: {leak}"
+        );
+    }
+    // The genericized replacements are present (so the redaction cannot
+    // quietly become a deletion that breaks the record shapes), and the
+    // `betas` array — whose real ids trip gitleaks' generic-api-key rule
+    // when juxtaposed in JSON — is a count-preserving marker.
+    assert!(
+        raw.contains("user@example.com"),
+        "the genericized email context block is present"
+    );
+    assert!(
+        raw.contains("mcp__example_"),
+        "the genericized connector namespace is present"
+    );
+    assert!(
+        raw.contains("\"betas\":[\"<redacted: "),
+        "the beta-id array is a count-preserving redaction marker"
+    );
+    // And it must stay parseable JSONL with the pinned record count, so a
+    // partial write cannot masquerade as a fixture.
+    assert_eq!(raw.lines().count(), 50, "the pinned 50-record session");
+}
+
 // The repo-root resolution itself: pinned so a future edit can't quietly
 // reintroduce a baked-only root — the failure mode the candidate chain
 // exists for (a close gate re-running this suite in a fresh extraction of
