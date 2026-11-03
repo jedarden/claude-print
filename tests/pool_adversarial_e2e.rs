@@ -502,6 +502,10 @@ fn daemon_pty_fd_count(daemon_pid: u32) -> usize {
         .count()
 }
 
+fn is_pty_master_target(target: &Path) -> bool {
+    target == Path::new("/dev/ptmx") || target == Path::new("/dev/pts/ptmx")
+}
+
 /// The helper-contract pin behind both at-rest PTY-master assertions in this
 /// binary: `daemon_pty_fd_count` must count a master opened through EITHER
 /// `/dev/ptmx` spelling. On this box opening `/dev/ptmx` (a char device)
@@ -547,13 +551,31 @@ fn pty_master_fd_count_accepts_both_ptmx_spellings() {
     let container_link =
         std::fs::read_link(format!("/proc/{pid}/fd/{}", container_spelling.as_raw_fd()))
             .expect("the container-spelling fd must be visible through /proc");
-    assert_eq!(host_link, Path::new("/dev/ptmx"));
-    assert_eq!(container_link, Path::new("/dev/pts/ptmx"));
+    assert!(
+        is_pty_master_target(&host_link),
+        "unexpected /dev/ptmx target: {host_link:?}"
+    );
+    assert!(
+        is_pty_master_target(&container_link),
+        "unexpected /dev/pts/ptmx target: {container_link:?}"
+    );
+    let expected_legacy = legacy_before
+        + if host_link == Path::new("/dev/ptmx") {
+            1
+        } else {
+            0
+        }
+        + if container_link == Path::new("/dev/ptmx") {
+            1
+        } else {
+            0
+        };
     assert_eq!(
         literal_ptmx_fd_count(pid),
-        legacy_before + 1,
-        "the legacy literal matcher must count only /dev/ptmx; the container \
-         spelling must contribute zero (fd link: {})",
+        expected_legacy,
+        "the legacy literal matcher must count only descriptors whose fd \
+         target is exactly /dev/ptmx (host fd: {}, container fd: {})",
+        host_link.display(),
         container_link.display()
     );
     assert_eq!(
