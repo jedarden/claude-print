@@ -5,7 +5,11 @@ are tagged `vX.Y.Z` and published as GitHub Releases by the `claude-print-ci`
 Argo workflow, which runs the full gate set (fmt, clippy, test, cargo audit,
 static musl build) against the tagged commit before publishing.
 
-## [Unreleased]
+## [0.2.3] - 2026-11-03
+
+First tagged release since v0.2.2. Headline change: contract evidence and the
+transcript-compatibility fixture re-pinned to Claude Code 2.1.317, the
+version this release is built and contract-tested against.
 
 ### Added
 
