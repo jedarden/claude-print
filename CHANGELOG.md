@@ -5,6 +5,12 @@ are tagged `vX.Y.Z` and published as GitHub Releases by the `claude-print-ci`
 Argo workflow, which runs the full gate set (fmt, clippy, test, cargo audit,
 static musl build) against the tagged commit before publishing.
 
+## [0.2.4] - 2026-11-03
+
+Patch release after the immutable v0.2.3 tag: the PTY-master contract test now
+accepts both Linux `/dev/ptmx` readlink layouts, including the symlinked layout
+used by the release CI container.
+
 ## [0.2.3] - 2026-11-03
 
 First tagged release since v0.2.2. Headline change: contract evidence and the
