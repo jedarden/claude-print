@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Pinned by** | `tests/stream_json_contract.rs` against the `tests/fixtures/stream_json_golden_v2.1.316.{input,expected,errors}.jsonl` triple |
+| **Pinned by** | `tests/stream_json_contract.rs` against the `tests/fixtures/stream_json_golden_v2.1.317.{input,expected,errors}.jsonl` triple |
 | **Implementation** | `src/emitter.rs` (the reader thread: `spawn_stream_json_reader_bound_to`, `tail_loop`, `StreamJsonHandle`), spawned and drained by `src/session.rs`; error objects by `emit_error` |
 | **Summarized by** | `docs/notes/output-format-contracts.md` §`stream-json` mode and the README — this document is the normative deep-dive; where they differ, this document wins |
-| **Provenance** | bead claudepr-6b587922 (2026-09-25); binding design bead claudepr-a927ec0c; first-output credit bead claudepr-33fdf4ed; re-measured and re-pinned to 2.1.282 by claudepr-b590e46d; re-measured and re-pinned to 2.1.288 by claudepr-cb9dcf25 (2026-10-02); re-measured and re-pinned to 2.1.289 by claudepr-9e054b3d (2026-10-04); re-measured and re-pinned to 2.1.290 by claudepr-c02f9cfc (2026-10-06); re-measured and re-pinned to 2.1.292 by claudepr-1558810f (2026-10-07; 39-record authenticated capture); re-measured and re-pinned to 2.1.294 by claudepr-49259380 (2026-10-08; prior pin); re-measured and re-pinned to 2.1.296 by claudepr-0548e0e4 (2026-10-09; prior pin); re-measured and re-pinned to 2.1.299 by claudepr-7ef1382c (2026-10-14; historical 41-record authenticated capture); re-measured and re-pinned to 2.1.300 by claudepr-05a74d6c (2026-10-15; historical 34-record authenticated capture); re-measured and re-pinned to 2.1.301 by claudepr-7b323468 (2026-10-16; historical 30-record authenticated capture); re-measured and re-pinned to 2.1.302 by claudepr-fa11b4f7 (2026-10-17; historical 39-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.303 by claudepr-9bdddad9 (2026-10-19; historical 29-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path; superseded uncommitted and landed as history by the 2.1.307 pin); re-measured and re-pinned to 2.1.307 by claudepr-f664c5cd (2026-10-22; historical 32-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.309 by claudepr-ab96e84a (2026-10-24; historical 34-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.311 by claudepr-88e4ceed (2026-10-27; historical 37-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.312 by claudepr-069683c7 (2026-10-28; historical 34-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.314 by claudepr-4123b744 (2026-10-30; historical 36-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.316 by claudepr-a628ef36 (2026-11-01; 36-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path) |
+| **Provenance** | bead claudepr-6b587922 (2026-09-25); binding design bead claudepr-a927ec0c; first-output credit bead claudepr-33fdf4ed; re-measured and re-pinned to 2.1.282 by claudepr-b590e46d; re-measured and re-pinned to 2.1.288 by claudepr-cb9dcf25 (2026-10-02); re-measured and re-pinned to 2.1.289 by claudepr-9e054b3d (2026-10-04); re-measured and re-pinned to 2.1.290 by claudepr-c02f9cfc (2026-10-06); re-measured and re-pinned to 2.1.292 by claudepr-1558810f (2026-10-07; 39-record authenticated capture); re-measured and re-pinned to 2.1.294 by claudepr-49259380 (2026-10-08; prior pin); re-measured and re-pinned to 2.1.296 by claudepr-0548e0e4 (2026-10-09; prior pin); re-measured and re-pinned to 2.1.299 by claudepr-7ef1382c (2026-10-14; historical 41-record authenticated capture); re-measured and re-pinned to 2.1.300 by claudepr-05a74d6c (2026-10-15; historical 34-record authenticated capture); re-measured and re-pinned to 2.1.301 by claudepr-7b323468 (2026-10-16; historical 30-record authenticated capture); re-measured and re-pinned to 2.1.302 by claudepr-fa11b4f7 (2026-10-17; historical 39-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.303 by claudepr-9bdddad9 (2026-10-19; historical 29-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path; superseded uncommitted and landed as history by the 2.1.307 pin); re-measured and re-pinned to 2.1.307 by claudepr-f664c5cd (2026-10-22; historical 32-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.309 by claudepr-ab96e84a (2026-10-24; historical 34-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.311 by claudepr-88e4ceed (2026-10-27; historical 37-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.312 by claudepr-069683c7 (2026-10-28; historical 34-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.314 by claudepr-4123b744 (2026-10-30; historical 36-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.316 by claudepr-a628ef36 (2026-11-01; 36-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path); re-measured and re-pinned to 2.1.317 by claudepr-cd744f39 (2026-11-03; 35-record authenticated capture, byte-identical stdout/transcript; sanitized representatives replayed through the real reader/emitter path) |
 
 This note is the normative definition of what `--output-format stream-json`
 writes to stdout: the framing of each line, which records are forwarded and
@@ -17,12 +17,12 @@ against a committed file, so any re-serialization, reorder, drop, duplicate,
 or synthesized byte surfaces as a diff in review, not as silent drift.
 
 The golden fixtures are version-pinned like the transcript captures
-(`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.316` in the filename
+(`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.317` in the filename
 names the Claude Code capture family whose record shapes the fixtures model,
 and the `claude_version` stamped into the golden error objects is
-`2.1.316 (Claude Code)`. The envelopes were re-measured against live
-claude 2.1.316 on 2026-11-01 in one authenticated, sandboxed PTY session
-driven through claude-print itself. The capture completed with 36 records,
+`2.1.317 (Claude Code)`. The envelopes were re-measured against live
+claude 2.1.317 on 2026-11-03 in one authenticated, sandboxed PTY session
+driven through claude-print itself. The capture completed with 35 records,
 no `result` record, no CR or blank lines, and stdout
 byte-identical to its transcript. The capture again included `permission-mode`, `atis-latch`,
 `file-history-snapshot`, `last-prompt`, `cost-state`, `turn_duration` and
@@ -30,14 +30,12 @@ byte-identical to its transcript. The capture again included `permission-mode`, 
 `agent_listing_delta`, `session_context`, `date`, `remote_session_change`,
 `prompt_snapshot`, `auto_mode`, the standing `deferred_tools_delta`, and a
 live `hook_success` (the seeded Stop hook's success record);
-this capture additionally observed `environment`, `model`, and
-`total_tokens_reminder` attachment types (absent from the prior samples) and
-two live `ai-title` records; the sampled assistant record's envelope matched
+the sampled assistant record's envelope matched
 the prior sample key-for-key (`requestRef` and `serverClassifierRequest`
 present), and the `ai-title` count varies run-to-run, as do
 `auto_mode`/`thinking` presence. The envelope set matched the prior pin:
-a live assistant record but no
-`assistant:thinking` or tool-use record in this capture, the
+a live assistant thinking/text split pair sharing one message id and no
+tool-use record in this capture, the
 `api-request-shape`/`api-request-blob`/`api-request`
 request-observability trio (exactly once per turn),
 `attachment:prompt_snapshot` carrying tool schema objects (formerly bare
@@ -50,11 +48,18 @@ No tool-use record occurred in this capture — the reader remains
 type-agnostic, and that case is
 retained from earlier live evidence as a historical forwarding case.
 The input golden uses sanitized representative records from that live
-transcript (a live 2.1.316 assistant record as the representative), with a
+transcript (a live 2.1.317 assistant record as the representative; the live
+`cost-state` records' second `modelUsage` entry — this host's haiku-class
+title model — is dropped per the family's single-model convention, keeping
+the live `hasUnknownModelCost` flag so the total/entry gap stays internally
+explained), with a
 retained thinking/split assistant case carrying
 `wireToolInputs` from earlier live
-evidence and retained spaced-JSON/Unicode and blank/CRLF framing cases. The
-2.1.312 capture family and earlier families are retained beside the active
+evidence and retained spaced-JSON/Unicode and blank-line framing cases (the
+CR-trim adjustment of §2 is implemented and asserted, but the active family
+has carried no CRLF-terminated line since the v2.1.314 pin — the retained
+v2.1.312 family still has one). The
+2.1.316 capture family and earlier families are retained beside the active
 one as measurement history. Re-pins follow the same maintenance workflow as
 the other version-stamped fixtures (`docs/notes/claude-contract-probes.md`
 §Maintenance), and the active families' versions must stay reconciled with
