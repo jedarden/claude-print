@@ -5,6 +5,22 @@ are tagged `vX.Y.Z` and published as GitHub Releases by the `claude-print-ci`
 Argo workflow, which runs the full gate set (fmt, clippy, test, cargo audit,
 static musl build) against the tagged commit before publishing.
 
+## [0.2.5] - 2026-11-03
+
+The published release of the v0.2.4 content — the section that reconciles
+this changelog with the release GitHub actually served. The v0.2.3 and
+v0.2.4 tags were cut first, but their release runs failed in the CI
+container on the PTY-master layout the v0.2.4 fix (below) addresses, so
+neither tag was ever published. The automated patch-release policy then
+verified the v0.2.4 content at its source commit, cut the release commit
+and the immutable `v0.2.5` tag itself (`CI-Release-Source` trailer), and
+published `v0.2.5` as the first GitHub Release of the Claude Code 2.1.317
+line. The binary content is the v0.2.3/v0.2.4 lineage: contract evidence
+re-pinned to Claude Code 2.1.317 (claudepr-cd744f39), the 2.1.317
+transcript-compatibility fixture (claudepr-3d431853), and the portable
+PTY-master contract test. `last-claude-version.txt` for this release
+reads `2.1.317`.
+
 ## [0.2.4] - 2026-11-03
 
 Patch release after the immutable v0.2.3 tag: the PTY-master contract test now
