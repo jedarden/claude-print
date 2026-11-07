@@ -5,6 +5,20 @@ are tagged `vX.Y.Z` and published as GitHub Releases by the `claude-print-ci`
 Argo workflow, which runs the full gate set (fmt, clippy, test, cargo audit,
 static musl build) against the tagged commit before publishing.
 
+## [0.2.7] - 2026-11-07
+
+Patch release for Claude Code 2.1.319. The runtime contracts and stream JSON
+evidence were re-measured against an authenticated 2.1.319 session
+(claudepr-66b09fde). A separate sanitized, real PTY transcript now exercises
+transcript parsing and token accounting for 2.1.319 (claudepr-bc60a615).
+The release is expected to carry `last-claude-version.txt` set to `2.1.319`.
+
+## [0.2.6] - 2026-11-04
+
+Published patch release for the Claude Code 2.1.318 contract re-pin. Its
+release metadata records the automated release commit and
+`last-claude-version.txt` set to `2.1.318`.
+
 ## [0.2.5] - 2026-11-03
 
 The published release of the v0.2.4 content — the section that reconciles
