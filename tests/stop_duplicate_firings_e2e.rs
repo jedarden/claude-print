@@ -38,8 +38,10 @@ use tempfile::TempDir;
 // Serializes the in-process test's env mutations (the `EnvGuard` set/remove
 // below) so a second env-touching test added to this binary later cannot race
 // one mid-flight. Same pattern as tests/home_unset.rs, tests/watchdog.rs, and
-// tests/transcript_race_e2e.rs. The subprocess-based test needs no lock: it
-// injects env into the child only.
+// tests/transcript_race_e2e.rs. The subprocess test also takes this lock:
+// TempDir::new reads the process-global TMPDIR, which the in-process test
+// changes. Without the lock, it can create HOME inside a TMPDIR that the
+// other test removes before the subprocess starts.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn env_lock() -> MutexGuard<'static, ()> {
@@ -296,6 +298,8 @@ const BUDGET: Duration = Duration::from_secs(30);
 /// test above.
 #[test]
 fn duplicate_stop_firings_binary_emits_exactly_one_result() {
+    let _lock = env_lock();
+
     let bin = workspace_bin("claude-print");
     let mock = workspace_bin("mock-claude");
     if !bin.exists() || !mock.exists() {

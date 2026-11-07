@@ -5,13 +5,23 @@ are tagged `vX.Y.Z` and published as GitHub Releases by the `claude-print-ci`
 Argo workflow, which runs the full gate set (fmt, clippy, test, cargo audit,
 static musl build) against the tagged commit before publishing.
 
-## [0.2.7] - 2026-11-07
+## [0.2.8] - 2026-11-07
 
 Patch release for Claude Code 2.1.319. The runtime contracts and stream JSON
 evidence were re-measured against an authenticated 2.1.319 session
 (claudepr-66b09fde). A separate sanitized, real PTY transcript now exercises
 transcript parsing and token accounting for 2.1.319 (claudepr-bc60a615).
-The release is expected to carry `last-claude-version.txt` set to `2.1.319`.
+The duplicate Stop firing test now serializes its temporary HOME setup with
+the in-process test that changes `TMPDIR`; this fixes a CI race that blocked
+the v0.2.7 release attempt. The release is expected to carry
+`last-claude-version.txt` set to `2.1.319`.
+
+## [0.2.7] - 2026-11-07
+
+Tag cut from the 2.1.319 release candidate, but never published: the Argo
+release gate exposed a race in `stop_duplicate_firings_e2e` when two tests
+created and removed temporary directories concurrently. The tag remains
+immutable; v0.2.8 carries the fix and the published release.
 
 ## [0.2.6] - 2026-11-04
 
