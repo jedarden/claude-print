@@ -1,0 +1,363 @@
+{
+  "claude_version": "2.1.323",
+  "measured_at": "2026-11-13",
+  "version_guard": {
+    "start": "2.1.323",
+    "end": "2.1.323",
+    "provenance": "All four guarded probes ran against concrete Claude Code 2.1.323 on 2026-11-13; each ended version-guard: verdict=single-version start=2.1.323 end=2.1.323. Arm S observed concurrent hook execution in 12/12 event pairs with relay-first in 8/12. Arm D completed 5/5 explicit-deny runs with every run exiting 0 and firing exactly one Stop, all 5 verifying an errored Bash result. Arm T killed all 8 overrun firings while all 4 sessions exited 0 with replies at 5.1 s after Stop-hook start. The dedicated TUI probe observed one Stop per turn at 1.5 s / 1.5 s. The allowed-tool probe completed both turns at one Stop each (30.1 s / 26.5 s); probe-claude-contracts T2 completed both turns with two Stops per turn for two loaded sources (35.0 s / 31.0 s). A same-session authenticated claude-print stream-json PTY capture used the same pinned binary; its 41-record stdout was byte-identical to the transcript, with no result, CR, or blank records. The sanitized family uses representatives from that live capture and retains historical framing cases. Replay bytes and error objects were produced and verified against the production reader and emitter."
+  },
+  "probe_scripts": [
+    "scripts/probe-claude-contracts.sh",
+    "scripts/probe-stop-toolallowed.sh",
+    "scripts/probe-tui-second-turn.sh",
+    "scripts/probe-stop-edge-contracts.sh"
+  ],
+  "evidence": "docs/notes/claude-contract-probes.md",
+  "resolves": [
+    "PO-1",
+    "PO-2",
+    "OQ-1",
+    "OQ-2",
+    "Stop-poller assumption (plan \u00a77)",
+    "relay-hook timeout (hook-design.md Relay Hook)"
+  ],
+  "contracts": {
+    "settings_flag_merges_not_replaces": true,
+    "all_loaded_sources_hooks_fire": true,
+    "cross_source_hook_order_guaranteed": false,
+    "setting_sources_empty_accepted": true,
+    "setting_sources_empty_suppresses_standard_sources": true,
+    "settings_file_loads_despite_setting_sources_empty": true,
+    "setting_sources_none_accepted": false,
+    "stop_firings_single_turn_completed_run_per_loaded_source": 1,
+    "stop_firings_multi_round_tool_use_completed_turn": 1,
+    "stop_firings_tui_per_turn": 1,
+    "stop_firings_max_turns_cutoff": 0,
+    "stop_firings_max_turns_cutoff_exit_code": 1,
+    "hook_timeout_kills_overrun_hook": true,
+    "hook_timeout_overrun_session_proceeds": true
+  },
+  "notes": {
+    "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host real settings and .claude.json were not read or modified. The host credentials file, when present, was copied file-to-file into the sandbox and never printed.",
+    "cross_source_order_evidence": "2.1.323 Arm S: across six runs and both hook events, all 12/12 pairs were concurrent; the relay started first in 8/12. The result is concurrency, not a contractual source order: claude-print must not depend on order.",
+    "tui_per_turn_evidence": "The dedicated probe-tui-second-turn.sh run on 2.1.323 completed two TUI turns: turn 1 fired 1 Stop with its reply rendered in 1.5 s, and turn 2 fired 1 Stop with its reply rendered in 1.5 s. The allowed-tool TUI arm completed both prompts at one Stop each (30.1 s / 26.5 s).",
+    "degraded_path_hazard": "Arm D on 2.1.323: 5 of 5 explicit-deny runs verified an errored Bash result, every run exited 0 and fired exactly one Stop. The historical 2.1.270 extra-Stop hazard did not reproduce.",
+    "print_mode_tool_use_evidence": "Arm P on 2.1.323 used --allowedTools=Bash. Both sequential Bash rounds completed in order, the final message was DONE, exit was 0, and exactly 1 Stop fired.",
+    "cutoff_evidence": "The focused 2.1.323 -p run with --max-turns 2 exited 1 and fired zero own Stops; the cutoff remains owned by the --stop-hook-timeout watchdog, not the Stop Poller.",
+    "hook_timeout_evidence": "Arm T on 2.1.323 configured a relay-position hook with timeout 5 s and sleep 30 s across four real single-turn runs: all 8 event firings were killed, all 4 sessions exited 0 with replies, and each Stop hook-to-process completion was 5.1 s."
+  },
+  "doc_evidence": {
+    "active_version": "2.1.323",
+    "cross_source": {
+      "concurrent_pairs": {
+        "observed": 12,
+        "total": 12
+      },
+      "relay_first_pairs": {
+        "observed": 8,
+        "total": 12
+      },
+      "earlier_concurrent_pairs": {
+        "observed": 24,
+        "total": 24
+      },
+      "earlier_relay_first_pairs": [
+        {
+          "observed": 5,
+          "total": 12
+        },
+        {
+          "observed": 1,
+          "total": 12
+        },
+        {
+          "observed": 4,
+          "total": 24
+        },
+        {
+          "observed": 3,
+          "total": 12
+        },
+        {
+          "observed": 6,
+          "total": 12
+        },
+        {
+          "observed": 4,
+          "total": 12
+        },
+        {
+          "observed": 5,
+          "total": 12
+        }
+      ]
+    },
+    "permission_denied_runs": {
+      "observed": 5,
+      "total": 5
+    },
+    "hook_timeout": {
+      "killed_firings": {
+        "observed": 8,
+        "total": 8
+      },
+      "successful_sessions": {
+        "observed": 4,
+        "total": 4
+      },
+      "rendered_replies": {
+        "observed": 4,
+        "total": 4
+      },
+      "rendered_per_invocation": {
+        "observed": 4,
+        "total": 4
+      },
+      "elapsed_seconds": 5.1
+    },
+    "stop_counts": {
+      "single_turn_per_loaded_source": 1,
+      "multi_round": 1,
+      "permission_denied": 1,
+      "tui_turn_1": 1,
+      "tui_turn_2": 1,
+      "max_turns_cutoff": 0
+    },
+    "active_tui_seconds": [
+      1.5,
+      1.5
+    ],
+    "historical": [
+      {
+        "version": "2.1.270",
+        "cross_source_relay_first_runs": {
+          "observed": 1,
+          "total": 4
+        },
+        "permission_denied_extra_stop_runs": {
+          "observed": 1,
+          "total": 2
+        },
+        "tui_seconds": [
+          22.6,
+          15.1
+        ]
+      },
+      {
+        "version": "2.1.281",
+        "arm_t_seconds": [
+          48.0,
+          60.0
+        ],
+        "tui_seconds": [
+          48.0,
+          60.0,
+          13.0,
+          9.1
+        ]
+      },
+      {
+        "version": "2.1.282",
+        "arm_t_seconds": [
+          62.5,
+          32.5,
+          60.5
+        ],
+        "tui_seconds": [
+          62.5,
+          32.5,
+          60.5,
+          41.6,
+          3.3
+        ]
+      },
+      {
+        "version": "2.1.307",
+        "cross_source_relay_first_runs": null,
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": null,
+        "tui_seconds": [
+          9.4,
+          2.8
+        ]
+      },
+      {
+        "version": "2.1.308",
+        "cross_source_relay_first_runs": null,
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": [
+          10.1,
+          6.7
+        ],
+        "tui_seconds": [
+          10.1,
+          6.7,
+          48.5
+        ]
+      },
+      {
+        "version": "2.1.309",
+        "arm_t_seconds": [
+          3.6,
+          10.3
+        ],
+        "tui_seconds": [
+          3.6,
+          10.3,
+          52.5,
+          27.0
+        ]
+      },
+      {
+        "version": "2.1.311",
+        "arm_t_seconds": [
+          2.2,
+          2.1
+        ],
+        "tui_seconds": [
+          2.2,
+          2.1,
+          31.5,
+          26.5
+        ]
+      },
+      {
+        "version": "2.1.312",
+        "arm_t_seconds": [
+          7.8,
+          2.1
+        ],
+        "tui_seconds": [
+          7.8,
+          2.1,
+          205.1
+        ]
+      },
+      {
+        "version": "2.1.316",
+        "cross_source_relay_first_runs": {
+          "observed": 4,
+          "total": 12
+        },
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": [
+          0.6,
+          0.9
+        ],
+        "tui_seconds": [
+          0.6,
+          0.9,
+          29.5,
+          26.0,
+          33.5,
+          31.0
+        ]
+      },
+      {
+        "version": "2.1.317",
+        "cross_source_relay_first_runs": {
+          "observed": 4,
+          "total": 12
+        },
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": [
+          9.5,
+          2.6
+        ],
+        "tui_seconds": [
+          9.5,
+          2.6,
+          205.1,
+          41.0,
+          60.5,
+          36.0
+        ]
+      },
+      {
+        "version": "2.1.318",
+        "cross_source_relay_first_runs": {
+          "observed": 6,
+          "total": 12
+        },
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": [
+          2.8,
+          2.1
+        ],
+        "tui_seconds": [
+          2.8,
+          2.1,
+          46.0,
+          47.5,
+          33.0
+        ]
+      },
+      {
+        "version": "2.1.319",
+        "cross_source_relay_first_runs": {
+          "observed": 4,
+          "total": 12
+        },
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": [
+          8.9,
+          2.8
+        ],
+        "tui_seconds": [
+          8.9,
+          2.8,
+          205.1,
+          205.1,
+          44.5,
+          33.0
+        ]
+      },
+      {
+        "version": "2.1.321",
+        "cross_source_relay_first_runs": {
+          "observed": 5,
+          "total": 12
+        },
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": null,
+        "tui_seconds": [
+          2.4,
+          1.5,
+          39.5,
+          29.0,
+          42.0,
+          34.0
+        ]
+      },
+      {
+        "version": "2.1.322",
+        "cross_source_relay_first_runs": {
+          "observed": 5,
+          "total": 12
+        },
+        "permission_denied_extra_stop_runs": null,
+        "arm_t_seconds": [
+          5.1,
+          5.1
+        ],
+        "tui_seconds": [
+          1.2,
+          3.0,
+          43.0,
+          31.0,
+          47.5,
+          33.5
+        ]
+      }
+    ],
+    "notes": {
+      "isolation": "Every probe ran with HOME redirected into a throwaway sandbox; the host real settings and .claude.json were not read or modified. The host credentials file, when present, was copied file-to-file into the sandbox and never printed.",
+      "cross_source_order_evidence": "2.1.323 Arm S: across six runs and both hook events, all 12/12 pairs were concurrent; the relay started first in 8/12. The result is concurrency, not a contractual source order: claude-print must not depend on order.",
+      "tui_per_turn_evidence": "The dedicated probe-tui-second-turn.sh run on 2.1.323 completed two TUI turns: turn 1 fired 1 Stop with its reply rendered in 1.5 s, and turn 2 fired 1 Stop with its reply rendered in 1.5 s. The allowed-tool TUI arm completed both prompts at one Stop each (30.1 s / 26.5 s).",
+      "degraded_path_hazard": "Arm D on 2.1.323: 5 of 5 explicit-deny runs verified an errored Bash result, every run exited 0 and fired exactly one Stop. The historical 2.1.270 extra-Stop hazard did not reproduce.",
+      "print_mode_tool_use_evidence": "Arm P on 2.1.323 used --allowedTools=Bash. Both sequential Bash rounds completed in order, the final message was DONE, exit was 0, and exactly 1 Stop fired.",
+      "cutoff_evidence": "The focused 2.1.323 -p run with --max-turns 2 exited 1 and fired zero own Stops; the cutoff remains owned by the --stop-hook-timeout watchdog, not the Stop Poller.",
+      "hook_timeout_evidence": "Arm T on 2.1.323 configured a relay-position hook with timeout 5 s and sleep 30 s across four real single-turn runs: all 8 event firings were killed, all 4 sessions exited 0 with replies, and each Stop hook-to-process completion was 5.1 s."
+    }
+  }
+}
