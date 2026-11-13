@@ -801,7 +801,7 @@ below the table. Measured scenarios:
 evidence: Arm P — `--allowedTools=Bash` completed both sequential Bash commands, final message `DONE`, exit 0, and one Stop fired,
 `stop_hook_active: false`, single session id; T1 — completed (exit 0) with
 exactly one firing of its own (the probe's per-arm print is the shared log's
-cumulative project count); TUI turns — 1 Stop each, 1.2 s / 3.0 s
+  cumulative project count); TUI turns — 1 Stop each, 1.5 s / 1.5 s
 (probe-tui-second-turn, verdict "once-per-turn confirmed", both replies
 rendered); cutoff
 (T3) — 0 own firings, exit 1. The same-day 2.1.281 run (measured hours before
@@ -873,7 +873,7 @@ probe-tui-second-turn.sh run completed both plain turns and is the per-turn
 TUI evidence for this re-pin. The prior 2.1.322 run (2026-11-11,
 claudepr-43ffc2a9, historical) measured Arm T at 5.1 s / 5.1 s,
 probe-tui-second-turn at 1.2 s / 3.0 s, the allowed-tool TUI at
-43.0 s / 31.0 s, and probe-claude-contracts T2 at 47.5 s / 33.5 s; and the original 2.1.321 run (historical) measured
+43.0 s / 31.0 s, and probe-claude-contracts T2 at 47.5 s / 33.5 s, and the original 2.1.321 run (historical) measured
 2.4 s / 1.5 s for plain turns, 39.5 s / 29.0 s for the allowed-tool TUI,
 and 42.0 s / 34.0 s for T2 — per-version numbers live in the historical
 fixture.)*
