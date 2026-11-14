@@ -3,67 +3,76 @@
 //! The contract these fixtures pin is specified in
 //! `docs/notes/stream-json-contract.md`; each test names the section it pins.
 //! Golden fixtures are version-pinned like the transcript captures
-//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.323` in the filename
+//! (`tests/fixtures/transcript_v2.1.*.jsonl`): the `v2.1.325` in the filename
 //! is the pinned Claude Code version from
 //! `docs/notes/claude-contract-probes.md`. The record envelopes were
-//! re-measured against live claude 2.1.323 on 2026-11-13: one authenticated,
-//! sandboxed claude-print PTY capture (41 records) completed with no `result`
+//! re-measured against live claude 2.1.325 on 2026-11-14: one authenticated,
+//! sandboxed claude-print PTY capture (35 records) completed with no `result`
 //! record, no CR or blank lines, and stdout
 //! byte-identical to its transcript. This pin's record-type set matched the prior
 //! pin: the
 //! `api-request-shape`/`api-request-blob`/`api-request` request-observability
 //! trio (exactly once per turn), `attachment:prompt_snapshot` carrying tool
-//! schema objects, and no live tool-use or thinking record,
+//! schema objects (twice),
 //! `agent_listing_delta` with
 //! `builtInPluginTypes`, and
-//! `skill_listing` with `digests`; `session_context.context` now carries a
-//! `userEmail` field, sanitized in the golden (the prior capture had `{}`).
+//! `skill_listing` with `digests`; `session_context.context` arrived empty
+//! `{}` again (the 2.1.323 capture had carried a `userEmail` field; no
+//! `session-owner` records occurred in this capture — both forwarding cases
+//! stay in the sanitized family from the prior captures).
 //! The capture cwd was not a git repo, so it does not settle the conditional
 //! `gitStatus` shape. The capture again observed
 //! `permission-mode`, `atis-latch`, `file-history-snapshot`, `attachment`
-//! (including `date`, `remote_session_change`, `mcp_instructions_delta`,
-//! `credential_org`, `deferred_tools_record`, and `deferred_tools_delta`;
-//! this run seeded no Stop hook, so no live
+//! (including `date`, `remote_session_change`, and `deferred_tools_delta`;
+//! `mcp_instructions_delta`, `credential_org`, `auto_mode`, and
+//! `deferred_tools_record` did not occur this run and stay as retained
+//! forwarding cases; this run seeded no Stop hook, so no live
 //! `hook_success` — that forwarding case is retained in the sanitized family
 //! from the prior captures), `last-prompt`, and `cost-state` records flowing —
 //! the standing envelope set, plus `environment`, `model`, and
 //! `total_tokens_reminder` attachments. The family
-//! sanitizes the live 2.1.323 sequence — using the live assistant record (its
-//! envelope matched the prior sample key-for-key, with `requestRef` and
-//! `promptCacheRequested` present; the live usage counts are retained) as the
-//! representative. The live `cost-state` records have one `modelUsage` entry,
-//! retained in the golden. The family also retains the
+//! sanitizes the live 2.1.325 sequence — using the live assistant records (a
+//! thinking + text split pair sharing one `message.id`; their envelopes carry
+//! `requestRef`, `promptCacheRequested` (`"5m"`), `effort`/`perTurnEffort`,
+//! `requestedModel`, and the new `madeBy` key, and drop the
+//! `serverClassifierRequest` and `requestId` keys and the message-level
+//! `container`/`context_management`/`diagnostics`/`input_transformations`
+//! keys the 2.1.323 sample carried; the live thinking record adds
+//! `thinkingDisplay`/`thinkingDurationMs`; the live usage counts are
+//! retained) as the representative. The live `cost-state` records have two
+//! `modelUsage` entries (the reply model and the title model), both retained
+//! with the live `hasUnknownModelCost` flag. The family also retains the
 //! 2.1.282 history
-//! block (a thinking + tool-use split pair with `wireToolInputs` and the
-//! tool-result user record) carried over with `requestId`. The
+//! block (a tool-use record with `wireToolInputs` and the message-level
+//! `requestId`/`container` envelope) carried over with `requestId`. The
 //! fixture carries representative samples.
 //! The envelope set was previously re-measured against 2.1.282 on 2026-09-25
 //! (claudepr-b590e46d: `thinking` blocks and split assistant records sharing a
 //! `message.id` observed live); the prior `v2.1.270`, `v2.1.282`, `v2.1.288`,
 //! `v2.1.301`, `v2.1.302`, `v2.1.303`, `v2.1.307`, `v2.1.309`, `v2.1.311`,
-//! `v2.1.312`, `v2.1.316`, `v2.1.317`, `v2.1.318`, and `v2.1.321` families are retained in
+//! `v2.1.312`, `v2.1.316`, `v2.1.317`, `v2.1.318`, `v2.1.321`, `v2.1.322`, and `v2.1.323` families are retained in
 //! `tests/fixtures/` as measurement history.
 //!
 //! What the golden pairs pin, and why each file exists:
 //!
-//! * `stream_json_golden_v2.1.323.input.jsonl` — a PTY-shaped transcript (the
+//! * `stream_json_golden_v2.1.325.input.jsonl` — a PTY-shaped transcript (the
 //!   shape `claude-print` actually tails: `mode`/`user`/`assistant`/`system`/
 //!   auxiliary records, NO `result` record) carrying instances of the
-//!   byte-level cases the contract calls out: a 2.1.323 `mode` record
+//!   byte-level cases the contract calls out: a 2.1.325 `mode` record
 //!   (introduced in 2.1.282), a live `turn_duration` record, the `api-request`
 //!   record trio, compact JSON, spaced JSON (no re-serialization), unicode
-//!   text, a live 2.1.323 assistant record beside the retained 2.1.282
+//!   text, a live 2.1.325 assistant record beside the retained 2.1.282
 //!   history block, split assistant records sharing a `message.id` (forwarded
 //!   verbatim, no dedup), and a blank line (dropped). This family carries no
 //!   CRLF-terminated line — the CR-trim half of the framing transform is
 //!   described in `docs/notes/stream-json-contract.md` §2 but has not been
 //!   exercised by the active golden family since the v2.1.314 pin (the
 //!   retained v2.1.312 family still carries the CR case).
-//! * `stream_json_golden_v2.1.323.expected.jsonl` — the exact stdout bytes a
+//! * `stream_json_golden_v2.1.325.expected.jsonl` — the exact stdout bytes a
 //!   full replay must produce: input minus the blank line (the framing
 //!   transform also trims a trailing CR per forwarded line; this family has
 //!   none), every line LF-terminated.
-//! * `stream_json_golden_v2.1.323.errors.jsonl` — the exact bytes of the two
+//! * `stream_json_golden_v2.1.325.errors.jsonl` — the exact bytes of the two
 //!   synthesized `result` error objects: the session-error line written to
 //!   stdout (line 1) and the config-error line written to stderr (line 2).
 //!
@@ -85,15 +94,15 @@ use claude_print::emitter::{
 };
 use claude_print::error::ClaudePrintError;
 
-const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.323.input.jsonl");
-const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.323.expected.jsonl");
-const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.323.errors.jsonl");
+const INPUT: &str = include_str!("fixtures/stream_json_golden_v2.1.325.input.jsonl");
+const EXPECTED: &str = include_str!("fixtures/stream_json_golden_v2.1.325.expected.jsonl");
+const ERRORS: &str = include_str!("fixtures/stream_json_golden_v2.1.325.errors.jsonl");
 const CAPTURE_V233: &str = include_str!("fixtures/transcript_v2.1.233.jsonl");
 
 /// The claude version stamped into the golden error objects — the pinned
 /// version from `docs/notes/claude-contract-probes.md`, in the same
 /// `<x.y.z> (Claude Code)` form `resolve_claude_version` records.
-const GOLDEN_CLAUDE_VERSION: &str = "2.1.323 (Claude Code)";
+const GOLDEN_CLAUDE_VERSION: &str = "2.1.325 (Claude Code)";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
