@@ -1,18 +1,18 @@
 {
   "active_root": {
-    "path": "objects/0c59aed67bb1e7623599cbfa6da30d3483e392172b35c783b0aa2dd32a223884.jsonl",
-    "sha256": "0c59aed67bb1e7623599cbfa6da30d3483e392172b35c783b0aa2dd32a223884"
+    "path": "objects/1dfdcd962550b8e5233362cc44afe8e3c377fe7a2094de8bb0c9e43518ddc334.jsonl",
+    "sha256": "1dfdcd962550b8e5233362cc44afe8e3c377fe7a2094de8bb0c9e43518ddc334"
   },
   "added_paths": [
-    "objects/0c59aed67bb1e7623599cbfa6da30d3483e392172b35c783b0aa2dd32a223884.jsonl"
+    "objects/1dfdcd962550b8e5233362cc44afe8e3c377fe7a2094de8bb0c9e43518ddc334.jsonl"
   ],
-  "attempt_outcome_count": 2960,
-  "created_at": "2026-11-17T05:23:59.556952357Z",
+  "attempt_outcome_count": 2961,
+  "created_at": "2026-11-17T05:55:15.582452156Z",
   "deleted_paths": [
-    "objects/c87c98e477eb66d249d9ba49a6b9aef586fcdf2ba9d3b89efc2c2db2977a9535.jsonl"
+    "objects/59e1a2fb0abe378df3651b087867e9bae98adfdee9efce0d71f098c93ed3fc72.jsonl"
   ],
-  "event_count": 26801,
-  "generation_id": "gen-5ed0c11d9573787907cb7af9aac9ae46",
+  "event_count": 26806,
+  "generation_id": "gen-41b2bfb44d1f71bb2ba245ef6ea9afc4",
   "issue_count": 1937,
   "mode": "monolithic",
   "receipt_count": 0,
@@ -22,7 +22,7 @@
     "forensic.jsonl"
   ],
   "schema_version": 1,
-  "snapshot_sequence": 26801,
+  "snapshot_sequence": 26806,
   "store_uuid": "cb377cc4-f2bd-782f-9ddf-a81ad2d5e589",
-  "total_record_count": 31698
+  "total_record_count": 31704
 }
