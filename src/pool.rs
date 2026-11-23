@@ -1362,27 +1362,30 @@ impl PoolServer {
 
         let socket_fd = stream.as_raw_fd();
 
-        // Create ancillary message with the fd
-        let iov = [std::io::IoSlice::new(&[0u8; 1])];
+        let byte = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: byte.as_ptr() as *mut libc::c_void,
+            iov_len: byte.len(),
+        };
 
         unsafe {
-            let mut cmsg: libc::cmsghdr = std::mem::zeroed();
-            // cmsg_len is usize on glibc but u32 on musl — cast into the
-            // field's own type so both targets compile.
-            cmsg.cmsg_len =
-                (std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>()) as _;
-            cmsg.cmsg_level = libc::SOL_SOCKET;
-            cmsg.cmsg_type = libc::SCM_RIGHTS;
+            // CMSG_SPACE includes the descriptor and its alignment padding.
+            // A bare cmsghdr is too small: writing CMSG_DATA beyond it is UB
+            // and fails as EFAULT in the optimized remote test profile.
+            let control_bytes = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) as usize;
+            let mut control = vec![0usize; control_bytes.div_ceil(std::mem::size_of::<usize>())];
+            debug_assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<libc::cmsghdr>());
+            let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as _;
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            libc::CMSG_DATA(cmsg).cast::<RawFd>().write(fd);
 
             let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+            msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
-            msg.msg_control = &mut cmsg as *mut _ as *mut _;
-            msg.msg_controllen = cmsg.cmsg_len;
-
-            // Copy the fd into the cmsg data
-            let cmsg_data = (msg.msg_control as *mut u8).add(std::mem::size_of::<libc::cmsghdr>());
-            *(cmsg_data as *mut RawFd) = fd;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = control_bytes as _;
 
             let ret = libc::sendmsg(socket_fd, &msg, 0);
             if ret < 0 {
