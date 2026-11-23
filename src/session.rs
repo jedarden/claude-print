@@ -65,6 +65,8 @@ pub struct SessionResult {
 /// See [`Cli`] flag docs for the per-knob rationale.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
+    /// Validated caller settings merged into the single relay settings file.
+    pub settings: Option<serde_json::Value>,
     /// Isolation mode (`--no-inherit-hooks`): forward `--setting-sources=` to
     /// the child so it loads NO standard settings sources — only the temp
     /// `--settings` relay hook is active, and the user's `~/.claude/settings.json`
@@ -420,7 +422,7 @@ impl Session {
         let tracer = Tracer::new(launch.verbose, start_time);
 
         // 1. Install hook files (temp dir, hook.sh, stop.fifo).
-        let installer = HookInstaller::new()?;
+        let installer = HookInstaller::new_with_settings(launch.settings.as_ref())?;
         tracer.trace(format!(
             "temp dir created at {}",
             installer.dir_path().display()
@@ -2141,6 +2143,7 @@ mod tests {
         // Test that --dangerously-skip-permissions works correctly with various LaunchOptions
         let installer = HookInstaller::new().unwrap();
         let launch = LaunchOptions {
+            settings: None,
             no_inherit_hooks: true,
             mcp_configs: vec!["/path/to/mcp.json".to_string()],
             pretrust_cwd: true,

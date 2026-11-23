@@ -1551,6 +1551,21 @@ pub fn acquire_for_invocation(
     }
 }
 
+/// A prewarmed worker has already loaded its settings before the caller
+/// arrives. A caller's permission rules must never be silently dropped, so
+/// invocations with `--settings` use the ordinary launch path, which merges
+/// them before spawning Claude.
+pub fn acquire_for_invocation_with_settings(
+    socket: Option<&std::path::Path>,
+    caller_timeout_secs: u64,
+    has_caller_settings: bool,
+) -> Result<InvocationAcquisition, AcquireFailure> {
+    if has_caller_settings {
+        return Ok(InvocationAcquisition::NotRequested);
+    }
+    acquire_for_invocation(socket, caller_timeout_secs)
+}
+
 /// One-time budget for a client release exchange. Teardown is best-effort by
 /// contract (a dead daemon has nothing left to release), but it must never
 /// hang the client: this bounds the connect + frame + reply.

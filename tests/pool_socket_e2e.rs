@@ -93,6 +93,53 @@ const REPLACE: Duration = Duration::from_secs(30);
 /// grace per worker is 2 s before SIGKILL).
 const SHUTDOWN_BOUND: Duration = Duration::from_secs(20);
 
+#[test]
+fn caller_settings_with_pool_socket_runs_a_fresh_child_with_merged_rules() {
+    let fx = Fixture::start();
+    let mut daemon = fx.daemon(&[]);
+    daemon.wait_for("settled and ready", 1, WARMUP);
+    let caller = fx.home.path().join("caller-settings.json");
+    let recorded = fx.home.path().join("merged-settings.json");
+    let args = fx.home.path().join("child-args");
+    std::fs::write(
+        &caller,
+        r#"{"permissions":{"deny":["Read(~/.config/**)"]},"env":{"LOOM":"true"}}"#,
+    )
+    .unwrap();
+    let mut cmd = fx.client();
+    cmd.arg("--pool-socket")
+        .arg(&fx.socket)
+        .arg("--settings")
+        .arg(&caller)
+        .arg("--verbose")
+        .arg(PROMPT)
+        .env("MOCK_RECORD_SETTINGS", &recorded)
+        .env("MOCK_RECORD_ARGS", &args);
+    let out = run(&mut cmd, POOLED_BUDGET);
+    assert_eq!(out.code, Some(0), "{out:?}");
+    assert!(
+        out.stderr.contains("--settings requires a fresh child"),
+        "{out:?}"
+    );
+    assert!(!out.stderr.contains("driving prewarmed worker"), "{out:?}");
+    let merged: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&recorded).unwrap()).unwrap();
+    assert_eq!(merged["permissions"]["deny"][0], "Read(~/.config/**)");
+    assert_eq!(merged["env"]["LOOM"], "true");
+    assert_eq!(merged["hooks"]["Stop"][0]["hooks"][0]["type"], "command");
+    assert_eq!(
+        merged["hooks"]["UserPromptSubmit"][0]["hooks"][0]["type"],
+        "command"
+    );
+    let args = std::fs::read(&args).unwrap();
+    let settings_count = args
+        .split(|byte| *byte == 0)
+        .filter(|arg| arg.starts_with(b"--settings="))
+        .count();
+    assert_eq!(settings_count, 1);
+    daemon.terminate(1);
+}
+
 /// A captured subprocess outcome: exit code (or `None` if killed on timeout),
 /// and decoded stdout/stderr.
 #[derive(Debug)]

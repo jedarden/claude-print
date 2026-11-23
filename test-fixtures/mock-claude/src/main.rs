@@ -98,6 +98,13 @@ fn main() {
     // startup sequencer) firing Stop immediately.
     let settings_arg: Option<String> =
         std::env::args().find_map(|a| a.strip_prefix("--settings=").map(|s| s.to_string()));
+    // Preserve the exact file the child received before claude-print cleans
+    // its temporary relay directory at the end of the invocation.
+    if let (Some(settings), Ok(destination)) =
+        (&settings_arg, std::env::var("MOCK_RECORD_SETTINGS"))
+    {
+        let _ = std::fs::copy(settings, destination);
+    }
     let driven_by_claude_print = settings_arg.is_some();
     let fifo_path: Option<String> = settings_arg
         .as_ref()

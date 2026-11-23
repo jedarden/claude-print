@@ -148,6 +148,12 @@ pub struct HookInstaller {
 
 impl HookInstaller {
     pub fn new() -> Result<Self> {
+        Self::new_with_settings(None)
+    }
+
+    /// Create relay artifacts with validated caller settings in the one file
+    /// passed to Claude. A second `--settings` flag could displace our hooks.
+    pub fn new_with_settings(caller_settings: Option<&serde_json::Value>) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
 
         // Owner-only from the first instant (plan T-1, docs/notes/hook-design.md):
@@ -169,7 +175,12 @@ impl HookInstaller {
         let identity_hook_path = dir.path().join("identity.sh");
         write_hook_sh(&hook_path, &fifo_path)?;
         write_identity_sh(&identity_hook_path, &identity_path)?;
-        write_settings_json(&settings_path, &hook_path, &identity_hook_path)?;
+        write_settings_json(
+            &settings_path,
+            &hook_path,
+            &identity_hook_path,
+            caller_settings,
+        )?;
 
         mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)
             .map_err(|e| Error::Internal(anyhow::anyhow!("mkfifo failed: {e}")))?;
@@ -309,10 +320,11 @@ fn write_settings_json(
     settings_path: &Path,
     hook_path: &Path,
     identity_hook_path: &Path,
+    caller_settings: Option<&serde_json::Value>,
 ) -> Result<()> {
     let hook_str = hook_path.to_string_lossy();
     let identity_str = identity_hook_path.to_string_lossy();
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "hooks": {
             "Stop": [{
                 "hooks": [{"type": "command", "command": hook_str, "timeout": 10}]
@@ -329,6 +341,9 @@ fn write_settings_json(
             }]
         }
     });
+    if let Some(caller) = caller_settings {
+        merge_settings(&mut json, caller, "")?;
+    }
     let content = serde_json::to_string_pretty(&json)
         .map_err(|e| Error::Internal(anyhow::anyhow!("serialize settings.json: {e}")))?;
     std::fs::write(settings_path, content)
@@ -336,9 +351,115 @@ fn write_settings_json(
     Ok(())
 }
 
+/// Read caller settings once so a missing, unreadable, or malformed file can
+/// never turn into an invocation that silently lacks its permission rules.
+pub fn load_caller_settings(path: &Path) -> Result<serde_json::Value> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::Config(format!("cannot read --settings {}: {e}", path.display())))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Config(format!("invalid --settings JSON {}: {e}", path.display())))?;
+    if !value.is_object() {
+        return Err(Error::Config(format!(
+            "--settings {} must contain a JSON object",
+            path.display()
+        )));
+    }
+    Ok(value)
+}
+
+fn merge_settings(
+    relay: &mut serde_json::Value,
+    caller: &serde_json::Value,
+    path: &str,
+) -> Result<()> {
+    let caller = caller
+        .as_object()
+        .ok_or_else(|| Error::Config(format!("--settings key {path} must be a JSON object")))?;
+    let relay = relay.as_object_mut().expect("relay settings are objects");
+    for (key, value) in caller {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        if matches!(child_path.as_str(), "hooks.Stop" | "hooks.UserPromptSubmit") {
+            return Err(Error::Config(format!(
+                "--settings key {child_path} conflicts with a required relay hook"
+            )));
+        }
+        if matches!(
+            child_path.as_str(),
+            "permissions.allow" | "permissions.deny"
+        ) && !value.is_array()
+        {
+            return Err(Error::Config(format!(
+                "--settings key {child_path} must be an array"
+            )));
+        }
+        match relay.get_mut(key) {
+            None => {
+                relay.insert(key.clone(), value.clone());
+            }
+            Some(existing) if existing.is_object() && value.is_object() => {
+                merge_settings(existing, value, &child_path)?;
+            }
+            Some(existing)
+                if matches!(
+                    child_path.as_str(),
+                    "permissions.allow" | "permissions.deny"
+                ) && existing.is_array()
+                    && value.is_array() =>
+            {
+                existing
+                    .as_array_mut()
+                    .expect("checked array")
+                    .extend(value.as_array().expect("checked array").iter().cloned());
+            }
+            Some(_) => {
+                return Err(Error::Config(format!(
+                    "--settings key {child_path} conflicts with relay settings"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_lists_append_and_relay_hook_collisions_fail() {
+        let mut relay = serde_json::json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command"}]}]},
+            "permissions": {"allow": ["Read(./relay/**)"], "deny": ["Read(./relay-secret/**)"]}
+        });
+        merge_settings(
+            &mut relay,
+            &serde_json::json!({
+                "permissions": {"allow": ["Grep"], "deny": ["Read(~/.config/**)"]},
+                "hooks": {"PreToolUse": []}
+            }),
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            relay["permissions"]["allow"],
+            serde_json::json!(["Read(./relay/**)", "Grep"])
+        );
+        assert_eq!(
+            relay["permissions"]["deny"],
+            serde_json::json!(["Read(./relay-secret/**)", "Read(~/.config/**)"])
+        );
+        assert!(relay["hooks"]["Stop"].is_array());
+        assert!(relay["hooks"]["PreToolUse"].is_array());
+        let err = merge_settings(&mut relay, &serde_json::json!({"hooks": {"Stop": []}}), "")
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("conflicts with a required relay hook"));
+    }
 
     #[test]
     fn creates_temp_dir_with_artifacts() {

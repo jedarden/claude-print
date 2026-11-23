@@ -240,6 +240,7 @@ claude-print --timeout 30 "quick question"
 | `--output-format <FORMAT>` | `-o` | `text` | Output format: `text`, `json`, `stream-json` |
 | `--allowedTools <LIST>` | | | Comma-separated list of allowed tools |
 | `--disallowedTools <LIST>` | | | Comma-separated list of disallowed tools |
+| `--settings <FILE>` | | | Merge a JSON settings file with the required relay hooks; conflicting relay hook keys fail. With `--pool-socket`, start a fresh child so caller rules take effect. |
 | `--dangerously-skip-permissions` | | | Skip permission prompts (dangerous) |
 | `--timeout <SECS>` | | `3600` | Wall-clock timeout in seconds |
 | `--first-output-timeout <SECS>` | | `90` | First-output timeout in seconds (PTY output) |
@@ -392,9 +393,13 @@ and this key controls only the first:
    hook defined there (`SessionStart`, `PreToolUse`, `Stop`, …) fires when its
    event happens.
 2. **claude-print's relay settings** — a private settings file in a per-run
-   temp dir, forwarded to the child as `--settings`. It carries only the
-   `Stop` and `UserPromptSubmit` relay hooks claude-print itself needs (Stop
-   detection and transcript binding); none of your settings are in it.
+   temp dir, forwarded to the child as `--settings`. It always carries the
+   `Stop` and `UserPromptSubmit` relay hooks claude-print needs (Stop
+   detection and transcript binding). When you pass `--settings <FILE>`,
+   its JSON keys are merged into that same file before Claude starts.
+   `permissions.allow` and `permissions.deny` arrays are appended; a caller
+   cannot replace either required relay hook. A pooled invocation with
+   `--settings` starts a fresh child to apply the per-call rules.
 
 With `inherit_hooks = true` (the default), claude-print forwards no
 `--setting-sources` flag, so the child loads both channels exactly as

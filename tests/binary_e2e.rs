@@ -131,6 +131,97 @@ fn run_with(
 /// ceiling that still fails fast on a wedge.
 const BUDGET: Duration = Duration::from_secs(30);
 
+#[test]
+fn caller_settings_merge_and_weft_argv_reach_one_child_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("caller.json");
+    std::fs::write(
+        &settings,
+        r#"{"permissions":{"allow":["Read(./safe/**)"],"deny":["Read(~/.config/**)"]},"model":"sonnet"}"#,
+    )
+    .unwrap();
+
+    for equals_form in [false, true] {
+        let recorded_settings = dir.path().join(format!("merged-{equals_form}.json"));
+        let recorded_args = dir.path().join(format!("args-{equals_form}"));
+        let mut cmd = claude_print();
+        cmd.current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("MOCK_RECORD_SETTINGS", &recorded_settings)
+            .env("MOCK_RECORD_ARGS", &recorded_args)
+            .args(["--max-turns", "8", "--output-format", "stream-json"]);
+        if equals_form {
+            cmd.arg(format!("--settings={}", settings.display()));
+        } else {
+            cmd.arg("--settings").arg(&settings);
+        }
+        cmd.args(["--allowedTools", "Read,Grep,Glob", "reply pong"]);
+        let out = run(&mut cmd, BUDGET);
+        assert_eq!(out.code, Some(0), "Weft argv failed: {out:?}");
+        let merged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&recorded_settings).unwrap()).unwrap();
+        assert_eq!(merged["permissions"]["deny"][0], "Read(~/.config/**)");
+        assert_eq!(merged["permissions"]["allow"][0], "Read(./safe/**)");
+        assert_eq!(merged["model"], "sonnet");
+        for event in ["Stop", "UserPromptSubmit"] {
+            assert_eq!(merged["hooks"][event][0]["hooks"][0]["type"], "command");
+        }
+        let args: Vec<_> = std::fs::read(&recorded_args)
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.starts_with("--settings="))
+                .count(),
+            1
+        );
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--allowedTools", "Read,Grep,Glob"]));
+    }
+}
+
+#[test]
+fn caller_settings_invalid_files_and_relay_hook_conflicts_fail_before_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("child-args");
+    for (name, content, diagnostic) in [
+        ("missing.json", None, "cannot read --settings"),
+        ("unreadable-dir", None, "cannot read --settings"),
+        ("invalid.json", Some("{"), "invalid --settings JSON"),
+        ("scalar.json", Some("null"), "must contain a JSON object"),
+        (
+            "conflict.json",
+            Some(r#"{"hooks":{"Stop":[]}}"#),
+            "conflicts with a required relay hook",
+        ),
+    ] {
+        let path = dir.path().join(name);
+        if let Some(content) = content {
+            std::fs::write(&path, content).unwrap();
+        } else if name == "unreadable-dir" {
+            std::fs::create_dir(&path).unwrap();
+        }
+        let out = run(
+            claude_print()
+                .env("HOME", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path())
+                .env("MOCK_RECORD_ARGS", &record)
+                .arg("--settings")
+                .arg(&path)
+                .arg("reply pong"),
+            BUDGET,
+        );
+        assert_eq!(out.code, Some(2), "{name}: {out:?}");
+        assert!(out.stderr.contains(diagnostic), "{name}: {out:?}");
+        assert!(!record.exists(), "{name} spawned a child");
+    }
+}
+
 /// Set up a temporary config directory for a test and return the temp dir.
 /// The caller must keep the TempDir alive for the duration of the test.
 fn setup_temp_config() -> TempDir {

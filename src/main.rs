@@ -289,6 +289,31 @@ fn main() {
         }
     };
 
+    // Read and validate caller rules before acquiring a worker or spawning Claude.
+    let caller_settings = match cli
+        .settings
+        .as_deref()
+        .map(hook::load_caller_settings)
+        .transpose()
+    {
+        Ok(settings) => settings,
+        Err(e) => {
+            let mut stdout = io::stdout().lock();
+            let mut stderr = io::stderr().lock();
+            let error: ClaudePrintError = e.into();
+            let _ = emit_error(
+                &mut stdout,
+                &mut stderr,
+                &error,
+                &cli.output_format,
+                &resolve_claude_version(cli.claude_binary.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                true,
+            );
+            exit_with_cleanup(error.exit_code());
+        }
+    };
+
     // Build claude_args: collect flags to forward to child
     let mut claude_args: Vec<std::ffi::OsString> = Vec::new();
 
@@ -348,6 +373,7 @@ fn main() {
         None
     });
     let launch = session::LaunchOptions {
+        settings: caller_settings,
         no_inherit_hooks: resolved_no_inherit_hooks,
         mcp_configs: cli.mcp_config.clone(),
         pretrust_cwd: cli.pretrust_cwd,
@@ -363,9 +389,13 @@ fn main() {
     // fallback-classified failure → one verbose diagnostic and the ordinary
     // stateless session below; protocol failure → the hard-error arm here.
     let pool_tracer = claude_print::verbose::Tracer::new(cli.verbose, t0);
-    let pooled_worker = match claude_print::pool::acquire_for_invocation(
+    if launch.settings.is_some() && cli.pool_socket.is_some() {
+        pool_tracer.trace("pool: --settings requires a fresh child; using the ordinary session");
+    }
+    let pooled_worker = match claude_print::pool::acquire_for_invocation_with_settings(
         cli.pool_socket.as_deref(),
         resolved_timeout,
+        launch.settings.is_some(),
     ) {
         Ok(claude_print::pool::InvocationAcquisition::NotRequested) => None,
         Ok(claude_print::pool::InvocationAcquisition::Fallback(failure)) => {

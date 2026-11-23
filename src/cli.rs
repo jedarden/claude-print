@@ -80,6 +80,10 @@ pub struct Cli {
     #[arg(long = "disallowedTools")]
     pub disallowed_tools: Option<String>,
 
+    /// JSON settings file to merge with claude-print's relay hooks
+    #[arg(long = "settings")]
+    pub settings: Option<std::path::PathBuf>,
+
     /// Skip permission prompts (dangerous)
     #[arg(long = "dangerously-skip-permissions")]
     pub dangerously_skip_permissions: bool,

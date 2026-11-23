@@ -50,6 +50,7 @@ the closed forwarding vocabulary the test enforces:
 | `--output-format <FORMAT>` | `-o` | `text` | never |
 | `--allowedTools <LIST>` | — | — | verbatim |
 | `--disallowedTools <LIST>` | — | — | verbatim |
+| `--settings <FILE>` | — | — | never (contents merge into the single relay settings file) |
 | `--dangerously-skip-permissions` | — | — | verbatim |
 | `--timeout <SECS>` | — | `3600` | never (claude-print's own wall-clock watchdog; claude has no such option) |
 | `--first-output-timeout <SECS>` | — | `90` | never |
