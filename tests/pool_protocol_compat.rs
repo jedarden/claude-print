@@ -185,25 +185,27 @@ fn error_body(code: &str) -> Vec<u8> {
 /// byte of in-band data — the same shape `PoolServer::send_fd` uses.
 fn send_fd_to(stream: &UnixStream, fd: libc::c_int) {
     let socket_fd = stream.as_raw_fd();
-    let iov = [std::io::IoSlice::new(&[0u8; 1])];
-    // SAFETY: mirrors src/pool.rs `PoolServer::send_fd`: one cmsghdr sized for
-    // exactly one fd, one iovec pointing at live storage, sendmsg on a live
-    // connected socket fd. The cmsg buffer is fully initialized before use.
+    let byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_ptr() as *mut libc::c_void,
+        iov_len: byte.len(),
+    };
+    // SAFETY: the aligned control buffer has CMSG_SPACE for one fd, and the
+    // iovec and socket remain live through sendmsg.
     unsafe {
-        let mut cmsg: libc::cmsghdr = std::mem::zeroed();
-        cmsg.cmsg_len =
-            (std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<libc::c_int>()) as _;
-        cmsg.cmsg_level = libc::SOL_SOCKET;
-        cmsg.cmsg_type = libc::SCM_RIGHTS;
+        let control_bytes = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as usize;
+        let mut control = vec![0usize; control_bytes.div_ceil(std::mem::size_of::<usize>())];
+        let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        libc::CMSG_DATA(cmsg).cast::<libc::c_int>().write(fd);
 
         let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+        msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        msg.msg_control = &mut cmsg as *mut _ as *mut _;
-        msg.msg_controllen = cmsg.cmsg_len;
-
-        let data = (msg.msg_control as *mut u8).add(std::mem::size_of::<libc::cmsghdr>());
-        *(data as *mut libc::c_int) = fd;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control_bytes as _;
 
         assert!(
             libc::sendmsg(socket_fd, &msg, 0) >= 0,
