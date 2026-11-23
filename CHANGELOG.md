@@ -5,6 +5,21 @@ are tagged `vX.Y.Z` and published as GitHub Releases by the `claude-print-ci`
 Argo workflow, which runs the full gate set (fmt, clippy, test, cargo audit,
 static musl build) against the tagged commit before publishing.
 
+## [0.2.11] - 2026-11-23
+
+`claude-print` now accepts a caller-supplied `--settings <file>` (both
+`--settings X` and `--settings=X`). The caller's rules are validated up
+front — a missing, unreadable, or malformed file fails the invocation
+before anything spawns — and merged into the single relay settings file
+the child receives, so the relay hooks stay in place and the child still
+sees exactly one `--settings`. `permissions.allow` and `permissions.deny`
+are concatenated, never replaced; any caller key that would override a
+required relay hook (or any other relay key) refuses the run with a
+config error. Invocations carrying `--settings` skip the prewarmed pool
+worker so the merged rules always reach a freshly spawned child. This is
+the flag NEEDLE's Weft envelope already sends, and the piece the tagged
+but unpublished v0.2.10 was cut for (claudepr-0deed6cd).
+
 ## [0.2.8] - 2026-11-07
 
 Patch release for Claude Code 2.1.319. The runtime contracts and stream JSON
