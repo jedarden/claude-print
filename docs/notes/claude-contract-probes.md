@@ -1,6 +1,6 @@
 # Claude Code Runtime Contract Probes — measured behavior
 
-**Measured against:** `claude` 2.1.331 (`2.1.331 (Claude Code)`), 2026-11-24, on the
+**Measured against:** `claude` 2.1.332 (`2.1.332 (Claude Code)`), 2026-11-25, on the
 claude-print dev host. Probe harness: `scripts/probe-claude-contracts.sh` (merge /
 suppression / single-turn Stop), `scripts/probe-stop-toolallowed.sh` (multi-round
 Stop contract, print mode), `scripts/probe-tui-second-turn.sh` (TUI
@@ -29,7 +29,7 @@ exists for. The runs: merge (P2/P6), suppression (P3), `=none` rejection
 the `--max-turns` cutoff again fired no Stop (T3, exit 1); the permitted-tool
 arms re-measured the multi-round and TUI Stop contracts
 (`probe-stop-toolallowed.sh`, `probe-tui-second-turn.sh` — outcomes recorded
-in §Stop firing contract below). Evidence tables below cite the 2.1.331
+in §Stop firing contract below). Evidence tables below cite the 2.1.332
 re-measurement — the same version the **Measured against:** stamp and the
 active fixtures pin — so the doc body upholds the one-pin invariant the gate
 enforces on the fixtures. Since claudepr-893bfc4e (2026-09-30) that upholding
@@ -122,10 +122,10 @@ claudepr-43ffc2a9, retained as history), and
 2026-11-17 by claudepr-cc906f52, landed as history in this re-pin), and
 `tests/fixtures/claude_contracts_v2.1.327.json` (the prior pin, measured
 2026-11-18 by claudepr-8d4eb55f, landed as history in this re-pin), and
-`tests/fixtures/claude_contracts_v2.1.330.json` (the prior pin, measured
-2026-11-22 by claudepr-10667744, landed as history in this re-pin), and
-`tests/fixtures/claude_contracts_v2.1.331.json` (the active pin, measured
-2026-11-24 by claudepr-f0321ea0).
+`tests/fixtures/claude_contracts_v2.1.331.json` (the prior pin, measured
+2026-11-24 by claudepr-f0321ea0, landed as history in this re-pin), and
+`tests/fixtures/claude_contracts_v2.1.332.json` (the active pin, measured
+2026-11-25 by claudepr-71048ad2).
 
 That incident also exposed a design gap that outlived it: the straddle was
 recoverable only because it was *noticed* — an unnoticed one would have
@@ -592,7 +592,7 @@ log: a **project source** (`.claude/settings.json` in the probe cwd) and a
 source was exercised, the sandbox `~/.claude/settings.json` carried the same
 wiring. The settings schema used was claude-print's double-nested
 `hooks.Stop[ { hooks: [ {type: "command", ...} ] } ]` form — accepted and
-fired by every measured version (2.1.270, 2.1.281, 2.1.282, 2.1.285, 2.1.286, 2.1.287, 2.1.288, 2.1.289, 2.1.290, 2.1.292, 2.1.294, 2.1.296, 2.1.300, 2.1.301, 2.1.302, 2.1.303, 2.1.307, 2.1.308, 2.1.309, 2.1.311, 2.1.312, 2.1.316, 2.1.317, 2.1.318, 2.1.321, 2.1.322, 2.1.323, 2.1.325, 2.1.326, 2.1.327, 2.1.330, 2.1.331), which also
+fired by every measured version (2.1.270, 2.1.281, 2.1.282, 2.1.285, 2.1.286, 2.1.287, 2.1.288, 2.1.289, 2.1.290, 2.1.292, 2.1.294, 2.1.296, 2.1.300, 2.1.301, 2.1.302, 2.1.303, 2.1.307, 2.1.308, 2.1.309, 2.1.311, 2.1.312, 2.1.316, 2.1.317, 2.1.318, 2.1.321, 2.1.322, 2.1.323, 2.1.325, 2.1.326, 2.1.327, 2.1.330, 2.1.331, 2.1.332), which also
 live-verifies the Hook Installer §2 schema note.
 
 On 2026-11-13 (claudepr-cda1493c, the scheduled drift-watch bead), all four
@@ -817,25 +817,80 @@ new sanitized 2.1.331 golden family uses representatives from this capture
 bytes and error objects are verified against the production reader and emitter
 by the golden test.
 
+On 2026-11-25 (claudepr-71048ad2, the scheduled drift-watch bead), all four
+guarded probes ran against the concrete 2.1.332 binary and ended
+`version-guard: verdict=single-version start=2.1.332 end=2.1.332`. Every
+contract matched the prior pin again. Arm S was concurrent in 12 of 12 event
+pairs across one invocation, with relay-first in 4 of 12. Arm D completed
+5 of 5 denied-scenario runs — every run exited 0 and fired exactly one Stop
+with an errored Bash result in each transcript. (Two earlier same-day
+invocations were discarded as re-runs, not findings: each lost one Arm D run
+to a `--max-turns` cutoff — exit 1, zero Stops, the measured cutoff contract
+— and the whole invocation was re-run per the documented re-run rule.)
+Arm T killed all 8 overrun firings while all 4 sessions completed with replies
+at 5.1 s after Stop-hook start. The dedicated TUI probe observed one Stop per
+turn at 6.8 s / 2.1 s. The allowed-tool TUI arm of probe-stop-toolallowed hit
+the documented zero-firing driver window on both prompts (205.1 s each, zero
+firings — the window shape of 2.1.331, 2.1.330, 2.1.312, 2.1.319, 2.1.325,
+2.1.326, and 2.1.327, historical; not a rendered-reply-without-Stop finding);
+its Arm P print-mode contract passed: one Stop, DONE, exit 0.
+probe-claude-contracts T2 (multi-round tool use, two loaded sources)
+completed both turns with two Stops per turn — one per loaded source
+(47.0 s / 35.5 s). probe-claude-contracts T1 (multi-round, print mode,
+exit 0) fired exactly one own Stop, and the T3 cutoff exited 1 with zero own
+firings. One same-session authenticated claude-print stream-json capture
+(36 records) had no `result`, CR, or blank records, and stdout was
+byte-identical to its transcript. The envelope set matched the prior pin with
+recurring facts and no new deltas: the capture's assistant records were again
+a thinking + text split pair sharing one `message.id` (the live thinking
+record carried `thinkingDisplay` (`"updates"`) and `thinkingDurationMs`
+(180)), and the sampled live assistant envelope matched the 2.1.331 sample
+key-for-key (`serverClassifierRequest` present, alongside the continuing
+`madeBy`, `requestRef`, `promptCacheRequested` (`"5m"`), `effort`,
+`perTurnEffort`, and `requestedModel` keys). Two live `ai-title` records
+occurred (the count varies run-to-run; the retained forwarding case is
+re-versioned by the live pair). The standing envelope facts held (the
+`environment` attachment's snapshot still drops `scratchpadDirectory`, the
+`api-request-shape` record's `shape` field remains an object, and the
+`api-request-blob` record's `message` field remains an object). The live
+`cost-state` records carried two `modelUsage` entries — `claude-sonnet-4-6`
+plus this host's glm title-class model — and the title-model entry is dropped
+per the family's single-model convention (the 2.1.317 rule), keeping the live
+`hasUnknownModelCost` flag (true this run) so the total/entry gap stays
+internally explained. No `session-owner`, `mcp_instructions_delta`, or
+`credential_org` records occurred in this capture (retained forwarding cases,
+re-versioned), `session_context.context` arrived empty again, and the capture
+carried two live `prompt_snapshot` attachments (the second with tool schema
+objects and `cliPrefix`) and a live `auto_mode` attachment. The new sanitized
+2.1.332 golden family uses representatives from this capture (the live
+assistant split pair with its live usage counts and the live thinking record;
+two live ai-title records this run — the retained forwarding case
+re-versioned by the live pair), retains the older 2.1.282 tool-use history
+block with `wireToolInputs`, and keeps the blank/spaced-JSON framing cases.
+Its expected bytes and error objects are verified against the production
+reader and emitter by the golden test.
+
 ## PO-1 / OQ-1 — `--settings` merge: CONFIRMED; firing order: NOT CONTRACTUAL
 
-Evidence (2.1.331; P2: project source + `--settings`; P6: user source +
+Evidence (2.1.332; P2: project source + `--settings`; P6: user source +
 `--settings`; each a real completed `claude -p` turn):
 
 | Run | Event | Firings in order |
 |---|---|---|
-| P2 | SessionStart | project → relay |
+| P2 | SessionStart | relay → project |
 | P2 | Stop | project → relay |
-| P6 | SessionStart | user → relay-settings (project also loaded; its position is not printed by the probe's `user|relay-settings` log filter) |
+| P6 | SessionStart | relay-settings → user (project also loaded; its position is not printed by the probe's `user|relay-settings` log filter) |
 | P6 | Stop | user → relay-settings (project also loaded; position not printed) |
 
 - `--settings <file>` hooks fire **alongside** standard-source hooks — merge,
   not replace. Every loaded source fired on every event. PO-1's
   in-process-merge fallback is not needed.
-- **Order across sources is not a contract.** On 2.1.331 the ordinary pairs
+- **Order across sources is not a contract.** On 2.1.332 the ordinary pairs
   showed every loaded source firing in each event (P2's SessionStart and Stop
-  pairs 2 ms apart; P6 one Stop per source), with start order varying
-  between the runs and events. The prior 2.1.330 run (2026-11-22,
+  pairs 2 ms and 7 ms apart; P6 one Stop per source), with start order varying
+  between the runs and events. The prior 2.1.331 run (2026-11-24,
+  claudepr-f0321ea0, historical) also showed every loaded source firing,
+  with its P2 pairs 2 ms apart. The prior 2.1.330 run (2026-11-22,
   claudepr-10667744, historical) also showed every loaded source firing,
   with its P2 pairs 2 ms apart. The prior 2.1.327 run (2026-11-18,
   claudepr-8d4eb55f, historical) also showed every loaded source firing,
@@ -856,12 +911,14 @@ Evidence (2.1.331; P2: project source + `--settings`; P6: user source +
   hook sleeping 300 ms and logging start/end; relay hook sleeping 0 ms —
   `scripts/probe-stop-edge-contracts.sh` Arm S) supplies the direct
   concurrency proof a timestamp pair alone cannot. Re-measured against the
-  pinned 2.1.331 on 2026-11-24 (claudepr-f0321ea0; 6 runs × 2 event pairs
+  pinned 2.1.332 on 2026-11-25 (claudepr-71048ad2; 6 runs × 2 event pairs
   in one invocation): the two hooks ran **concurrently in 12 of 12
   pairs** — the relay always started while the project hook's sleep was
   still running (project wall time exceeded 300 ms across the firings, so
   the sleep demonstrably executed), and
   the relay **started before** the project hook in **4 of 12 pairs**. The
+  prior 2.1.331 run (2026-11-24, claudepr-f0321ea0, historical) also showed
+  concurrent starts, with relay first in four of twelve pairs. The
   prior 2.1.330 run (2026-11-22, claudepr-10667744, historical) also showed
   concurrent starts, with relay first in three of twelve pairs. The
   prior 2.1.327 run (2026-11-18, claudepr-8d4eb55f, historical) also showed
@@ -895,7 +952,7 @@ Evidence (2.1.331; P2: project source + `--settings`; P6: user source +
   pinned 2.1.282
   run of 2026-09-25 (claudepr-d9553d38) with its two extra same-day
   invocations had measured the same shape — concurrent 24/24 and 12 of 12 each, flips
-  3/12, 4/12, 3/12, 1/12, 8/12, 5/12, 1/12, 4/24, 3/12, 6/12, 4/12 and 5/12 — and an earlier drift-window invocation had measured
+  4/12, 3/12, 4/12, 3/12, 1/12, 8/12, 5/12, 1/12, 4/24, 3/12, 6/12, 4/12 and 5/12 — and an earlier drift-window invocation had measured
   12 of 12 concurrent with 7 of 12 flips, so the flip rate itself is unstable.
   That reproduces the original 2.1.270 finding
   (concurrent firing observed; start-order flip in 1 of 4 runs) on a later
@@ -925,7 +982,7 @@ Evidence (2.1.331; P2: project source + `--settings`; P6: user source +
   starts and with zero hook firings: `Error processing --setting-sources:
   Invalid setting source: none. Valid options are: user, project, local`.
 The PO-2 fallback spelling is rejected identically by every measured
-version (2.1.270 through 2.1.331); do not adopt it.
+version (2.1.270 through 2.1.332); do not adopt it.
   (Side observation: `--allowedTools` consumes a variadic value list — pass it
   as `--allowedTools=Bash` or it will swallow a following positional prompt.)
 
@@ -934,7 +991,7 @@ version (2.1.270 through 2.1.331); do not adopt it.
 `docs/notes/hook-design.md` §Relay Hook configures both relay hooks with
 `"timeout": 10` and states Claude Code "does not wait beyond the 10s timeout"
 — a claim the merge/suppression/Stop pins above did not cover. Measured
-directly against the pinned 2.1.331 on 2026-11-24 (claudepr-f0321ea0; Arm T
+directly against the pinned 2.1.332 on 2026-11-25 (claudepr-71048ad2; Arm T
 of `scripts/probe-stop-edge-contracts.sh`, added 2026-09-26,
 claudepr-352cf1df, re-run natively here in the same pinned session as the
 rest of the re-pin — the contract's first measurement, against the pinned
@@ -945,14 +1002,16 @@ claude-print's isolation-mode shape) was configured with a per-hook
 `"timeout": 5` while its script slept 30 s, wired on SessionStart and Stop,
 across 4 real single-turn runs (one invocation):
 
-| Signal | Result (2.1.331, 2026-11-24) |
+| Signal | Result (2.1.332, 2026-11-25) |
 |---|---|
 | Hook killed before its sleep finished — `end` line never logged after `start` | **8/8** event firings (4 SessionStart + 4 Stop) |
 | Session proceeds — claude exit code | **4/4** runs exit 0 |
 | Session proceeds — reply rendered | 4/4 runs (`reply-contains-OK` 4/4) |
 | claude process exit − Stop hook start | **5.1 s** in each of 4 runs (4/4) — the configured 5 s timeout, not the 30 s sleep |
 
-The prior 2.1.330 run (2026-11-22, claudepr-10667744, historical — one
+The prior 2.1.331 run (2026-11-24, claudepr-f0321ea0, historical — one
+invocation, eight of eight firings killed, four of four sessions exit 0 with
+replies at 5.1 s), the prior 2.1.330 run (2026-11-22, claudepr-10667744, historical — one
 invocation, eight of eight firings killed, four of four sessions exit 0 with
 replies at 5.1 s), the prior 2.1.327 run (2026-11-18, claudepr-8d4eb55f,
 historical — one invocation, eight of eight firings killed, four of four
@@ -1006,13 +1065,13 @@ Conclusions:
 ## Stop firing contract — single-turn baseline
 
 Every completed single-turn `claude -p` run (P1, P2, P3, P4, P6: no tool use)
-fired **exactly one Stop per loaded source** (e.g. 2.1.331 P6: user and
+fired **exactly one Stop per loaded source** (e.g. 2.1.332 P6: user and
 relay Stop hooks each fired once, with the project source also loaded (its
 firings sit outside the probe's `user|relay-settings` log filter); P3:
 relay Stop only). No run produced
 zero Stops; no run produced more than one Stop per source — re-verified
 unchanged on 2.1.281, 2.1.282, 2.1.287, 2.1.288, 2.1.289, 2.1.290, 2.1.292,
-2.1.296, 2.1.300, 2.1.301, 2.1.302, 2.1.303, 2.1.307, 2.1.308, 2.1.309, 2.1.311, 2.1.312, 2.1.316, 2.1.317, 2.1.318, 2.1.321, 2.1.322, 2.1.323, 2.1.325, 2.1.326, 2.1.327, 2.1.330, and 2.1.331, whose fixtures pin the count at 1 per loaded source.
+2.1.296, 2.1.300, 2.1.301, 2.1.302, 2.1.303, 2.1.307, 2.1.308, 2.1.309, 2.1.311, 2.1.312, 2.1.316, 2.1.317, 2.1.318, 2.1.321, 2.1.322, 2.1.323, 2.1.325, 2.1.326, 2.1.327, 2.1.330, 2.1.331, and 2.1.332, whose fixtures pin the count at 1 per loaded source.
 
 ## Stop firing contract — multi-round tool use, TUI turns, cutoffs
 
@@ -1025,9 +1084,9 @@ allowlist alone did not deny Bash, so those counts do not establish the
 degraded-path contract. The completed-turn contract was measured with tools
 actually permitted
 (`scripts/probe-stop-toolallowed.sh`, `scripts/probe-tui-second-turn.sh`);
-counts and timings below are the 2.1.331 run — the active pin. Arm D now
+counts and timings below are the 2.1.332 run — the active pin. Arm D now
 installs a command-specific Bash deny rule and verifies an errored Bash result
-in each transcript. Its 2.1.331 re-measurement verified 5 of 5 denied-scenario
+in each transcript. Its 2.1.332 re-measurement verified 5 of 5 denied-scenario
 runs — every run exited 0, verified an errored Bash result, and fired exactly
 one Stop. No completed run fired
 ≠1 Stop. See the hazard note
@@ -1037,16 +1096,16 @@ below the table. Measured scenarios:
 |---|---|---|
 | Single-turn `claude -p`, no tools | 1 per loaded source | P1–P6 (above) |
 | `claude -p`, two sequential permitted Bash rounds (`--allowedTools=Bash`) | **1**, at the turn's true end | one firing, `last_assistant_message: "DONE"`, `stop_hook_active: false`, single session id |
-| `claude -p`, tool calls permission-denied (degraded, explicit Bash deny) | **1** | Arm D (2.1.331, 2026-11-24): 5/5 denied-scenario runs verified an errored Bash result, every run exited 0, and every run fired exactly one Stop (`stop_hook_active: false`); the historical 2.1.270 hazard — one extra Stop in 1 of 2 runs — did not reproduce (the 2.1.330 run, historical, verified 5 of 5 across one invocation; the 2.1.326 run, historical, verified 5 of 5 across one invocation; the 2.1.325 run, historical, verified 5 of 5 across one invocation; the 2.1.323 run, historical, verified 5 of 5 across one invocation; the 2.1.312 run, historical, verified 6 of 10 across two invocations; the 2.1.311 run, historical, verified 5 of 5 across one invocation; the 2.1.309 run, historical, verified 5 of 10 across two invocations; the 2.1.307 run, historical, verified 10 of 15 across three invocations; the 2.1.308 run, historical, verified 8 of 10 across two) |
-| TUI, turn 1 (plain reply) | **1** | firing + reply both observed (6.9 s) |
-| TUI, turn 2 in the same session (plain reply) | **1** | firing + reply both observed (8.8 s); TUI status line showed `(running Stop hook)` |
+| `claude -p`, tool calls permission-denied (degraded, explicit Bash deny) | **1** | Arm D (2.1.332, 2026-11-25): 5/5 denied-scenario runs verified an errored Bash result, every run exited 0, and every run fired exactly one Stop (`stop_hook_active: false`); the historical 2.1.270 hazard — one extra Stop in 1 of 2 runs — did not reproduce (the 2.1.331 run, historical, verified 5 of 5 across one invocation; the 2.1.330 run, historical, verified 5 of 5 across one invocation; the 2.1.326 run, historical, verified 5 of 5 across one invocation; the 2.1.325 run, historical, verified 5 of 5 across one invocation; the 2.1.323 run, historical, verified 5 of 5 across one invocation; the 2.1.312 run, historical, verified 6 of 10 across two invocations; the 2.1.311 run, historical, verified 5 of 5 across one invocation; the 2.1.309 run, historical, verified 5 of 10 across two invocations; the 2.1.307 run, historical, verified 10 of 15 across three invocations; the 2.1.308 run, historical, verified 8 of 10 across two) |
+| TUI, turn 1 (plain reply) | **1** | firing + reply both observed (6.8 s) |
+| TUI, turn 2 in the same session (plain reply) | **1** | firing + reply both observed (2.1 s); TUI status line showed `(running Stop hook)` |
 | `claude -p` cut off by `--max-turns 2` mid-task | **0** | exit code 1, zero firings across the run |
 
-*(Timings in the table above are the 2.1.331 measurement. Full 2.1.331
+*(Timings in the table above are the 2.1.332 measurement. Full 2.1.332
 evidence: Arm P — `--allowedTools=Bash` completed both sequential Bash commands, final message `DONE`, exit 0, and one Stop fired,
 `stop_hook_active: false`, single session id; T1 — completed (exit 0) with
 exactly one firing of its own (the probe's per-arm print is the shared log's
-  cumulative project count); TUI turns — 1 Stop each, 6.9 s / 8.8 s
+  cumulative project count); TUI turns — 1 Stop each, 6.8 s / 2.1 s
 (probe-tui-second-turn, verdict "once-per-turn confirmed", both replies
 rendered); cutoff
 (T3) — 0 own firings, exit 1. The same-day 2.1.281 run (measured hours before
@@ -1148,9 +1207,16 @@ probe-tui-second-turn at 12.1 s / 2.1 s, the allowed-tool TUI at
 205.1 s / 205.1 s (its zero-firing driver window), and
 probe-claude-contracts T2 at 49.0 s / 32.0 s, and the original 2.1.330 run
 had measured 12.1 s / 2.1 s for its plain TUI turns — per-version numbers
-live in the fixtures. The 2.1.331 allowed-tool TUI arm hit the documented zero-firing driver window on both prompts (205.1 s each, zero firings — the window shape of 2.1.330, 2.1.312, 2.1.319, 2.1.325, 2.1.326, and 2.1.327, historical; not a rendered-reply-without-Stop finding); the tool-using TUI turn is additionally measured by
+live in the fixtures. The prior 2.1.331 pin
+(claudepr-f0321ea0, 2026-11-24,
+historical) measured Arm T at 5.1 s / 5.1 s / 5.1 s / 5.1 s,
+probe-tui-second-turn at 6.9 s / 8.8 s, the allowed-tool TUI at
+205.1 s / 205.1 s (its zero-firing driver window), and
+probe-claude-contracts T2 at 45.5 s / 32.5 s, and the original 2.1.331 run
+had measured 6.9 s / 8.8 s for its plain TUI turns — per-version numbers
+live in the fixtures. The 2.1.332 allowed-tool TUI arm hit the documented zero-firing driver window on both prompts (205.1 s each, zero firings — the window shape of 2.1.331, 2.1.330, 2.1.312, 2.1.319, 2.1.325, 2.1.326, and 2.1.327, historical; not a rendered-reply-without-Stop finding); the tool-using TUI turn is additionally measured by
 probe-claude-contracts T2 — two Stops for two loaded sources on each
-completed turn (45.5 s / 32.5 s) — and the dedicated
+completed turn (47.0 s / 35.5 s) — and the dedicated
 probe-tui-second-turn.sh run completed both plain turns and is the per-turn
 TUI evidence for this re-pin.)*
 
@@ -1170,11 +1236,13 @@ Conclusions:
   `--dangerously-skip-permissions`): on headless runs where the model's tool
   calls are permission-denied, an extra Stop firing was observed once (2
   firings for one prompt — a 2.1.270 measurement, historical).
-  **Re-measured against the pinned 2.1.331 on 2026-11-24** (claudepr-f0321ea0,
+  **Re-measured against the pinned 2.1.332 on 2026-11-25** (claudepr-71048ad2,
   `scripts/probe-stop-edge-contracts.sh` Arm D): its 5 denied-scenario runs
   all contained an errored Bash result, exited 0, and had
   `stop_hook_active: false` on every firing — **every run fired exactly one
   Stop**; the hazard did not reproduce. The
+  prior pin 2.1.331 (claudepr-f0321ea0, 2026-11-24,
+  historical: 5 of 5 verified across one invocation), the
   prior pin 2.1.330 (claudepr-10667744, 2026-11-22,
   historical: 5 of 5 verified across one invocation), the
   prior pin 2.1.327 (claudepr-8d4eb55f, 2026-11-18,
@@ -1214,7 +1282,7 @@ Conclusions:
   permission-denied paths ever become a supported mode.
 
 (first filled in by the claudepr-6ef2541c probe run against 2.1.270; the
-counts and timings above are re-cited from the 2.1.331 re-measurement — see
+counts and timings above are re-cited from the 2.1.332 re-measurement — see
 plan.md §Stop Poller for the concluded contract)
 
 ## Reproducing
